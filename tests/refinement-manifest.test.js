@@ -2,7 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fallbackRefinePrd, getTicketById, readManifest, writeManifest, writeTicketFiles } from '../lib/tickets.js';
+import {
+  ensureTicketFilesMaterialized,
+  fallbackRefinePrd,
+  getTicketById,
+  readManifest,
+  summarizeTickets,
+  writeManifest,
+  writeTicketFiles,
+} from '../lib/tickets.js';
 import { makeTempRoot } from './helpers.js';
 
 test('fallbackRefinePrd builds tickets from the PRD task breakdown table', () => {
@@ -71,4 +79,73 @@ test('readManifest and writeTicketFiles normalize uppercase ticket ids and persi
   assert.equal(rewritten.tickets[0].id, 'r1');
   assert.ok(fs.existsSync(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')));
   assert.equal(getTicketById(sessionDir, 'R1')?.id, 'r1');
+});
+
+test('normalizeManifestTicketIds rewrites dependency references to canonical ids', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Root Ticket',
+        description: 'first',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'R2',
+        title: 'Dependent Ticket',
+        description: 'second',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: 'R1',
+      },
+    ],
+  });
+
+  const manifest = readManifest(sessionDir);
+  assert.equal(manifest.tickets[0].id, 'r1');
+  assert.equal(manifest.tickets[1].id, 'r2');
+  assert.equal(manifest.tickets[1].depends_on, 'r1');
+});
+
+test('summarizeTickets and ensureTicketFilesMaterialized restore missing ticket files from the manifest', () => {
+  const sessionDir = makeTempRoot();
+  const manifest = {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'First Ticket',
+        description: 'first',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'ticket-b',
+        title: 'Second Ticket',
+        description: 'second',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  };
+
+  writeManifest(sessionDir, manifest);
+  writeTicketFiles(sessionDir, { tickets: [manifest.tickets[0]] });
+
+  const materialized = ensureTicketFilesMaterialized(sessionDir);
+  const summary = summarizeTickets(sessionDir);
+  assert.equal(materialized.length, 2);
+  assert.equal(summary.total, 2);
+  assert.equal(summary.runnable.length, 2);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-b', 'linear_ticket_ticket-b.md')));
 });

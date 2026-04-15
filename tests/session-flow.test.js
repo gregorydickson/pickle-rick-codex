@@ -294,6 +294,34 @@ test('pickle-tmux --resume refines an existing PRD-only session before launch', 
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
 });
 
+test('pickle-tmux clears a stale launch lock before relaunching', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-stale-lock.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'stale lock epic'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Existing PRD\n\n## Summary\nResume from this PRD.\n');
+  fs.writeFileSync(path.join(sessionDir, '.tmux-launch.lock'), 'not-a-pid\n');
+
+  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  assert.match(output, /Pickle Rick tmux mode launched/);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
+});
+
 test('mux-runner fails closed when a session has no tickets', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

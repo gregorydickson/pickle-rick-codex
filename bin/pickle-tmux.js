@@ -103,9 +103,16 @@ function acquireLaunchLock(sessionDir) {
     fd = fs.openSync(lockPath, 'wx', 0o600);
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
-      throw new Error(`A tmux launch is already in progress for ${sessionDir}.`);
+      const rawLock = fs.readFileSync(lockPath, 'utf8').trim();
+      const lockPid = Number(rawLock);
+      if (Number.isInteger(lockPid) && isProcessAlive(lockPid)) {
+        throw new Error(`A tmux launch is already in progress for ${sessionDir}.`);
+      }
+      fs.rmSync(lockPath, { force: true });
+      fd = fs.openSync(lockPath, 'wx', 0o600);
+    } else {
+      throw error;
     }
-    throw error;
   }
   fs.writeFileSync(fd, String(process.pid));
   return () => {
