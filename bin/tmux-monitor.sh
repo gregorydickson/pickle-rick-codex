@@ -21,17 +21,24 @@ mkdir -p "$SESSION_ROOT"
 touch "$RUNNER_LOG"
 
 status_cmd="while true; do clear; node '$RUNTIME_ROOT/bin/status.js' --session-dir '$SESSION_ROOT'; sleep 2; done"
-runner_cmd="tail -n 120 -F '$RUNNER_LOG'"
-state_cmd="while true; do clear; cat '$SESSION_ROOT/state.json' 2>/dev/null || echo 'No state.json yet.'; sleep 2; done"
+runner_cmd="while true; do clear; echo 'Runner Log'; echo; if [[ -s '$RUNNER_LOG' ]]; then tail -n 120 '$RUNNER_LOG'; else echo 'Waiting for runner log...'; fi; sleep 2; done"
+state_cmd="while true; do clear; echo 'State JSON'; echo; cat '$SESSION_ROOT/state.json' 2>/dev/null || echo 'No state.json yet.'; sleep 2; done"
 last_message_cmd="while true; do clear; node '$RUNTIME_ROOT/bin/latest-worker-message.js' '$SESSION_ROOT'; sleep 2; done"
 
-tmux new-window -t "$NAME" -n monitor -c "$SESSION_ROOT"
-tmux send-keys -t "$NAME:monitor.0" "$status_cmd" Enter
-tmux split-window -h -t "$NAME:monitor.0" -c "$SESSION_ROOT"
-tmux send-keys -t "$NAME:monitor.1" "$runner_cmd" Enter
-tmux split-window -v -t "$NAME:monitor.0" -c "$SESSION_ROOT"
-tmux send-keys -t "$NAME:monitor.2" "$state_cmd" Enter
-tmux split-window -v -t "$NAME:monitor.1" -c "$SESSION_ROOT"
-tmux send-keys -t "$NAME:monitor.3" "$last_message_cmd" Enter
-tmux select-layout -t "$NAME:monitor" tiled >/dev/null
+tmux set-option -t "$NAME" mouse on
+
+TOP_LEFT="$(tmux new-window -P -F '#{pane_id}' -t "$NAME" -n monitor -c "$SESSION_ROOT")"
+BOTTOM_LEFT="$(tmux split-window -P -F '#{pane_id}' -v -t "$TOP_LEFT" -l 40% -c "$SESSION_ROOT")"
+TOP_RIGHT="$(tmux split-window -P -F '#{pane_id}' -h -t "$TOP_LEFT" -c "$SESSION_ROOT")"
+BOTTOM_RIGHT="$(tmux split-window -P -F '#{pane_id}' -h -t "$BOTTOM_LEFT" -c "$SESSION_ROOT")"
+
+tmux send-keys -t "$TOP_LEFT" "$status_cmd" Enter
+tmux send-keys -t "$TOP_RIGHT" "$runner_cmd" Enter
+tmux send-keys -t "$BOTTOM_LEFT" "$state_cmd" Enter
+tmux send-keys -t "$BOTTOM_RIGHT" "$last_message_cmd" Enter
+
+tmux select-pane -t "$TOP_LEFT" -T "status"
+tmux select-pane -t "$TOP_RIGHT" -T "runner-log"
+tmux select-pane -t "$BOTTOM_LEFT" -T "state-json"
+tmux select-pane -t "$BOTTOM_RIGHT" -T "worker-message"
 tmux select-window -t "$NAME:monitor"

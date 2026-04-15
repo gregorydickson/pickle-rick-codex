@@ -227,6 +227,15 @@ if (args[0] === '-V') {
   process.exit(0);
 }
 
+if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-P')) {
+  const counterPath = (logPath || '/tmp/fake-tmux') + '.pane-counter';
+  const next = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '-1') + 1;
+  fs.writeFileSync(counterPath, String(next));
+  const paneId = '%' + next;
+  console.log(paneId);
+  process.exit(0);
+}
+
 process.exit(0);
 `,
   );
