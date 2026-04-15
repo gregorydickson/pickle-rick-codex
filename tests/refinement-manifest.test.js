@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fallbackRefinePrd, readManifest, writeManifest, writeTicketFiles } from '../lib/tickets.js';
+import { fallbackRefinePrd, getTicketById, readManifest, writeManifest, writeTicketFiles } from '../lib/tickets.js';
 import { makeTempRoot } from './helpers.js';
 
 test('fallbackRefinePrd builds tickets from the PRD task breakdown table', () => {
@@ -46,4 +46,29 @@ test('writeManifest and writeTicketFiles materialize refinement output', () => {
   const ticketDir = path.join(sessionDir, 'ticket-001');
   const files = fs.readdirSync(ticketDir);
   assert.ok(files.some((fileName) => fileName === 'linear_ticket_ticket-001.md'));
+});
+
+test('readManifest and writeTicketFiles normalize uppercase ticket ids and persist them', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Uppercase ID Ticket',
+        description: 'Do the work',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const manifest = readManifest(sessionDir);
+  writeTicketFiles(sessionDir, manifest);
+
+  const rewritten = readManifest(sessionDir);
+  assert.equal(rewritten.tickets[0].id, 'r1');
+  assert.ok(fs.existsSync(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')));
+  assert.equal(getTicketById(sessionDir, 'R1')?.id, 'r1');
 });

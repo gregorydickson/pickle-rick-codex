@@ -19,7 +19,7 @@ import {
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
-import { readManifest, updateTicketStatus } from '../lib/tickets.js';
+import { normalizeTicketId, readManifest, updateTicketStatus } from '../lib/tickets.js';
 
 function splitVerificationCommands(ticket) {
   if (Array.isArray(ticket.verification)) return ticket.verification;
@@ -45,7 +45,8 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
   const manifest = readManifest(sessionDir);
-  const manifestTicket = manifest.tickets.find((ticket) => ticket.id === ticketId);
+  const normalizedTicketId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
+  const manifestTicket = manifest.tickets.find((ticket) => normalizeTicketId(ticket.id, ticket.id) === normalizedTicketId);
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
@@ -53,20 +54,20 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   const { worktreeDir, baseSha } = createTicketWorktree({
     repoDir: state.working_dir,
     sessionDir,
-    ticketId,
+    ticketId: normalizedTicketId,
   });
 
   const config = loadConfig();
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
-  updateTicketStatus(sessionDir, ticketId, { status: 'In Progress', started_at: new Date().toISOString() });
+  updateTicketStatus(sessionDir, normalizedTicketId, { status: 'In Progress', started_at: new Date().toISOString() });
 
   try {
     for (const phase of phases) {
       manager.update(statePath, (current) => {
-        current.current_ticket = ticketId;
+        current.current_ticket = normalizedTicketId;
         current.step = phase;
         current.iteration += 1;
-        appendHistory(current, phase, ticketId);
+        appendHistory(current, phase, normalizedTicketId);
         return current;
       });
 
@@ -79,10 +80,10 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
           worktreeDir,
         }),
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
-        outputLastMessagePath: path.join(sessionDir, `${ticketId}.${phase}.last-message.txt`),
+        outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
         addDirs: [sessionDir],
       });
-      assertCodexSucceeded(result, `Ticket ${ticketId} failed in ${phase}`);
+      assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
       recordIteration(sessionDir, manager.read(statePath));
     }
 
@@ -91,25 +92,25 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     }
 
     if (!worktreeHasDiff(worktreeDir, baseSha)) {
-      updateTicketStatus(sessionDir, ticketId, { status: 'Done', completed_at: new Date().toISOString() });
+      updateTicketStatus(sessionDir, normalizedTicketId, { status: 'Done', completed_at: new Date().toISOString() });
       return { status: 'done', applied: false, reason: 'No diff generated.' };
     }
 
-    const patchPath = path.join(sessionDir, `${ticketId}.patch`);
+    const patchPath = path.join(sessionDir, `${normalizedTicketId}.patch`);
     createPatchFromWorktree(worktreeDir, baseSha, patchPath);
     if (!canApplyPatch(state.working_dir, patchPath)) {
-      writePatchSummary(sessionDir, ticketId, patchPath, {
+      writePatchSummary(sessionDir, normalizedTicketId, patchPath, {
         applied: false,
         reason: 'patch-conflict',
       });
-      throw new Error(`Patch for ${ticketId} could not be applied safely to ${state.working_dir}`);
+      throw new Error(`Patch for ${normalizedTicketId} could not be applied safely to ${state.working_dir}`);
     }
 
     applyPatch(state.working_dir, patchPath);
-    updateTicketStatus(sessionDir, ticketId, { status: 'Done', completed_at: new Date().toISOString() });
+    updateTicketStatus(sessionDir, normalizedTicketId, { status: 'Done', completed_at: new Date().toISOString() });
     manager.update(statePath, (current) => {
       current.step = 'done';
-      appendHistory(current, 'done', ticketId);
+      appendHistory(current, 'done', normalizedTicketId);
       return current;
     });
 
@@ -117,12 +118,12 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       event: 'ticket_completed',
       source: 'pickle',
       session: path.basename(sessionDir),
-      ticket: ticketId,
+      ticket: normalizedTicketId,
     }, { enabled: config.defaults.activity_logging });
 
     return { status: 'done', applied: true, patchPath };
   } catch (error) {
-    updateTicketStatus(sessionDir, ticketId, {
+    updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Blocked',
       failed_at: new Date().toISOString(),
       failure_reason: error instanceof Error ? error.message : String(error),
