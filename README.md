@@ -97,11 +97,14 @@ The important part is not the markdown file. The important part is that the PRD 
 
 Once the PRD exists, refinement turns it into execution material:
 
+- `analyst-requirements.md`
+- `analyst-codebase.md`
+- `analyst-risk.md`
 - `prd_refined.md`
 - `refinement_manifest.json`
 - ticket markdown files under per-ticket directories
 
-This is where broad intent gets narrowed into atomic work that can be run in order, verified, retried, and inspected later.
+This is where broad intent gets narrowed into atomic work that can be run in order, verified, retried, and inspected later. The Codex port now does this through a real three-analyst review pass followed by a synthesis step, instead of a single blind rewrite.
 
 ### Step 3: Execute Tickets Sequentially
 
@@ -118,7 +121,7 @@ The point is not “maximum chaos.” The point is controlled autonomy. Each tic
 For longer runs, launch the detached tmux version instead of keeping the current session occupied:
 
 ```text
-Use the pickle-tmux skill for this epic so the runner stays detached and I can monitor it in tmux.
+Use the pickle-tmux skill with --prd ./prd.md so the runtime refines the PRD, launches detached, and gives me a tmux monitor I can reattach to later.
 ```
 
 ### Step 4: Inspect, Retry, Or Cancel
@@ -170,9 +173,9 @@ You describe a feature
 The current Codex install exposes these primary skills:
 
 - `pickle` — end-to-end autonomous loop
-- `pickle-tmux` — detached tmux runner with live monitor panes
+- `pickle-tmux` — bootstrap from a PRD or resume a prepared session in detached tmux
 - `pickle-prd` — draft a PRD
-- `pickle-refine` — refine and decompose a PRD
+- `pickle-refine` — run three analyst passes, synthesize the result, and decompose the PRD into tickets
 - `pickle-orchestrate` — execute the manifest sequentially
 - `pickle-status` — inspect current runtime state
 - `pickle-metrics` — session, token, commit, and LOC reporting
@@ -212,7 +215,8 @@ Detached advanced loops currently present in the repo:
 If you want the guaranteed path without relying on skill invocation, use the runtime directly:
 
 ```bash
-node ~/.codex/pickle-rick/bin/pickle-tmux.js "<task>"
+node ~/.codex/pickle-rick/bin/pickle-tmux.js --prd ./prd.md
+node ~/.codex/pickle-rick/bin/pickle-tmux.js --resume
 node ~/.codex/pickle-rick/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"
 node ~/.codex/pickle-rick/bin/szechuan-sauce.js <target>
 node ~/.codex/pickle-rick/bin/anatomy-park.js <target>
@@ -231,6 +235,11 @@ node ~/.codex/pickle-rick/bin/metrics.js --weekly
 node ~/.codex/pickle-rick/bin/cancel.js
 node ~/.codex/pickle-rick/bin/retry-ticket.js --ticket <ticket-id>
 ```
+
+`pickle-tmux` has two first-class modes now:
+
+- `--prd <path>` or `--bootstrap-from <path>`: create a detached session from an existing PRD, run refinement if needed, then launch tmux
+- `--resume [session-dir]`: relaunch an existing session after validating that the manifest exists and there is at least one runnable ticket
 
 ## Session Model
 
@@ -282,6 +291,8 @@ Validated locally on April 15, 2026 against `codex-cli 0.120.0`:
 - `bash install.sh` installs the runtime, persona, and skills globally
 - a clean `codex exec` probe in a temp directory returned `Pickle Rick`
 - the PRD and refinement flows can detect success artifacts and exit promptly even if the child Codex process lingers
+- `pickle-tmux --prd ./prd.md` bootstraps, refines, and launches detached tmux instead of requiring a task-string workaround
+- zero-ticket detached runs fail closed with `last_exit_reason = "no_tickets"` instead of marking the session complete
 - detached tmux launchers for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park` are covered by local tests with a fake `tmux` binary
 - the runtime test suite passes on the checked-in code
 

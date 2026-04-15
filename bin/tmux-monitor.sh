@@ -23,7 +23,7 @@ touch "$RUNNER_LOG"
 status_cmd="while true; do clear; node '$RUNTIME_ROOT/bin/status.js' --session-dir '$SESSION_ROOT'; sleep 2; done"
 runner_cmd="tail -n 120 -F '$RUNNER_LOG'"
 state_cmd="while true; do clear; cat '$SESSION_ROOT/state.json' 2>/dev/null || echo 'No state.json yet.'; sleep 2; done"
-last_message_cmd="while true; do clear; latest=\$(find '$SESSION_ROOT' -maxdepth 1 -name '*.last-message.txt' | sort | tail -n 1); if [[ -n \"\$latest\" ]]; then echo \"\$latest\"; echo; tail -n 80 \"\$latest\"; else echo 'No worker last-message files yet.'; fi; sleep 2; done"
+last_message_cmd="while true; do clear; node '$RUNTIME_ROOT/bin/latest-worker-message.js' '$SESSION_ROOT'; sleep 2; done"
 
 tmux new-window -t "$NAME" -n monitor -c "$SESSION_ROOT"
 tmux send-keys -t "$NAME:monitor.0" "$status_cmd" Enter

@@ -119,6 +119,51 @@ test('status command reports circuit breaker details for an active session', () 
   assert.match(output, /Circuit Reason: progress stalled/);
 });
 
+test('status command shows ticket counts, title, verification, and last failure', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'status details task'], { env, cwd: projectDir }).trim();
+  const ticketDir = path.join(sessionDir, 'ticket-a');
+  const blockedDir = path.join(sessionDir, 'ticket-b');
+  fs.mkdirSync(ticketDir, { recursive: true });
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(ticketDir, 'linear_ticket_ticket-a.md'),
+    '---\nid: "ticket-a"\ntitle: "Current Ticket"\nstatus: "In Progress"\norder: 1\nverify: "npm test && npm run lint"\n---\n# body\n',
+  );
+  fs.writeFileSync(
+    path.join(blockedDir, 'linear_ticket_ticket-b.md'),
+    '---\nid: "ticket-b"\ntitle: "Blocked Ticket"\nstatus: "Blocked"\norder: 2\nfailure_reason: "verification failed"\nfailed_at: "2026-04-15T12:00:00.000Z"\nverify: "npm test"\n---\n# body\n',
+  );
+
+  writeJson(path.join(sessionDir, 'state.json'), {
+    active: true,
+    working_dir: projectDir,
+    step: 'implement',
+    iteration: 4,
+    max_iterations: 0,
+    max_time_minutes: 10,
+    worker_timeout_seconds: 60,
+    start_time_epoch: 0,
+    original_prompt: 'status details task',
+    current_ticket: 'ticket-a',
+    history: [],
+    started_at: '2026-04-15T00:00:00.000Z',
+    session_dir: sessionDir,
+    schema_version: 1,
+    tmux_mode: true,
+    last_exit_reason: null,
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], { env }).trim();
+  assert.match(output, /Ticket: ticket-a - Current Ticket/);
+  assert.match(output, /Tickets: queued 1 \| done 0 \| blocked 1 \| skipped 0/);
+  assert.match(output, /Next Verification: npm test && npm run lint/);
+  assert.match(output, /Last Failure: verification failed/);
+  assert.match(output, /Iteration: 4 \/ unlimited/);
+});
+
 test('cancel marks the session inactive and removes the session map entry', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -183,29 +228,91 @@ test('retry-ticket reactivates the session and resets the ticket state', () => {
   assert.equal(ticket.frontmatter.retry_requested_at.length > 0, true);
 });
 
-test('pickle-tmux launches detached tmux runner and monitor windows', () => {
+test('pickle-tmux bootstraps from --prd, refines, and launches detached tmux', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
-  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
   const tmuxLog = path.join(dataRoot, 'tmux.jsonl');
+  const prdSource = path.join(projectDir, 'loan-programs-prd.md');
+  fs.writeFileSync(prdSource, '# Loan Programs Decoupling\n\n## Summary\nDetach the implementation from the PRD.\n');
+  createFakeCodex(fakeBin);
   createFakeTmux(fakeBin);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     FAKE_TMUX_LOG: tmuxLog,
   });
 
-  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--max-iterations', '5', 'detached epic'], {
+  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], {
     env,
     cwd: projectDir,
   }).trim();
 
   assert.match(output, /Pickle Rick tmux mode launched/);
   assert.match(output, /Attach: tmux attach -t pickle-/);
+  assert.match(output, /Runnable Tickets: 1/);
+  const statePath = output.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'prd.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.max_iterations, 0);
+  assert.match(state.tmux_session_name, /^pickle-/);
   const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(logLines[0][0], '-V');
   assert.ok(logLines.some((args) => args[0] === 'new-session'));
   assert.ok(logLines.some((args) => args[0] === 'send-keys'));
   assert.ok(logLines.some((args) => args[0] === 'select-window'));
+});
+
+test('pickle-tmux --resume refines an existing PRD-only session before launch', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-resume.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'resume detached epic'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Existing PRD\n\n## Summary\nResume from this PRD.\n');
+
+  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  assert.match(output, /Pickle Rick tmux mode launched/);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+});
+
+test('mux-runner fails closed when a session has no tickets', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'empty manifest task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), { tickets: [] });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], { env, cwd: projectDir }),
+    /Command failed/,
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.last_exit_reason, 'no_tickets');
+  assert.equal(state.step, 'paused');
+  assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /no tickets found/);
 });
 
 test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLETE', () => {

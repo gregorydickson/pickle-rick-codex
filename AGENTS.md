@@ -37,9 +37,9 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 ## Skills
 
 - `pickle` is the primary entrypoint for the autonomous loop
-- `pickle-tmux` launches the detached tmux runner plus live monitor
+- `pickle-tmux` bootstraps from a PRD or resumes a prepared session in detached tmux with a live monitor
 - `pickle-prd` drafts the PRD
-- `pickle-refine` decomposes the PRD into tickets
+- `pickle-refine` runs three analyst passes, synthesizes the result, and decomposes the PRD into tickets
 - `pickle-orchestrate` runs multi-ticket sequential orchestration
 - `pickle-status` and `pickle-metrics` expose runtime state
 - `pickle-cancel` and `pickle-retry` manage session recovery

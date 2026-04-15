@@ -5,7 +5,7 @@ import { logActivity } from '../lib/activity-logger.js';
 import { loadConfig } from '../lib/config.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
-import { readManifest, updateTicketStatus } from '../lib/tickets.js';
+import { listTickets, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
 import { runTicket } from './spawn-morty.js';
 
 function appendRunnerLog(sessionDir, message) {
@@ -42,7 +42,6 @@ function shouldStop(state) {
 export async function runSequential(sessionDir, options = {}) {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
-  const manifest = readManifest(sessionDir);
   const failureMode = options.onFailure || 'abort';
   const config = loadConfig();
   let exitReason = 'success';
@@ -56,8 +55,22 @@ export async function runSequential(sessionDir, options = {}) {
     return state;
   });
 
-  for (const ticket of manifest.tickets) {
-    if (ticket.status === 'Done' || ticket.status === 'Skipped') continue;
+  const summary = summarizeTickets(sessionDir);
+  if (!summary.total) {
+    exitReason = 'no_tickets';
+    appendRunnerLog(sessionDir, 'no tickets found in refinement manifest');
+  } else if (!summary.runnable.length) {
+    exitReason = 'no_tickets';
+    appendRunnerLog(
+      sessionDir,
+      `no runnable tickets found (done=${summary.done} blocked=${summary.blocked} skipped=${summary.skipped})`,
+    );
+  }
+
+  const executionTickets = listTickets(sessionDir);
+  for (const ticket of executionTickets.length ? executionTickets : summary.tickets) {
+    if (exitReason !== 'success') break;
+    if (ticket.status === 'Done' || ticket.status === 'Skipped' || ticket.status === 'Blocked') continue;
 
     const ticketStopReason = shouldStop(manager.read(statePath));
     if (ticketStopReason) {
@@ -136,6 +149,7 @@ export async function runSequential(sessionDir, options = {}) {
   }
 
   appendRunnerLog(sessionDir, `mux-runner finished: ${exitReason}`);
+  return exitReason;
 }
 
 async function main(argv) {
@@ -143,7 +157,10 @@ async function main(argv) {
   if (!sessionDir) {
     throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
-  await runSequential(sessionDir, { onFailure: parseFailureMode(argv) });
+  const exitReason = await runSequential(sessionDir, { onFailure: parseFailureMode(argv) });
+  if (exitReason === 'no_tickets' || exitReason === 'invalid_session') {
+    process.exitCode = 1;
+  }
 }
 
 main(process.argv.slice(2)).catch((error) => {

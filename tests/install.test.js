@@ -26,6 +26,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'CLAUDE.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-refine', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-tmux', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'anatomy-park', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'existing-skill', 'SKILL.md')));
@@ -68,6 +69,7 @@ test('install.sh --project preserves existing project codex state while adding r
   assert.match(output, /global Pickle Rick install remains available in every workspace/);
   assert.ok(fs.existsSync(path.join(projectDir, 'AGENTS.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle-refine', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle-tmux', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'anatomy-park', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'existing-skill', 'SKILL.md')));

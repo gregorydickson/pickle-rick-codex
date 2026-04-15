@@ -1,15 +1,19 @@
 ---
 name: pickle-tmux
-description: "Launch Pickle Rick in detached tmux mode with a runner window and monitor dashboard. Use for longer epics where you want the runtime detached from the current Codex interaction."
+description: "Bootstrap a detached Pickle Rick tmux run from an existing PRD or resume a prepared session, then launch the runner and monitor dashboard."
 metadata:
-  short-description: "Detached tmux orchestration mode"
+  short-description: "Detached tmux bootstrap and resume mode"
 ---
 
 # Pickle Rick tmux Mode
 
-Launch the detached tmux manager:
+Bootstrap from an existing PRD file:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js "<task>"`
+`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --prd ./prd.md`
+
+Alias:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --bootstrap-from ./prd.md`
 
 Resume the latest session for the current repo:
 
@@ -19,16 +23,24 @@ Resume a specific session:
 
 `node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --resume <session-dir>`
 
+Resume only if the session is already fully prepared:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --resume <session-dir> --resume-ready-only`
+
 ## Behavior
 
 1. Verifies `tmux` is available
-2. Creates or resumes a Pickle Rick session in tmux mode
-3. Launches the detached `mux-runner`
-4. Creates a monitor window for status, runner logs, state, and latest worker output
-5. Prints `tmux attach` instructions
+2. `--prd` creates a tmux session, copies `prd.md`, runs refinement if needed, and materializes ticket files
+3. `--resume` loads an existing session and refines it if `prd.md` exists but the manifest is missing
+4. Validates readiness before launch: `state.json`, `refinement_manifest.json`, and at least one runnable ticket
+5. Refuses zero-ticket or blocked-only sessions instead of launching tmux anyway
+6. Launches the detached `mux-runner`
+7. Creates a monitor window that shows ticket counts, current ticket title, last failure, next verification, state, logs, and latest worker output by mtime
+8. Prints `tmux attach` instructions
 
 ## Use It When
 
-- The task is large enough that you want a detached runtime
+- You already have a PRD and want tmux to refine it and execute it end to end
+- You already have a prepared session and want to resume it in detached mode
 - You want a live monitor without keeping the current Codex prompt occupied
 - You expect the run to continue while you detach and come back later

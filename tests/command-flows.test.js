@@ -92,6 +92,9 @@ test('spawn-refinement-team writes the manifest and ticket files', () => {
 
   const manifest = JSON.parse(output);
   assert.equal(manifest.tickets.length, 1);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-requirements.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-codebase.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-risk.md')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'prd_refined.md')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
@@ -130,6 +133,9 @@ test('spawn-refinement-team exits promptly after success artifacts even if codex
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 5000, `spawn-refinement-team took too long after success: ${elapsed}ms`);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-requirements.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-codebase.md')));
+  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-risk.md')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'prd_refined.md')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
 });

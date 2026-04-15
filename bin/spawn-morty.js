@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logActivity } from '../lib/activity-logger.js';
 import { assertCodexSucceeded, runCodexExec } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
@@ -144,7 +145,9 @@ async function main(argv) {
   console.log(JSON.stringify(result, null, 2));
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

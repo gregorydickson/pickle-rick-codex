@@ -91,6 +91,11 @@ const refinedPath = path.join(sessionDir, 'prd_refined.md');
 const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
 let lastMessage = JSON.stringify({ ok: true }, null, 2);
 
+function extractPathAfter(prefix) {
+  const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim().replace(/[.)]+$/, '') : '';
+}
+
 if (prompt.includes('Loop mode:')) {
   const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
   const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
@@ -98,6 +103,57 @@ if (prompt.includes('Loop mode:')) {
   fs.writeFileSync(path.join(sessionDir, 'loop-iteration-' + current + '.txt'), prompt);
   const completeAfter = Number(process.env.FAKE_LOOP_COMPLETE_AFTER || '2');
   lastMessage = current >= completeAfter ? '<promise>LOOP_COMPLETE</promise>' : '<promise>CONTINUE</promise>';
+} else if (prompt.includes('Refinement analyst role:')) {
+  const analysisPath = extractPathAfter('Write your analyst report to ');
+  if (!analysisPath) {
+    console.error('missing analysis path in analyst prompt');
+    process.exit(1);
+  }
+  fs.mkdirSync(path.dirname(analysisPath), { recursive: true });
+  fs.writeFileSync(
+    analysisPath,
+    [
+      '# Analyst Report',
+      '',
+      '## Findings',
+      '- Fake codex found a refinement issue.',
+      '',
+      '## Recommended Changes',
+      '- Clarify acceptance criteria and execution order.',
+      '',
+      '## Verification Gaps',
+      '- Add at least one concrete verification command.',
+      '',
+      '## Ticketing Notes',
+      '- Keep the first ticket atomic and runnable.',
+      '',
+    ].join('\\n'),
+  );
+  lastMessage = '<promise>ANALYST_COMPLETE</promise>';
+} else if (prompt.includes('You are synthesizing parallel PRD refinement analyst reports')) {
+  fs.writeFileSync(
+    refinedPath,
+    '# Refined PRD\\n\\n## Summary\\nSynthesized from analyst reports.\\n\\n## Execution Notes\\n- Start with the safest atomic ticket.\\n',
+  );
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      generated_at: '2026-04-15T00:00:00.000Z',
+      source: 'fake-codex-synthesis',
+      tickets: [
+        {
+          id: 'ticket-001',
+          title: 'Harden tests',
+          description: 'Stub ticket emitted by fake codex synthesis.',
+          acceptance_criteria: ['The ticket exists.'],
+          verification: ['npm test'],
+          priority: 'P1',
+          status: 'Todo',
+        },
+      ],
+    }, null, 2),
+  );
+  lastMessage = '<promise>REFINEMENT_COMPLETE</promise>';
 } else if (!fs.existsSync(prdPath)) {
   fs.writeFileSync(
     prdPath,

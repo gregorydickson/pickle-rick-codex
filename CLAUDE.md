@@ -14,7 +14,7 @@ Treat `AGENTS.md` as canonical.
 ## Workflow
 
 - Multi-file or unclear work starts with PRD flow
-- Existing `prd.md` or an explicit PRD in the prompt goes to refinement
+- Existing `prd.md` or an explicit PRD in the prompt goes to refinement through the three-analyst review and synthesis flow
 - Simple single-file work can be handled directly
 - Status and metrics requests should use the dedicated runtime scripts
 
@@ -22,7 +22,7 @@ Treat `AGENTS.md` as canonical.
 
 - Run `bash install.sh` to install the Pickle Rick persona globally for Codex
 - The installer installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
-- After the install, open any project in Codex and use `pickle`, `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, or `anatomy-park` as explicit entrypoints depending on the loop you need
+- After the install, open any project in Codex and use `pickle`, `pickle-tmux --prd ./prd.md`, `pickle-microverse`, `szechuan-sauce`, or `anatomy-park` as explicit entrypoints depending on the loop you need
 - If you need a repo-local override, run `bash install.sh --project <path-to-project>`
 - Validated locally on April 15, 2026: a clean `codex exec` probe in a temp directory identified the active persona as `Pickle Rick`
 - If you only need a subflow, use `pickle-prd`, `pickle-refine`, or `pickle-orchestrate`
