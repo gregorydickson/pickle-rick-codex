@@ -1,0 +1,20 @@
+{
+  "name": "pickle-rick-codex",
+  "description": "Pickle Rick Codex CLI package and persona bootstrap — local install into ~/.codex/pickle-rick/ plus optional target-project persona activation on the guaranteed `codex exec` path",
+  "version": "0.2.0",
+  "skills": [
+    "pickle",
+    "pickle-prd",
+    "pickle-refine",
+    "pickle-orchestrate",
+    "pickle-status",
+    "pickle-metrics",
+    "pickle-cancel",
+    "pickle-retry",
+    "pickle-microverse",
+    "szechuan-sauce",
+    "anatomy-park"
+  ],
+  "hooks": ".codex/hooks/hooks.json",
+  "scripts": "bin/"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "pickle-rick-codex",
+  "version": "0.2.0",
+  "description": "Pickle Rick autonomous engineering lifecycle — Codex CLI native port",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "smoke": "node ./bin/status.js --help >/dev/null",
+    "install:local": "bash install.sh",
+    "validate:codex": "node ./bin/validate-codex.js"
+  },
+  "license": "MIT"
+}
