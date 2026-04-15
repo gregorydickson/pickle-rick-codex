@@ -18,6 +18,7 @@ export async function renderStatus(cwd, options = {}) {
 
   return [
     `Active: ${state.active ? 'Yes' : 'No'}`,
+    `Tmux Mode: ${state.tmux_mode ? 'Yes' : 'No'}`,
     `Step: ${state.step || 'unknown'}`,
     `Iteration: ${state.iteration} / ${state.max_iterations}`,
     `Ticket: ${state.current_ticket || 'none'}`,

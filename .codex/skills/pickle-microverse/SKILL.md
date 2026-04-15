@@ -9,6 +9,18 @@ metadata:
 
 Iterative metric optimization loop: measure -> compare -> accept/revert -> repeat.
 
+Launch the detached tmux runner:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"`
+
+Or use a qualitative goal:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --goal "<goal>" --task "<task>"`
+
+Resume:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --resume`
+
 ## Process
 
 1. Establish baseline measurement

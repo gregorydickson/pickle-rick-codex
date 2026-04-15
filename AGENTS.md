@@ -37,12 +37,15 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 ## Skills
 
 - `pickle` is the primary entrypoint for the autonomous loop
+- `pickle-tmux` launches the detached tmux runner plus live monitor
 - `pickle-prd` drafts the PRD
 - `pickle-refine` decomposes the PRD into tickets
 - `pickle-orchestrate` runs multi-ticket sequential orchestration
 - `pickle-status` and `pickle-metrics` expose runtime state
 - `pickle-cancel` and `pickle-retry` manage session recovery
-- `szechuan-sauce`, `pickle-microverse`, and `anatomy-park` remain advanced or deferred surfaces
+- `pickle-microverse` launches the detached metric-convergence tmux loop
+- `szechuan-sauce` launches the detached principle-driven cleanup tmux loop
+- `anatomy-park` launches the detached subsystem correctness tmux loop
 
 ## Hooks
 

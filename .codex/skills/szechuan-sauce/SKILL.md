@@ -9,6 +9,17 @@ metadata:
 
 Principle-driven iterative code cleanup.
 
+Launch the detached tmux runner:
+
+`node $HOME/.codex/pickle-rick/bin/szechuan-sauce.js <target>`
+
+Optional flags:
+
+- `--focus "<text>"`
+- `--domain <name>`
+- `--dry-run`
+- `--resume`
+
 ## Principles
 
 - KISS: Simplest solution that works

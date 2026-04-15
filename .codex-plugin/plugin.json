@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "skills": [
     "pickle",
+    "pickle-tmux",
     "pickle-prd",
     "pickle-refine",
     "pickle-orchestrate",

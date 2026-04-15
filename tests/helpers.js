@@ -60,6 +60,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
 
 if (args[0] === '--version') {
   console.log('codex 9.9.9-test');
@@ -90,7 +91,14 @@ const refinedPath = path.join(sessionDir, 'prd_refined.md');
 const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
 let lastMessage = JSON.stringify({ ok: true }, null, 2);
 
-if (!fs.existsSync(prdPath)) {
+if (prompt.includes('Loop mode:')) {
+  const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
+  const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
+  fs.writeFileSync(counterPath, String(current));
+  fs.writeFileSync(path.join(sessionDir, 'loop-iteration-' + current + '.txt'), prompt);
+  const completeAfter = Number(process.env.FAKE_LOOP_COMPLETE_AFTER || '2');
+  lastMessage = current >= completeAfter ? '<promise>LOOP_COMPLETE</promise>' : '<promise>CONTINUE</promise>';
+} else if (!fs.existsSync(prdPath)) {
   fs.writeFileSync(
     prdPath,
     '# PRD\\n\\n## Summary\\nFake codex produced a draft.\\n\\n## Verification\\n- \`npm test\`\\n',
@@ -141,6 +149,29 @@ if (hangMs > 0) {
 } else {
 process.exit(0);
 }
+`,
+  );
+}
+
+export function createFakeTmux(binDir) {
+  return writeExecutable(
+    path.join(binDir, 'tmux'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+const logPath = process.env.FAKE_TMUX_LOG || '';
+
+if (logPath) {
+  fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
+}
+
+if (args[0] === '-V') {
+  console.log('tmux 3.4-test');
+  process.exit(0);
+}
+
+process.exit(0);
 `,
   );
 }
