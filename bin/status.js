@@ -11,14 +11,14 @@ function formatIterationLimit(maxIterations) {
 }
 
 function latestFailureReason(tickets) {
-  const blocked = tickets
-    .filter((ticket) => String(ticket.status || '').trim().toLowerCase() === 'blocked')
+  const failed = tickets
+    .filter((ticket) => Boolean(ticket.frontmatter?.failure_reason || ticket.failure_reason))
     .sort((left, right) =>
       String(right.frontmatter?.failed_at || right.failed_at || '').localeCompare(
         String(left.frontmatter?.failed_at || left.failed_at || ''),
       ),
     );
-  return blocked[0]?.frontmatter?.failure_reason || blocked[0]?.failure_reason || null;
+  return failed[0]?.frontmatter?.failure_reason || failed[0]?.failure_reason || null;
 }
 
 function ticketVerification(ticket) {
@@ -58,6 +58,7 @@ export async function renderStatus(cwd, options = {}) {
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,
     nextTicket ? `Next Verification: ${ticketVerification(nextTicket)}` : null,
     latestFailureReason(summary.tickets) ? `Last Failure: ${latestFailureReason(summary.tickets)}` : null,
+    state.last_exit_reason ? `Last Exit: ${state.last_exit_reason}` : null,
     `Elapsed: ${formatDuration(elapsed)}`,
     `Session: ${path.basename(sessionDir)}`,
     `Circuit Breaker: ${circuit.state}`,

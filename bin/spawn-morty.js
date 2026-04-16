@@ -21,6 +21,7 @@ import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../lib/tickets.js';
+import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
 
 function splitVerificationCommands(ticket) {
   if (Array.isArray(ticket.verification)) return ticket.verification;
@@ -77,7 +78,7 @@ function terminateChild(child, signal) {
   }
 }
 
-async function runVerificationCommand({ command, cwd, timeoutMs, manager, statePath }) {
+async function runVerificationCommand({ command, cwd, timeoutMs, manager, statePath, env }) {
   return await new Promise((resolve, reject) => {
     let settled = false;
     let timeoutTimer = null;
@@ -88,7 +89,7 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
     const child = spawn(process.env.SHELL || 'zsh', ['-lc', command], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      env,
       detached: process.platform !== 'win32',
     });
 
@@ -148,7 +149,8 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
         return;
       }
       if (code !== 0) {
-        settle(reject, new Error(Buffer.concat(stderrChunks).toString('utf8') || Buffer.concat(stdoutChunks).toString('utf8') || `Verification failed: ${command}`));
+        const output = Buffer.concat(stderrChunks).toString('utf8') || Buffer.concat(stdoutChunks).toString('utf8');
+        settle(reject, new Error(`verification-command-failed: ${output || command}`));
         return;
       }
       settle(resolve, undefined);
@@ -167,23 +169,36 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
 
-  const { worktreeDir, baseSha } = createTicketWorktree({
-    repoDir: state.working_dir,
-    sessionDir,
-    ticketId: normalizedTicketId,
-  });
-
   const config = loadConfig();
+  let verificationReady = null;
+  let worktreeDir = null;
+  let baseSha = null;
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
-  updateTicketStatus(sessionDir, normalizedTicketId, { status: 'In Progress', started_at: new Date().toISOString() });
-  updateActiveChild(statePath, manager, {
-    worker_pid: process.pid,
-    active_child_pid: null,
-    active_child_kind: null,
-    active_child_command: null,
-  });
 
   try {
+    verificationReady = assertTicketVerificationReady({
+      ticket: manifestTicket,
+      config,
+    });
+    ({ worktreeDir, baseSha } = createTicketWorktree({
+      repoDir: state.working_dir,
+      sessionDir,
+      ticketId: normalizedTicketId,
+    }));
+    updateTicketStatus(sessionDir, normalizedTicketId, {
+      status: 'In Progress',
+      started_at: new Date().toISOString(),
+      failure_reason: null,
+      failure_kind: null,
+      failed_at: null,
+    });
+    updateActiveChild(statePath, manager, {
+      worker_pid: process.pid,
+      active_child_pid: null,
+      active_child_kind: null,
+      active_child_command: null,
+    });
+
     for (const phase of phases) {
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
@@ -200,7 +215,10 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         cwd: worktreeDir,
         prompt: buildTicketPhasePrompt({
           phase,
-          ticket: manifestTicket,
+          ticket: {
+            ...manifestTicket,
+            verificationContract: verificationReady.contract,
+          },
           sessionDir,
           worktreeDir,
         }),
@@ -238,11 +256,18 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         timeoutMs: config.defaults.worker_timeout_seconds * 1000,
         manager,
         statePath,
+        env: verificationReady.env,
       });
     }
 
     if (!worktreeHasDiff(worktreeDir, baseSha)) {
-      updateTicketStatus(sessionDir, normalizedTicketId, { status: 'Done', completed_at: new Date().toISOString() });
+      updateTicketStatus(sessionDir, normalizedTicketId, {
+        status: 'Done',
+        completed_at: new Date().toISOString(),
+        failure_reason: null,
+        failure_kind: null,
+        failed_at: null,
+      });
       return { status: 'done', applied: false, reason: 'No diff generated.' };
     }
 
@@ -262,7 +287,13 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     }
 
     applyPatch(state.working_dir, patchPath);
-    updateTicketStatus(sessionDir, normalizedTicketId, { status: 'Done', completed_at: new Date().toISOString() });
+    updateTicketStatus(sessionDir, normalizedTicketId, {
+      status: 'Done',
+      completed_at: new Date().toISOString(),
+      failure_reason: null,
+      failure_kind: null,
+      failed_at: null,
+    });
     manager.update(statePath, (current) => {
       current.step = 'done';
       appendHistory(current, 'done', normalizedTicketId);
@@ -285,10 +316,23 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       });
       throw error;
     }
+    if (isPreflightError(error)) {
+      updateTicketStatus(sessionDir, normalizedTicketId, {
+        status: 'Todo',
+        failed_at: new Date().toISOString(),
+        failure_reason: error.message,
+        failure_kind: error.kind,
+      });
+      recordIteration(sessionDir, manager.read(statePath), {
+        error: error.message,
+      });
+      throw error;
+    }
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Blocked',
       failed_at: new Date().toISOString(),
       failure_reason: error instanceof Error ? error.message : String(error),
+      failure_kind: 'command_failed',
     });
     recordIteration(sessionDir, manager.read(statePath), {
       error: error instanceof Error ? error.message : String(error),
@@ -301,7 +345,9 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       active_child_kind: null,
       active_child_command: null,
     });
-    removeTicketWorktree(worktreeDir);
+    if (worktreeDir) {
+      removeTicketWorktree(worktreeDir);
+    }
   }
 }
 

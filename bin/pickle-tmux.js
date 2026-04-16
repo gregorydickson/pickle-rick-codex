@@ -7,8 +7,10 @@ import { refinePrd } from './spawn-refinement-team.js';
 import { setupSession } from '../lib/setup-session.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
-import { summarizeTickets } from '../lib/tickets.js';
+import { getNextRunnableTicket, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
 import { ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote } from '../lib/tmux.js';
+import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
+import { loadConfig } from '../lib/config.js';
 
 function parseFailureMode(argv) {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
@@ -218,7 +220,41 @@ async function ensureSessionReadyForTmux(sessionDir, options = {}) {
     throw new Error(`Session has no runnable tickets (done=${summary.done}, blocked=${summary.blocked}, skipped=${summary.skipped}).`);
   }
 
+  const nextTicket = getNextRunnableTicket(sessionDir);
+  if (nextTicket) {
+    assertTicketVerificationReady({
+      ticket: nextTicket,
+      config: loadConfig(),
+    });
+  }
+
   return { state: manager.read(statePath), summary };
+}
+
+function recordPreflightBlocked(sessionDir, error) {
+  const manager = new StateManager();
+  const statePath = path.join(sessionDir, 'state.json');
+  manager.update(statePath, (current) => {
+    current.active = false;
+    current.tmux_runner_pid = null;
+    current.tmux_session_name = null;
+    current.active_child_pid = null;
+    current.active_child_kind = null;
+    current.active_child_command = null;
+    current.current_ticket = error.ticketId || current.current_ticket || null;
+    current.step = 'blocked';
+    current.last_exit_reason = error.kind;
+    appendHistory(current, error.kind, current.current_ticket || undefined);
+    return current;
+  });
+  if (error.ticketId) {
+    updateTicketStatus(sessionDir, error.ticketId, {
+      status: 'Todo',
+      failed_at: new Date().toISOString(),
+      failure_reason: error.message,
+      failure_kind: error.kind,
+    });
+  }
 }
 
 function assertSessionNotRunning(sessionDir, state) {
@@ -242,7 +278,16 @@ async function main(argv) {
   const releaseLock = acquireLaunchLock(sessionDir);
   const runtimeRoot = getRuntimeRoot();
   try {
-    const { state, summary } = await ensureSessionReadyForTmux(sessionDir, { resumeReadyOnly: parsed.resumeReadyOnly });
+    let state;
+    let summary;
+    try {
+      ({ state, summary } = await ensureSessionReadyForTmux(sessionDir, { resumeReadyOnly: parsed.resumeReadyOnly }));
+    } catch (error) {
+      if (isPreflightError(error)) {
+        recordPreflightBlocked(sessionDir, error);
+      }
+      throw error;
+    }
     assertSessionNotRunning(sessionDir, state);
     const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
 

@@ -12,6 +12,7 @@ import {
   unresolvedTicketDependencies,
   updateTicketStatus,
 } from '../lib/tickets.js';
+import { isPreflightError } from '../lib/verification-env.js';
 import { runTicket } from './spawn-morty.js';
 
 function appendRunnerLog(sessionDir, message) {
@@ -133,6 +134,12 @@ export async function runSequential(sessionDir, options = {}) {
           appendRunnerLog(sessionDir, `ticket ${ticket.id} stopped: ${exitReason}`);
           break;
         }
+        if (isPreflightError(error)) {
+          failedTicketId = ticket.id;
+          exitReason = error.kind;
+          appendRunnerLog(sessionDir, `ticket ${ticket.id} preflight blocked: ${error.message}`);
+          break;
+        }
         appendRunnerLog(sessionDir, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
         if (attempts < maxAttempts) {
           const retryStopReason = shouldStop(manager.read(statePath));
@@ -179,10 +186,14 @@ export async function runSequential(sessionDir, options = {}) {
       state.step = 'complete';
       appendHistory(state, 'complete');
     } else {
-      state.current_ticket = finalReason === 'error' ? failedTicketId || state.current_ticket || null : null;
-      state.step = 'paused';
+      state.current_ticket = finalReason === 'error' || String(finalReason).startsWith('preflight-')
+        ? failedTicketId || state.current_ticket || null
+        : null;
+      state.step = String(finalReason).startsWith('preflight-') ? 'blocked' : 'paused';
       if (finalReason === 'error') {
         appendHistory(state, 'failed', state.current_ticket || undefined);
+      } else if (String(finalReason).startsWith('preflight-')) {
+        appendHistory(state, finalReason, state.current_ticket || undefined);
       } else {
         appendHistory(state, finalReason);
       }
@@ -208,7 +219,7 @@ async function main(argv) {
     throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
   const exitReason = await runSequential(sessionDir, { onFailure: parseFailureMode(argv) });
-  if (exitReason === 'error' || exitReason === 'no_tickets' || exitReason === 'invalid_session') {
+  if (exitReason === 'error' || exitReason === 'no_tickets' || exitReason === 'invalid_session' || String(exitReason).startsWith('preflight-')) {
     process.exitCode = 1;
   }
 }
