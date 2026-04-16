@@ -33,6 +33,22 @@ export function runBash(args, options = {}) {
   });
 }
 
+export async function waitFor(assertReady, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const intervalMs = options.intervalMs ?? 50;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const value = await assertReady();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(options.message || 'Timed out waiting for condition');
+}
+
 export function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
@@ -225,6 +241,12 @@ if (logPath) {
 if (args[0] === '-V') {
   console.log('tmux 3.4-test');
   process.exit(0);
+}
+
+const failOn = process.env.FAKE_TMUX_FAIL_ON || '';
+if (failOn && args[0] === failOn) {
+  console.error('fake tmux forced failure on ' + failOn);
+  process.exit(1);
 }
 
 if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-P')) {

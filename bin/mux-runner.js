@@ -5,7 +5,13 @@ import { logActivity } from '../lib/activity-logger.js';
 import { loadConfig } from '../lib/config.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
-import { listTickets, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
+import {
+  areTicketDependenciesSatisfied,
+  listTickets,
+  summarizeTickets,
+  unresolvedTicketDependencies,
+  updateTicketStatus,
+} from '../lib/tickets.js';
 import { runTicket } from './spawn-morty.js';
 
 function appendRunnerLog(sessionDir, message) {
@@ -52,6 +58,11 @@ export async function runSequential(sessionDir, options = {}) {
     state.active = true;
     state.tmux_runner_pid = process.pid;
     state.last_exit_reason = null;
+    state.cancel_requested_at = null;
+    state.active_child_pid = null;
+    state.active_child_kind = null;
+    state.active_child_command = null;
+    state.worker_pid = null;
     markRunStart(state);
     appendHistory(state, 'runner_start', state.current_ticket || undefined);
     return state;
@@ -81,6 +92,21 @@ export async function runSequential(sessionDir, options = {}) {
       break;
     }
 
+    const currentTickets = listTickets(sessionDir);
+    const currentTicket = currentTickets.find((entry) => entry.id === ticket.id) || ticket;
+    if (!areTicketDependenciesSatisfied(currentTicket, currentTickets)) {
+      const unresolved = unresolvedTicketDependencies(currentTicket, currentTickets);
+      failedTicketId = ticket.id;
+      exitReason = 'error';
+      updateTicketStatus(sessionDir, ticket.id, {
+        status: 'Blocked',
+        failed_at: new Date().toISOString(),
+        failure_reason: `Unresolved dependencies: ${unresolved.join(', ')}`,
+      });
+      appendRunnerLog(sessionDir, `blocking ticket ${ticket.id}: unresolved dependencies ${unresolved.join(', ')}`);
+      break;
+    }
+
     let attempts = 0;
     const maxAttempts = failureMode === 'retry-once' ? 2 : 1;
 
@@ -101,6 +127,12 @@ export async function runSequential(sessionDir, options = {}) {
         appendRunnerLog(sessionDir, `completed ticket ${ticket.id}`);
         break;
       } catch (error) {
+        const cancelled = manager.read(statePath).active === false;
+        if (cancelled) {
+          exitReason = manager.read(statePath).last_exit_reason || 'cancelled';
+          appendRunnerLog(sessionDir, `ticket ${ticket.id} stopped: ${exitReason}`);
+          break;
+        }
         appendRunnerLog(sessionDir, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
         if (attempts < maxAttempts) {
           const retryStopReason = shouldStop(manager.read(statePath));
@@ -132,26 +164,33 @@ export async function runSequential(sessionDir, options = {}) {
   }
 
   manager.update(statePath, (state) => {
+    const finalReason = state.active === false && state.last_exit_reason
+      ? state.last_exit_reason
+      : exitReason;
     state.active = false;
     state.tmux_runner_pid = null;
-    state.last_exit_reason = exitReason;
-    if (exitReason === 'success') {
+    state.worker_pid = null;
+    state.active_child_pid = null;
+    state.active_child_kind = null;
+    state.active_child_command = null;
+    state.last_exit_reason = finalReason;
+    if (finalReason === 'success') {
       state.current_ticket = null;
       state.step = 'complete';
       appendHistory(state, 'complete');
     } else {
-      state.current_ticket = exitReason === 'error' ? failedTicketId || state.current_ticket || null : null;
+      state.current_ticket = finalReason === 'error' ? failedTicketId || state.current_ticket || null : null;
       state.step = 'paused';
-      if (exitReason === 'error') {
+      if (finalReason === 'error') {
         appendHistory(state, 'failed', state.current_ticket || undefined);
       } else {
-        appendHistory(state, exitReason);
+        appendHistory(state, finalReason);
       }
     }
     return state;
   });
 
-  if (exitReason === 'success') {
+  if (manager.read(statePath).last_exit_reason === 'success') {
     logActivity({
       event: 'epic_completed',
       source: 'pickle',
@@ -159,8 +198,8 @@ export async function runSequential(sessionDir, options = {}) {
     }, { enabled: config.defaults.activity_logging });
   }
 
-  appendRunnerLog(sessionDir, `mux-runner finished: ${exitReason}`);
-  return exitReason;
+  appendRunnerLog(sessionDir, `mux-runner finished: ${manager.read(statePath).last_exit_reason}`);
+  return manager.read(statePath).last_exit_reason;
 }
 
 async function main(argv) {

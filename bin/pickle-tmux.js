@@ -247,7 +247,9 @@ async function main(argv) {
     const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
 
     const manager = new StateManager();
-    manager.update(path.join(sessionDir, 'state.json'), (current) => {
+    const statePath = path.join(sessionDir, 'state.json');
+    let launchStarted = false;
+    manager.update(statePath, (current) => {
       current.tmux_mode = true;
       current.active = false;
       current.max_iterations = 0;
@@ -257,32 +259,56 @@ async function main(argv) {
       return current;
     });
 
-    runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir]);
-    runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
+    try {
+      runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir]);
+      launchStarted = true;
+      runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
 
-    const runnerCommand = [
-      'node',
-      shellQuote(path.join(runtimeRoot, 'bin', 'mux-runner.js')),
-      shellQuote(sessionDir),
-      `--on-failure=${onFailure}`,
-      ';',
-      'echo',
-      shellQuote(''),
-      ';',
-      'echo',
-      shellQuote('Runner finished.  Ctrl+B 1 -> monitor  |  Ctrl+B D -> detach'),
-      ';',
-      'read',
-    ].join(' ');
+      const runnerCommand = [
+        'node',
+        shellQuote(path.join(runtimeRoot, 'bin', 'mux-runner.js')),
+        shellQuote(sessionDir),
+        `--on-failure=${onFailure}`,
+        ';',
+        'echo',
+        shellQuote(''),
+        ';',
+        'echo',
+        shellQuote('Runner finished.  Ctrl+B 1 -> monitor  |  Ctrl+B D -> detach'),
+        ';',
+        'read',
+      ].join(' ');
 
-    runTmux(['send-keys', '-t', `${sessionName}:0`, runnerCommand, 'Enter']);
-    const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, 'pickle'], {
-      encoding: 'utf8',
-      timeout: 30_000,
-      env: process.env,
-    });
-    if (monitorResult.status !== 0) {
-      throw new Error(monitorResult.stderr || monitorResult.stdout || 'tmux monitor bootstrap failed');
+      runTmux(['send-keys', '-t', `${sessionName}:0`, runnerCommand, 'Enter']);
+      const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, 'pickle'], {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: process.env,
+      });
+      if (monitorResult.status !== 0) {
+        throw new Error(monitorResult.stderr || monitorResult.stdout || 'tmux monitor bootstrap failed');
+      }
+    } catch (error) {
+      if (launchStarted) {
+        try {
+          runTmux(['kill-session', '-t', sessionName]);
+        } catch {
+          // Best-effort cleanup for partially created tmux sessions.
+        }
+      }
+      manager.update(statePath, (current) => {
+        current.active = false;
+        current.tmux_runner_pid = null;
+        current.tmux_session_name = null;
+        current.worker_pid = null;
+        current.active_child_pid = null;
+        current.active_child_kind = null;
+        current.active_child_command = null;
+        current.last_exit_reason = 'launch_failed';
+        appendHistory(current, 'tmux_launch_failed', current.current_ticket || undefined);
+        return current;
+      });
+      throw error;
     }
 
     console.log([

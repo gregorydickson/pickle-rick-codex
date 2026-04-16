@@ -24,11 +24,12 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 - Optional project-local override: `bash install.sh --project <path-to-project>`
 - Keep installs local; do not assume marketplace publishing
 - Preserve unrelated runtime data under the Codex root when reinstalling
+- The installed runtime keeps its source `.codex/skills` and `.codex/hooks` trees so `~/.codex/pickle-rick/install.sh --project <path>` remains supported after global install
 
 ## Persona Activation
 
 - To activate the Pickle Rick persona generally, run `bash install.sh`
-- That installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
+- That installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges managed Pickle Rick marker blocks into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
 - Open any project in Codex after the install; the persona is active when Codex reads the global instructions and the `pickle` skill is available
 - If you want a repo-local override, run `bash install.sh --project <path-to-project>`
 - Existing `AGENTS.md` and `CLAUDE.md` content is preserved below the managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
@@ -50,6 +51,7 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 ## Hooks
 
 - Hooks are optional; install them explicitly with `bash install.sh --project <path> --enable-hooks`
+- The installed runtime ships `.codex/hooks/hooks.json` as an empty default contract and `.codex/hooks/hooks.template.json` for rendered project hooks
 - Keep `.codex/hooks/hooks.json` limited to handlers that exist locally
 - Do not encode unsupported hook events into the default path
 - Hook failures should fail open unless the operation is explicitly safety-critical

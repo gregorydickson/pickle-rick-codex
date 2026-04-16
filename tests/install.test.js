@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { repoRoot, makeTempRoot, runBash, runNode } from './helpers.js';
 
+function countMatches(content, pattern) {
+  return [...content.matchAll(pattern)].length;
+}
+
 test('install.sh copies the runtime and installs the global persona and skills', () => {
   const codexHome = makeTempRoot('pickle-rick-codex-home-');
   const installRoot = path.join(codexHome, 'pickle-rick-runtime');
@@ -23,6 +27,11 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.match(output, new RegExp(`node ${installRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/bin/setup\\.js`));
   assert.ok(fs.existsSync(path.join(installRoot, 'bin', 'setup.js')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex-plugin', 'plugin.json')));
+  assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.json')));
+  assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.template.json')));
+  assert.ok(fs.existsSync(path.join(installRoot, 'tests', 'install.test.js')));
+  assert.ok(fs.existsSync(path.join(installRoot, 'tests', 'helpers.js')));
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'CLAUDE.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle', 'SKILL.md')));
@@ -38,6 +47,12 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.match(fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8'), /# Existing Global Instructions/);
   assert.match(fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8'), /PICKLE_RICK_CLAUDE_BEGIN/);
   assert.ok(fs.existsSync(path.join(codexHome, 'pickle-rick-backups')));
+  const installedPlugin = JSON.parse(fs.readFileSync(path.join(installRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
+  assert.equal(installedPlugin.hooks, '.codex/hooks/hooks.json');
+  assert.ok(fs.existsSync(path.join(installRoot, installedPlugin.hooks)));
+  const installedPackage = JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8'));
+  assert.equal(installedPackage.scripts.test, 'node --test tests/*.test.js');
+  assert.ok(fs.readdirSync(path.join(installRoot, 'tests')).filter((entry) => entry.endsWith('.test.js')).length > 0);
 
   const sessionDir = runNode(
     [path.join(installRoot, 'bin', 'setup.js'), 'installed runtime smoke test'],
@@ -50,6 +65,33 @@ test('install.sh copies the runtime and installs the global persona and skills',
     { cwd: realProjectDir, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } },
   ).trim();
   assert.equal(resolved, sessionDir);
+});
+
+test('install.sh writes managed marker blocks on first install and remains idempotent', () => {
+  const codexHome = makeTempRoot('pickle-rick-codex-home-');
+  const installRoot = path.join(codexHome, 'pickle-rick-runtime');
+
+  runBash(['install.sh'], {
+    cwd: repoRoot,
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+  });
+
+  const firstAgents = fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8');
+  const firstClaude = fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8');
+  assert.match(firstAgents, /PICKLE_RICK_AGENTS_BEGIN/);
+  assert.match(firstClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
+  assert.equal(countMatches(firstAgents, /PICKLE_RICK_AGENTS_BEGIN/g), 1);
+  assert.equal(countMatches(firstAgents, /PICKLE_RICK_AGENTS_END/g), 1);
+  assert.equal(countMatches(firstClaude, /PICKLE_RICK_CLAUDE_BEGIN/g), 1);
+  assert.equal(countMatches(firstClaude, /PICKLE_RICK_CLAUDE_END/g), 1);
+
+  runBash(['install.sh'], {
+    cwd: repoRoot,
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+  });
+
+  assert.equal(fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8'), firstAgents);
+  assert.equal(fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8'), firstClaude);
 });
 
 test('install.sh --project preserves existing project codex state while adding repo-local overrides', () => {
@@ -82,6 +124,32 @@ test('install.sh --project preserves existing project codex state while adding r
   assert.match(fs.readFileSync(path.join(projectDir, 'AGENTS.md'), 'utf8'), /# Existing Instructions/);
   assert.match(fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8'), /PICKLE_RICK_CLAUDE_BEGIN/);
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'pickle-rick-backups')));
+});
+
+test('installed runtime install.sh supports documented --project usage', () => {
+  const codexHome = makeTempRoot('pickle-rick-codex-home-');
+  const installRoot = path.join(codexHome, 'pickle-rick-runtime');
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'AGENTS.md'), '# Existing Project Instructions\n');
+
+  runBash(['install.sh'], {
+    cwd: repoRoot,
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+  });
+
+  const output = runBash([path.join(installRoot, 'install.sh'), '--project', projectDir, '--enable-hooks'], {
+    cwd: installRoot,
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+  });
+
+  assert.match(output, /Copied project-facing \.codex assets to:/);
+  assert.match(output, /project-local hooks were installed from a rendered template/);
+  assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'hooks', 'hooks.json')));
+  assert.match(fs.readFileSync(path.join(projectDir, 'AGENTS.md'), 'utf8'), /PICKLE_RICK_AGENTS_BEGIN/);
+  const hooksContent = fs.readFileSync(path.join(projectDir, '.codex', 'hooks', 'hooks.json'), 'utf8');
+  assert.match(hooksContent, new RegExp(installRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(hooksContent, /\$HOME\/\.codex\/pickle-rick/);
 });
 
 test('install.sh --enable-hooks renders project hooks to the installed runtime root', () => {

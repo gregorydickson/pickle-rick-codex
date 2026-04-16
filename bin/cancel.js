@@ -1,6 +1,18 @@
 #!/usr/bin/env node
 import { deactivateSession, resolveSessionForCwd } from '../lib/session.js';
 
+function signalProcess(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function main(argv) {
   let cwd = process.cwd();
   let sessionDir;
@@ -22,7 +34,8 @@ async function main(argv) {
     return;
   }
 
-  await deactivateSession(resolved, 'cancelled');
+  const state = await deactivateSession(resolved, 'cancelled');
+  signalProcess(state.active_child_pid);
   console.log(`Cancelled ${resolved}`);
 }
 

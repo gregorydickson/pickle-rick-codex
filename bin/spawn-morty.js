@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../lib/activity-logger.js';
-import { assertCodexSucceeded, runCodexExec } from '../lib/codex.js';
+import { assertCodexSucceeded, runCodexExecMonitored } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { recordIteration } from '../lib/circuit-breaker.js';
 import {
@@ -30,22 +30,130 @@ function splitVerificationCommands(ticket) {
   return ['npm test'];
 }
 
-function runShell(command, cwd, timeoutMs) {
-  const result = spawnSync(process.env.SHELL || 'zsh', ['-lc', command], {
-    cwd,
-    encoding: 'utf8',
-    timeout: timeoutMs,
-  });
-  if (result.status !== 0) {
-    throw new Error(result.stderr || result.stdout || `Verification failed: ${command}`);
-  }
-}
-
 function summarizePatchApplyError(errorText) {
   return String(errorText || '')
     .split('\n')
     .map((line) => line.trim())
     .find(Boolean) || 'git apply --check failed';
+}
+
+class CancellationError extends Error {
+  constructor(message = 'Session cancelled') {
+    super(message);
+    this.name = 'CancellationError';
+  }
+}
+
+function readCurrentState(manager, statePath) {
+  return manager.read(statePath);
+}
+
+function isSessionCancelled(manager, statePath) {
+  return readCurrentState(manager, statePath).active === false;
+}
+
+function updateActiveChild(statePath, manager, fields) {
+  manager.update(statePath, (current) => {
+    Object.assign(current, fields);
+    return current;
+  });
+}
+
+function terminateChild(child, signal) {
+  const pid = Number(child?.pid || 0);
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall through to direct child kill.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Ignore teardown failures.
+  }
+}
+
+async function runVerificationCommand({ command, cwd, timeoutMs, manager, statePath }) {
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutTimer = null;
+    let cancelTimer = null;
+    let forcedByCancel = false;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const child = spawn(process.env.SHELL || 'zsh', ['-lc', command], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+      detached: process.platform !== 'win32',
+    });
+
+    updateActiveChild(statePath, manager, {
+      active_child_pid: child.pid,
+      active_child_kind: 'verification',
+      active_child_command: command,
+    });
+
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (cancelTimer) clearInterval(cancelTimer);
+      updateActiveChild(statePath, manager, {
+        active_child_pid: null,
+        active_child_kind: null,
+        active_child_command: null,
+      });
+    };
+
+    const settle = (handler, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      handler(value);
+    };
+
+    timeoutTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        terminateChild(child, 'SIGTERM');
+        setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            terminateChild(child, 'SIGKILL');
+          }
+        }, 1_000).unref?.();
+      }
+    }, timeoutMs);
+
+    cancelTimer = setInterval(() => {
+      if (!isSessionCancelled(manager, statePath)) return;
+      if (child.exitCode === null && child.signalCode === null) {
+        forcedByCancel = true;
+        terminateChild(child, 'SIGTERM');
+        setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            terminateChild(child, 'SIGKILL');
+          }
+        }, 1_000).unref?.();
+      }
+    }, 100);
+
+    child.stdout.on('data', (chunk) => stdoutChunks.push(Buffer.from(chunk)));
+    child.stderr.on('data', (chunk) => stderrChunks.push(Buffer.from(chunk)));
+    child.on('error', (error) => settle(reject, error));
+    child.on('close', (code) => {
+      if (forcedByCancel || isSessionCancelled(manager, statePath)) {
+        settle(reject, new CancellationError());
+        return;
+      }
+      if (code !== 0) {
+        settle(reject, new Error(Buffer.concat(stderrChunks).toString('utf8') || Buffer.concat(stdoutChunks).toString('utf8') || `Verification failed: ${command}`));
+        return;
+      }
+      settle(resolve, undefined);
+    });
+  });
 }
 
 export async function runTicket(sessionDir, ticketId, options = {}) {
@@ -68,9 +176,18 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   const config = loadConfig();
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
   updateTicketStatus(sessionDir, normalizedTicketId, { status: 'In Progress', started_at: new Date().toISOString() });
+  updateActiveChild(statePath, manager, {
+    worker_pid: process.pid,
+    active_child_pid: null,
+    active_child_kind: null,
+    active_child_command: null,
+  });
 
   try {
     for (const phase of phases) {
+      if (isSessionCancelled(manager, statePath)) {
+        throw new CancellationError();
+      }
       manager.update(statePath, (current) => {
         current.current_ticket = normalizedTicketId;
         current.step = phase;
@@ -79,7 +196,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         return current;
       });
 
-      const result = runCodexExec({
+      const result = await runCodexExecMonitored({
         cwd: worktreeDir,
         prompt: buildTicketPhasePrompt({
           phase,
@@ -90,13 +207,38 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
         outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
         addDirs: [sessionDir],
+        onSpawn: (child) => {
+          updateActiveChild(statePath, manager, {
+            active_child_pid: child.pid,
+            active_child_kind: 'codex',
+            active_child_command: phase,
+          });
+        },
+        cancelCheck: () => isSessionCancelled(manager, statePath),
       });
+      updateActiveChild(statePath, manager, {
+        active_child_pid: null,
+        active_child_kind: null,
+        active_child_command: null,
+      });
+      if (result.cancelled || isSessionCancelled(manager, statePath)) {
+        throw new CancellationError();
+      }
       assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
       recordIteration(sessionDir, manager.read(statePath));
     }
 
     for (const command of splitVerificationCommands(manifestTicket)) {
-      runShell(command, worktreeDir, config.defaults.worker_timeout_seconds * 1000);
+      if (isSessionCancelled(manager, statePath)) {
+        throw new CancellationError();
+      }
+      await runVerificationCommand({
+        command,
+        cwd: worktreeDir,
+        timeoutMs: config.defaults.worker_timeout_seconds * 1000,
+        manager,
+        statePath,
+      });
     }
 
     if (!worktreeHasDiff(worktreeDir, baseSha)) {
@@ -136,6 +278,13 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
 
     return { status: 'done', applied: true, patchPath };
   } catch (error) {
+    if (error instanceof CancellationError) {
+      updateTicketStatus(sessionDir, normalizedTicketId, {
+        status: 'Todo',
+        cancelled_at: new Date().toISOString(),
+      });
+      throw error;
+    }
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Blocked',
       failed_at: new Date().toISOString(),
@@ -146,6 +295,12 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     });
     throw error;
   } finally {
+    updateActiveChild(statePath, manager, {
+      worker_pid: null,
+      active_child_pid: null,
+      active_child_kind: null,
+      active_child_command: null,
+    });
     removeTicketWorktree(worktreeDir);
   }
 }

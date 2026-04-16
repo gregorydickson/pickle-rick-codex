@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { loadConfig } from '../lib/config.js';
 import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 
 function createSessionFixture(dataRoot, ticketContent) {
@@ -85,4 +86,36 @@ test('config protection blocks install.sh when it is invoked through a shell com
 
   assert.match(output, /"decision":"block"/);
   assert.match(output, /install\.sh/);
+});
+
+test('loadConfig falls back to safe defaults when nested config shapes are malformed', () => {
+  const dataRoot = makeTempRoot();
+  const configPath = path.join(dataRoot, 'config.json');
+  writeJson(configPath, {
+    runtime: 'codex --bad-shape',
+    defaults: {
+      max_iterations: 'lots',
+      activity_logging: 'yes',
+      circuit_breaker: ['broken'],
+    },
+    hooks: {
+      enabled: 'sometimes',
+      validated_events: 'SessionStart',
+    },
+  });
+
+  const config = loadConfig(configPath);
+
+  assert.equal(config.runtime.command, 'codex');
+  assert.deepEqual(config.runtime.exec_args, ['--full-auto']);
+  assert.equal(config.defaults.max_iterations, 25);
+  assert.equal(config.defaults.activity_logging, true);
+  assert.deepEqual(config.defaults.circuit_breaker, {
+    enabled: true,
+    no_progress_threshold: 5,
+    half_open_after: 2,
+    same_error_threshold: 5,
+  });
+  assert.equal(config.hooks.enabled, true);
+  assert.deepEqual(config.hooks.validated_events, ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse']);
 });

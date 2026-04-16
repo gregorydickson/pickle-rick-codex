@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { launchDetachedLoop } from '../lib/detached-launch.js';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable } from './helpers.js';
+import { updateSessionMap } from '../lib/session-map.js';
+import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
 test('setup command creates a session and get-session resolves it', () => {
@@ -185,6 +188,109 @@ test('cancel marks the session inactive and removes the session map entry', () =
   assert.equal(readJsonFile(path.join(dataRoot, 'current_sessions.json'), {} )[projectDir], undefined);
 });
 
+test('cancel stops an in-flight mux-runner worker and clears tracked child state', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+process.on('SIGTERM', () => process.exit(143));
+setInterval(() => {}, 1000);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'cancel in-flight task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Cancel Me',
+        description: 'Runner should stop promptly when cancelled.',
+        acceptance_criteria: ['Cancellation should stop the active worker.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const runner = spawn('node', [path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
+    cwd: repoRoot,
+    env: { ...process.env, ...env },
+    stdio: 'ignore',
+  });
+
+  await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return Number.isInteger(state?.active_child_pid) && state.active_child_pid > 0;
+  }, { timeoutMs: 5_000, message: 'runner never reported an active child pid' });
+
+  const output = runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  assert.match(output, /Cancelled/);
+
+  await waitFor(() => runner.exitCode !== null || runner.signalCode !== null, {
+    timeoutMs: 5_000,
+    message: 'runner did not stop after cancel',
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.active_child_pid, null);
+  assert.equal(state.worker_pid, null);
+  assert.equal(state.tmux_runner_pid, null);
+});
+
+test('canceling an older session does not clear a newer cwd mapping', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const firstSession = runNode([path.join(repoRoot, 'bin/setup.js'), 'older task'], { env, cwd: realProjectDir }).trim();
+  const secondSession = runNode([path.join(repoRoot, 'bin/setup.js'), 'newer task'], { env, cwd: realProjectDir }).trim();
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', firstSession], { env, cwd: realProjectDir });
+
+  const map = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(map[realProjectDir], secondSession);
+  const resolved = runNode([path.join(repoRoot, 'bin/get-session.js'), '--cwd', realProjectDir], { env, cwd: realProjectDir }).trim();
+  assert.equal(resolved, secondSession);
+});
+
+test('session-map lock fails closed when the lock cannot be acquired', async () => {
+  const dataRoot = makeTempRoot();
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  const lockPath = path.join(dataRoot, 'current_sessions.json.lock');
+  fs.writeFileSync(lockPath, 'busy\n');
+
+  try {
+    await assert.rejects(
+      () => updateSessionMap('/tmp/project-a', '/tmp/session-a'),
+      /Failed to acquire session map lock/,
+    );
+    assert.equal(fs.existsSync(path.join(dataRoot, 'current_sessions.json')), false);
+  } finally {
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
+});
+
 test('retry-ticket reactivates the session and resets the ticket state', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -325,6 +431,73 @@ test('pickle-tmux clears a stale launch lock before relaunching', () => {
 
   assert.match(output, /Pickle Rick tmux mode launched/);
   assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
+});
+
+test('pickle-tmux rolls back tmux launch state when monitor bootstrap fails', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-launch-failure.jsonl');
+  const prdSource = path.join(projectDir, 'launch-failure-prd.md');
+  fs.writeFileSync(prdSource, '# Launch Failure\n\n## Summary\nTrigger tmux monitor failure.\n');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_TMUX_FAIL_ON: 'new-window',
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], {
+      env,
+      cwd: projectDir,
+    }),
+    /tmux monitor bootstrap failed|fake tmux forced failure/,
+  );
+
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  const [sessionName] = fs.readdirSync(sessionsRoot);
+  const sessionDir = path.join(sessionsRoot, sessionName);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(state.last_exit_reason, 'launch_failed');
+  assert.equal(state.tmux_session_name, null);
+  assert.ok(logLines.some((args) => args[0] === 'kill-session'));
+});
+
+test('pickle-tmux rolls back tmux launch state on launch failure', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-launch-failure.jsonl');
+  const prdSource = path.join(projectDir, 'launch-failure-prd.md');
+  fs.writeFileSync(prdSource, '# Launch Failure\n\n## Summary\nForce tmux launch failure.\n');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_TMUX_FAIL_ON: 'send-keys',
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], { env, cwd: projectDir }),
+    /fake tmux forced failure on send-keys/,
+  );
+
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  const [sessionId] = fs.readdirSync(sessionsRoot);
+  const sessionDir = path.join(sessionsRoot, sessionId);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const tmuxLogLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(state.tmux_session_name, null);
+  assert.equal(state.last_exit_reason, 'launch_failed');
+  assert.equal(state.active, false);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
+  assert.ok(tmuxLogLines.some((args) => args[0] === 'kill-session'));
 });
 
 test('mux-runner refreshes the run timer instead of inheriting stale session start time', () => {
@@ -548,6 +721,230 @@ test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLE
   assert.match(fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8'), /loop-runner finished: success/);
 });
 
+test('loop-runner clears active state after a worker failure', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+console.error('loop worker failed');
+process.exit(1);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'loop failure task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse',
+    task: 'improve something',
+    metric: 'echo 1',
+    direction: 'higher',
+    stall_limit: 5,
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], {
+      env,
+      cwd: repoRoot,
+    }),
+    /Command failed/,
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'error');
+  assert.equal(state.step, 'paused');
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.active_child_pid, null);
+});
+
+test('loop-runner cleans session state when an iteration fails', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+console.error('loop failure');
+process.exit(1);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'loop failure task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse',
+    task: 'fail immediately',
+    metric: 'echo 1',
+    direction: 'higher',
+    stall_limit: 5,
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir }),
+    /loop failure/,
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.active, false);
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.active_child_pid, null);
+  assert.equal(state.last_exit_reason, 'error');
+  assert.equal(state.step, 'paused');
+  assert.match(log, /loop-runner finished: error/);
+});
+
+test('cancel stops a live loop-runner iteration without rewriting the result as success', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+setTimeout(() => process.exit(0), 10000);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'cancel live loop task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse',
+    task: 'wait for cancel',
+    metric: 'echo 1',
+    direction: 'higher',
+    stall_limit: 5,
+  });
+
+  const child = spawn('node', [path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], {
+    cwd: projectDir,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return state.active_child_kind === 'codex';
+  }, { message: 'loop-runner never entered codex phase' });
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: projectDir });
+
+  const exit = await new Promise((resolve) => {
+    child.on('close', (code, signal) => resolve({ code, signal }));
+  });
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.active_child_pid, null);
+  assert.equal(state.step, 'paused');
+  assert.match(log, /loop-runner finished: cancelled/);
+  assert.doesNotMatch(log, /finished: success/);
+});
+
+test('cancel stops live verification work without blocking the ticket', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, '<promise>OK</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'cancel verification task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Verification Cancel Ticket',
+        description: 'Cancel verification mid-flight.',
+        acceptance_criteria: ['The ticket can resume after cancel.'],
+        verification: ['node -e "setTimeout(() => process.exit(0), 10000)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const child = spawn('node', [path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
+    cwd: repoRoot,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return state.active_child_kind === 'verification';
+  }, { timeoutMs: 10_000, message: 'mux-runner never entered verification phase' });
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: repoRoot });
+
+  await new Promise((resolve) => {
+    child.on('close', () => resolve());
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.active, false);
+  assert.equal(state.active_child_pid, null);
+  assert.equal(ticket.status, 'Todo');
+  assert.match(log, /mux-runner finished: cancelled/);
+  assert.doesNotMatch(log, /finished: success/);
+});
+
 test('pickle-microverse launches detached tmux loop and writes loop config', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -577,6 +974,60 @@ test('pickle-microverse launches detached tmux loop and writes loop config', () 
   assert.equal(loopConfig.mode, 'microverse');
   assert.equal(loopConfig.metric, 'echo 42');
   assert.equal(loopConfig.stall_limit, 4);
+});
+
+test('launchDetachedLoop rolls back tmux and session mapping on launch failure', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-detached-failure.jsonl');
+  createFakeTmux(fakeBin);
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  const previousPath = process.env.PATH;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  process.env.FAKE_TMUX_LOG = tmuxLog;
+  process.env.FAKE_TMUX_FAIL_ON = 'send-keys';
+  process.env.PATH = `${fakeBin}${path.delimiter}${previousPath}`;
+  const previousCwd = process.cwd();
+  process.chdir(projectDir);
+
+  try {
+    await assert.rejects(
+      () => launchDetachedLoop({
+        setupArgs: ['--tmux', '--command-template', 'microverse.md', '--task', 'detached failure'],
+        loopConfig: {
+          mode: 'microverse',
+          task: 'detached failure',
+          metric: 'echo 1',
+          direction: 'higher',
+          stall_limit: 3,
+        },
+      }),
+      /fake tmux forced failure on send-keys/,
+    );
+
+    const sessionsRoot = path.join(dataRoot, 'sessions');
+    const [sessionId] = fs.readdirSync(sessionsRoot);
+    const sessionDir = path.join(sessionsRoot, sessionId);
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+    const tmuxLogLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+    assert.equal(state.last_exit_reason, 'launch_failed');
+    assert.equal(state.tmux_session_name, null);
+    assert.equal(sessionMap[fs.realpathSync(projectDir)], undefined);
+    assert.ok(tmuxLogLines.some((args) => args[0] === 'kill-session'));
+  } finally {
+    process.chdir(previousCwd);
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+    delete process.env.FAKE_TMUX_LOG;
+    delete process.env.FAKE_TMUX_FAIL_ON;
+    process.env.PATH = previousPath;
+  }
 });
 
 test('szechuan-sauce and anatomy-park launch detached tmux loops', () => {

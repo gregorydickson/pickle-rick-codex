@@ -53,7 +53,7 @@ That install does three things:
 
 1. Copies the runtime to `~/.codex/pickle-rick/`
 2. Copies Pickle Rick skills to `~/.codex/skills/`
-3. Merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
+3. Merges managed Pickle Rick marker blocks into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
 
 After that, the Pickle Rick persona is available in Codex generally. You do not need to reinstall it per project.
 
@@ -65,7 +65,7 @@ Only use project bootstrap if you explicitly want repo-local Pickle Rick instruc
 bash install.sh --project /path/to/project
 ```
 
-That keeps the global install, and also adds managed Pickle Rick files to the target repo without deleting unrelated project-local Codex configuration.
+That keeps the global install, and also adds managed Pickle Rick files to the target repo without deleting unrelated project-local Codex configuration. The installed runtime carries the source `.codex/skills` and `.codex/hooks` trees it needs, so the documented `~/.codex/pickle-rick/install.sh --project ...` path works after the first global install too.
 
 Optional hooks remain opt-in:
 
@@ -260,6 +260,9 @@ The design is deliberately file-backed so runs can resume and be inspected outsi
 Global install:
 
 - `~/.codex/pickle-rick/` — runtime, scripts, docs
+- `~/.codex/pickle-rick/.codex/skills/` — bundled source skill definitions used by the installed `install.sh --project ...` path
+- `~/.codex/pickle-rick/.codex/hooks/` — empty default hook contract plus the opt-in project hook template
+- `~/.codex/pickle-rick/tests/` — installed regression tests referenced by the package `test` script
 - `~/.codex/skills/` — globally available Pickle Rick skills
 - `~/.codex/AGENTS.md` — managed Pickle Rick persona block
 - `~/.codex/CLAUDE.md` — compatibility mirror
@@ -282,13 +285,14 @@ The repo ships local handlers for:
 - `PreToolUse -> bin/config-protection.js`
 - `PostToolUse -> bin/log-commit.js`
 
-But the default install does not enable project hooks automatically. Use hooks only when you explicitly want them and the installed Codex build has been validated to fire the events you care about.
+The installed runtime ships `.codex/hooks/hooks.json` as an empty fail-open contract and `.codex/hooks/hooks.template.json` as the opt-in project template rendered by `bash install.sh --project <path> --enable-hooks`. The default install still does not enable project hooks automatically. Use hooks only when you explicitly want them and the installed Codex build has been validated to fire the events you care about.
 
 ## Validated Behavior
 
 Validated locally on April 15, 2026 against `codex-cli 0.120.0`:
 
 - `bash install.sh` installs the runtime, persona, and skills globally
+- `~/.codex/pickle-rick/install.sh --project <path> [--enable-hooks]` works from the installed runtime because the source `.codex` tree is shipped with it
 - a clean `codex exec` probe in a temp directory returned `Pickle Rick`
 - the PRD and refinement flows can detect success artifacts and exit promptly even if the child Codex process lingers
 - `pickle-tmux --prd ./prd.md` bootstraps, refines, and launches detached tmux instead of requiring a task-string workaround
@@ -316,5 +320,7 @@ npm test
 node ./bin/validate-codex.js
 bash install.sh
 ```
+
+The installed runtime now includes the `tests/` directory referenced by `package.json`, so `npm test` is truthful both in the repo and after install.
 
 If you change install behavior, persona wiring, or runtime completion detection, update the tests and the validation doc in the same change.

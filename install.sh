@@ -7,6 +7,7 @@ target_root="${PICKLE_DATA_ROOT:-$codex_home/pickle-rick}"
 project_dir=""
 enable_hooks=0
 project_is_source=0
+runtime_is_installed_source=0
 
 usage() {
   cat <<'EOF'
@@ -42,18 +43,27 @@ const start = `<!-- PICKLE_RICK_${label.toUpperCase()}_BEGIN -->`;
 const end = `<!-- PICKLE_RICK_${label.toUpperCase()}_END -->`;
 const block = `${start}\n${source}\n${end}`;
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 if (!fs.existsSync(targetFile)) {
-  fs.writeFileSync(targetFile, `${source}\n`);
+  fs.writeFileSync(targetFile, `${block}\n`);
   process.exit(0);
 }
 
 const current = fs.readFileSync(targetFile, 'utf8');
 if (current.includes(start) && current.includes(end)) {
   const updated = current.replace(
-    new RegExp(`${start}[\\s\\S]*?${end}`, 'm'),
+    new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`, 'm'),
     block,
   );
   fs.writeFileSync(targetFile, updated.endsWith('\n') ? updated : `${updated}\n`);
+  process.exit(0);
+}
+
+if (current.trimEnd() === source) {
+  fs.writeFileSync(targetFile, `${block}\n`);
   process.exit(0);
 }
 
@@ -65,17 +75,33 @@ fs.writeFileSync(targetFile, merged.endsWith('\n') ? merged : `${merged}\n`);
 EOF
 }
 
+sync_runtime_source_tree() {
+  local runtime_root="$1"
+
+  if [[ "$runtime_root" == "$repo_root" ]]; then
+    return
+  fi
+
+  mkdir -p "$runtime_root/.codex"
+  rm -rf "$runtime_root/.codex/skills" "$runtime_root/.codex/hooks" "$runtime_root/tests"
+  cp -R "$repo_root/.codex/skills" "$runtime_root/.codex/"
+  cp -R "$repo_root/.codex/hooks" "$runtime_root/.codex/"
+  cp -R "$repo_root/tests" "$runtime_root/"
+}
+
 install_skill_tree() {
   local skills_root="$1"
   local runtime_root="$2"
 
   mkdir -p "$skills_root"
+  shopt -s nullglob
   for skill_dir in "$repo_root/.codex/skills"/*; do
     local skill_name
     skill_name="$(basename "$skill_dir")"
     rm -rf "$skills_root/$skill_name"
     cp -R "$skill_dir" "$skills_root/"
   done
+  shopt -u nullglob
   render_runtime_root_in_tree "$skills_root" "$runtime_root"
 }
 
@@ -152,8 +178,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$repo_root" == "$target_root" ]]; then
-  echo "Already installed at $target_root"
-  exit 0
+  runtime_is_installed_source=1
 fi
 
 if [[ -n "$project_dir" ]]; then
@@ -173,17 +198,20 @@ copy_item() {
   fi
 }
 
-rm -rf "$target_root/bin" "$target_root/lib" "$target_root/docs" "$target_root/.codex-plugin"
-copy_item README.md
-copy_item AGENTS.md
-copy_item CLAUDE.md
-copy_item package.json
-copy_item prd.md
-copy_item install.sh
-copy_item .codex-plugin
-copy_item docs
-copy_item bin
-copy_item lib
+if [[ "$runtime_is_installed_source" -eq 0 ]]; then
+  rm -rf "$target_root/bin" "$target_root/lib" "$target_root/docs" "$target_root/.codex-plugin"
+  copy_item README.md
+  copy_item AGENTS.md
+  copy_item CLAUDE.md
+  copy_item package.json
+  copy_item prd.md
+  copy_item install.sh
+  copy_item .codex-plugin
+  copy_item docs
+  copy_item bin
+  copy_item lib
+fi
+sync_runtime_source_tree "$target_root"
 
 install_skill_tree "$codex_home/skills" "$target_root"
 merge_managed_markdown "$repo_root/AGENTS.md" "$codex_home/AGENTS.md" "agents" "$codex_home/pickle-rick-backups"

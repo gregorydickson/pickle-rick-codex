@@ -46,6 +46,7 @@ export async function draftPrd(sessionDir, task, options = {}) {
     timeoutMs: options.timeoutMs || 900_000,
     outputLastMessagePath,
     addDirs: [sessionDir],
+    cleanupPaths: [prdPath],
     successCheck: ({ lastMessage }) =>
       fs.existsSync(prdPath) && hasPromiseToken(lastMessage, 'PRD_COMPLETE'),
   });

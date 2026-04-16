@@ -53,6 +53,7 @@ async function runAnalyst(state, prdPath, spec, timeoutMs) {
     timeoutMs,
     outputLastMessagePath: spec.messagePath,
     addDirs: [path.dirname(prdPath)],
+    cleanupPaths: [spec.analysisPath],
     successCheck: ({ lastMessage }) =>
       fs.existsSync(spec.analysisPath) &&
       hasPromiseToken(lastMessage, 'ANALYST_COMPLETE'),
@@ -72,6 +73,7 @@ async function runSynthesis(state, sessionDir, prdPath, timeoutMs) {
     timeoutMs,
     outputLastMessagePath,
     addDirs: [sessionDir],
+    cleanupPaths: [refinedPath, manifestPath],
     successCheck: ({ lastMessage }) =>
       fs.existsSync(refinedPath) &&
       fs.existsSync(manifestPath) &&
@@ -131,6 +133,7 @@ export async function refinePrd(sessionDir, options = {}) {
       timeoutMs,
       outputLastMessagePath,
       addDirs: [sessionDir],
+      cleanupPaths: [refinedPath, manifestPath],
       successCheck: ({ lastMessage }) =>
         fs.existsSync(refinedPath) &&
         fs.existsSync(manifestPath) &&

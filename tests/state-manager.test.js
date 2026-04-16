@@ -35,6 +35,19 @@ test('StateManager readOrReinitialize backs up corrupt state and rewrites defaul
   assert.equal(backups.length, 1);
 });
 
+test('StateManager read hydrates missing schema_version without rewriting the file', () => {
+  const tempRoot = makeTempRoot();
+  const statePath = path.join(tempRoot, 'state.json');
+  const originalContent = JSON.stringify(defaultState(tempRoot), null, 2);
+  fs.writeFileSync(statePath, originalContent);
+
+  const manager = new StateManager();
+  const state = manager.read(statePath);
+
+  assert.equal(state.schema_version, 1);
+  assert.equal(fs.readFileSync(statePath, 'utf8'), originalContent);
+});
+
 test('StateManager update steals stale lock files', () => {
   const tempRoot = makeTempRoot();
   const statePath = path.join(tempRoot, 'state.json');

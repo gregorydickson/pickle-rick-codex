@@ -149,3 +149,32 @@ test('summarizeTickets and ensureTicketFilesMaterialized restore missing ticket 
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-b', 'linear_ticket_ticket-b.md')));
 });
+
+test('ticket rematerialization preserves operational frontmatter needed by status and config protection', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'Config Ticket',
+        description: 'first',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Blocked',
+        config_change: true,
+        failed_at: '2026-04-15T12:00:00.000Z',
+        failure_reason: 'verification failed',
+        retry_requested_at: '2026-04-15T13:00:00.000Z',
+      },
+    ],
+  });
+
+  ensureTicketFilesMaterialized(sessionDir);
+  const ticket = getTicketById(sessionDir, 'ticket-a');
+
+  assert.equal(ticket.frontmatter.failed_at, '2026-04-15T12:00:00.000Z');
+  assert.equal(ticket.frontmatter.failure_reason, 'verification failed');
+  assert.equal(ticket.frontmatter.retry_requested_at, '2026-04-15T13:00:00.000Z');
+  assert.match(ticket.content, /config_change: true/);
+});
