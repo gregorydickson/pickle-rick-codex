@@ -9,7 +9,8 @@ import { loadConfig } from '../lib/config.js';
 import { recordIteration } from '../lib/circuit-breaker.js';
 import {
   applyPatch,
-  canApplyPatch,
+  classifyPatchApplyError,
+  checkPatchApply,
   createPatchFromWorktree,
   createTicketWorktree,
   removeTicketWorktree,
@@ -38,6 +39,13 @@ function runShell(command, cwd, timeoutMs) {
   if (result.status !== 0) {
     throw new Error(result.stderr || result.stdout || `Verification failed: ${command}`);
   }
+}
+
+function summarizePatchApplyError(errorText) {
+  return String(errorText || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean) || 'git apply --check failed';
 }
 
 export async function runTicket(sessionDir, ticketId, options = {}) {
@@ -98,12 +106,17 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
 
     const patchPath = path.join(sessionDir, `${normalizedTicketId}.patch`);
     createPatchFromWorktree(worktreeDir, baseSha, patchPath);
-    if (!canApplyPatch(state.working_dir, patchPath)) {
+    const patchCheck = checkPatchApply(state.working_dir, patchPath);
+    if (!patchCheck.ok) {
+      const reason = classifyPatchApplyError(patchCheck.error);
       writePatchSummary(sessionDir, normalizedTicketId, patchPath, {
         applied: false,
-        reason: 'patch-conflict',
+        reason,
+        error: patchCheck.error,
       });
-      throw new Error(`Patch for ${normalizedTicketId} could not be applied safely to ${state.working_dir}`);
+      throw new Error(
+        `Patch for ${normalizedTicketId} could not be applied safely to ${state.working_dir}: ${summarizePatchApplyError(patchCheck.error)}`,
+      );
     }
 
     applyPatch(state.working_dir, patchPath);

@@ -6,7 +6,7 @@ import { loadConfig } from '../lib/config.js';
 import { getWorkingTreeStatus } from '../lib/git-utils.js';
 import { logActivity } from '../lib/activity-logger.js';
 import { buildLoopPrompt } from '../lib/prompts.js';
-import { appendHistory } from '../lib/session.js';
+import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
 import { readJsonFile } from '../lib/pickle-utils.js';
 
@@ -36,6 +36,7 @@ export async function runLoop(sessionDir) {
     state.last_exit_reason = null;
     state.loop_mode = loopConfig.mode;
     state.loop_stall_count = state.loop_stall_count || 0;
+    markRunStart(state);
     appendHistory(state, `${loopConfig.mode}_runner_start`, state.current_ticket || undefined);
     return state;
   });
@@ -52,7 +53,7 @@ export async function runLoop(sessionDir) {
       break;
     }
     if (Number.isFinite(state.max_time_minutes) && state.max_time_minutes > 0) {
-      const elapsedMinutes = (Date.now() / 1000 - Number(state.start_time_epoch || 0)) / 60;
+      const elapsedMinutes = (Date.now() / 1000 - getRunStartEpoch(state)) / 60;
       if (elapsedMinutes >= state.max_time_minutes) {
         exitReason = 'max_time';
         break;

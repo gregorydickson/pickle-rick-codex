@@ -1,11 +1,11 @@
 # Codex API Validation
 
-Validated locally on `2026-04-15` against `codex-cli 0.120.0`.
+Validated locally on `2026-04-16` against `codex-cli 0.121.0`.
 
 ## Verified Facts
 
-- Codex CLI version: `codex-cli 0.120.0`
-- Guaranteed automation path: `codex exec`
+- Codex CLI version: `codex-cli 0.121.0`
+- Guaranteed automation path: `codex exec --full-auto`
 - Hook usage is gated by local validation of the installed build
 - Native multi-agent controls are not part of the guaranteed v1 contract
 - Reliable progress signaling for v1 comes from session state plus filesystem artifacts under `~/.codex/pickle-rick/`

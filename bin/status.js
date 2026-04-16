@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { formatDuration } from '../lib/pickle-utils.js';
-import { resolveSessionForCwd } from '../lib/session.js';
+import { getRunStartEpoch, resolveSessionForCwd } from '../lib/session.js';
 import { loadCircuitState } from '../lib/circuit-breaker.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getTicketById, summarizeTickets } from '../lib/tickets.js';
@@ -38,7 +38,11 @@ export async function renderStatus(cwd, options = {}) {
 
   const manager = new StateManager();
   const state = manager.read(path.join(sessionDir, 'state.json'));
-  const elapsed = Math.floor(Date.now() / 1000) - Number(state.start_time_epoch || 0);
+  const runNotStarted = state.active === false && state.last_exit_reason == null
+    && state.run_started_at == null && state.run_start_time_epoch == null;
+  const elapsed = runNotStarted
+    ? 0
+    : Math.max(0, Math.floor(Date.now() / 1000) - getRunStartEpoch(state));
   const circuit = loadCircuitState(sessionDir);
   const summary = summarizeTickets(sessionDir);
   const currentTicket = state.current_ticket ? getTicketById(sessionDir, state.current_ticket) : null;

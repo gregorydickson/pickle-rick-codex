@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux } from './helpers.js';
+import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
 test('setup command creates a session and get-session resolves it', () => {
@@ -56,6 +56,11 @@ test('setup command supports tmux mode and command templates', () => {
   assert.equal(state.tmux_mode, true);
   assert.equal(state.command_template, 'pickle-tmux.md');
   assert.equal(state.active, false);
+  assert.equal(state.run_start_time_epoch, null);
+  assert.equal(state.run_started_at, null);
+
+  const output = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], { env }).trim();
+  assert.match(output, /Elapsed: 0m 0s/);
 });
 
 test('setup command can resume the latest session in tmux mode', () => {
@@ -322,6 +327,89 @@ test('pickle-tmux clears a stale launch lock before relaunching', () => {
   assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
 });
 
+test('mux-runner refreshes the run timer instead of inheriting stale session start time', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const countPath = path.join(dataRoot, 'codex-count.txt');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+const counterPath = ${JSON.stringify(countPath)};
+const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
+fs.writeFileSync(counterPath, String(current));
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, '<promise>OK</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'runner timer task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Runner Timer Ticket',
+        description: 'Verify the timer refreshes on detached runner start.',
+        acceptance_criteria: ['Runner can execute one ticket.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  writeJson(path.join(sessionDir, 'state.json'), {
+    ...readJsonFile(path.join(sessionDir, 'state.json')),
+    active: false,
+    step: 'paused',
+    start_time_epoch: 1,
+    run_start_time_epoch: 1,
+    started_at: '2026-04-15T00:00:00.000Z',
+    run_started_at: '2026-04-15T00:00:00.000Z',
+    last_exit_reason: null,
+  });
+
+  runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
+    env,
+    cwd: repoRoot,
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.step, 'complete');
+  assert.equal(state.start_time_epoch, 1);
+  assert.ok(Number(state.run_start_time_epoch) > 1);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '5');
+
+  const output = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  assert.match(output, /Elapsed: 0m /);
+});
+
 test('mux-runner fails closed when a session has no tickets', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -341,6 +429,87 @@ test('mux-runner fails closed when a session has no tickets', () => {
   assert.equal(state.last_exit_reason, 'no_tickets');
   assert.equal(state.step, 'paused');
   assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /no tickets found/);
+});
+
+test('mux-runner preserves ticket failure when max_time would block a retry', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const countPath = path.join(dataRoot, 'codex-fail-count.txt');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+const counterPath = ${JSON.stringify(countPath)};
+const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
+fs.writeFileSync(counterPath, String(current));
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+await new Promise((resolve) => setTimeout(resolve, 1200));
+console.error('fake codex failure');
+process.exit(1);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'runner failure task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Runner Failure Ticket',
+        description: 'Verify max_time does not hide a real failure.',
+        acceptance_criteria: ['Runner should preserve the original failure.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  writeJson(path.join(sessionDir, 'state.json'), {
+    ...readJsonFile(path.join(sessionDir, 'state.json')),
+    active: false,
+    step: 'paused',
+    max_time_minutes: 0.005,
+    start_time_epoch: 1,
+    run_start_time_epoch: 1,
+    last_exit_reason: null,
+  });
+
+  try {
+    runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
+      env,
+      cwd: repoRoot,
+    });
+  } catch {
+    // The child process may surface the terminal error directly; session state is the real assertion target.
+  }
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'error');
+  assert.equal(state.step, 'paused');
+  assert.equal(state.current_ticket, 'r1');
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.history.at(-1).step, 'failed');
+  assert.equal(ticket.status, 'Blocked');
+  assert.match(ticket.frontmatter.failure_reason, /fake codex failure/);
+  assert.match(log, /ticket r1 failed on attempt 1/);
+  assert.match(log, /mux-runner finished: error/);
+  assert.doesNotMatch(log, /attempt 2\/2/);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '1');
 });
 
 test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLETE', () => {
