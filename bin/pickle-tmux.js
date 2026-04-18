@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { refinePrd } from './spawn-refinement-team.js';
 import { setupSession } from '../lib/setup-session.js';
 import { appendHistory } from '../lib/session.js';
+import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getNextRunnableTicket, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
 import { ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote } from '../lib/tmux.js';
@@ -149,7 +150,7 @@ async function createBootstrapSession(parsed) {
   if (parsed.maxTime) args.push('--max-time', parsed.maxTime);
   if (parsed.workerTimeout) args.push('--worker-timeout', parsed.workerTimeout);
 
-  const { sessionDir } = await setupSession(args);
+  const { sessionDir } = await setupSession(args, { updateSessionMap: false });
   copyPrdIntoSession(sessionDir, prdSource);
 
   const manager = new StateManager();
@@ -167,13 +168,12 @@ async function createBootstrapSession(parsed) {
 }
 
 async function resumeSession(parsed) {
-  const args = ['--resume', '--tmux'];
-  if (parsed.resume !== '__LAST__') {
-    args.push(parsed.resume);
-  }
+  const args = parsed.resume === '__LAST__'
+    ? ['--resume', '--tmux']
+    : ['--resume', parsed.resume, '--tmux'];
   if (parsed.maxTime) args.push('--max-time', parsed.maxTime);
   if (parsed.workerTimeout) args.push('--worker-timeout', parsed.workerTimeout);
-  const { sessionDir } = await setupSession(args);
+  const { sessionDir } = await setupSession(args, { updateSessionMap: false });
 
   const manager = new StateManager();
   manager.update(path.join(sessionDir, 'state.json'), (state) => {
@@ -277,6 +277,7 @@ async function main(argv) {
     : await resumeSession(parsed);
   const releaseLock = acquireLaunchLock(sessionDir);
   const runtimeRoot = getRuntimeRoot();
+  let previousSessionDir = null;
   try {
     let state;
     let summary;
@@ -289,6 +290,8 @@ async function main(argv) {
       throw error;
     }
     assertSessionNotRunning(sessionDir, state);
+    previousSessionDir = getSessionForCwd(state.working_dir);
+    await updateSessionMap(state.working_dir, sessionDir);
     const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
 
     const manager = new StateManager();
@@ -353,6 +356,15 @@ async function main(argv) {
         appendHistory(current, 'tmux_launch_failed', current.current_ticket || undefined);
         return current;
       });
+      try {
+        if (previousSessionDir) {
+          await updateSessionMap(state.working_dir, previousSessionDir);
+        } else {
+          await removeSessionMapEntry(state.working_dir, sessionDir);
+        }
+      } catch {
+        // Best-effort map rollback for failed tmux launches.
+      }
       throw error;
     }
 

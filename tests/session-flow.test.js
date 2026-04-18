@@ -405,6 +405,71 @@ test('pickle-tmux --resume refines an existing PRD-only session before launch', 
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
 });
 
+test('pickle-tmux honors an explicit --resume session when --resume-ready-only is set', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-explicit-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const mappedSession = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'mapped tmux session'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const explicitSession = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'explicit tmux session'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(mappedSession, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'mapped-ticket',
+        title: 'Mapped Session Ticket',
+        description: 'Keep this session runnable but unused.',
+        acceptance_criteria: ['It stays out of the way.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  writeJson(path.join(explicitSession, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'explicit-ticket',
+        title: 'Explicit Session Ticket',
+        description: 'This is the session that should launch.',
+        acceptance_criteria: ['It is chosen explicitly.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  await updateSessionMap(realProjectDir, mappedSession);
+
+  const output = runNode([
+    path.join(repoRoot, 'bin/pickle-tmux.js'),
+    '--resume',
+    explicitSession,
+    '--resume-ready-only',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  assert.match(output, new RegExp(`Session: pickle-${path.basename(explicitSession)}`));
+  assert.ok(output.includes(`State: ${path.join(explicitSession, 'state.json')}`));
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(sessionMap[realProjectDir], explicitSession);
+});
+
 test('pickle-tmux clears a stale launch lock before relaunching', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -465,6 +530,100 @@ test('pickle-tmux rolls back tmux launch state when monitor bootstrap fails', ()
   assert.equal(state.last_exit_reason, 'launch_failed');
   assert.equal(state.tmux_session_name, null);
   assert.ok(logLines.some((args) => args[0] === 'kill-session'));
+});
+
+test('pickle-tmux --prd preserves the prior session mapping when refinement fails before readiness', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const prdSource = path.join(projectDir, 'broken-bootstrap-prd.md');
+  fs.writeFileSync(prdSource, '# Broken Bootstrap\n\n## Summary\nForce refinement failure before tmux launch.\n');
+  createFakeTmux(fakeBin);
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+const addDirs = [];
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  } else if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const prompt = fs.readFileSync(0, 'utf8');
+const refinedPath = path.join(sessionDir, 'prd_refined.md');
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+if (prompt.includes('Refinement analyst role:')) {
+  if (outputLastMessagePath) {
+    fs.writeFileSync(outputLastMessagePath, '<promise>ANALYST_COMPLETE</promise>');
+  }
+  console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+  process.exit(0);
+}
+
+fs.writeFileSync(refinedPath, '# Refined PRD\\n\\n## Summary\\nPreflight should fail before tmux launch.\\n');
+fs.writeFileSync(
+  manifestPath,
+  JSON.stringify({
+    generated_at: '2026-04-15T00:00:00.000Z',
+    source: 'preflight-fake-codex',
+    tickets: [
+      {
+        id: 'ticket-001',
+        title: 'Require package token',
+        description: 'Preflight should block this launch.',
+        acceptance_criteria: ['Verification env must be present.'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+        required_env: ['GITHUB_PACKAGES_TOKEN'],
+      },
+    ],
+  }, null, 2),
+);
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, '<promise>REFINEMENT_COMPLETE</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`,
+  );
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const stableSession = runNode([path.join(repoRoot, 'bin/setup.js'), 'stable mapped session'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  await updateSessionMap(realProjectDir, stableSession);
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], {
+      env,
+      cwd: projectDir,
+    }),
+    /GITHUB_PACKAGES_TOKEN is required for verification/,
+  );
+
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(sessionMap[realProjectDir], stableSession);
 });
 
 test('pickle-tmux rolls back tmux launch state on launch failure', () => {

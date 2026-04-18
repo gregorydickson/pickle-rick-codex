@@ -1,6 +1,6 @@
 {
   "name": "pickle-rick-codex",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Pickle Rick autonomous engineering lifecycle — Codex CLI native port",
   "type": "module",
   "private": true,

@@ -30,6 +30,23 @@ test('fallbackRefinePrd builds tickets from the PRD task breakdown table', () =>
   assert.equal(manifest.tickets[1].priority, 'P0');
 });
 
+test('fallbackRefinePrd accepts numbered Task Breakdown headings', () => {
+  const prd = [
+    '# PRD',
+    '',
+    '## 15. Task Breakdown',
+    '| Order | ID | Title | Priority | Phase | Depends On |',
+    '|---|---|---|---|---|---|',
+    '| 10 | T0 | Parse numbered headings | P1 | 0 | none |',
+    '| 20 | T1 | Materialize real tickets | P1 | 1 | T0 |',
+  ].join('\n');
+
+  const manifest = fallbackRefinePrd(prd);
+  assert.equal(manifest.tickets.length, 2);
+  assert.equal(manifest.tickets[0].title, 'Parse numbered headings');
+  assert.equal(manifest.tickets[1].depends_on, 'T0');
+});
+
 test('writeManifest and writeTicketFiles materialize refinement output', () => {
   const sessionDir = makeTempRoot();
   const manifest = {

@@ -105,6 +105,19 @@ function sumUsage(results) {
   });
 }
 
+function appendRefineLog(sessionDir, message) {
+  fs.appendFileSync(path.join(sessionDir, 'refine.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
+}
+
+function markRefinePhase(manager, statePath, sessionDir, step, message) {
+  manager.update(statePath, (current) => {
+    current.step = step;
+    return current;
+  });
+  appendRefineLog(sessionDir, message);
+  console.error(`[refine] ${message}`);
+}
+
 export async function refinePrd(sessionDir, options = {}) {
   const prdPath = path.join(sessionDir, 'prd.md');
   if (!fs.existsSync(prdPath)) {
@@ -118,11 +131,14 @@ export async function refinePrd(sessionDir, options = {}) {
 
   let analystResults = [];
   try {
+    markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
     analystResults = await Promise.all(
       analystSpecs(sessionDir).map((spec) => runAnalyst(state, prdPath, spec, timeoutMs)),
     );
+    appendRefineLog(sessionDir, 'Analyst fanout complete.');
   } catch {
     // If analyst fanout fails, keep the prior single-pass refinement path as fallback.
+    markRefinePhase(manager, statePath, sessionDir, 'refine:fallback', 'Analyst fanout failed. Falling back to single-pass refinement.');
     const fallbackPrompt = buildRefinePrdPrompt({ sessionDir, prdPath });
     const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
     const refinedPath = path.join(sessionDir, 'prd_refined.md');
@@ -142,13 +158,16 @@ export async function refinePrd(sessionDir, options = {}) {
     analystResults = [fallbackResult];
   }
 
+  markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
   const synthesisResult = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
 
   let manifest = readManifest(sessionDir);
   if (!manifest.tickets.length) {
+    appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
     manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
     writeManifest(sessionDir, manifest);
   }
+  markRefinePhase(manager, statePath, sessionDir, 'refine:materialize', 'Materializing ticket files.');
   writeTicketFiles(sessionDir, manifest);
 
   if (!manifest.tickets.length) {
@@ -160,6 +179,7 @@ export async function refinePrd(sessionDir, options = {}) {
     appendHistory(current, 'refine');
     return current;
   });
+  appendRefineLog(sessionDir, 'Refinement complete.');
 
   const config = loadConfig();
   const usage = sumUsage([...analystResults, synthesisResult]);
