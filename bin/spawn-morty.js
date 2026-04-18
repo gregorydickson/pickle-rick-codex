@@ -7,16 +7,7 @@ import { logActivity } from '../lib/activity-logger.js';
 import { assertCodexSucceeded, runCodexExecMonitored } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { recordIteration } from '../lib/circuit-breaker.js';
-import {
-  applyPatch,
-  classifyPatchApplyError,
-  checkPatchApply,
-  createPatchFromWorktree,
-  createTicketWorktree,
-  removeTicketWorktree,
-  worktreeHasDiff,
-  writePatchSummary,
-} from '../lib/git-utils.js';
+import { getWorkingTreeFingerprint } from '../lib/git-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
@@ -29,13 +20,6 @@ function splitVerificationCommands(ticket) {
     return ticket.verify.split('&&').map((item) => item.trim()).filter(Boolean);
   }
   return ['npm test'];
-}
-
-function summarizePatchApplyError(errorText) {
-  return String(errorText || '')
-    .split('\n')
-    .map((line) => line.trim())
-    .find(Boolean) || 'git apply --check failed';
 }
 
 class CancellationError extends Error {
@@ -170,9 +154,9 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   }
 
   const config = loadConfig();
+  const workingDir = state.working_dir;
   let verificationReady = null;
-  let worktreeDir = null;
-  let baseSha = null;
+  let baselineFingerprint = '';
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
   try {
@@ -180,11 +164,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       ticket: manifestTicket,
       config,
     });
-    ({ worktreeDir, baseSha } = createTicketWorktree({
-      repoDir: state.working_dir,
-      sessionDir,
-      ticketId: normalizedTicketId,
-    }));
+    baselineFingerprint = getWorkingTreeFingerprint(workingDir);
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -212,7 +192,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       });
 
       const result = await runCodexExecMonitored({
-        cwd: worktreeDir,
+        cwd: workingDir,
         prompt: buildTicketPhasePrompt({
           phase,
           ticket: {
@@ -220,7 +200,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
             verificationContract: verificationReady.contract,
           },
           sessionDir,
-          worktreeDir,
+          workingDir,
         }),
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
         outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
@@ -252,7 +232,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       }
       await runVerificationCommand({
         command,
-        cwd: worktreeDir,
+        cwd: workingDir,
         timeoutMs: config.defaults.worker_timeout_seconds * 1000,
         manager,
         statePath,
@@ -260,7 +240,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       });
     }
 
-    if (!worktreeHasDiff(worktreeDir, baseSha)) {
+    if (getWorkingTreeFingerprint(workingDir) === baselineFingerprint) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Done',
         completed_at: new Date().toISOString(),
@@ -270,23 +250,6 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       });
       return { status: 'done', applied: false, reason: 'No diff generated.' };
     }
-
-    const patchPath = path.join(sessionDir, `${normalizedTicketId}.patch`);
-    createPatchFromWorktree(worktreeDir, baseSha, patchPath);
-    const patchCheck = checkPatchApply(state.working_dir, patchPath);
-    if (!patchCheck.ok) {
-      const reason = classifyPatchApplyError(patchCheck.error);
-      writePatchSummary(sessionDir, normalizedTicketId, patchPath, {
-        applied: false,
-        reason,
-        error: patchCheck.error,
-      });
-      throw new Error(
-        `Patch for ${normalizedTicketId} could not be applied safely to ${state.working_dir}: ${summarizePatchApplyError(patchCheck.error)}`,
-      );
-    }
-
-    applyPatch(state.working_dir, patchPath);
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Done',
       completed_at: new Date().toISOString(),
@@ -307,7 +270,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       ticket: normalizedTicketId,
     }, { enabled: config.defaults.activity_logging });
 
-    return { status: 'done', applied: true, patchPath };
+    return { status: 'done', applied: true };
   } catch (error) {
     if (error instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
@@ -345,9 +308,6 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       active_child_kind: null,
       active_child_command: null,
     });
-    if (worktreeDir) {
-      removeTicketWorktree(worktreeDir);
-    }
   }
 }
 

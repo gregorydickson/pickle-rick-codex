@@ -20,7 +20,7 @@ If you want the short version: this repo gives Codex a real Pickle Rick persona,
 - Installs Pickle Rick skills into `~/.codex/skills`
 - Drafts PRDs with machine-checkable acceptance criteria
 - Refines PRDs into ticket manifests and per-ticket markdown files
-- Executes tickets sequentially in isolated git worktrees
+- Executes tickets sequentially in the current branch working tree
 - Supports detached tmux orchestration with a runner window and live monitor
 - Supports detached context-clearing loops for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park`
 - Tracks runtime state, session mappings, metrics, and circuit-breaker state
@@ -110,13 +110,12 @@ This is where broad intent gets narrowed into atomic work that can be run in ord
 
 The orchestrator runs tickets in manifest order. For each ticket it:
 
-1. creates an isolated git worktree
+1. works directly in the current branch working tree
 2. runs the ticket through the worker loop
 3. verifies outputs
-4. applies the patch back only if it can be applied safely
-5. advances state or stops on policy
+4. advances state or stops on policy
 
-The point is not “maximum chaos.” The point is controlled autonomy. Each ticket gets a bounded work area, explicit artifacts, and a safe merge path back into the main tree.
+The point is not “maximum chaos.” The point is controlled sequential autonomy. Each ticket works on the branch as it exists now, carries forward prior ticket changes naturally, and still records explicit session artifacts and verification results.
 
 For longer runs, launch the detached tmux version instead of keeping the current session occupied:
 

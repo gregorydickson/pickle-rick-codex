@@ -2,8 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
-import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeExecutable, writeJson } from './helpers.js';
+import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
+
+function runGit(repoDir, args) {
+  return execFileSync('git', args, {
+    cwd: repoDir,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
 
 function writePreflightManifest(sessionDir, verificationEnv, verificationCommand = 'node -e "process.exit(0)"') {
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -169,6 +178,59 @@ test('spawn-morty uses deterministic verification env when configured', () => {
   const result = JSON.parse(output);
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
   assert.equal(result.status, 'done');
+  assert.equal(ticket.status, 'Done');
+});
+
+test('spawn-morty works directly in the current branch working tree', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-working-branch-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\nuser-change\n');
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'working tree ticket'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Working branch execution',
+        description: 'Run directly in the repository working tree.',
+        acceptance_criteria: ['The ticket succeeds on top of existing uncommitted branch changes.'],
+        verification: [
+          'node -e "const fs = require(\'fs\'); const text = fs.readFileSync(\'feature.txt\', \'utf8\'); if (text !== \'base\\nuser-change\\nagent-change\\n\') process.exit(1)"',
+        ],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const result = JSON.parse(output);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(result.status, 'done');
+  assert.equal(result.applied, true);
+  assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\nuser-change\nagent-change\n');
   assert.equal(ticket.status, 'Done');
 });
 

@@ -66,9 +66,7 @@ This PRD is written against that real baseline.
 ### Rollback Safety
 
 - Do not use `git checkout -- .` as a failure or cancel rollback strategy.
-- v1 must use one of:
-  - per-ticket worktree or branch isolation
-  - exact patch-based rollback against a recorded base SHA
+- v1 works directly in the active branch working tree and must fail open rather than attempt destructive rollback.
 - Unrelated user changes must survive failure, retry, cancel, and skip flows.
 
 ### Monitoring Scope
@@ -121,7 +119,7 @@ Success:
 ### CUJ-3: Failure, Retry, or Skip
 
 1. A ticket fails verification or times out.
-2. Pickle Rick records failure metadata and preserves the worktree safely.
+2. Pickle Rick records failure metadata and preserves the current branch state without destructive rollback.
 3. User chooses retry, skip, or abort.
 
 Success:
@@ -416,7 +414,7 @@ They may be reintroduced after the core loop is stable.
 
 1. Which hook events are reliable in the exact Codex workflow this project targets?
 2. Can interactive native-agent behavior be used consistently enough to justify an optional acceleration path?
-3. What is the simplest safe rollback primitive for v1: worktrees, branches, or stored patches?
+3. What is the cleanest retry and recovery policy for direct branch execution without destructive rollback?
 4. Should `pickle-orchestrate` remain a separate skill, or should `pickle` absorb orchestration for v1 simplicity?
 
 ## Success Criteria

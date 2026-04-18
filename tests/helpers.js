@@ -112,6 +112,11 @@ function extractPathAfter(prefix) {
   return line ? line.slice(prefix.length).trim().replace(/[.)]+$/, '') : '';
 }
 
+function extractTicketPhase() {
+  const match = prompt.match(/You are executing the "([^"]+)" phase/);
+  return match ? match[1] : '';
+}
+
 if (prompt.includes('Loop mode:')) {
   const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
   const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
@@ -176,6 +181,18 @@ if (prompt.includes('Loop mode:')) {
     '# PRD\\n\\n## Summary\\nFake codex produced a draft.\\n\\n## Verification\\n- \`npm test\`\\n',
   );
   lastMessage = '<promise>PRD_COMPLETE</promise>';
+} else if (prompt.includes('You are executing the "')) {
+  const phase = extractTicketPhase();
+  const mutatePhase = process.env.FAKE_CODEX_MUTATE_PHASE || 'implement';
+  const mutateFile = process.env.FAKE_CODEX_MUTATE_FILE || '';
+  if (mutateFile && phase === mutatePhase) {
+    const targetPath = path.resolve(process.cwd(), mutateFile);
+    const existing = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : '';
+    const suffix = process.env.FAKE_CODEX_APPEND_TEXT || '';
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, existing + suffix);
+  }
+  lastMessage = phase ? '<promise>' + phase.toUpperCase() + '_COMPLETE</promise>' : '<promise>OK</promise>';
 } else {
   fs.writeFileSync(
     refinedPath,
