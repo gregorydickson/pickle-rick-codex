@@ -117,8 +117,10 @@ test('setup command creates a session and get-session resolves it', () => {
   const env = { PICKLE_DATA_ROOT: dataRoot };
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'session flow task'], { env }).trim();
   const fetched = runNode([path.join(repoRoot, 'bin/get-session.js'), '--cwd', repoRoot], { env }).trim();
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
 
   assert.equal(fetched, sessionDir);
+  assert.equal(state.max_time_minutes, 0);
   const map = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
   assert.equal(map[repoRoot], sessionDir);
 });

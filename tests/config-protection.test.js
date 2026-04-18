@@ -109,6 +109,7 @@ test('loadConfig falls back to safe defaults when nested config shapes are malfo
   assert.equal(config.runtime.command, 'codex');
   assert.deepEqual(config.runtime.exec_args, ['--full-auto']);
   assert.equal(config.defaults.max_iterations, 25);
+  assert.equal(config.defaults.max_time_minutes, 0);
   assert.equal(config.defaults.activity_logging, true);
   assert.deepEqual(config.defaults.circuit_breaker, {
     enabled: true,
