@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import path from 'node:path';
 import { runCodexExecMonitored, assertCodexSucceeded } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
-import { getWorkingTreeStatus } from '../lib/git-utils.js';
 import { logActivity } from '../lib/activity-logger.js';
+import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
 import { buildLoopPrompt } from '../lib/prompts.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
@@ -39,58 +38,11 @@ function summaryPaths(sessionDir, mode) {
   };
 }
 
-function fileDigest(filePath) {
-  if (!fs.existsSync(filePath)) return null;
-  const content = fs.readFileSync(filePath, 'utf8');
-  return crypto.createHash('sha256').update(content).digest('hex');
-}
-
-function readProgressSnapshot(sessionDir, mode) {
-  if (mode !== 'anatomy-park') {
-    return {};
-  }
-  const paths = summaryPaths(sessionDir, mode);
-  return {
-    summaryJson: fileDigest(paths.json),
-    summaryMarkdown: fileDigest(paths.markdown),
-  };
-}
-
-function snapshotsDiffer(left, right) {
-  const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
-  for (const key of keys) {
-    if ((left?.[key] || null) !== (right?.[key] || null)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function normalizeLoopMessage(message) {
   return String(message || '')
     .replace(/<promise>[^<]+<\/promise>/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function loopProgress(state, options) {
-  const repoChanged = options.beforeStatus !== options.afterStatus;
-  if (repoChanged) {
-    return { progressed: true, reasons: ['repo_changed'] };
-  }
-
-  const summaryChanged = snapshotsDiffer(options.beforeSnapshot, options.afterSnapshot);
-  if (summaryChanged) {
-    return { progressed: true, reasons: ['summary_changed'] };
-  }
-
-  const previousMessage = normalizeLoopMessage(state.last_loop_message);
-  const nextMessage = normalizeLoopMessage(options.lastMessage);
-  if (!options.afterSnapshot.summaryJson && !options.afterSnapshot.summaryMarkdown && nextMessage && nextMessage !== previousMessage) {
-    return { progressed: true, reasons: ['message_changed'] };
-  }
-
-  return { progressed: false, reasons: [] };
 }
 
 function summarizeVerification(summary) {
@@ -209,8 +161,13 @@ export async function runLoop(sessionDir) {
         }
       }
 
-      const beforeStatus = getWorkingTreeStatus(state.working_dir);
-      const beforeSnapshot = readProgressSnapshot(sessionDir, loopConfig.mode);
+      const beforeSnapshot = captureProgressSnapshot({
+        sessionDir,
+        workingDir: state.working_dir,
+        mode: loopConfig.mode,
+        step: state.step,
+        currentTicket: state.current_ticket,
+      });
       manager.update(statePath, (current) => {
         current.iteration += 1;
         current.step = loopConfig.mode;
@@ -255,22 +212,21 @@ export async function runLoop(sessionDir) {
       const lastMessage = result.lastMessage || '';
       appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} finished`);
 
-      const afterStatus = getWorkingTreeStatus(state.working_dir);
-      const afterSnapshot = readProgressSnapshot(sessionDir, loopConfig.mode);
-      const progress = loopProgress(state, {
-        beforeStatus,
-        afterStatus,
-        beforeSnapshot,
-        afterSnapshot,
-        lastMessage,
+      const afterSnapshot = captureProgressSnapshot({
+        sessionDir,
+        workingDir: state.working_dir,
+        mode: loopConfig.mode,
+        step: loopConfig.mode,
+        currentTicket: manager.read(statePath).current_ticket,
       });
+      const progressReasons = diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot');
       const latest = manager.update(statePath, (current) => {
-        current.loop_stall_count = progress.progressed ? 0 : Number(current.loop_stall_count || 0) + 1;
+        current.loop_stall_count = progressReasons.length ? 0 : Number(current.loop_stall_count || 0) + 1;
         current.last_loop_message = lastMessage.trim();
         return current;
       });
-      if (progress.reasons.length) {
-        appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} progress: ${progress.reasons.join(',')}`);
+      if (progressReasons.length) {
+        appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} progress: ${progressReasons.join(',')}`);
       }
 
       if (/<promise>LOOP_COMPLETE<\/promise>|<promise>TASK_COMPLETED<\/promise>/.test(lastMessage)) {

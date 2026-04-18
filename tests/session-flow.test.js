@@ -1351,6 +1351,42 @@ test('loop-runner honors the stored worker timeout when config changes after ses
   assert.match(log, /loop-runner finished: success/);
 });
 
+test('loop-runner passes the persisted iteration budget to anatomy-park prompts without a second increment', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy prompt budget task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  const statePath = path.join(sessionDir, 'state.json');
+  const originalState = readJsonFile(statePath);
+  writeJson(statePath, {
+    ...originalState,
+    iteration: 21,
+    max_iterations: 0,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const prompt = fs.readFileSync(path.join(sessionDir, 'loop-iteration-1.txt'), 'utf8');
+  assert.match(prompt, /Iteration: 22 \/ unlimited/);
+  assert.doesNotMatch(prompt, /Iteration: 23 \/ 0/);
+});
+
 test('loop-runner counts anatomy-park summary updates as progress and writes stop summaries', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -1400,7 +1436,7 @@ test('loop-runner counts anatomy-park summary updates as progress and writes sto
   assert.equal(stopSummary.finding_family, 'fake-correctness-family');
   assert.match(stopMarkdown, /Stop Reason: success/);
   assert.match(stopMarkdown, /Highest-Severity Finding: Fake correctness finding #2/);
-  assert.match(runnerLog, /iteration 1 progress: summary_changed/);
+  assert.match(runnerLog, /iteration 1 progress: .*progress_artifact:anatomy-park-summary\.json/);
 });
 
 test('loop-runner stalls anatomy-park when the canonical summary stops changing and writes stop summaries', () => {
