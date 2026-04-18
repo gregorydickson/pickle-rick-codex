@@ -12,7 +12,14 @@ import {
 } from '../lib/prompts.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
-import { fallbackRefinePrd, readManifest, writeManifest, writeTicketFiles } from '../lib/tickets.js';
+import {
+  enrichRefinementManifest,
+  fallbackRefinePrd,
+  readManifest,
+  validateRefinementManifest,
+  writeManifest,
+  writeTicketFiles,
+} from '../lib/tickets.js';
 
 function hasPromiseToken(text, token) {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
@@ -127,7 +134,8 @@ export async function refinePrd(sessionDir, options = {}) {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
   const state = manager.read(statePath);
-  const timeoutMs = options.timeoutMs || loadConfig().defaults.refinement_timeout_seconds * 1000;
+  const config = loadConfig();
+  const timeoutMs = options.timeoutMs || config.defaults.refinement_timeout_seconds * 1000;
 
   let analystResults = [];
   try {
@@ -165,7 +173,16 @@ export async function refinePrd(sessionDir, options = {}) {
   if (!manifest.tickets.length) {
     appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
     manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
+  }
+  const enrichedManifest = enrichRefinementManifest(manifest, config);
+  manifest = enrichedManifest.manifest;
+  if (enrichedManifest.changed || !fs.existsSync(path.join(sessionDir, 'refinement_manifest.json'))) {
     writeManifest(sessionDir, manifest);
+  }
+  const manifestIssues = validateRefinementManifest(manifest);
+  if (manifestIssues.length > 0) {
+    appendRefineLog(sessionDir, `Refinement manifest rejected: ${manifestIssues.join('; ')}`);
+    throw new Error(`Refinement manifest rejected: ${manifestIssues.join('; ')}`);
   }
   markRefinePhase(manager, statePath, sessionDir, 'refine:materialize', 'Materializing ticket files.');
   writeTicketFiles(sessionDir, manifest);
@@ -181,7 +198,6 @@ export async function refinePrd(sessionDir, options = {}) {
   });
   appendRefineLog(sessionDir, 'Refinement complete.');
 
-  const config = loadConfig();
   const usage = sumUsage([...analystResults, synthesisResult]);
   logActivity({
     event: 'feature',

@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  enrichRefinementManifest,
   ensureTicketFilesMaterialized,
   fallbackRefinePrd,
   getTicketById,
   readManifest,
   summarizeTickets,
+  validateRefinementManifest,
   writeManifest,
   writeTicketFiles,
 } from '../lib/tickets.js';
@@ -128,6 +130,54 @@ test('normalizeManifestTicketIds rewrites dependency references to canonical ids
   assert.equal(manifest.tickets[0].id, 'r1');
   assert.equal(manifest.tickets[1].id, 'r2');
   assert.equal(manifest.tickets[1].depends_on, 'r1');
+});
+
+test('enrichRefinementManifest normalizes dependency aliases and materializes verification_env', () => {
+  const manifest = {
+    tickets: [
+      {
+        id: 'T00',
+        title: 'Freeze contract',
+        description: 'Capture sibling repo contract.',
+        acceptance_criteria: ['The sibling contract is recorded in repo-owned artifacts.'],
+        verification: ['git -C "$ATTRACTOR_ROOT" rev-parse HEAD'],
+        priority: 'P0',
+        status: 'Todo',
+        dependencies: [],
+      },
+      {
+        id: 'T01',
+        title: 'Use previous ticket',
+        description: 'Depends on the freeze ticket.',
+        acceptance_criteria: ['The next ticket depends on the normalized freeze ticket id.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        priority: 'P0',
+        status: 'Todo',
+        dependencies: ['T00'],
+      },
+    ],
+  };
+
+  const enriched = enrichRefinementManifest(manifest);
+  assert.equal(enriched.manifest.tickets[1].depends_on[0], 't00');
+  assert.deepEqual(
+    enriched.manifest.tickets[0].verification_env.required.map((entry) => entry.name),
+    ['ATTRACTOR_ROOT'],
+  );
+});
+
+test('validateRefinementManifest rejects fallback parser output with placeholder contracts', () => {
+  const issues = validateRefinementManifest(fallbackRefinePrd([
+    '# PRD',
+    '',
+    '## Task Breakdown',
+    '| Order | ID | Title | Priority | Phase | Depends On |',
+    '|---|---|---|---|---|---|',
+    '| 10 | T0 | Placeholder Ticket | P1 | 0 | none |',
+  ].join('\n')));
+
+  assert.ok(issues.some((issue) => issue.includes('fallback parser output')));
+  assert.ok(issues.some((issue) => issue.includes('placeholder text')));
 });
 
 test('summarizeTickets and ensureTicketFilesMaterialized restore missing ticket files from the manifest', () => {
