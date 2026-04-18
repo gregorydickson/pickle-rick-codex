@@ -8,6 +8,7 @@ project_dir=""
 enable_hooks=0
 project_is_source=0
 runtime_is_installed_source=0
+repo_is_checkout=0
 
 usage() {
   cat <<'EOF'
@@ -114,7 +115,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const [rootDir, runtimeRoot] = process.argv.slice(2);
-const sourceRoot = '$HOME/.codex/pickle-rick';
+const sourceRoots = [
+  '$HOME/.codex/pickle-rick',
+  '$HOME/.codex/pickle-rick/',
+  '~/.codex/pickle-rick',
+  '~/.codex/pickle-rick/',
+];
 
 function walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -124,8 +130,14 @@ function walk(dir) {
       continue;
     }
     const content = fs.readFileSync(filePath, 'utf8');
-    if (!content.includes(sourceRoot)) continue;
-    fs.writeFileSync(filePath, content.split(sourceRoot).join(runtimeRoot));
+    let updated = content;
+    for (const sourceRoot of sourceRoots) {
+      if (!updated.includes(sourceRoot)) continue;
+      const replacement = sourceRoot.endsWith('/') ? `${runtimeRoot}/` : runtimeRoot;
+      updated = updated.split(sourceRoot).join(replacement);
+    }
+    if (updated === content) continue;
+    fs.writeFileSync(filePath, updated);
   }
 }
 
@@ -181,6 +193,10 @@ if [[ "$repo_root" == "$target_root" ]]; then
   runtime_is_installed_source=1
 fi
 
+if [[ -d "$repo_root/.git" ]]; then
+  repo_is_checkout=1
+fi
+
 if [[ -n "$project_dir" ]]; then
   project_dir="$(cd "$project_dir" && pwd -P)"
   if [[ "$project_dir" == "$repo_root" ]]; then
@@ -208,19 +224,23 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   copy_item install.sh
   copy_item .codex-plugin
   copy_item docs
+  copy_item images
   copy_item bin
   copy_item lib
 fi
 sync_runtime_source_tree "$target_root"
+if [[ "$runtime_is_installed_source" -eq 0 || "$repo_is_checkout" -eq 0 ]]; then
+  render_runtime_root_in_tree "$target_root" "$target_root"
+fi
 
 install_skill_tree "$codex_home/skills" "$target_root"
-merge_managed_markdown "$repo_root/AGENTS.md" "$codex_home/AGENTS.md" "agents" "$codex_home/pickle-rick-backups"
-merge_managed_markdown "$repo_root/CLAUDE.md" "$codex_home/CLAUDE.md" "claude" "$codex_home/pickle-rick-backups"
+merge_managed_markdown "$target_root/AGENTS.md" "$codex_home/AGENTS.md" "agents" "$codex_home/pickle-rick-backups"
+merge_managed_markdown "$target_root/CLAUDE.md" "$codex_home/CLAUDE.md" "claude" "$codex_home/pickle-rick-backups"
 
 if [[ -n "$project_dir" && "$project_is_source" -eq 0 ]]; then
   install_skill_tree "$project_dir/.codex/skills" "$target_root"
-  merge_managed_markdown "$repo_root/AGENTS.md" "$project_dir/AGENTS.md" "agents" "$project_dir/.codex/pickle-rick-backups"
-  merge_managed_markdown "$repo_root/CLAUDE.md" "$project_dir/CLAUDE.md" "claude" "$project_dir/.codex/pickle-rick-backups"
+  merge_managed_markdown "$target_root/AGENTS.md" "$project_dir/AGENTS.md" "agents" "$project_dir/.codex/pickle-rick-backups"
+  merge_managed_markdown "$target_root/CLAUDE.md" "$project_dir/CLAUDE.md" "claude" "$project_dir/.codex/pickle-rick-backups"
   if [[ "$enable_hooks" -eq 1 ]]; then
     install_project_hooks "$project_dir/.codex/hooks" "$target_root" "$repo_root/.codex/hooks/hooks.template.json"
   fi

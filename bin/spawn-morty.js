@@ -159,6 +159,31 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   let baselineFingerprint = '';
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
+  function finalizeSuccess(applied) {
+    updateTicketStatus(sessionDir, normalizedTicketId, {
+      status: 'Done',
+      completed_at: new Date().toISOString(),
+      failure_reason: null,
+      failure_kind: null,
+      failed_at: null,
+    });
+    manager.update(statePath, (current) => {
+      current.step = 'done';
+      appendHistory(current, 'done', normalizedTicketId);
+      return current;
+    });
+    logActivity({
+      event: 'ticket_completed',
+      source: 'pickle',
+      session: path.basename(sessionDir),
+      ticket: normalizedTicketId,
+    }, { enabled: config.defaults.activity_logging });
+
+    return applied
+      ? { status: 'done', applied: true }
+      : { status: 'done', applied: false, reason: 'No diff generated.' };
+  }
+
   try {
     verificationReady = assertTicketVerificationReady({
       ticket: manifestTicket,
@@ -241,36 +266,9 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     }
 
     if (getWorkingTreeFingerprint(workingDir) === baselineFingerprint) {
-      updateTicketStatus(sessionDir, normalizedTicketId, {
-        status: 'Done',
-        completed_at: new Date().toISOString(),
-        failure_reason: null,
-        failure_kind: null,
-        failed_at: null,
-      });
-      return { status: 'done', applied: false, reason: 'No diff generated.' };
+      return finalizeSuccess(false);
     }
-    updateTicketStatus(sessionDir, normalizedTicketId, {
-      status: 'Done',
-      completed_at: new Date().toISOString(),
-      failure_reason: null,
-      failure_kind: null,
-      failed_at: null,
-    });
-    manager.update(statePath, (current) => {
-      current.step = 'done';
-      appendHistory(current, 'done', normalizedTicketId);
-      return current;
-    });
-
-    logActivity({
-      event: 'ticket_completed',
-      source: 'pickle',
-      session: path.basename(sessionDir),
-      ticket: normalizedTicketId,
-    }, { enabled: config.defaults.activity_logging });
-
-    return { status: 'done', applied: true };
+    return finalizeSuccess(true);
   } catch (error) {
     if (error instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {

@@ -1,7 +1,7 @@
 {
   "name": "pickle-rick-codex",
   "description": "Pickle Rick Codex CLI package and persona bootstrap — local install into ~/.codex/pickle-rick/ with bundled source .codex assets, empty default hooks contract, and optional target-project persona activation on the guaranteed `codex exec` path",
-  "version": "0.2.5",
+  "version": "0.2.10",
   "skills": [
     "pickle",
     "pickle-tmux",

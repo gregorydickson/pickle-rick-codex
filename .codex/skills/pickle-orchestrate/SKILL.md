@@ -14,11 +14,10 @@ Run:
 ## Loop Engine
 
 For each ticket in manifest order:
-1. Create an isolated git worktree
+1. Work directly in the current branch working tree
 2. Run the ticket through `research -> plan -> implement -> review -> simplify`
 3. Run verification commands
-4. Apply the resulting patch back to the main worktree only if it can be applied safely
-5. Advance state and move to the next ticket
+4. Leave successful changes in place on the current branch and move to the next ticket
 
 ## Failure Modes
 

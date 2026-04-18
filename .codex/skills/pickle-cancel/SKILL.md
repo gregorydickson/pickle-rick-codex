@@ -1,6 +1,6 @@
 ---
 name: pickle-cancel
-description: "Cancel the active Pickle Rick session without destroying current worktree state."
+description: "Cancel the active Pickle Rick session without destroying current branch state."
 metadata:
   short-description: "Cancel the active session"
 ---

@@ -176,8 +176,12 @@ test('spawn-morty uses deterministic verification env when configured', () => {
   }).trim();
 
   const result = JSON.parse(output);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
   assert.equal(result.status, 'done');
+  assert.equal(result.applied, false);
+  assert.equal(state.step, 'done');
+  assert.equal(state.history.at(-1)?.step, 'done');
   assert.equal(ticket.status, 'Done');
 });
 
