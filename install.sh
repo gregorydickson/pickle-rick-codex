@@ -109,27 +109,45 @@ install_skill_tree() {
 render_runtime_root_in_tree() {
   local root_dir="$1"
   local runtime_root="$2"
+  local exclude_names="${3:-}"
 
-  node - "$root_dir" "$runtime_root" <<'EOF'
+  node - "$root_dir" "$runtime_root" "$exclude_names" <<'EOF'
 const fs = require('node:fs');
 const path = require('node:path');
 
-const [rootDir, runtimeRoot] = process.argv.slice(2);
+const [rootDir, runtimeRoot, excludeNamesRaw] = process.argv.slice(2);
 const sourceRoots = [
   '$HOME/.codex/pickle-rick',
   '$HOME/.codex/pickle-rick/',
   '~/.codex/pickle-rick',
   '~/.codex/pickle-rick/',
 ];
+const excludedNames = new Set(
+  String(excludeNamesRaw || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 
 function walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const filePath = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
     if (entry.isDirectory()) {
+      if (excludedNames.has(entry.name)) {
+        continue;
+      }
       walk(filePath);
       continue;
     }
-    const content = fs.readFileSync(filePath, 'utf8');
+    let content;
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch {
+      continue;
+    }
     let updated = content;
     for (const sourceRoot of sourceRoots) {
       if (!updated.includes(sourceRoot)) continue;
@@ -137,7 +155,11 @@ function walk(dir) {
       updated = updated.split(sourceRoot).join(replacement);
     }
     if (updated === content) continue;
-    fs.writeFileSync(filePath, updated);
+    try {
+      fs.writeFileSync(filePath, updated);
+    } catch {
+      // Fail open for generated/runtime files we cannot rewrite safely.
+    }
   }
 }
 
@@ -230,7 +252,7 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
 fi
 sync_runtime_source_tree "$target_root"
 if [[ "$runtime_is_installed_source" -eq 0 || "$repo_is_checkout" -eq 0 ]]; then
-  render_runtime_root_in_tree "$target_root" "$target_root"
+  render_runtime_root_in_tree "$target_root" "$target_root" "sessions,activity"
 fi
 
 install_skill_tree "$codex_home/skills" "$target_root"

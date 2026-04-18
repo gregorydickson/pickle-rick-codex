@@ -283,3 +283,165 @@ test('spawn-morty distinguishes normal verification command failure from preflig
   assert.equal(ticket.frontmatter.failure_kind, 'command_failed');
   assert.match(ticket.frontmatter.failure_reason, /verification-command-failed:/);
 });
+
+test('spawn-morty infers required env vars from verification commands', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'inferred env preflight'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Inferred env verification',
+        description: 'Verification references a custom env var without an explicit contract.',
+        acceptance_criteria: ['Missing env is caught before verification runs.'],
+        verification: ['test -f "$SIBLING_REPO_ROOT/fixture.dot"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /preflight-missing-env: SIBLING_REPO_ROOT is required for verification/,
+  );
+
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Todo');
+  assert.equal(ticket.frontmatter.failure_kind, 'preflight-missing-env');
+  assert.match(ticket.frontmatter.failure_reason, /SIBLING_REPO_ROOT/);
+});
+
+test('spawn-morty infers env vars from braced shell expansions', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'braced inferred env preflight'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Braced inferred env verification',
+        description: 'Verification uses a braced shell parameter expansion.',
+        acceptance_criteria: ['Missing env is caught even when the variable is referenced with braces.'],
+        verification: ['test -f "${SIBLING_REPO_ROOT:-}/fixture.dot"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /preflight-missing-env: SIBLING_REPO_ROOT is required for verification/,
+  );
+});
+
+test('spawn-morty ignores vars assigned inside verification commands', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'local assignment verification env'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Local assignment verification',
+        description: 'Verification assigns its own shell variable before using it.',
+        acceptance_criteria: ['Shell-local assignments do not trigger missing-env preflight failures.'],
+        verification: ['export SIBLING_REPO_ROOT=. ; test -d "$SIBLING_REPO_ROOT"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  const result = JSON.parse(output);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(result.status, 'done');
+  assert.equal(ticket.status, 'Done');
+});
+
+test('pickle-tmux infers required env vars from verification commands before launch', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-inferred-env.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'inferred env tmux'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Existing PRD\n\n## Summary\nResume from this PRD.\n');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Inferred env tmux ticket',
+        description: 'Verification references a custom env var without an explicit contract.',
+        acceptance_criteria: ['Missing env is caught before tmux launch.'],
+        verification: ['test -f "$EXTERNAL_FIXTURE_ROOT/fixture.dot"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+      env,
+      cwd: projectDir,
+    }),
+    /preflight-missing-env: EXTERNAL_FIXTURE_ROOT is required for verification/,
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(state.last_exit_reason, 'preflight-missing-env');
+  assert.equal(state.step, 'blocked');
+  assert.equal(ticket.status, 'Todo');
+  assert.equal(ticket.frontmatter.failure_kind, 'preflight-missing-env');
+  assert.match(ticket.frontmatter.failure_reason, /EXTERNAL_FIXTURE_ROOT/);
+  const tmuxLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert.ok(!tmuxLines.some((args) => args[0] === 'new-session'));
+});
