@@ -6,12 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { refinePrd } from './spawn-refinement-team.js';
 import { setupSession } from '../lib/setup-session.js';
 import { appendHistory } from '../lib/session.js';
-import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
+import { findLastSessionForCwd, getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getNextRunnableTicket, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
 import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../lib/tmux.js';
 import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
 import { loadConfig } from '../lib/config.js';
+import { readJsonFile } from '../lib/pickle-utils.js';
 
 function parseFailureMode(argv) {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
@@ -92,6 +93,26 @@ function isProcessAlive(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function resolveResumeSessionDir(resumeTarget, cwd = fs.realpathSync(process.cwd())) {
+  if (!resumeTarget) {
+    return null;
+  }
+  if (resumeTarget !== '__LAST__') {
+    return resumeTarget;
+  }
+  return getSessionForCwd(cwd) || findLastSessionForCwd(cwd);
+}
+
+function assertResumeSessionNotRunning(sessionDir) {
+  if (!sessionDir) {
+    return;
+  }
+  const state = readJsonFile(path.join(sessionDir, 'state.json'), null);
+  if (isProcessAlive(Number(state?.tmux_runner_pid))) {
+    throw new Error(`Session is already running under tmux runner pid ${state.tmux_runner_pid}.`);
   }
 }
 
@@ -272,6 +293,7 @@ async function main(argv) {
   ensureTmuxAvailable();
   const onFailure = parseFailureMode(argv);
   const parsed = parseArgs(argv);
+  assertResumeSessionNotRunning(resolveResumeSessionDir(parsed.resume));
   const sessionDir = parsed.prdPath
     ? await createBootstrapSession(parsed)
     : await resumeSession(parsed);
@@ -296,13 +318,20 @@ async function main(argv) {
 
     const manager = new StateManager();
     const statePath = path.join(sessionDir, 'state.json');
+    const runnerLogPath = path.join(sessionDir, 'mux-runner.log');
+    const existingLogSizeBytes = fs.existsSync(runnerLogPath) ? fs.statSync(runnerLogPath).size : 0;
     let launchStarted = false;
     manager.update(statePath, (current) => {
       current.tmux_mode = true;
       current.active = false;
       current.max_iterations = 0;
+      current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;
       current.last_exit_reason = null;
+      current.active_child_pid = null;
+      current.active_child_kind = null;
+      current.active_child_command = null;
+      current.worker_pid = null;
       appendHistory(current, 'tmux_launch_requested');
       return current;
     });
@@ -341,7 +370,7 @@ async function main(argv) {
       if (monitorResult.status !== 0) {
         throw new Error(monitorResult.stderr || monitorResult.stdout || 'tmux monitor bootstrap failed');
       }
-      await waitForTmuxRunnerStart(sessionDir, sessionName, 'pickle');
+      await waitForTmuxRunnerStart(sessionDir, sessionName, 'pickle', { existingLogSizeBytes });
     } catch (error) {
       if (launchStarted) {
         try {

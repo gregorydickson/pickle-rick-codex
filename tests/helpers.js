@@ -122,6 +122,34 @@ if (prompt.includes('Loop mode:')) {
   const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
   fs.writeFileSync(counterPath, String(current));
   fs.writeFileSync(path.join(sessionDir, 'loop-iteration-' + current + '.txt'), prompt);
+  const loopModeMatch = prompt.match(/Loop mode: ([^\\n]+)/);
+  const loopMode = loopModeMatch ? loopModeMatch[1].trim() : 'loop';
+  if (process.env.FAKE_LOOP_WRITE_SUMMARY === 'changing' || process.env.FAKE_LOOP_WRITE_SUMMARY === 'static') {
+    const summaryVariant = process.env.FAKE_LOOP_WRITE_SUMMARY;
+    const summaryId = summaryVariant === 'changing' ? current : 1;
+    const finding = 'Fake correctness finding #' + summaryId;
+    const summary = {
+      finding_family: process.env.FAKE_LOOP_FINDING_FAMILY || 'fake-correctness-family',
+      highest_severity_finding: finding,
+      data_flow_path: 'input -> parser -> runner -> output',
+      fix_applied: summaryVariant === 'changing' ? 'tightened guard #' + summaryId : 'static fix',
+      verification: ['node --test tests/session-flow.test.js'],
+      trap_doors: ['guard drift'],
+      next_action: summaryVariant === 'changing' ? 'continue' : 'new evidence required',
+    };
+    fs.writeFileSync(path.join(sessionDir, loopMode + '-summary.json'), JSON.stringify(summary, null, 2));
+    fs.writeFileSync(
+      path.join(sessionDir, loopMode + '-summary.md'),
+      [
+        '# Summary',
+        '',
+        '- Finding Family: ' + summary.finding_family,
+        '- Highest-Severity Finding: ' + summary.highest_severity_finding,
+        '- Data Flow Path: ' + summary.data_flow_path,
+        '- Fix Applied: ' + summary.fix_applied,
+      ].join('\\n'),
+    );
+  }
   const completeAfter = Number(process.env.FAKE_LOOP_COMPLETE_AFTER || '2');
   lastMessage = current >= completeAfter ? '<promise>LOOP_COMPLETE</promise>' : '<promise>CONTINUE</promise>';
 } else if (prompt.includes('Refinement analyst role:')) {

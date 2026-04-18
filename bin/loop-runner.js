@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { runCodexExecMonitored, assertCodexSucceeded } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
@@ -22,6 +23,148 @@ function readLoopConfig(sessionDir) {
   return config;
 }
 
+function getWorkerTimeoutMs(state, config) {
+  const timeoutSeconds = Number.isFinite(state?.worker_timeout_seconds)
+    ? Number(state.worker_timeout_seconds)
+    : config.defaults.worker_timeout_seconds;
+  return timeoutSeconds * 1000;
+}
+
+function summaryPaths(sessionDir, mode) {
+  return {
+    json: path.join(sessionDir, `${mode}-summary.json`),
+    markdown: path.join(sessionDir, `${mode}-summary.md`),
+    stopJson: path.join(sessionDir, `${mode}-stop-summary.json`),
+    stopMarkdown: path.join(sessionDir, `${mode}-stop-summary.md`),
+  };
+}
+
+function fileDigest(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const content = fs.readFileSync(filePath, 'utf8');
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+function readProgressSnapshot(sessionDir, mode) {
+  if (mode !== 'anatomy-park') {
+    return {};
+  }
+  const paths = summaryPaths(sessionDir, mode);
+  return {
+    summaryJson: fileDigest(paths.json),
+    summaryMarkdown: fileDigest(paths.markdown),
+  };
+}
+
+function snapshotsDiffer(left, right) {
+  const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+  for (const key of keys) {
+    if ((left?.[key] || null) !== (right?.[key] || null)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeLoopMessage(message) {
+  return String(message || '')
+    .replace(/<promise>[^<]+<\/promise>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function loopProgress(state, options) {
+  const repoChanged = options.beforeStatus !== options.afterStatus;
+  if (repoChanged) {
+    return { progressed: true, reasons: ['repo_changed'] };
+  }
+
+  const summaryChanged = snapshotsDiffer(options.beforeSnapshot, options.afterSnapshot);
+  if (summaryChanged) {
+    return { progressed: true, reasons: ['summary_changed'] };
+  }
+
+  const previousMessage = normalizeLoopMessage(state.last_loop_message);
+  const nextMessage = normalizeLoopMessage(options.lastMessage);
+  if (!options.afterSnapshot.summaryJson && !options.afterSnapshot.summaryMarkdown && nextMessage && nextMessage !== previousMessage) {
+    return { progressed: true, reasons: ['message_changed'] };
+  }
+
+  return { progressed: false, reasons: [] };
+}
+
+function summarizeVerification(summary) {
+  if (Array.isArray(summary.verification)) {
+    return summary.verification;
+  }
+  if (typeof summary.verification === 'string' && summary.verification.trim()) {
+    return [summary.verification.trim()];
+  }
+  return [];
+}
+
+function summarizeTrapDoors(summary) {
+  if (Array.isArray(summary.trap_doors)) {
+    return summary.trap_doors.map((entry) => String(entry).trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function stopSummaryFromState(state, loopConfig, exitReason, sessionDir) {
+  const paths = summaryPaths(sessionDir, loopConfig.mode);
+  const persistedSummary = readJsonFile(paths.json, {});
+  const lastMessage = normalizeLoopMessage(state.last_loop_message);
+  return {
+    mode: loopConfig.mode,
+    target: loopConfig.target || null,
+    stop_reason: exitReason,
+    iteration: state.iteration,
+    max_iterations: state.max_iterations,
+    max_time_minutes: state.max_time_minutes,
+    highest_severity_finding: persistedSummary.highest_severity_finding || (lastMessage.split('\n')[0] || null),
+    finding_family: persistedSummary.finding_family || null,
+    data_flow_path: persistedSummary.data_flow_path || null,
+    fix_applied: persistedSummary.fix_applied || null,
+    verification: summarizeVerification(persistedSummary),
+    trap_doors: summarizeTrapDoors(persistedSummary),
+    next_action: persistedSummary.next_action || null,
+    last_loop_message: state.last_loop_message || null,
+    summary_generated_at: new Date().toISOString(),
+  };
+}
+
+function writeStopSummaryArtifacts(sessionDir, loopConfig, state, exitReason) {
+  const paths = summaryPaths(sessionDir, loopConfig.mode);
+  const summary = stopSummaryFromState(state, loopConfig, exitReason, sessionDir);
+  fs.writeFileSync(paths.stopJson, JSON.stringify(summary, null, 2));
+
+  const markdown = [
+    `# ${loopConfig.mode} Stop Summary`,
+    '',
+    `- Stop Reason: ${summary.stop_reason}`,
+    `- Iteration: ${summary.iteration}`,
+    `- Highest-Severity Finding: ${summary.highest_severity_finding || 'n/a'}`,
+    `- Finding Family: ${summary.finding_family || 'n/a'}`,
+    `- Data Flow Path: ${summary.data_flow_path || 'n/a'}`,
+    `- Fix Applied: ${summary.fix_applied || 'n/a'}`,
+    `- Next Action: ${summary.next_action || 'n/a'}`,
+    '',
+    '## Verification',
+    ...(summary.verification.length ? summary.verification.map((entry) => `- ${entry}`) : ['- n/a']),
+    '',
+    '## Trap Doors',
+    ...(summary.trap_doors.length ? summary.trap_doors.map((entry) => `- ${entry}`) : ['- none recorded']),
+    '',
+    '## Last Loop Message',
+    '',
+    '```text',
+    summary.last_loop_message || 'n/a',
+    '```',
+    '',
+  ].join('\n');
+  fs.writeFileSync(paths.stopMarkdown, markdown);
+}
+
 export async function runLoop(sessionDir) {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
@@ -36,7 +179,7 @@ export async function runLoop(sessionDir) {
     state.last_exit_reason = null;
     state.cancel_requested_at = null;
     state.loop_mode = loopConfig.mode;
-    state.loop_stall_count = state.loop_stall_count || 0;
+    state.loop_stall_count = 0;
     state.active_child_pid = null;
     state.active_child_kind = null;
     state.active_child_command = null;
@@ -67,6 +210,7 @@ export async function runLoop(sessionDir) {
       }
 
       const beforeStatus = getWorkingTreeStatus(state.working_dir);
+      const beforeSnapshot = readProgressSnapshot(sessionDir, loopConfig.mode);
       manager.update(statePath, (current) => {
         current.iteration += 1;
         current.step = loopConfig.mode;
@@ -83,7 +227,7 @@ export async function runLoop(sessionDir) {
           state: manager.read(statePath),
           loopConfig,
         }),
-        timeoutMs: config.defaults.worker_timeout_seconds * 1000,
+        timeoutMs: getWorkerTimeoutMs(state, config),
         outputLastMessagePath: path.join(sessionDir, `${loopConfig.mode}.${state.iteration + 1}.last-message.txt`),
         addDirs: [sessionDir],
         onSpawn: (child) => {
@@ -112,12 +256,22 @@ export async function runLoop(sessionDir) {
       appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} finished`);
 
       const afterStatus = getWorkingTreeStatus(state.working_dir);
-      const progressed = beforeStatus !== afterStatus;
+      const afterSnapshot = readProgressSnapshot(sessionDir, loopConfig.mode);
+      const progress = loopProgress(state, {
+        beforeStatus,
+        afterStatus,
+        beforeSnapshot,
+        afterSnapshot,
+        lastMessage,
+      });
       const latest = manager.update(statePath, (current) => {
-        current.loop_stall_count = progressed ? 0 : Number(current.loop_stall_count || 0) + 1;
+        current.loop_stall_count = progress.progressed ? 0 : Number(current.loop_stall_count || 0) + 1;
         current.last_loop_message = lastMessage.trim();
         return current;
       });
+      if (progress.reasons.length) {
+        appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} progress: ${progress.reasons.join(',')}`);
+      }
 
       if (/<promise>LOOP_COMPLETE<\/promise>|<promise>TASK_COMPLETED<\/promise>/.test(lastMessage)) {
         exitReason = 'success';
@@ -151,6 +305,7 @@ export async function runLoop(sessionDir) {
       return state;
     });
 
+    writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), manager.read(statePath).last_exit_reason);
     appendRunnerLog(sessionDir, `loop-runner finished: ${manager.read(statePath).last_exit_reason}`);
   }
 

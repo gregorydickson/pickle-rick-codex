@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { launchDetachedLoop } from '../lib/detached-launch.js';
@@ -187,6 +188,34 @@ test('setup command can resume the latest session in tmux mode', () => {
   assert.equal(state.tmux_mode, true);
   assert.equal(state.active, false);
   assert.equal(state.max_iterations, 9);
+});
+
+test('setup command resume preserves stored limits when no numeric overrides are passed', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const sessionDir = runNode(
+    [
+      path.join(repoRoot, 'bin/setup.js'),
+      '--max-iterations', '2',
+      '--max-time', '3',
+      '--worker-timeout', '4',
+      'resume preserve task',
+    ],
+    { env, cwd: projectDir },
+  ).trim();
+
+  const resumed = runNode(
+    [path.join(repoRoot, 'bin/setup.js'), '--resume', '--tmux'],
+    { env, cwd: projectDir },
+  ).trim();
+
+  assert.equal(resumed, sessionDir);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.max_iterations, 2);
+  assert.equal(state.max_time_minutes, 3);
+  assert.equal(state.worker_timeout_seconds, 4);
+  assert.equal(state.active, false);
 });
 
 test('get-session lists current mappings and falls back to the newest session', () => {
@@ -557,7 +586,17 @@ test('pickle-tmux honors an explicit --resume session when --resume-ready-only i
       },
     ],
   });
-  await updateSessionMap(realProjectDir, mappedSession);
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    await updateSessionMap(realProjectDir, mappedSession);
+  } finally {
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
 
   const output = runNode([
     path.join(repoRoot, 'bin/pickle-tmux.js'),
@@ -573,6 +612,55 @@ test('pickle-tmux honors an explicit --resume session when --resume-ready-only i
   assert.ok(output.includes(`State: ${path.join(explicitSession, 'state.json')}`));
   const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
   assert.equal(sessionMap[realProjectDir], explicitSession);
+});
+
+test('pickle-tmux resume refuses to relaunch a live session before mutating state', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-pickle-live-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'pickle tmux live resume'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+    writeJson(path.join(sessionDir, 'state.json'), {
+      ...originalState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
+        env,
+        cwd: projectDir,
+      }),
+      /Session is already running under tmux runner pid \d+\./,
+    );
+
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    assert.equal(state.active, true);
+    assert.equal(state.tmux_runner_pid, runner.pid);
+    assert.equal(state.last_exit_reason, null);
+    assert.equal(state.command_template, null);
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), '["-V"]\n');
+  } finally {
+    runner.kill('SIGTERM');
+  }
 });
 
 test('pickle-tmux clears a stale launch lock before relaunching', () => {
@@ -643,6 +731,60 @@ test('pickle-tmux replaces a stale tmux session before relaunching', () => {
   assert.ok(logLines.some((args) => args[0] === 'has-session' && args.includes(sessionName)));
   assert.ok(logLines.some((args) => args[0] === 'kill-session' && args.includes(sessionName)));
   assert.ok(logLines.some((args) => args[0] === 'new-session' && args.includes(sessionName)));
+});
+
+test('pickle-tmux ignores stale runner artifacts when resuming a session', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-stale-runner-artifacts.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_TMUX_RUNNER_START: 'never',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'stale runner artifacts epic'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'ticket-001',
+        title: 'Ignore stale runner artifacts',
+        description: 'Only a fresh runner start should satisfy launch readiness.',
+        acceptance_criteria: ['Resuming should fail if the new runner never starts.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  writeJson(path.join(sessionDir, 'state.json'), {
+    ...readJsonFile(path.join(sessionDir, 'state.json')),
+    active: false,
+    tmux_session_name: sessionName,
+    tmux_runner_pid: 999999,
+    last_exit_reason: 'error',
+  });
+  fs.writeFileSync(path.join(sessionDir, 'mux-runner.log'), '[2026-04-18T00:00:00.000Z] mux-runner started\n');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
+      env,
+      cwd: projectDir,
+    }),
+    /tmux runner did not start/,
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.tmux_session_name, null);
+  assert.equal(state.last_exit_reason, 'launch_failed');
 });
 
 test('pickle-tmux rolls back tmux launch state when monitor bootstrap fails', () => {
@@ -797,7 +939,17 @@ process.exit(0);
     env,
     cwd: projectDir,
   }).trim();
-  await updateSessionMap(realProjectDir, stableSession);
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    await updateSessionMap(realProjectDir, stableSession);
+  } finally {
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], {
@@ -1155,6 +1307,144 @@ process.exit(1);
   assert.match(log, /loop-runner finished: error/);
 });
 
+test('loop-runner honors the stored worker timeout when config changes after session setup', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_HANG_MS: '1500',
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: {
+      worker_timeout_seconds: 1,
+    },
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'loop timeout contract'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 5,
+  });
+
+  const statePath = path.join(sessionDir, 'state.json');
+  const originalState = readJsonFile(statePath);
+  writeJson(statePath, {
+    ...originalState,
+    worker_timeout_seconds: 3,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const state = readJsonFile(statePath);
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.active, false);
+  assert.match(log, /loop-runner finished: success/);
+});
+
+test('loop-runner counts anatomy-park summary updates as progress and writes stop summaries', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '2',
+    FAKE_LOOP_WRITE_SUMMARY: 'changing',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy progress task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  const statePath = path.join(sessionDir, 'state.json');
+  const originalState = readJsonFile(statePath);
+  writeJson(statePath, {
+    ...originalState,
+    max_iterations: 9,
+    max_time_minutes: 0,
+    loop_stall_count: 4,
+    last_exit_reason: 'stalled',
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const state = readJsonFile(statePath);
+  const stopSummary = readJsonFile(path.join(sessionDir, 'anatomy-park-stop-summary.json'));
+  const stopMarkdown = fs.readFileSync(path.join(sessionDir, 'anatomy-park-stop-summary.md'), 'utf8');
+  const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.step, 'complete');
+  assert.equal(state.max_iterations, 9);
+  assert.equal(state.max_time_minutes, 0);
+  assert.equal(state.loop_stall_count, 0);
+  assert.equal(stopSummary.stop_reason, 'success');
+  assert.equal(stopSummary.highest_severity_finding, 'Fake correctness finding #2');
+  assert.equal(stopSummary.finding_family, 'fake-correctness-family');
+  assert.match(stopMarkdown, /Stop Reason: success/);
+  assert.match(stopMarkdown, /Highest-Severity Finding: Fake correctness finding #2/);
+  assert.match(runnerLog, /iteration 1 progress: summary_changed/);
+});
+
+test('loop-runner stalls anatomy-park when the canonical summary stops changing and writes stop summaries', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '99',
+    FAKE_LOOP_WRITE_SUMMARY: 'static',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy stall task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const stopSummary = readJsonFile(path.join(sessionDir, 'anatomy-park-stop-summary.json'));
+  const stopMarkdown = fs.readFileSync(path.join(sessionDir, 'anatomy-park-stop-summary.md'), 'utf8');
+  const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.equal(state.last_exit_reason, 'stalled');
+  assert.equal(state.step, 'paused');
+  assert.equal(state.loop_stall_count, 2);
+  assert.equal(stopSummary.stop_reason, 'stalled');
+  assert.equal(stopSummary.highest_severity_finding, 'Fake correctness finding #1');
+  assert.equal(stopSummary.finding_family, 'fake-correctness-family');
+  assert.deepEqual(stopSummary.verification, ['node --test tests/session-flow.test.js']);
+  assert.deepEqual(stopSummary.trap_doors, ['guard drift']);
+  assert.match(stopMarkdown, /Stop Reason: stalled/);
+  assert.match(stopMarkdown, /Highest-Severity Finding: Fake correctness finding #1/);
+  assert.match(runnerLog, /loop-runner finished: stalled/);
+});
+
 test('cancel stops a live loop-runner iteration without rewriting the result as success', async () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -1399,4 +1689,805 @@ test('szechuan-sauce and anatomy-park launch detached tmux loops', () => {
     projectDir,
   ], { env, cwd: projectDir }).trim();
   assert.match(anatomyOutput, /Anatomy Park tmux loop launched/);
+});
+
+test('anatomy-park preserves an explicit unbounded max-iterations override', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: {
+      max_iterations: 7,
+    },
+  });
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-max-iterations-zero.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const output = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--max-iterations', '0',
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  assert.match(output, /Anatomy Park tmux loop launched/);
+
+  const statePath = output.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const state = readJsonFile(statePath);
+  assert.equal(state.max_iterations, 0);
+});
+
+test('anatomy-park resume preserves the stored loop target and explicit loop settings', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetDir = path.join(projectDir, 'subsystem');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-resume-config.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const initialOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    '--stall-limit', '9',
+    targetDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = initialOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+  const initialLoopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+  const initialState = readJsonFile(statePath);
+  writeJson(statePath, {
+    ...initialState,
+    max_iterations: 41,
+    max_time_minutes: 0,
+    worker_timeout_seconds: 321,
+  });
+
+  const resumedOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--resume',
+    sessionDir,
+  ], { env, cwd: projectDir }).trim();
+  assert.match(resumedOutput, /Anatomy Park tmux loop launched/);
+
+  const loopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+  const resumedState = readJsonFile(statePath);
+  assert.equal(loopConfig.target, initialLoopConfig.target);
+  assert.equal(loopConfig.dry_run, initialLoopConfig.dry_run);
+  assert.equal(loopConfig.stall_limit, initialLoopConfig.stall_limit);
+  assert.equal(resumedState.max_iterations, 41);
+  assert.equal(resumedState.max_time_minutes, 0);
+  assert.equal(resumedState.worker_timeout_seconds, 321);
+});
+
+test('anatomy-park resume rejects retargeting the session and preserves the stored target', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetA = path.join(projectDir, 'subsystem-a');
+  const targetB = path.join(projectDir, 'subsystem-b');
+  fs.mkdirSync(targetA, { recursive: true });
+  fs.mkdirSync(targetB, { recursive: true });
+  fs.writeFileSync(path.join(targetA, 'index.js'), 'export const value = "a";\n');
+  fs.writeFileSync(path.join(targetB, 'index.js'), 'export const value = "b";\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-retarget-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const initialOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    targetA,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = initialOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+  const initialState = readJsonFile(statePath);
+  const initialLoopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+  writeJson(statePath, {
+    ...initialState,
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume', sessionDir, targetB], {
+      env,
+      cwd: projectDir,
+    }),
+    /Cannot change target when resuming anatomy-park:/,
+  );
+
+  const resumedState = readJsonFile(statePath);
+  const resumedLoopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+  assert.equal(resumedState.active, false);
+  assert.equal(resumedState.tmux_runner_pid, null);
+  assert.equal(resumedState.last_exit_reason, 'cancelled');
+  assert.equal(resumedLoopConfig.target, initialLoopConfig.target);
+  assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
+});
+
+test('anatomy-park launches tmux against the requested target instead of the launcher cwd', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetDir = path.join(projectDir, 'subsystem');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-target-cwd.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const output = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    targetDir,
+  ], { env, cwd: projectDir }).trim();
+  assert.match(output, /Anatomy Park tmux loop launched/);
+
+  const statePath = output.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+  const state = readJsonFile(statePath);
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+  const tmuxLogLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const newSessionArgs = tmuxLogLines.find((args) => args[0] === 'new-session');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const realTargetDir = fs.realpathSync(targetDir);
+
+  assert.equal(state.working_dir, realTargetDir);
+  assert.equal(sessionMap[realProjectDir], sessionDir);
+  assert.equal(sessionMap[realTargetDir], sessionDir);
+  assert.equal(newSessionArgs[newSessionArgs.indexOf('-c') + 1], realTargetDir);
+});
+
+test('anatomy-park target-based sessions resolve from the target cwd and cancel clears both cwd aliases', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetDir = path.join(projectDir, 'subsystem');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-session-aliases.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const output = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    targetDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = output.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+  const realProjectDir = fs.realpathSync(projectDir);
+  const realTargetDir = fs.realpathSync(targetDir);
+
+  assert.equal(runNode([path.join(repoRoot, 'bin/get-session.js'), '--cwd', targetDir], { env }).trim(), sessionDir);
+
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(sessionMap[realProjectDir], sessionDir);
+  assert.equal(sessionMap[realTargetDir], sessionDir);
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--cwd', projectDir], { env, cwd: projectDir });
+
+  const updatedSessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(updatedSessionMap[realProjectDir], undefined);
+  assert.equal(updatedSessionMap[realTargetDir], undefined);
+});
+
+test('anatomy-park resume falls back to launcher cwd aliases when the session map is missing', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetDir = path.join(projectDir, 'subsystem');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-anatomy-resume-alias-fallback.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const firstOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    targetDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = firstOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  writeJson(statePath, {
+    ...readJsonFile(statePath),
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  fs.rmSync(path.join(dataRoot, 'current_sessions.json'), { force: true });
+
+  const resumedOutput = runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  assert.match(resumedOutput, new RegExp(`Session: anatomy-park-${path.basename(sessionDir)}`));
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(sessionMap[fs.realpathSync(projectDir)], sessionDir);
+  assert.equal(sessionMap[fs.realpathSync(targetDir)], sessionDir);
+});
+
+test('setup resume restores every stored alias when recovering an anatomy-park session', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetDir = path.join(projectDir, 'subsystem');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-setup-resume-alias-recovery.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const launchOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    '--dry-run',
+    targetDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = launchOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  writeJson(statePath, {
+    ...readJsonFile(statePath),
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  fs.rmSync(path.join(dataRoot, 'current_sessions.json'), { force: true });
+
+  const resumed = runNode([
+    path.join(repoRoot, 'bin/setup.js'),
+    '--resume',
+    '--tmux',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  assert.equal(resumed, sessionDir);
+  const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
+  assert.equal(sessionMap[fs.realpathSync(projectDir)], sessionDir);
+  assert.equal(sessionMap[fs.realpathSync(targetDir)], sessionDir);
+});
+
+test('advanced loop resume rejects cross-mode session reuse before mutating state', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const microverseOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-microverse.js'),
+    '--metric', 'echo 42',
+    '--task', 'improve score',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const statePath = microverseOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume'], {
+      env,
+      cwd: projectDir,
+    }),
+    /Cannot resume anatomy-park: .* is a microverse session\./,
+  );
+
+  const loopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(loopConfig.mode, 'microverse');
+  assert.equal(state.command_template, 'microverse.md');
+});
+
+test('advanced loop resume refuses to relaunch a live session before mutating state', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-live-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const anatomyOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = anatomyOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+    writeJson(path.join(sessionDir, 'state.json'), {
+      ...originalState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+    const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume'], {
+        env,
+        cwd: projectDir,
+      }),
+      /Session is already running under tmux runner pid \d+\./,
+    );
+
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    assert.equal(state.active, true);
+    assert.equal(state.tmux_runner_pid, runner.pid);
+    assert.equal(state.last_exit_reason, null);
+    assert.equal(state.command_template, 'anatomy-park.md');
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
+  } finally {
+    runner.kill('SIGTERM');
+  }
+});
+
+test('advanced loop fresh launch refuses to start while another tmux runner owns the working tree', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-concurrent-launch.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const firstOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = firstOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+    writeJson(path.join(sessionDir, 'state.json'), {
+      ...originalState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+    const tmuxLogBeforeSecondLaunch = fs.readFileSync(tmuxLog, 'utf8');
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), projectDir], {
+        env,
+        cwd: projectDir,
+      }),
+      new RegExp(`A tmux runner is already active for ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} under session .* \\(pid ${runner.pid}\\)\\.`),
+    );
+
+    const sessionsRoot = path.join(dataRoot, 'sessions');
+    const sessionEntries = fs.readdirSync(sessionsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    assert.equal(sessionEntries.length, 1);
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    assert.equal(state.active, true);
+    assert.equal(state.tmux_runner_pid, runner.pid);
+    const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+    assert.equal(sessionMap[fs.realpathSync(projectDir)], sessionDir);
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeSecondLaunch}["-V"]\n`);
+  } finally {
+    runner.kill('SIGTERM');
+  }
+});
+
+test('advanced loop fresh launch refuses to reuse the launcher cwd alias for a different target', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const targetA = path.join(projectDir, 'subsystem-a');
+  const targetB = path.join(projectDir, 'subsystem-b');
+  fs.mkdirSync(targetA, { recursive: true });
+  fs.mkdirSync(targetB, { recursive: true });
+  fs.writeFileSync(path.join(targetA, 'index.js'), 'export const value = "a";\n');
+  fs.writeFileSync(path.join(targetB, 'index.js'), 'export const value = "b";\n');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const realTargetA = fs.realpathSync(targetA);
+  const realTargetB = fs.realpathSync(targetB);
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-launcher-alias-conflict.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const firstOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    targetA,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = firstOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+    writeJson(path.join(sessionDir, 'state.json'), {
+      ...originalState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+    const tmuxLogBeforeSecondLaunch = fs.readFileSync(tmuxLog, 'utf8');
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), targetB], {
+        env,
+        cwd: projectDir,
+      }),
+      new RegExp(`A tmux runner is already active for ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} under session .* \\(pid ${runner.pid}\\)\\.`),
+    );
+
+    const sessionsRoot = path.join(dataRoot, 'sessions');
+    const sessionEntries = fs.readdirSync(sessionsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    assert.equal(sessionEntries.length, 1);
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    assert.equal(state.active, true);
+    assert.equal(state.tmux_runner_pid, runner.pid);
+    const sessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+    assert.equal(sessionMap[realProjectDir], sessionDir);
+    assert.equal(sessionMap[realTargetA], sessionDir);
+    assert.equal(sessionMap[realTargetB], undefined);
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeSecondLaunch}["-V"]\n`);
+  } finally {
+    runner.kill('SIGTERM');
+  }
+});
+
+test('advanced loop fresh launch refuses to start while a cwd reservation lock is held', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  fs.mkdirSync(sessionsRoot, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-cwd-reservation.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  holder.unref();
+
+  try {
+    const cwdLockName = `.tmux-cwd-${crypto.createHash('sha256').update(realProjectDir).digest('hex').slice(0, 16)}.lock`;
+    fs.writeFileSync(path.join(sessionsRoot, cwdLockName), String(holder.pid));
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), projectDir], {
+        env,
+        cwd: projectDir,
+      }),
+      new RegExp(`A tmux launch is already in progress for ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`),
+    );
+
+    const sessionEntries = fs.readdirSync(sessionsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    assert.equal(sessionEntries.length, 0);
+    assert.deepEqual(readJsonFile(path.join(dataRoot, 'current_sessions.json'), {}), {});
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), '["-V"]\n');
+  } finally {
+    holder.kill('SIGTERM');
+  }
+});
+
+test('advanced loop resume honors an explicit session dir instead of the cwd mapping', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-explicit-resume.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const explicitOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const explicitStatePath = explicitOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(explicitStatePath);
+  const explicitSession = path.dirname(explicitStatePath);
+
+  const mappedOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const mappedStatePath = mappedOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(mappedStatePath);
+  const mappedSession = path.dirname(mappedStatePath);
+  assert.notEqual(mappedSession, explicitSession);
+
+  const originalExplicitState = readJsonFile(path.join(explicitSession, 'state.json'));
+  writeJson(path.join(explicitSession, 'state.json'), {
+    ...originalExplicitState,
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  fs.writeFileSync(path.join(explicitSession, '.tmux-launch.lock'), String(process.pid));
+  const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume', explicitSession], {
+      env,
+      cwd: projectDir,
+    }),
+    new RegExp(`A tmux launch is already in progress for ${explicitSession.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`),
+  );
+
+  const explicitState = readJsonFile(path.join(explicitSession, 'state.json'));
+  assert.equal(explicitState.active, false);
+  assert.equal(explicitState.tmux_runner_pid, null);
+  assert.equal(explicitState.last_exit_reason, 'cancelled');
+
+  const currentSessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+  assert.equal(currentSessionMap[fs.realpathSync(projectDir)], mappedSession);
+  assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
+});
+
+test('advanced loop explicit resume refuses to relaunch while another session owns the working tree', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-explicit-resume-conflict.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const pausedOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const pausedStatePath = pausedOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(pausedStatePath);
+  const pausedSession = path.dirname(pausedStatePath);
+
+  const activeOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const activeStatePath = activeOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(activeStatePath);
+  const activeSession = path.dirname(activeStatePath);
+  assert.notEqual(activeSession, pausedSession);
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const pausedState = readJsonFile(path.join(pausedSession, 'state.json'));
+    writeJson(path.join(pausedSession, 'state.json'), {
+      ...pausedState,
+      active: false,
+      tmux_runner_pid: null,
+      last_exit_reason: 'cancelled',
+    });
+
+    const activeState = readJsonFile(path.join(activeSession, 'state.json'));
+    writeJson(path.join(activeSession, 'state.json'), {
+      ...activeState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+    const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+    assert.throws(
+      () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume', pausedSession], {
+        env,
+        cwd: projectDir,
+      }),
+      new RegExp(`A tmux runner is already active for ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} under session ${activeSession.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(pid ${runner.pid}\\)\\.`),
+    );
+
+    const resumedState = readJsonFile(path.join(pausedSession, 'state.json'));
+    assert.equal(resumedState.active, false);
+    assert.equal(resumedState.tmux_runner_pid, null);
+    assert.equal(resumedState.last_exit_reason, 'cancelled');
+
+    const currentSessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+    assert.equal(currentSessionMap[realProjectDir], activeSession);
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
+  } finally {
+    runner.kill('SIGTERM');
+  }
+});
+
+test('advanced loop explicit resume ignores an unrelated launcher cwd reservation', () => {
+  const dataRoot = makeTempRoot();
+  const projectADir = makeTempRoot('pickle-rick-project-a-');
+  const projectBDir = makeTempRoot('pickle-rick-project-b-');
+  const realProjectADir = fs.realpathSync(projectADir);
+  const realProjectBDir = fs.realpathSync(projectBDir);
+  fs.writeFileSync(path.join(projectADir, 'index.js'), 'export const project = "a";\n');
+  fs.writeFileSync(path.join(projectBDir, 'index.js'), 'export const project = "b";\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-explicit-resume-cross-project.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const pausedOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectADir,
+  ], { env, cwd: projectADir }).trim();
+  const pausedStatePath = pausedOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(pausedStatePath);
+  const pausedSession = path.dirname(pausedStatePath);
+
+  const activeOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectBDir,
+  ], { env, cwd: projectBDir }).trim();
+  const activeStatePath = activeOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(activeStatePath);
+  const activeSession = path.dirname(activeStatePath);
+
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  try {
+    const pausedState = readJsonFile(path.join(pausedSession, 'state.json'));
+    writeJson(path.join(pausedSession, 'state.json'), {
+      ...pausedState,
+      active: false,
+      tmux_runner_pid: null,
+      last_exit_reason: 'cancelled',
+    });
+
+    const activeState = readJsonFile(path.join(activeSession, 'state.json'));
+    writeJson(path.join(activeSession, 'state.json'), {
+      ...activeState,
+      active: true,
+      tmux_runner_pid: runner.pid,
+      last_exit_reason: null,
+    });
+
+    const resumedOutput = runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume', pausedSession], {
+      env,
+      cwd: projectBDir,
+    }).trim();
+
+    assert.match(resumedOutput, new RegExp(`Session: anatomy-park-${path.basename(pausedSession)}`));
+    const currentSessionMap = readJsonFile(path.join(dataRoot, 'current_sessions.json'));
+    assert.equal(currentSessionMap[realProjectADir], pausedSession);
+    assert.equal(currentSessionMap[realProjectBDir], activeSession);
+
+    const resumedState = readJsonFile(path.join(pausedSession, 'state.json'));
+    assert.equal(resumedState.working_dir, realProjectADir);
+    assert.ok(!resumedState.session_map_cwds.includes(realProjectBDir));
+  } finally {
+    runner.kill('SIGTERM');
+  }
+});
+
+test('advanced loop resume refuses to relaunch while a tmux launch lock is held', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-launch-lock.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const anatomyOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = anatomyOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+  writeJson(path.join(sessionDir, 'state.json'), {
+    ...originalState,
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  fs.writeFileSync(path.join(sessionDir, '.tmux-launch.lock'), String(process.pid));
+  const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume'], {
+      env,
+      cwd: projectDir,
+    }),
+    new RegExp(`A tmux launch is already in progress for ${sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`),
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.command_template, 'anatomy-park.md');
+  assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
 });
