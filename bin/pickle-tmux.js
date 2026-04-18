@@ -9,7 +9,7 @@ import { appendHistory } from '../lib/session.js';
 import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getNextRunnableTicket, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote } from '../lib/tmux.js';
+import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../lib/tmux.js';
 import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
 import { loadConfig } from '../lib/config.js';
 
@@ -319,16 +319,20 @@ async function main(argv) {
         shellQuote(sessionDir),
         `--on-failure=${onFailure}`,
         ';',
+        'status=$?',
+        ';',
         'echo',
         shellQuote(''),
         ';',
         'echo',
         shellQuote('Runner finished.  Ctrl+B 1 -> monitor  |  Ctrl+B D -> detach'),
         ';',
-        'read',
+        'exit',
+        '$status',
       ].join(' ');
 
-      runTmux(['send-keys', '-t', `${sessionName}:0`, runnerCommand, 'Enter']);
+      runTmux(['set-option', '-w', '-t', `${sessionName}:0`, 'remain-on-exit', 'on']);
+      runTmux(['respawn-pane', '-k', '-t', `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`]);
       const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, 'pickle'], {
         encoding: 'utf8',
         timeout: 30_000,
@@ -337,6 +341,7 @@ async function main(argv) {
       if (monitorResult.status !== 0) {
         throw new Error(monitorResult.stderr || monitorResult.stdout || 'tmux monitor bootstrap failed');
       }
+      await waitForTmuxRunnerStart(sessionDir, sessionName, 'pickle');
     } catch (error) {
       if (launchStarted) {
         try {

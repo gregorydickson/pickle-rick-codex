@@ -359,6 +359,46 @@ test('spawn-morty infers env vars from braced shell expansions', () => {
   );
 });
 
+test('spawn-morty infers sibling roots from repo wrapper verification commands', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'wrapper inferred env preflight'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Wrapper inferred env verification',
+        description: 'Verification delegates to repo-owned wrapper scripts.',
+        acceptance_criteria: ['Missing sibling roots are caught before wrapper verification runs.'],
+        verification: ['bun run check:env && bun run validate:attractor'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /preflight-missing-env: ATTRACTOR_ROOT is required for verification/,
+  );
+
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Todo');
+  assert.equal(ticket.frontmatter.failure_kind, 'preflight-missing-env');
+  assert.match(ticket.frontmatter.failure_reason, /ATTRACTOR_ROOT/);
+});
+
 test('spawn-morty ignores vars assigned inside verification commands', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');

@@ -16,10 +16,48 @@ function createStaleSessionFakeTmux(binDir, sessionName) {
     path.join(binDir, 'tmux'),
     `#!/usr/bin/env node
 import fs from 'node:fs';
+import path from 'node:path';
 
 const args = process.argv.slice(2);
 const logPath = process.env.FAKE_TMUX_LOG || '';
 const staleFile = ${JSON.stringify(staleFile)};
+
+function latestSessionDir() {
+  const dataRoot = process.env.PICKLE_DATA_ROOT || '';
+  const sessionsRoot = dataRoot ? path.join(dataRoot, 'sessions') : '';
+  if (!sessionsRoot || !fs.existsSync(sessionsRoot)) {
+    return '';
+  }
+  const sessionDirs = fs.readdirSync(sessionsRoot)
+    .map((name) => path.join(sessionsRoot, name))
+    .filter((candidate) => {
+      try {
+        return fs.statSync(candidate).isDirectory();
+      } catch {
+        return false;
+      }
+    })
+    .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+  return sessionDirs[0] || '';
+}
+
+function simulateRunnerStart(mode) {
+  const sessionDir = latestSessionDir();
+  if (!sessionDir) {
+    return;
+  }
+  const statePath = path.join(sessionDir, 'state.json');
+  if (fs.existsSync(statePath)) {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    state.active = true;
+    state.tmux_runner_pid = 4242;
+    state.last_exit_reason = null;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  }
+  const runnerLogName = mode === 'pickle' ? 'mux-runner.log' : 'loop-runner.log';
+  const runnerMarker = mode === 'pickle' ? 'mux-runner started' : 'loop-runner started (fake)';
+  fs.appendFileSync(path.join(sessionDir, runnerLogName), '[2026-04-18T00:00:00.000Z] ' + runnerMarker + '\\n');
+}
 
 if (logPath) {
   fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
@@ -56,6 +94,16 @@ if (args[0] === 'new-session' && args.includes('-s')) {
 
 if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-P')) {
   console.log('%0');
+  process.exit(0);
+}
+
+if (args[0] === 'respawn-pane') {
+  const command = args.at(-1) || '';
+  if (command.includes('mux-runner.js')) {
+    simulateRunnerStart('pickle');
+  } else if (command.includes('loop-runner.js')) {
+    simulateRunnerStart('loop');
+  }
   process.exit(0);
 }
 
@@ -626,6 +674,44 @@ test('pickle-tmux rolls back tmux launch state when monitor bootstrap fails', ()
 
   assert.equal(state.last_exit_reason, 'launch_failed');
   assert.equal(state.tmux_session_name, null);
+  assert.ok(logLines.some((args) => args[0] === 'kill-session'));
+});
+
+test('pickle-tmux fails launch when tmux accepts commands but the runner never starts', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-runner-never-started.jsonl');
+  const prdSource = path.join(projectDir, 'runner-never-started-prd.md');
+  fs.writeFileSync(prdSource, '# Runner Never Started\n\n## Summary\nAccept tmux commands without starting the runner.\n');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_TMUX_RUNNER_START: 'never',
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--prd', prdSource], {
+      env,
+      cwd: projectDir,
+    }),
+    /tmux runner did not start/,
+  );
+
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  const [sessionId] = fs.readdirSync(sessionsRoot);
+  const sessionDir = path.join(sessionsRoot, sessionId);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'launch_failed');
+  assert.equal(state.tmux_session_name, null);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
+  assert.ok(logLines.some((args) => args[0] === 'respawn-pane'));
+  assert.ok(logLines.some((args) => args[0] === 'send-keys'));
   assert.ok(logLines.some((args) => args[0] === 'kill-session'));
 });
 
