@@ -9,7 +9,7 @@ import { appendHistory } from '../lib/session.js';
 import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getNextRunnableTicket, summarizeTickets, updateTicketStatus } from '../lib/tickets.js';
-import { ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote } from '../lib/tmux.js';
+import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote } from '../lib/tmux.js';
 import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
 import { loadConfig } from '../lib/config.js';
 
@@ -308,6 +308,7 @@ async function main(argv) {
     });
 
     try {
+      clearTmuxSession(sessionName);
       runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);

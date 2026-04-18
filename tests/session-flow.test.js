@@ -9,6 +9,61 @@ import { updateSessionMap } from '../lib/session-map.js';
 import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
+function createStaleSessionFakeTmux(binDir, sessionName) {
+  const staleFile = path.join(binDir, 'fake-tmux-stale-session.txt');
+  fs.writeFileSync(staleFile, sessionName);
+  return writeExecutable(
+    path.join(binDir, 'tmux'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+const logPath = process.env.FAKE_TMUX_LOG || '';
+const staleFile = ${JSON.stringify(staleFile)};
+
+if (logPath) {
+  fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
+}
+
+const currentStale = fs.existsSync(staleFile) ? fs.readFileSync(staleFile, 'utf8').trim() : '';
+const targetIndex = args.indexOf('-t');
+const target = targetIndex === -1 ? '' : (args[targetIndex + 1] || '');
+
+if (args[0] === '-V') {
+  console.log('tmux 3.4-test');
+  process.exit(0);
+}
+
+if (args[0] === 'has-session') {
+  process.exit(target === currentStale ? 0 : 1);
+}
+
+if (args[0] === 'kill-session') {
+  if (target === currentStale) {
+    fs.rmSync(staleFile, { force: true });
+  }
+  process.exit(0);
+}
+
+if (args[0] === 'new-session' && args.includes('-s')) {
+  const name = args[args.indexOf('-s') + 1] || '';
+  if (name === currentStale) {
+    console.error('duplicate session: ' + name);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-P')) {
+  console.log('%0');
+  process.exit(0);
+}
+
+process.exit(0);
+`,
+  );
+}
+
 test('setup command creates a session and get-session resolves it', () => {
   const dataRoot = makeTempRoot();
   const env = { PICKLE_DATA_ROOT: dataRoot };
@@ -496,6 +551,48 @@ test('pickle-tmux clears a stale launch lock before relaunching', () => {
 
   assert.match(output, /Pickle Rick tmux mode launched/);
   assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
+});
+
+test('pickle-tmux replaces a stale tmux session before relaunching', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-stale-session.jsonl');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'stale tmux session epic'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+  createStaleSessionFakeTmux(fakeBin, sessionName);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'ticket-001',
+        title: 'Replace stale tmux session',
+        description: 'Relaunch without manual cleanup.',
+        acceptance_criteria: ['The stale tmux session is replaced automatically.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.match(output, /Pickle Rick tmux mode launched/);
+  assert.ok(logLines.some((args) => args[0] === 'has-session' && args.includes(sessionName)));
+  assert.ok(logLines.some((args) => args[0] === 'kill-session' && args.includes(sessionName)));
+  assert.ok(logLines.some((args) => args[0] === 'new-session' && args.includes(sessionName)));
 });
 
 test('pickle-tmux rolls back tmux launch state when monitor bootstrap fails', () => {

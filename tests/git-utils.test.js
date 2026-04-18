@@ -61,6 +61,34 @@ test('createPatchFromWorktree preserves a valid trailing newline for git apply',
   }
 });
 
+test('createTicketWorktree supports repos with an unborn HEAD', () => {
+  const repoDir = makeTempRoot('pickle-rick-git-utils-unborn-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-git-utils-unborn-session-');
+  let worktreeDir = null;
+
+  runGit(repoDir, ['init']);
+  const targetFile = path.join(repoDir, 'README.md');
+  fs.writeFileSync(targetFile, '# bootstrap\n');
+
+  try {
+    const worktree = createTicketWorktree({ repoDir, sessionDir, ticketId: 'r1' });
+    worktreeDir = worktree.worktreeDir;
+
+    fs.writeFileSync(path.join(worktreeDir, 'README.md'), '# bootstrap\n\nupdated\n');
+
+    const patchPath = path.join(sessionDir, 'r1.patch');
+    createPatchFromWorktree(worktreeDir, worktree.baseSha, patchPath);
+
+    assert.equal(canApplyPatch(repoDir, patchPath), true);
+    applyPatch(repoDir, patchPath);
+    assert.equal(fs.readFileSync(targetFile, 'utf8'), '# bootstrap\n\nupdated\n');
+  } finally {
+    if (worktreeDir) {
+      removeTicketWorktree(worktreeDir);
+    }
+  }
+});
+
 test('checkPatchApply classifies malformed patch payloads as invalid', () => {
   const repoDir = makeTempRoot('pickle-rick-git-utils-repo-');
   const patchPath = path.join(repoDir, 'broken.patch');
