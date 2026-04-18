@@ -253,9 +253,50 @@ export function createFakeTmux(binDir) {
     path.join(binDir, 'tmux'),
     `#!/usr/bin/env node
 import fs from 'node:fs';
+import path from 'node:path';
 
 const args = process.argv.slice(2);
 const logPath = process.env.FAKE_TMUX_LOG || '';
+
+function latestSessionDir() {
+  const dataRoot = process.env.PICKLE_DATA_ROOT || '';
+  const sessionsRoot = dataRoot ? path.join(dataRoot, 'sessions') : '';
+  if (!sessionsRoot || !fs.existsSync(sessionsRoot)) {
+    return '';
+  }
+  const sessionDirs = fs.readdirSync(sessionsRoot)
+    .map((name) => path.join(sessionsRoot, name))
+    .filter((candidate) => {
+      try {
+        return fs.statSync(candidate).isDirectory();
+      } catch {
+        return false;
+      }
+    })
+    .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+  return sessionDirs[0] || '';
+}
+
+function simulateRunnerStart(mode) {
+  if (process.env.FAKE_TMUX_RUNNER_START === 'never') {
+    return;
+  }
+  const sessionDir = latestSessionDir();
+  if (!sessionDir) {
+    return;
+  }
+  const statePath = path.join(sessionDir, 'state.json');
+  if (fs.existsSync(statePath)) {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    state.active = true;
+    state.tmux_runner_pid = 4242;
+    state.last_exit_reason = null;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  }
+  const runnerLogName = mode === 'pickle' ? 'mux-runner.log' : 'loop-runner.log';
+  const runnerMarker = mode === 'pickle' ? 'mux-runner started' : 'loop-runner started (fake)';
+  fs.appendFileSync(path.join(sessionDir, runnerLogName), '[2026-04-18T00:00:00.000Z] ' + runnerMarker + '\\n');
+}
 
 if (logPath) {
   fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
@@ -278,6 +319,16 @@ if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-
   fs.writeFileSync(counterPath, String(next));
   const paneId = '%' + next;
   console.log(paneId);
+  process.exit(0);
+}
+
+if (args[0] === 'respawn-pane') {
+  const command = args.at(-1) || '';
+  if (command.includes('mux-runner.js')) {
+    simulateRunnerStart('pickle');
+  } else if (command.includes('loop-runner.js')) {
+    simulateRunnerStart('loop');
+  }
   process.exit(0);
 }
 

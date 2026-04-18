@@ -166,6 +166,41 @@ test('enrichRefinementManifest normalizes dependency aliases and materializes ve
   );
 });
 
+test('enrichRefinementManifest infers wrapper env requirements and normalizes freeze contract aliases', () => {
+  const manifest = {
+    tickets: [
+      {
+        id: 'T00',
+        title: 'Freeze attractor contract',
+        description: 'Capture sibling SHA into a freeze artifact via wrapper scripts.',
+        acceptance_criteria: ['The authoritative sibling SHA is frozen into a repo artifact.'],
+        verification: ['bun run check:env && bun run validate:attractor'],
+        outputArtifacts: ['research/external-contract-freeze.md'],
+        freezeContract: {
+          path: 'research/external-contract-freeze.md',
+          env: 'ATTRACTOR_ROOT',
+          authority: 'git:ATTRACTOR_ROOT:HEAD',
+        },
+        priority: 'P0',
+        status: 'Todo',
+      },
+    ],
+  };
+
+  const enriched = enrichRefinementManifest(manifest);
+  assert.deepEqual(
+    enriched.manifest.tickets[0].verification_env.required.map((entry) => entry.name),
+    ['ATTRACTOR_ROOT', 'DIPPIN_ROOT'],
+  );
+  assert.deepEqual(enriched.manifest.tickets[0].output_artifacts, ['research/external-contract-freeze.md']);
+  assert.deepEqual(enriched.manifest.tickets[0].freeze_contract, {
+    artifact_path: 'research/external-contract-freeze.md',
+    sibling: 'attractor',
+    root_env: 'ATTRACTOR_ROOT',
+    sha_source: 'git:ATTRACTOR_ROOT:HEAD',
+  });
+});
+
 test('validateRefinementManifest rejects fallback parser output with placeholder contracts', () => {
   const issues = validateRefinementManifest(fallbackRefinePrd([
     '# PRD',
@@ -178,6 +213,160 @@ test('validateRefinementManifest rejects fallback parser output with placeholder
 
   assert.ok(issues.some((issue) => issue.includes('fallback parser output')));
   assert.ok(issues.some((issue) => issue.includes('placeholder text')));
+});
+
+test('validateRefinementManifest rejects formatter ownership drift, opaque wrappers, parity gaps, and unowned artifacts', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'formatter-ticket',
+        title: 'Formatter ownership',
+        description: 'Own formatter changes for the port.',
+        acceptance_criteria: ['Formatter ownership is explicit.'],
+        verification: ['test -f README.md'],
+        formatter_ticket: true,
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'parity-ticket',
+        title: 'Mirror parity fixtures',
+        description: 'Keep parity aligned with the sibling wrapper flow.',
+        acceptance_criteria: ['Parity stays aligned with mirrored sibling behavior.'],
+        verification: ['bun run fixtures:sync'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'artifact-consumer',
+        title: 'Verify frozen contract artifact',
+        description: 'Check the frozen sibling SHA artifact.',
+        acceptance_criteria: ['The freeze artifact exists for downstream verification.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('formatter ownership requires explicit formatter work')));
+  assert.ok(issues.some((issue) => issue.includes('opaque verification wrapper commands require explicit')));
+  assert.ok(issues.some((issue) => issue.includes('wrapper verification requires explicit output_artifacts')));
+  assert.ok(issues.some((issue) => issue.includes('must declare proof_corpus coverage')));
+  assert.ok(issues.some((issue) => issue.includes('verification references artifact "research/external-contract-freeze.md" but no ticket owns it')));
+  assert.ok(issues.some((issue) => issue.includes('no authoritative producer exists')));
+});
+
+test('validateRefinementManifest rejects formatter-sensitive verification before formatter ownership dependency', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'implementation',
+        title: 'Generate parity docs',
+        description: 'Writes repo artifacts that still need a later formatter pass.',
+        acceptance_criteria: ['Generated docs are checked before handoff.'],
+        verification: ['bun run format'],
+        priority: 'P0',
+        status: 'Todo',
+      },
+      {
+        id: 'formatter-ticket',
+        title: 'Formatter ownership',
+        description: 'Own formatter changes for the port.',
+        acceptance_criteria: ['Formatter ownership is explicit.'],
+        verification: ['bun run format'],
+        formatter_ticket: true,
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('formatter-sensitive verification runs before formatter ownership is declared')));
+});
+
+test('validateRefinementManifest rejects conflicting freeze authorities and consumer drift', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'freeze-attractor',
+        title: 'Freeze attractor contract',
+        description: 'Record the authoritative ATTRACTOR sibling SHA.',
+        acceptance_criteria: ['The attractor SHA is frozen into the artifact.'],
+        verification: ['git -C "$ATTRACTOR_ROOT" rev-parse HEAD'],
+        output_artifacts: ['research/external-contract-freeze.md'],
+        freeze_contract: {
+          artifact_path: 'research/external-contract-freeze.md',
+          sibling: 'attractor',
+          root_env: 'ATTRACTOR_ROOT',
+          sha_source: 'git:ATTRACTOR_ROOT:HEAD',
+        },
+        priority: 'P0',
+        status: 'Todo',
+      },
+      {
+        id: 'freeze-dippin',
+        title: 'Freeze dippin contract',
+        description: 'Record a different sibling SHA into the same artifact.',
+        acceptance_criteria: ['The dippin SHA is also frozen.'],
+        verification: ['git -C "$DIPPIN_ROOT" rev-parse HEAD'],
+        output_artifacts: ['research/external-contract-freeze.md'],
+        freeze_contract: {
+          artifact_path: 'research/external-contract-freeze.md',
+          sibling: 'dippin',
+          root_env: 'DIPPIN_ROOT',
+          sha_source: 'git:DIPPIN_ROOT:HEAD',
+        },
+        priority: 'P0',
+        status: 'Todo',
+      },
+      {
+        id: 'consumer',
+        title: 'Validate frozen contract',
+        description: 'Use the existing freeze artifact for downstream checks.',
+        acceptance_criteria: ['The downstream checks align with the authoritative freeze contract.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        freeze_contract: {
+          artifact_path: 'research/external-contract-freeze.md',
+          sibling: 'dippin',
+          root_env: 'DIPPIN_ROOT',
+          sha_source: 'git:DIPPIN_ROOT:HEAD',
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('conflicting sibling SHA authorities')));
+  assert.ok(issues.some((issue) => issue.includes('freeze_contract disagrees with authoritative producer')));
+});
+
+test('validateRefinementManifest rejects freeze consumers without an authoritative producer', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'consumer',
+        title: 'Validate frozen contract',
+        description: 'Use a freeze artifact before any producer ticket exists.',
+        acceptance_criteria: ['The consumer checks the frozen contract artifact.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        freezeContract: {
+          path: 'research/external-contract-freeze.md',
+          env: 'ATTRACTOR_ROOT',
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('no authoritative producer exists')));
+  assert.ok(issues.some((issue) => issue.includes('freeze_contract for "research/external-contract-freeze.md" has no authoritative producer')));
 });
 
 test('summarizeTickets and ensureTicketFilesMaterialized restore missing ticket files from the manifest', () => {
