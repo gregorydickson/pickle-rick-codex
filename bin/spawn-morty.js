@@ -7,8 +7,17 @@ import { logActivity } from '../lib/activity-logger.js';
 import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { recordIteration } from '../lib/circuit-breaker.js';
-import { getWorkingTreeFingerprint } from '../lib/git-utils.js';
+import {
+  commitTrackedChanges,
+  getHeadSha,
+  getWorkingTreeFingerprint,
+  isGitRepo,
+  isWorkingTreeDirty,
+  resetGitIndex,
+  stageAllChanges,
+} from '../lib/git-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
+import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../lib/tickets.js';
@@ -62,6 +71,75 @@ function commandReferencesContractArtifacts(ticket, command) {
 
 function shouldClassifyVerificationContractFailure(ticket, command) {
   return ticketHasVerificationContracts(ticket) || commandReferencesContractArtifacts(ticket, command);
+}
+
+function safeErrorMessage(error) {
+  if (typeof error?.stderr === 'string' && error.stderr.trim()) {
+    return error.stderr.trim();
+  }
+  if (Buffer.isBuffer(error?.stderr)) {
+    const stderr = error.stderr.toString('utf8').trim();
+    if (stderr) return stderr;
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function appendRunnerLog(sessionDir, runnerMode, message) {
+  if (!runnerMode) return;
+  const descriptor = getRunnerDescriptor(runnerMode);
+  fs.appendFileSync(
+    path.join(sessionDir, descriptor.runnerLog),
+    `[${new Date().toISOString()}] ${message}\n`,
+    { mode: 0o600 },
+  );
+}
+
+function normalizeCommitSubject(value, fallback) {
+  const normalized = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized || fallback;
+}
+
+function ticketCommitMessage(ticketId, ticket) {
+  return `pickle: ${ticketId} - ${normalizeCommitSubject(ticket?.title, 'completed ticket')}`;
+}
+
+function autoCommitDetachedTicketChanges({
+  sessionDir,
+  runnerMode,
+  workingDir,
+  tmuxMode,
+  baselineTreeClean,
+  ticketId,
+  ticket,
+  config,
+}) {
+  if (!tmuxMode || !baselineTreeClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
+    return;
+  }
+
+  appendRunnerLog(sessionDir, runnerMode, `no clean commit boundary detected for ${ticketId}; auto-committing ticket changes`);
+  try {
+    stageAllChanges(workingDir);
+    commitTrackedChanges(workingDir, ticketCommitMessage(ticketId, ticket));
+    const head = getHeadSha(workingDir);
+    appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-committed: ${head}`);
+    logActivity({
+      event: 'commit',
+      source: 'pickle',
+      session: path.basename(sessionDir),
+      ticket: ticketId,
+      commit_hash: head,
+    }, { enabled: config.defaults.activity_logging });
+  } catch (error) {
+    resetGitIndex(workingDir);
+    appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-commit failed: ${safeErrorMessage(error)}`);
+    throw new Error(`Ticket ${ticketId} completed but auto-commit failed: ${safeErrorMessage(error)}`);
+  }
 }
 
 class CancellationError extends Error {
@@ -197,8 +275,11 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
 
   const config = loadConfig();
   const workingDir = state.working_dir;
+  const tmuxMode = Boolean(state.tmux_mode);
+  const runnerMode = options.runnerMode || null;
   let verificationReady = null;
   let baselineFingerprint = '';
+  let baselineTreeClean = true;
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
   function finalizeSuccess(applied) {
@@ -232,6 +313,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       config,
     });
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
+    baselineTreeClean = !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir);
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -268,6 +350,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
           },
           sessionDir,
           workingDir,
+          tmuxMode,
         }),
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
         outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
@@ -324,6 +407,17 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         throw error;
       }
     }
+
+    autoCommitDetachedTicketChanges({
+      sessionDir,
+      runnerMode,
+      workingDir,
+      tmuxMode,
+      baselineTreeClean,
+      ticketId: normalizedTicketId,
+      ticket: manifestTicket,
+      config,
+    });
 
     if (getWorkingTreeFingerprint(workingDir) === baselineFingerprint) {
       return finalizeSuccess(false);

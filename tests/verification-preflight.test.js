@@ -203,6 +203,7 @@ test('spawn-morty works directly in the current branch working tree', () => {
   fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
   runGit(projectDir, ['add', 'feature.txt']);
   runGit(projectDir, ['commit', '-m', 'base']);
+  const baseHead = runGit(projectDir, ['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\nuser-change\n');
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'working tree ticket'], {
@@ -235,6 +236,7 @@ test('spawn-morty works directly in the current branch working tree', () => {
   assert.equal(result.status, 'done');
   assert.equal(result.applied, true);
   assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\nuser-change\nagent-change\n');
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
   assert.equal(ticket.status, 'Done');
 });
 

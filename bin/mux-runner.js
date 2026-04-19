@@ -119,7 +119,10 @@ export async function runSequential(sessionDir, options = {}) {
       attempts += 1;
       try {
         appendRunnerLog(sessionDir, runnerMode, `starting ticket ${ticket.id} attempt ${attempts}/${maxAttempts}`);
-        await runTicket(sessionDir, ticket.id, options);
+        await runTicket(sessionDir, ticket.id, {
+          ...options,
+          runnerMode,
+        });
         ticket.status = 'Done';
         appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
         break;

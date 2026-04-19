@@ -1283,6 +1283,62 @@ test('mux-runner fails closed when a session has no tickets', () => {
   assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /no tickets found/);
 });
 
+test('mux-runner auto-commits completed tmux tickets and leaves a clean tree', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'commit boundary task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Commit boundary ticket',
+        description: 'Detached tmux tickets should end on a clean commit boundary.',
+        acceptance_criteria: ['The ticket leaves a clean git working tree.'],
+        verification: [
+          'node -e "const fs = require(\'fs\'); const text = fs.readFileSync(\'feature.txt\', \'utf8\'); if (text !== \'base\\nagent-change\\n\') process.exit(1)"',
+        ],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+
+  assert.notEqual(afterHead, beforeHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.equal(commitSubject, 'pickle: r1 - Commit boundary ticket');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(ticket.status, 'Done');
+  assert.match(log, /ticket r1 auto-committed:/);
+});
+
 test('mux-runner preserves ticket failure when max_time would block a retry', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
