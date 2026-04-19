@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig } from '../lib/config.js';
+import { ensureConfigFile, loadConfig } from '../lib/config.js';
 import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 
 function createSessionFixture(dataRoot, ticketContent) {
@@ -109,7 +109,7 @@ test('loadConfig falls back to safe defaults when nested config shapes are malfo
   assert.equal(config.runtime.command, 'codex');
   assert.deepEqual(config.runtime.exec_args, ['--full-auto']);
   assert.equal(config.defaults.max_iterations, 25);
-  assert.equal(config.defaults.max_time_minutes, 0);
+  assert.equal(config.defaults.max_time_minutes, 480);
   assert.equal(config.defaults.activity_logging, true);
   assert.deepEqual(config.defaults.circuit_breaker, {
     enabled: true,
@@ -119,4 +119,42 @@ test('loadConfig falls back to safe defaults when nested config shapes are malfo
   });
   assert.equal(config.hooks.enabled, true);
   assert.deepEqual(config.hooks.validated_events, ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse']);
+});
+
+test('ensureConfigFile migrates untouched legacy managed max-time defaults to eight hours', () => {
+  const dataRoot = makeTempRoot();
+  const configPath = path.join(dataRoot, 'config.json');
+  writeJson(configPath, {
+    runtime: {
+      command: 'codex',
+      model: null,
+      exec_args: ['--full-auto'],
+      add_dirs: [],
+      json_output: true,
+    },
+    defaults: {
+      max_iterations: 25,
+      max_time_minutes: 120,
+      worker_timeout_seconds: 900,
+      refinement_timeout_seconds: 600,
+      max_retry_attempts: 2,
+      activity_logging: true,
+      hook_timeout_seconds: 10,
+      circuit_breaker: {
+        enabled: true,
+        no_progress_threshold: 5,
+        half_open_after: 2,
+        same_error_threshold: 5,
+      },
+    },
+    hooks: {
+      enabled: true,
+      validated_events: ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse'],
+    },
+  });
+
+  const config = ensureConfigFile(configPath);
+
+  assert.equal(config.defaults.max_time_minutes, 480);
+  assert.equal(loadConfig(configPath).defaults.max_time_minutes, 480);
 });

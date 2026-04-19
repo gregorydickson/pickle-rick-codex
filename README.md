@@ -22,6 +22,7 @@ If you want the short version: this repo gives Codex a real Pickle Rick persona,
 - Refines PRDs into ticket manifests and per-ticket markdown files
 - Executes tickets sequentially in the current branch working tree
 - Supports detached tmux orchestration with a runner window and live monitor
+- Supports a detached `pickle-pipeline` path that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce` in one tmux session
 - Supports detached context-clearing loops for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park`
 - Tracks runtime state, session mappings, metrics, and circuit-breaker state
 - Supports safe cancel and retry flows without destructive rollback
@@ -123,6 +124,12 @@ For longer runs, launch the detached tmux version instead of keeping the current
 Use the pickle-tmux skill with --prd ./prd.md so the runtime refines the PRD, launches detached, and gives me a tmux monitor I can reattach to later.
 ```
 
+If the work should move through the full proven multi-phase path, use the dedicated detached pipeline entrypoint instead:
+
+```text
+Use the pickle-pipeline skill with "ship the feature" so the runtime launches one tmux session, runs pickle first, then advances through anatomy-park and szechuan-sauce when those phases are enabled.
+```
+
 ### Step 4: Inspect, Retry, Or Cancel
 
 Pickle Rick is not a black box. The runtime exposes state and recovery tools:
@@ -172,6 +179,7 @@ You describe a feature
 The current Codex install exposes these primary skills:
 
 - `pickle` — end-to-end autonomous loop
+- `pickle-pipeline` — detached multi-phase pipeline across `pickle`, `anatomy-park`, and `szechuan-sauce`
 - `pickle-tmux` — bootstrap from a PRD or resume a prepared session in detached tmux
 - `pickle-prd` — draft a PRD
 - `pickle-refine` — run three analyst passes, synthesize the result, and decompose the PRD into tickets
@@ -214,6 +222,8 @@ Detached advanced loops currently present in the repo:
 If you want the guaranteed path without relying on skill invocation, use the runtime directly:
 
 ```bash
+node ~/.codex/pickle-rick/bin/pickle-pipeline.js "<task>"
+node ~/.codex/pickle-rick/bin/pickle-pipeline.js --resume
 node ~/.codex/pickle-rick/bin/pickle-tmux.js --prd ./prd.md
 node ~/.codex/pickle-rick/bin/pickle-tmux.js --resume
 node ~/.codex/pickle-rick/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"
@@ -234,6 +244,8 @@ node ~/.codex/pickle-rick/bin/metrics.js --weekly
 node ~/.codex/pickle-rick/bin/cancel.js
 node ~/.codex/pickle-rick/bin/retry-ticket.js --ticket <ticket-id>
 ```
+
+For pipeline sessions, `status.js` prints the active pipeline phase, per-phase status summary, bootstrap source, and target path while preserving the existing non-pipeline status output.
 
 `pickle-tmux` has two first-class modes now:
 
@@ -288,12 +300,14 @@ The installed runtime ships `.codex/hooks/hooks.json` as an empty fail-open cont
 
 ## Validated Behavior
 
-Validated locally on April 15, 2026 against `codex-cli 0.120.0`:
+Validated locally on April 19, 2026 against `codex-cli 0.120.0`:
 
 - `bash install.sh` installs the runtime, persona, and skills globally
 - `~/.codex/pickle-rick/install.sh --project <path> [--enable-hooks]` works from the installed runtime because the source `.codex` tree is shipped with it
 - a clean `codex exec` probe in a temp directory returned `Pickle Rick`
 - the PRD and refinement flows can detect success artifacts and exit promptly even if the child Codex process lingers
+- `pickle-pipeline` launches one detached tmux session, records immutable pipeline metadata, and advances through the configured phases with `pipeline-runner.log` in the monitor pane
+- `status.js` renders pipeline metadata for pipeline sessions without changing legacy non-pipeline status output
 - `pickle-tmux --prd ./prd.md` bootstraps, refines, and launches detached tmux instead of requiring a task-string workaround
 - zero-ticket detached runs fail closed with `last_exit_reason = "no_tickets"` instead of marking the session complete
 - detached tmux launchers for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park` are covered by local tests with a fake `tmux` binary

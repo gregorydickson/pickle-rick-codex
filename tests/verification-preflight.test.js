@@ -238,6 +238,45 @@ test('spawn-morty works directly in the current branch working tree', () => {
   assert.equal(ticket.status, 'Done');
 });
 
+test('spawn-morty stops phases promptly after writing phase promise tokens', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_HANG_MS: '3000',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'phase promise stop'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Phase promise stop',
+        description: 'Phase runs should stop promptly once the promise token is written.',
+        acceptance_criteria: ['The ticket completes without waiting for each lingering fake codex process to self-exit.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const started = Date.now();
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 7000, `spawn-morty took too long after phase success: ${elapsed}ms`);
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+});
+
 test('spawn-morty distinguishes normal verification command failure from preflight failures', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -282,6 +321,47 @@ test('spawn-morty distinguishes normal verification command failure from preflig
   assert.equal(ticket.status, 'Blocked');
   assert.equal(ticket.frontmatter.failure_kind, 'command_failed');
   assert.match(ticket.frontmatter.failure_reason, /verification-command-failed:/);
+});
+
+test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'verification contract failure'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Verification contract failure',
+        description: 'Verification fails while enforcing a declared artifact contract.',
+        acceptance_criteria: ['Contract failures are distinct from generic implementation failures.'],
+        verification: ['test -f research/proof.txt'],
+        output_artifacts: ['research/proof.txt'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /verification-contract-failed:/,
+  );
+
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'verification-contract-failed');
+  assert.match(ticket.frontmatter.failure_reason, /research\/proof\.txt/);
 });
 
 test('spawn-morty infers required env vars from verification commands', () => {

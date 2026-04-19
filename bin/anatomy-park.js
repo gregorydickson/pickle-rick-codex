@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { launchDetachedLoop } from '../lib/detached-launch.js';
+import { prepareAnatomyParkPhase } from '../lib/pipeline-phase-setup.js';
 
 function parseArgs(argv) {
   let dryRun = false;
@@ -55,37 +56,9 @@ function parseArgs(argv) {
   };
 }
 
-function resolveSessionCwd(target) {
-  const resolvedTarget = fs.realpathSync(path.resolve(target));
-  return fs.statSync(resolvedTarget).isDirectory() ? resolvedTarget : path.dirname(resolvedTarget);
-}
-
 async function main(argv) {
   const parsed = parseArgs(argv);
-  const sessionCwd = parsed.resume ? null : resolveSessionCwd(parsed.target);
-  const setupArgs = ['--tmux', '--command-template', 'anatomy-park.md'];
-  if (parsed.resume) {
-    setupArgs.push('--resume');
-    if (parsed.resume !== '__LAST__') {
-      setupArgs.push(parsed.resume);
-    }
-  } else {
-    if (Number.isInteger(parsed.maxIterations)) setupArgs.push('--max-iterations', String(parsed.maxIterations));
-    setupArgs.push('--task', `Anatomy Park: deep review ${parsed.target}`);
-  }
-
-  const loopConfig = {
-    mode: 'anatomy-park',
-  };
-  if (!parsed.resume || parsed.targetSpecified) {
-    loopConfig.target = path.resolve(parsed.target);
-  }
-  if (!parsed.resume || parsed.dryRunSpecified) {
-    loopConfig.dry_run = parsed.dryRun;
-  }
-  if (!parsed.resume || parsed.stallLimitSpecified) {
-    loopConfig.stall_limit = parsed.stallLimit;
-  }
+  const { setupArgs, loopConfig, sessionCwd } = prepareAnatomyParkPhase(parsed);
 
   const output = await launchDetachedLoop({
     setupArgs,

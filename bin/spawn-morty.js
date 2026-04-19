@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../lib/activity-logger.js';
-import { assertCodexSucceeded, runCodexExecMonitored } from '../lib/codex.js';
+import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { recordIteration } from '../lib/circuit-breaker.js';
 import { getWorkingTreeFingerprint } from '../lib/git-utils.js';
@@ -12,7 +12,12 @@ import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { appendHistory } from '../lib/session.js';
 import { StateManager } from '../lib/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../lib/tickets.js';
-import { assertTicketVerificationReady, isPreflightError } from '../lib/verification-env.js';
+import {
+  assertTicketVerificationReady,
+  isPreflightError,
+  isVerificationContractError,
+  VerificationContractError,
+} from '../lib/verification-env.js';
 
 function splitVerificationCommands(ticket) {
   if (Array.isArray(ticket.verification)) return ticket.verification;
@@ -20,6 +25,43 @@ function splitVerificationCommands(ticket) {
     return ticket.verify.split('&&').map((item) => item.trim()).filter(Boolean);
   }
   return ['npm test'];
+}
+
+function phasePromiseToken(phase) {
+  return `${String(phase || '').toUpperCase()}_COMPLETE`;
+}
+
+function phaseSuccessCheck(phase, outputLastMessagePath) {
+  const token = phasePromiseToken(phase);
+  return ({ stdout, lastMessage }) => {
+    if (hasPromiseToken(lastMessage, token)) return true;
+    if (hasPromiseToken(stdout, token)) return true;
+    return outputLastMessagePath && hasPromiseToken(
+      fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '',
+      token,
+    );
+  };
+}
+
+function ticketHasVerificationContracts(ticket) {
+  return Boolean(
+    ticket?.freeze_contract
+    || (Array.isArray(ticket?.output_artifacts) && ticket.output_artifacts.length > 0)
+    || (Array.isArray(ticket?.proof_corpus) && ticket.proof_corpus.length > 0)
+  );
+}
+
+function commandReferencesContractArtifacts(ticket, command) {
+  const contractPaths = [
+    ...(Array.isArray(ticket?.output_artifacts) ? ticket.output_artifacts : []),
+    ...(Array.isArray(ticket?.proof_corpus) ? ticket.proof_corpus : []),
+    ticket?.freeze_contract?.artifact_path,
+  ].filter(Boolean);
+  return contractPaths.some((artifactPath) => String(command || '').includes(artifactPath));
+}
+
+function shouldClassifyVerificationContractFailure(ticket, command) {
+  return ticketHasVerificationContracts(ticket) || commandReferencesContractArtifacts(ticket, command);
 }
 
 class CancellationError extends Error {
@@ -230,6 +272,9 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
         outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
         addDirs: [sessionDir],
+        successCheck: phaseSuccessCheck(phase, path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`)),
+        successSignalGraceMs: 150,
+        successPollMs: 50,
         onSpawn: (child) => {
           updateActiveChild(statePath, manager, {
             active_child_pid: child.pid,
@@ -255,14 +300,29 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }
-      await runVerificationCommand({
-        command,
-        cwd: workingDir,
-        timeoutMs: config.defaults.worker_timeout_seconds * 1000,
-        manager,
-        statePath,
-        env: verificationReady.env,
-      });
+      try {
+        await runVerificationCommand({
+          command,
+          cwd: workingDir,
+          timeoutMs: config.defaults.worker_timeout_seconds * 1000,
+          manager,
+          statePath,
+          env: verificationReady.env,
+        });
+      } catch (error) {
+        if (
+          !(error instanceof CancellationError)
+          && shouldClassifyVerificationContractFailure(manifestTicket, command)
+          && !isPreflightError(error)
+        ) {
+          throw new VerificationContractError({
+            ticketId: normalizedTicketId,
+            command,
+            message: `verification contract failed for ${command}: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        throw error;
+      }
     }
 
     if (getWorkingTreeFingerprint(workingDir) === baselineFingerprint) {
@@ -280,6 +340,18 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     if (isPreflightError(error)) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Todo',
+        failed_at: new Date().toISOString(),
+        failure_reason: error.message,
+        failure_kind: error.kind,
+      });
+      recordIteration(sessionDir, manager.read(statePath), {
+        error: error.message,
+      });
+      throw error;
+    }
+    if (isVerificationContractError(error)) {
+      updateTicketStatus(sessionDir, normalizedTicketId, {
+        status: 'Blocked',
         failed_at: new Date().toISOString(),
         failure_reason: error.message,
         failure_kind: error.kind,

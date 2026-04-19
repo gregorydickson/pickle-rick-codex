@@ -32,6 +32,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(installRoot, 'bin', 'setup.js')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex-plugin', 'plugin.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'skills', 'pickle-pipeline', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.template.json')));
   assert.ok(fs.existsSync(path.join(installRoot, 'images', 'pickle-rick.png')));
@@ -40,12 +41,17 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'CLAUDE.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-pipeline', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-refine', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-tmux', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'anatomy-park', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'existing-skill', 'SKILL.md')));
   assert.match(
     fs.readFileSync(path.join(codexHome, 'skills', 'pickle', 'SKILL.md'), 'utf8'),
+    new RegExp(escapeRegex(installRoot)),
+  );
+  assert.match(
+    fs.readFileSync(path.join(codexHome, 'skills', 'pickle-pipeline', 'SKILL.md'), 'utf8'),
     new RegExp(escapeRegex(installRoot)),
   );
   const globalAgents = fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8');
@@ -126,6 +132,7 @@ test('install.sh --project preserves existing project codex state while adding r
   assert.match(output, /global Pickle Rick install remains available in every workspace/);
   assert.ok(fs.existsSync(path.join(projectDir, 'AGENTS.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle', 'SKILL.md')));
+  assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle-pipeline', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle-refine', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'pickle-tmux', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'skills', 'anatomy-park', 'SKILL.md')));
@@ -133,6 +140,10 @@ test('install.sh --project preserves existing project codex state while adding r
   assert.equal(fs.existsSync(path.join(projectDir, '.codex', 'hooks', 'hooks.json')), false);
   assert.match(
     fs.readFileSync(path.join(projectDir, '.codex', 'skills', 'pickle', 'SKILL.md'), 'utf8'),
+    new RegExp(escapeRegex(installRoot)),
+  );
+  assert.match(
+    fs.readFileSync(path.join(projectDir, '.codex', 'skills', 'pickle-pipeline', 'SKILL.md'), 'utf8'),
     new RegExp(escapeRegex(installRoot)),
   );
   const projectAgents = fs.readFileSync(path.join(projectDir, 'AGENTS.md'), 'utf8');

@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logActivity } from '../lib/activity-logger.js';
 import { loadConfig } from '../lib/config.js';
-import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
+import { getRunStartEpoch, markRunStart } from '../lib/session.js';
+import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../lib/pipeline-bootstrap.js';
+import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
 import { StateManager } from '../lib/state-manager.js';
 import {
   areTicketDependenciesSatisfied,
@@ -12,11 +15,12 @@ import {
   unresolvedTicketDependencies,
   updateTicketStatus,
 } from '../lib/tickets.js';
-import { isPreflightError } from '../lib/verification-env.js';
+import { isPreflightError, isVerificationContractError } from '../lib/verification-env.js';
 import { runTicket } from './spawn-morty.js';
 
-function appendRunnerLog(sessionDir, message) {
-  const filePath = path.join(sessionDir, 'mux-runner.log');
+function appendRunnerLog(sessionDir, mode, message) {
+  const descriptor = getRunnerDescriptor(mode);
+  const filePath = path.join(sessionDir, descriptor.runnerLog);
   fs.appendFileSync(filePath, `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
 }
 
@@ -50,33 +54,25 @@ export async function runSequential(sessionDir, options = {}) {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const failureMode = options.onFailure || 'abort';
+  const runnerMode = options.runnerMode || 'pickle';
+  const runnerDescriptor = getRunnerDescriptor(runnerMode);
+  const runnerLabel = runnerDescriptor.runnerStartMarker.replace(/\s+started$/, '');
   const config = loadConfig();
   let exitReason = 'success';
   let failedTicketId = null;
 
-  appendRunnerLog(sessionDir, 'mux-runner started');
-  manager.update(statePath, (state) => {
-    state.active = true;
-    state.tmux_runner_pid = process.pid;
-    state.last_exit_reason = null;
-    state.cancel_requested_at = null;
-    state.active_child_pid = null;
-    state.active_child_kind = null;
-    state.active_child_command = null;
-    state.worker_pid = null;
-    markRunStart(state);
-    appendHistory(state, 'runner_start', state.current_ticket || undefined);
-    return state;
-  });
+  appendRunnerLog(sessionDir, runnerMode, runnerDescriptor.runnerStartMarker);
+  enterMuxRunnerPhase(manager, statePath, { markRunStart });
 
   const summary = summarizeTickets(sessionDir);
   if (!summary.total) {
     exitReason = 'no_tickets';
-    appendRunnerLog(sessionDir, 'no tickets found in refinement manifest');
+    appendRunnerLog(sessionDir, runnerMode, 'no tickets found in refinement manifest');
   } else if (!summary.runnable.length) {
     exitReason = 'no_tickets';
     appendRunnerLog(
       sessionDir,
+      runnerMode,
       `no runnable tickets found (done=${summary.done} blocked=${summary.blocked} skipped=${summary.skipped})`,
     );
   }
@@ -89,7 +85,7 @@ export async function runSequential(sessionDir, options = {}) {
     const ticketStopReason = shouldStop(manager.read(statePath));
     if (ticketStopReason) {
       exitReason = ticketStopReason;
-      appendRunnerLog(sessionDir, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
+      appendRunnerLog(sessionDir, runnerMode, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
       break;
     }
 
@@ -104,7 +100,7 @@ export async function runSequential(sessionDir, options = {}) {
         failed_at: new Date().toISOString(),
         failure_reason: `Unresolved dependencies: ${unresolved.join(', ')}`,
       });
-      appendRunnerLog(sessionDir, `blocking ticket ${ticket.id}: unresolved dependencies ${unresolved.join(', ')}`);
+      appendRunnerLog(sessionDir, runnerMode, `blocking ticket ${ticket.id}: unresolved dependencies ${unresolved.join(', ')}`);
       break;
     }
 
@@ -116,38 +112,45 @@ export async function runSequential(sessionDir, options = {}) {
       const stopReason = shouldStop(latestState);
       if (stopReason) {
         exitReason = stopReason;
-        appendRunnerLog(sessionDir, `stopping during ticket ${ticket.id}: ${stopReason}`);
+        appendRunnerLog(sessionDir, runnerMode, `stopping during ticket ${ticket.id}: ${stopReason}`);
         break;
       }
 
       attempts += 1;
       try {
-        appendRunnerLog(sessionDir, `starting ticket ${ticket.id} attempt ${attempts}/${maxAttempts}`);
+        appendRunnerLog(sessionDir, runnerMode, `starting ticket ${ticket.id} attempt ${attempts}/${maxAttempts}`);
         await runTicket(sessionDir, ticket.id, options);
         ticket.status = 'Done';
-        appendRunnerLog(sessionDir, `completed ticket ${ticket.id}`);
+        appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
         break;
       } catch (error) {
         const cancelled = manager.read(statePath).active === false;
         if (cancelled) {
           exitReason = manager.read(statePath).last_exit_reason || 'cancelled';
-          appendRunnerLog(sessionDir, `ticket ${ticket.id} stopped: ${exitReason}`);
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} stopped: ${exitReason}`);
           break;
         }
         if (isPreflightError(error)) {
           failedTicketId = ticket.id;
           exitReason = error.kind;
-          appendRunnerLog(sessionDir, `ticket ${ticket.id} preflight blocked: ${error.message}`);
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight blocked: ${error.message}`);
           break;
         }
-        appendRunnerLog(sessionDir, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
+        if (isVerificationContractError(error)) {
+          failedTicketId = ticket.id;
+          exitReason = error.kind;
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract blocked: ${error.message}`);
+          appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} stopping on ${ticket.id} without retry`);
+          break;
+        }
+        appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
         if (attempts < maxAttempts) {
           const retryStopReason = shouldStop(manager.read(statePath));
           if (retryStopReason === 'max_time' || retryStopReason === 'max_iterations') {
             failedTicketId = ticket.id;
             exitReason = 'error';
-            appendRunnerLog(sessionDir, `not retrying ${ticket.id}: ${retryStopReason} would mask the current failure`);
-            appendRunnerLog(sessionDir, `mux-runner aborting on ${ticket.id}`);
+            appendRunnerLog(sessionDir, runnerMode, `not retrying ${ticket.id}: ${retryStopReason} would mask the current failure`);
+            appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
             break;
           }
           continue;
@@ -155,12 +158,12 @@ export async function runSequential(sessionDir, options = {}) {
         if (failureMode === 'skip') {
           ticket.status = 'Skipped';
           updateTicketStatus(sessionDir, ticket.id, { status: 'Skipped', skipped_at: new Date().toISOString() });
-          appendRunnerLog(sessionDir, `skipping ticket ${ticket.id}`);
+          appendRunnerLog(sessionDir, runnerMode, `skipping ticket ${ticket.id}`);
           break;
         }
         failedTicketId = ticket.id;
         exitReason = 'error';
-        appendRunnerLog(sessionDir, `mux-runner aborting on ${ticket.id}`);
+        appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       }
     }
@@ -170,38 +173,13 @@ export async function runSequential(sessionDir, options = {}) {
     }
   }
 
-  manager.update(statePath, (state) => {
-    const finalReason = state.active === false && state.last_exit_reason
-      ? state.last_exit_reason
-      : exitReason;
-    state.active = false;
-    state.tmux_runner_pid = null;
-    state.worker_pid = null;
-    state.active_child_pid = null;
-    state.active_child_kind = null;
-    state.active_child_command = null;
-    state.last_exit_reason = finalReason;
-    if (finalReason === 'success') {
-      state.current_ticket = null;
-      state.step = 'complete';
-      appendHistory(state, 'complete');
-    } else {
-      state.current_ticket = finalReason === 'error' || String(finalReason).startsWith('preflight-')
-        ? failedTicketId || state.current_ticket || null
-        : null;
-      state.step = String(finalReason).startsWith('preflight-') ? 'blocked' : 'paused';
-      if (finalReason === 'error') {
-        appendHistory(state, 'failed', state.current_ticket || undefined);
-      } else if (String(finalReason).startsWith('preflight-')) {
-        appendHistory(state, finalReason, state.current_ticket || undefined);
-      } else {
-        appendHistory(state, finalReason);
-      }
-    }
-    return state;
+  const finalReason = exitMuxRunnerPhase(manager, statePath, {
+    exitReason,
+    failedTicketId,
+    deferTerminalState: runnerMode === 'pipeline',
   });
 
-  if (manager.read(statePath).last_exit_reason === 'success') {
+  if (finalReason === 'success') {
     logActivity({
       event: 'epic_completed',
       source: 'pickle',
@@ -209,8 +187,8 @@ export async function runSequential(sessionDir, options = {}) {
     }, { enabled: config.defaults.activity_logging });
   }
 
-  appendRunnerLog(sessionDir, `mux-runner finished: ${manager.read(statePath).last_exit_reason}`);
-  return manager.read(statePath).last_exit_reason;
+  appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} finished: ${finalReason}`);
+  return finalReason;
 }
 
 async function main(argv) {
@@ -219,12 +197,20 @@ async function main(argv) {
     throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
   const exitReason = await runSequential(sessionDir, { onFailure: parseFailureMode(argv) });
-  if (exitReason === 'error' || exitReason === 'no_tickets' || exitReason === 'invalid_session' || String(exitReason).startsWith('preflight-')) {
+  if (
+    exitReason === 'error'
+    || exitReason === 'no_tickets'
+    || exitReason === 'invalid_session'
+    || exitReason === 'verification-contract-failed'
+    || String(exitReason).startsWith('preflight-')
+  ) {
     process.exitCode = 1;
   }
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

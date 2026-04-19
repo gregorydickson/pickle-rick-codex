@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { listRunnerDescriptors } from '../lib/runner-descriptors.js';
 
 export const repoRoot = path.resolve(new URL('..', import.meta.url).pathname);
 
@@ -158,6 +159,11 @@ if (prompt.includes('Loop mode:')) {
       ].join('\\n'),
     );
   }
+  const failAt = Number(process.env.FAKE_LOOP_FAIL_AT || '0');
+  if (failAt > 0 && current === failAt) {
+    console.error(process.env.FAKE_LOOP_ERROR_MESSAGE || 'fake loop failure');
+    process.exit(Number(process.env.FAKE_LOOP_EXIT_CODE || '1'));
+  }
   const completeAfter = Number(process.env.FAKE_LOOP_COMPLETE_AFTER || '2');
   lastMessage = current >= completeAfter ? '<promise>LOOP_COMPLETE</promise>' : '<promise>CONTINUE</promise>';
 } else if (prompt.includes('Refinement analyst role:')) {
@@ -275,8 +281,10 @@ console.log(JSON.stringify({
 }));
 
 const hangMs = Number(process.env.FAKE_CODEX_HANG_MS || '0');
-if (hangMs > 0) {
-  setTimeout(() => process.exit(0), hangMs);
+const loopHangMs = prompt.includes('Loop mode:') ? Number(process.env.FAKE_LOOP_HANG_MS || '0') : 0;
+const effectiveHangMs = loopHangMs || hangMs;
+if (effectiveHangMs > 0) {
+  setTimeout(() => process.exit(0), effectiveHangMs);
 } else {
 process.exit(0);
 }
@@ -285,6 +293,7 @@ process.exit(0);
 }
 
 export function createFakeTmux(binDir) {
+  const runnerDescriptors = listRunnerDescriptors();
   return writeExecutable(
     path.join(binDir, 'tmux'),
     `#!/usr/bin/env node
@@ -293,6 +302,7 @@ import path from 'node:path';
 
 const args = process.argv.slice(2);
 const logPath = process.env.FAKE_TMUX_LOG || '';
+const runnerDescriptors = ${JSON.stringify(runnerDescriptors)};
 
 function latestSessionDir() {
   const dataRoot = process.env.PICKLE_DATA_ROOT || '';
@@ -329,9 +339,14 @@ function simulateRunnerStart(mode) {
     state.last_exit_reason = null;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   }
-  const runnerLogName = mode === 'pickle' ? 'mux-runner.log' : 'loop-runner.log';
-  const runnerMarker = mode === 'pickle' ? 'mux-runner started' : 'loop-runner started (fake)';
-  fs.appendFileSync(path.join(sessionDir, runnerLogName), '[2026-04-18T00:00:00.000Z] ' + runnerMarker + '\\n');
+  const descriptor = runnerDescriptors[mode];
+  if (!descriptor) {
+    return;
+  }
+  fs.appendFileSync(
+    path.join(sessionDir, descriptor.runnerLog),
+    '[2026-04-18T00:00:00.000Z] ' + descriptor.runnerStartMarker + ' (fake)\\n',
+  );
 }
 
 if (logPath) {
@@ -360,10 +375,9 @@ if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-
 
 if (args[0] === 'respawn-pane') {
   const command = args.at(-1) || '';
-  if (command.includes('mux-runner.js')) {
-    simulateRunnerStart('pickle');
-  } else if (command.includes('loop-runner.js')) {
-    simulateRunnerStart('loop');
+  const runnerMode = Object.entries(runnerDescriptors).find(([, descriptor]) => command.includes(descriptor.runnerBin))?.[0];
+  if (runnerMode) {
+    simulateRunnerStart(runnerMode);
   }
   process.exit(0);
 }

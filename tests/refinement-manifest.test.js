@@ -201,6 +201,34 @@ test('enrichRefinementManifest infers wrapper env requirements and normalizes fr
   });
 });
 
+test('enrichRefinementManifest preserves ambiguous evolving external freeze contracts without defaulting to fixed SHA', () => {
+  const manifest = {
+    tickets: [
+      {
+        id: 'T02',
+        title: 'Decide evolving external contract',
+        description: 'Record the contract decision before choosing runtime commit pinning.',
+        acceptance_criteria: ['The refinement preserves the ambiguity until commit pinning is explicitly required.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        freezeContract: {
+          path: 'research/external-contract-freeze.md',
+          env: 'ATTRACTOR_ROOT',
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  };
+
+  const enriched = enrichRefinementManifest(manifest);
+  assert.deepEqual(enriched.manifest.tickets[0].freeze_contract, {
+    artifact_path: 'research/external-contract-freeze.md',
+    sibling: 'attractor',
+    root_env: 'ATTRACTOR_ROOT',
+    sha_source: '',
+  });
+});
+
 test('validateRefinementManifest rejects fallback parser output with placeholder contracts', () => {
   const issues = validateRefinementManifest(fallbackRefinePrd([
     '# PRD',
@@ -345,7 +373,62 @@ test('validateRefinementManifest rejects conflicting freeze authorities and cons
   assert.ok(issues.some((issue) => issue.includes('freeze_contract disagrees with authoritative producer')));
 });
 
-test('validateRefinementManifest rejects freeze consumers without an authoritative producer', () => {
+test('validateRefinementManifest rejects opaque wrapper verification without declared contracts', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'wrapper-only',
+        title: 'Run wrapper without proof',
+        description: 'This should fail because the wrapper hides the real contract.',
+        acceptance_criteria: ['Wrapper execution is backed by explicit artifacts and env contracts.'],
+        verification: ['bun run check:env'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('opaque verification wrapper commands require explicit')));
+  assert.ok(issues.some((issue) => issue.includes('wrapper verification requires explicit contracts instead of opaque shell assumptions')));
+});
+
+test('validateRefinementManifest rejects freeze consumers when no authoritative producer exists', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'artifact-owner',
+        title: 'Own freeze artifact path only',
+        description: 'This ticket owns the artifact path but does not define the authoritative freeze contract.',
+        acceptance_criteria: ['The artifact path is present.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        output_artifacts: ['research/external-contract-freeze.md'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'freeze-consumer',
+        title: 'Consume contract artifact',
+        description: 'This should fail because no authoritative sibling-SHA producer exists.',
+        acceptance_criteria: ['The consumer aligns with the frozen sibling SHA.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        freeze_contract: {
+          artifact_path: 'research/external-contract-freeze.md',
+          sibling: 'attractor',
+          root_env: 'ATTRACTOR_ROOT',
+          sha_source: 'git:ATTRACTOR_ROOT:HEAD',
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('freeze_contract for "research/external-contract-freeze.md" has no authoritative producer')));
+});
+
+test('validateRefinementManifest requires an explicit contract-decision ticket for ambiguous evolving external contracts', () => {
   const issues = validateRefinementManifest({
     source: 'fake-codex-synthesis',
     tickets: [
@@ -365,8 +448,43 @@ test('validateRefinementManifest rejects freeze consumers without an authoritati
     ],
   });
 
-  assert.ok(issues.some((issue) => issue.includes('no authoritative producer exists')));
-  assert.ok(issues.some((issue) => issue.includes('freeze_contract for "research/external-contract-freeze.md" has no authoritative producer')));
+  assert.ok(issues.some((issue) => issue.includes('explicit contract-decision ticket')));
+  assert.ok(!issues.some((issue) => issue.includes('freeze_contract for "research/external-contract-freeze.md" has no authoritative producer')));
+});
+
+test('validateRefinementManifest preserves explicit contract-decision tickets for ambiguous evolving external contracts', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'contract-decision',
+        title: 'Contract decision for evolving external validation',
+        description: 'Decide whether this artifact stays live against the evolving sibling or requires fixed-SHA commit pinning.',
+        acceptance_criteria: ['The refinement captures the chosen contract explicitly before implementation proceeds.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        output_artifacts: ['research/external-contract-freeze.md'],
+        contract_decision: true,
+        priority: 'P0',
+        status: 'Todo',
+      },
+      {
+        id: 'consumer',
+        title: 'Validate external contract artifact',
+        description: 'Preserve the ambiguity until the contract-decision ticket resolves pinning.',
+        acceptance_criteria: ['Verification defers fixed-SHA enforcement until the decision ticket resolves it.'],
+        verification: ['test -f research/external-contract-freeze.md'],
+        freezeContract: {
+          path: 'research/external-contract-freeze.md',
+          env: 'ATTRACTOR_ROOT',
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.ok(!issues.some((issue) => issue.includes('explicit contract-decision ticket')));
+  assert.ok(!issues.some((issue) => issue.includes('no authoritative producer exists')));
 });
 
 test('summarizeTickets and ensureTicketFilesMaterialized restore missing ticket files from the manifest', () => {

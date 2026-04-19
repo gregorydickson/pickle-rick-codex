@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { runCodexExecMonitored, assertCodexSucceeded } from '../lib/codex.js';
+import { fileURLToPath } from 'node:url';
+import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { logActivity } from '../lib/activity-logger.js';
 import {
@@ -14,20 +15,13 @@ import {
 } from '../lib/git-utils.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
 import { buildLoopPrompt } from '../lib/prompts.js';
-import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
+import { appendHistory, getRunStartEpoch } from '../lib/session.js';
+import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../lib/pipeline-phase-setup.js';
 import { StateManager } from '../lib/state-manager.js';
 import { readJsonFile } from '../lib/pickle-utils.js';
 
 function appendRunnerLog(sessionDir, message) {
   fs.appendFileSync(path.join(sessionDir, 'loop-runner.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
-}
-
-function readLoopConfig(sessionDir) {
-  const config = readJsonFile(path.join(sessionDir, 'loop_config.json'), null);
-  if (!config || !config.mode) {
-    throw new Error(`Missing loop_config.json in ${sessionDir}`);
-  }
-  return config;
 }
 
 function getWorkerTimeoutMs(state, config) {
@@ -43,6 +37,22 @@ function summaryPaths(sessionDir, mode) {
     markdown: path.join(sessionDir, `${mode}-summary.md`),
     stopJson: path.join(sessionDir, `${mode}-stop-summary.json`),
     stopMarkdown: path.join(sessionDir, `${mode}-stop-summary.md`),
+  };
+}
+
+function loopSuccessCheck(outputLastMessagePath) {
+  return ({ stdout, lastMessage }) => {
+    if (hasPromiseToken(lastMessage, 'LOOP_COMPLETE') || hasPromiseToken(lastMessage, 'TASK_COMPLETED') || hasPromiseToken(lastMessage, 'CONTINUE')) {
+      return true;
+    }
+    if (hasPromiseToken(stdout, 'LOOP_COMPLETE') || hasPromiseToken(stdout, 'TASK_COMPLETED') || hasPromiseToken(stdout, 'CONTINUE')) {
+      return true;
+    }
+    return outputLastMessagePath && (
+      hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'LOOP_COMPLETE')
+      || hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'TASK_COMPLETED')
+      || hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'CONTINUE')
+    );
   };
 }
 
@@ -217,21 +227,7 @@ export async function runLoop(sessionDir) {
 
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
   ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, initialState.working_dir);
-  manager.update(statePath, (state) => {
-    state.active = true;
-    state.tmux_runner_pid = process.pid;
-    state.step = loopConfig.mode;
-    state.last_exit_reason = null;
-    state.cancel_requested_at = null;
-    state.loop_mode = loopConfig.mode;
-    state.loop_stall_count = 0;
-    state.active_child_pid = null;
-    state.active_child_kind = null;
-    state.active_child_command = null;
-    markRunStart(state);
-    appendHistory(state, `${loopConfig.mode}_runner_start`, state.current_ticket || undefined);
-    return state;
-  });
+  enterLoopRunnerPhase(manager, statePath, loopConfig.mode);
 
   let exitReason = 'success';
   let thrownError = null;
@@ -268,6 +264,7 @@ export async function runLoop(sessionDir) {
         return current;
       });
 
+      const outputLastMessagePath = path.join(sessionDir, `${loopConfig.mode}.${state.iteration + 1}.last-message.txt`);
       const result = await runCodexExecMonitored({
         cwd: state.working_dir,
         prompt: buildLoopPrompt({
@@ -278,8 +275,11 @@ export async function runLoop(sessionDir) {
           loopConfig,
         }),
         timeoutMs: getWorkerTimeoutMs(state, config),
-        outputLastMessagePath: path.join(sessionDir, `${loopConfig.mode}.${state.iteration + 1}.last-message.txt`),
+        outputLastMessagePath,
         addDirs: [sessionDir],
+        successCheck: loopSuccessCheck(outputLastMessagePath),
+        successSignalGraceMs: 150,
+        successPollMs: 50,
         onSpawn: (child) => {
           manager.update(statePath, (current) => {
             current.active_child_pid = child.pid;
@@ -350,23 +350,9 @@ export async function runLoop(sessionDir) {
       thrownError = error;
     }
   } finally {
-    manager.update(statePath, (state) => {
-      const finalReason = state.active === false && state.last_exit_reason
-        ? state.last_exit_reason
-        : exitReason;
-      state.active = false;
-      state.tmux_runner_pid = null;
-      state.active_child_pid = null;
-      state.active_child_kind = null;
-      state.active_child_command = null;
-      state.last_exit_reason = finalReason;
-      state.step = finalReason === 'success' ? 'complete' : 'paused';
-      appendHistory(state, finalReason === 'success' ? 'complete' : finalReason, state.current_ticket || undefined);
-      return state;
-    });
-
-    writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), manager.read(statePath).last_exit_reason);
-    appendRunnerLog(sessionDir, `loop-runner finished: ${manager.read(statePath).last_exit_reason}`);
+    const finalReason = exitLoopRunnerPhase(manager, statePath, exitReason);
+    writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), finalReason);
+    appendRunnerLog(sessionDir, `loop-runner finished: ${finalReason}`);
   }
 
   if (manager.read(statePath).last_exit_reason === 'success') {
@@ -390,7 +376,9 @@ async function main(argv) {
   await runLoop(sessionDir);
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

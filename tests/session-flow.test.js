@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { launchDetachedLoop } from '../lib/detached-launch.js';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
+import { listRunnerDescriptors } from '../lib/runner-descriptors.js';
 import { updateSessionMap } from '../lib/session-map.js';
 import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
@@ -25,8 +26,60 @@ function initGitRepo(repoDir) {
   runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
 }
 
+function createPipelineSession({
+  env,
+  projectDir,
+  task = 'pipeline session task',
+  phases = ['pickle', 'anatomy-park'],
+  anatomy = {},
+  szechuan = {},
+} = {}) {
+  const realProjectDir = fs.realpathSync(projectDir);
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', task], {
+    env,
+    cwd: realProjectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Pickle ticket',
+        description: 'Complete the pickle phase.',
+        acceptance_criteria: ['The phase can advance to the next pipeline phase.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  writeJson(path.join(sessionDir, 'pipeline.json'), {
+    schema_version: 1,
+    working_dir: realProjectDir,
+    target: realProjectDir,
+    phases,
+    skip_flags: {
+      anatomy: !phases.includes('anatomy-park'),
+      szechuan: !phases.includes('szechuan-sauce'),
+    },
+    bootstrap_source: 'task',
+    task,
+    anatomy,
+    szechuan,
+  });
+
+  return sessionDir;
+}
+
+function sessionDirFromLaunchOutput(output) {
+  const statePath = output.match(/^State: (.+\/state\.json)$/m)?.[1];
+  assert.ok(statePath, `missing state path in output:\n${output}`);
+  return path.dirname(statePath);
+}
+
 function createStaleSessionFakeTmux(binDir, sessionName) {
   const staleFile = path.join(binDir, 'fake-tmux-stale-session.txt');
+  const runnerDescriptors = listRunnerDescriptors();
   fs.writeFileSync(staleFile, sessionName);
   return writeExecutable(
     path.join(binDir, 'tmux'),
@@ -37,6 +90,7 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const logPath = process.env.FAKE_TMUX_LOG || '';
 const staleFile = ${JSON.stringify(staleFile)};
+const runnerDescriptors = ${JSON.stringify(runnerDescriptors)};
 
 function latestSessionDir() {
   const dataRoot = process.env.PICKLE_DATA_ROOT || '';
@@ -70,9 +124,14 @@ function simulateRunnerStart(mode) {
     state.last_exit_reason = null;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   }
-  const runnerLogName = mode === 'pickle' ? 'mux-runner.log' : 'loop-runner.log';
-  const runnerMarker = mode === 'pickle' ? 'mux-runner started' : 'loop-runner started (fake)';
-  fs.appendFileSync(path.join(sessionDir, runnerLogName), '[2026-04-18T00:00:00.000Z] ' + runnerMarker + '\\n');
+  const descriptor = runnerDescriptors[mode];
+  if (!descriptor) {
+    return;
+  }
+  fs.appendFileSync(
+    path.join(sessionDir, descriptor.runnerLog),
+    '[2026-04-18T00:00:00.000Z] ' + descriptor.runnerStartMarker + ' (fake)\\n',
+  );
 }
 
 if (logPath) {
@@ -115,10 +174,9 @@ if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-
 
 if (args[0] === 'respawn-pane') {
   const command = args.at(-1) || '';
-  if (command.includes('mux-runner.js')) {
-    simulateRunnerStart('pickle');
-  } else if (command.includes('loop-runner.js')) {
-    simulateRunnerStart('loop');
+  const runnerMode = Object.entries(runnerDescriptors).find(([, descriptor]) => command.includes(descriptor.runnerBin))?.[0];
+  if (runnerMode) {
+    simulateRunnerStart(runnerMode);
   }
   process.exit(0);
 }
@@ -136,7 +194,7 @@ test('setup command creates a session and get-session resolves it', () => {
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
 
   assert.equal(fetched, sessionDir);
-  assert.equal(state.max_time_minutes, 0);
+  assert.equal(state.max_time_minutes, 480);
   const map = readJsonFile(path.join(dataRoot, 'current_sessions.json'), {});
   assert.equal(map[repoRoot], sessionDir);
 });
@@ -321,6 +379,80 @@ test('status command shows ticket counts, title, verification, and last failure'
   assert.match(output, /Iteration: 4 \/ unlimited/);
 });
 
+test('status renders pipeline metadata without regressing non-pipeline sessions', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const realProjectDir = fs.realpathSync(projectDir);
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  const nonPipelineSession = runNode([path.join(repoRoot, 'bin/setup.js'), 'non pipeline status task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const nonPipelineTicketDir = path.join(nonPipelineSession, 'ticket-a');
+  fs.mkdirSync(nonPipelineTicketDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(nonPipelineTicketDir, 'linear_ticket_ticket-a.md'),
+    '---\nid: "ticket-a"\ntitle: "Current Ticket"\nstatus: "In Progress"\norder: 1\nverify: "npm test && npm run lint"\n---\n# body\n',
+  );
+  writeJson(path.join(nonPipelineSession, 'state.json'), {
+    active: true,
+    working_dir: projectDir,
+    step: 'implement',
+    iteration: 4,
+    max_iterations: 0,
+    max_time_minutes: 10,
+    worker_timeout_seconds: 60,
+    start_time_epoch: 0,
+    original_prompt: 'non pipeline status task',
+    current_ticket: 'ticket-a',
+    history: [],
+    started_at: '2026-04-15T00:00:00.000Z',
+    session_dir: nonPipelineSession,
+    schema_version: 1,
+    tmux_mode: true,
+    last_exit_reason: null,
+  });
+
+  const nonPipelineStatus = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', nonPipelineSession], {
+    env,
+  }).trim();
+  assert.match(nonPipelineStatus, /Ticket: ticket-a - Current Ticket/);
+  assert.match(nonPipelineStatus, /Next Verification: npm test && npm run lint/);
+  assert.doesNotMatch(nonPipelineStatus, /Pipeline Phase:/);
+  assert.doesNotMatch(nonPipelineStatus, /Pipeline Bootstrap:/);
+
+  const pipelineSession = createPipelineSession({
+    env,
+    projectDir,
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+  });
+  writeJson(path.join(pipelineSession, 'pipeline-state.json'), {
+    schema_version: 1,
+    current_phase: 'anatomy-park',
+    current_phase_index: 1,
+    phase_statuses: {
+      pickle: 'done',
+      'anatomy-park': 'running',
+      'szechuan-sauce': 'todo',
+    },
+    started_at: '2026-04-19T00:00:00.000Z',
+    phase_started_at: '2026-04-19T00:01:00.000Z',
+    completed_at: null,
+    last_error: null,
+    last_exit_reason: null,
+  });
+
+  const pipelineStatus = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', pipelineSession], {
+    env,
+  }).trim();
+  assert.match(pipelineStatus, /Pipeline Phase: anatomy-park \(2 \/ 3\)/);
+  assert.match(pipelineStatus, /Pipeline Phases: pickle=done \| anatomy-park=running \| szechuan-sauce=todo/);
+  assert.match(pipelineStatus, /Pipeline Bootstrap: task/);
+  assert.match(pipelineStatus, /Pipeline Task: pipeline session task/);
+  assert.match(pipelineStatus, new RegExp(`Pipeline Target: ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+});
+
 test('cancel marks the session inactive and removes the session map entry', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -328,12 +460,48 @@ test('cancel marks the session inactive and removes the session map entry', () =
   const env = { PICKLE_DATA_ROOT: dataRoot };
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'cancel task'], { env, cwd: realProjectDir }).trim();
 
+  writeJson(path.join(sessionDir, 'pipeline.json'), {
+    schema_version: 1,
+    working_dir: realProjectDir,
+    target: realProjectDir,
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+    skip_flags: {
+      anatomy: false,
+      szechuan: false,
+    },
+    bootstrap_source: 'task',
+    task: 'cancel task',
+  });
+  writeJson(path.join(sessionDir, 'pipeline-state.json'), {
+    schema_version: 1,
+    current_phase: 'anatomy-park',
+    current_phase_index: 1,
+    phase_statuses: {
+      pickle: 'done',
+      'anatomy-park': 'running',
+      'szechuan-sauce': 'todo',
+    },
+    started_at: '2026-04-19T00:00:00.000Z',
+    phase_started_at: '2026-04-19T00:01:00.000Z',
+    completed_at: null,
+    last_error: null,
+    last_exit_reason: null,
+  });
+
   const output = runNode([path.join(repoRoot, 'bin/cancel.js'), '--cwd', realProjectDir], { env }).trim();
   assert.match(output, new RegExp(`^Cancelled ${sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`));
 
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
   assert.equal(state.active, false);
   assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.pipeline_mode, true);
+  assert.equal(state.pipeline_phase, 'anatomy-park');
+  assert.equal(state.pipeline_phase_index, 1);
+  assert.equal(state.pipeline_total_phases, 3);
+  assert.equal(pipelineState.current_phase, 'anatomy-park');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'cancelled');
+  assert.equal(pipelineState.last_exit_reason, 'cancelled');
   assert.equal(readJsonFile(path.join(dataRoot, 'current_sessions.json'), {} )[projectDir], undefined);
 });
 
@@ -1196,6 +1364,87 @@ process.exit(1);
   assert.equal(fs.readFileSync(countPath, 'utf8'), '1');
 });
 
+test('mux-runner does not retry verification-contract failures and leaves the ticket blocked', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const countPath = path.join(dataRoot, 'codex-contract-count.txt');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+const counterPath = ${JSON.stringify(countPath)};
+const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
+fs.writeFileSync(counterPath, String(current));
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, '<promise>SIMPLIFY_COMPLETE</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'verification contract retry task'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Verification contract blocker',
+        description: 'Implementation succeeds but the declared contract is wrong.',
+        acceptance_criteria: ['Verification contract failures block without replaying the whole ticket.'],
+        verification: ['test -f research/proof.txt'],
+        output_artifacts: ['research/proof.txt'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  try {
+    runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
+      env,
+      cwd: repoRoot,
+    });
+  } catch {
+    // Exit code is part of the assertion.
+  }
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'verification-contract-failed');
+  assert.equal(state.step, 'blocked');
+  assert.equal(state.current_ticket, 'r1');
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'verification-contract-failed');
+  assert.match(ticket.frontmatter.failure_reason, /research\/proof\.txt/);
+  assert.match(log, /verification contract blocked/);
+  assert.match(log, /without retry/);
+  assert.doesNotMatch(log, /attempt 2\/2/);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '5');
+});
+
 test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLETE', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -1400,6 +1649,546 @@ test('loop-runner passes the persisted iteration budget to anatomy-park prompts 
   const prompt = fs.readFileSync(path.join(sessionDir, 'loop-iteration-1.txt'), 'utf8');
   assert.match(prompt, /Iteration: 22 \/ unlimited/);
   assert.doesNotMatch(prompt, /Iteration: 23 \/ 0/);
+});
+
+test('pickle-pipeline advances from pickle to anatomy-park in one tmux session', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline anatomy handoff task',
+    phases: ['pickle', 'anatomy-park'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, {
+    ...readJsonFile(statePath),
+    tmux_session_name: 'pickle-shared-session',
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const state = readJsonFile(statePath);
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
+  const pipelineLog = fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8');
+  const loopLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const loopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+
+  assert.equal(state.tmux_session_name, 'pickle-shared-session');
+  assert.equal(state.command_template, 'anatomy-park.md');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.step, 'complete');
+  assert.equal(pipelineState.current_phase, null);
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'done');
+  assert.equal(loopConfig.mode, 'anatomy-park');
+  assert.equal(loopConfig.target, fs.realpathSync(projectDir));
+  assert.match(pipelineLog, /pipeline-runner started/);
+  assert.match(loopLog, /loop-runner started \(anatomy-park\)/);
+  assert.ok(state.history.some((entry) => entry.step === 'anatomy-park'));
+});
+
+test('pickle-pipeline does not launch nested tmux sessions for anatomy', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const tmuxLog = path.join(dataRoot, 'pipeline-anatomy-tmux.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline anatomy without nested tmux',
+    phases: ['pickle', 'anatomy-park'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  assert.equal(fs.existsSync(tmuxLog), false);
+});
+
+test('pickle-pipeline advances through all configured phases in one tmux session', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline full parity task',
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+    szechuan: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+      focus: 'shared abstractions',
+      domain: 'KISS',
+    },
+  });
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, {
+    ...readJsonFile(statePath),
+    tmux_session_name: 'pickle-shared-session',
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const state = readJsonFile(statePath);
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
+  const pipelineLog = fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8');
+  const loopLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const loopConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'));
+
+  assert.equal(state.tmux_session_name, 'pickle-shared-session');
+  assert.equal(state.command_template, 'szechuan-sauce.md');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.step, 'complete');
+  assert.equal(state.pipeline_phase, null);
+  assert.equal(state.pipeline_phase_index, null);
+  assert.equal(state.pipeline_total_phases, 3);
+  assert.equal(pipelineState.current_phase, null);
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'done');
+  assert.equal(pipelineState.phase_statuses['szechuan-sauce'], 'done');
+  assert.ok(pipelineState.completed_at);
+  assert.equal(loopConfig.mode, 'szechuan-sauce');
+  assert.equal(loopConfig.target, fs.realpathSync(projectDir));
+  assert.equal(loopConfig.focus, 'shared abstractions');
+  assert.equal(loopConfig.domain, 'KISS');
+  assert.match(pipelineLog, /pipeline-runner started/);
+  assert.match(pipelineLog, /pipeline-runner finished: success/);
+  assert.match(loopLog, /loop-runner started \(anatomy-park\)/);
+  assert.match(loopLog, /loop-runner started \(szechuan-sauce\)/);
+  assert.ok(state.history.some((entry) => entry.step === 'anatomy-park'));
+  assert.ok(state.history.some((entry) => entry.step === 'szechuan-sauce'));
+});
+
+test('pickle-pipeline honors immutable skip flags', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'pickle-pipeline-skip-flags.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const skipAnatomyOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-pipeline.js'),
+    '--skip-anatomy',
+    'skip anatomy pipeline task',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const skipAnatomySession = sessionDirFromLaunchOutput(skipAnatomyOutput);
+  const skipAnatomyPipeline = readJsonFile(path.join(skipAnatomySession, 'pipeline.json'));
+
+  assert.deepEqual(skipAnatomyPipeline.phases, ['pickle', 'szechuan-sauce']);
+  assert.deepEqual(skipAnatomyPipeline.skip_flags, {
+    anatomy: true,
+    szechuan: false,
+  });
+
+  const skipSzechuanOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-pipeline.js'),
+    '--skip-szechuan',
+    'skip szechuan pipeline task',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const skipSzechuanSession = sessionDirFromLaunchOutput(skipSzechuanOutput);
+  const skipSzechuanPipeline = readJsonFile(path.join(skipSzechuanSession, 'pipeline.json'));
+
+  assert.deepEqual(skipSzechuanPipeline.phases, ['pickle', 'anatomy-park']);
+  assert.deepEqual(skipSzechuanPipeline.skip_flags, {
+    anatomy: false,
+    szechuan: true,
+  });
+});
+
+test('pickle-pipeline resume rejects immutable contract mutation', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const otherProjectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'pickle-pipeline-resume-mutation.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const launchOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-pipeline.js'),
+    '--skip-szechuan',
+    'immutable pipeline contract task',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const sessionDir = sessionDirFromLaunchOutput(launchOutput);
+  const statePath = path.join(sessionDir, 'state.json');
+  const originalPipeline = readJsonFile(path.join(sessionDir, 'pipeline.json'));
+  writeJson(statePath, {
+    ...readJsonFile(statePath),
+    active: false,
+    tmux_runner_pid: null,
+    tmux_session_name: null,
+    last_exit_reason: 'cancelled',
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-pipeline.js'), '--resume', sessionDir], {
+      env,
+      cwd: otherProjectDir,
+    }),
+    /Cannot change pipeline target on resume/,
+  );
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-pipeline.js'), '--resume', sessionDir, '--skip-anatomy'], {
+      env,
+      cwd: projectDir,
+    }),
+    /Cannot change pipeline skip flags on resume/,
+  );
+
+  const pipeline = readJsonFile(path.join(sessionDir, 'pipeline.json'));
+  assert.deepEqual(pipeline, originalPipeline);
+});
+
+test('pickle-pipeline resumes the first incomplete phase', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline resume first incomplete task',
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+    szechuan: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  writeJson(path.join(sessionDir, 'pipeline-state.json'), {
+    schema_version: 1,
+    current_phase: 'pickle',
+    current_phase_index: 0,
+    phase_statuses: {
+      pickle: 'done',
+      'anatomy-park': 'done',
+      'szechuan-sauce': 'todo',
+    },
+    started_at: '2026-04-19T00:00:00.000Z',
+    phase_started_at: null,
+    completed_at: null,
+    last_error: null,
+    last_exit_reason: null,
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
+  const loopLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.equal(state.command_template, 'szechuan-sauce.md');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(pipelineState.current_phase, null);
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'done');
+  assert.equal(pipelineState.phase_statuses['szechuan-sauce'], 'done');
+  assert.match(loopLog, /loop-runner started \(szechuan-sauce\)/);
+  assert.doesNotMatch(loopLog, /loop-runner started \(anatomy-park\)/);
+});
+
+test('pickle-pipeline marks abrupt runner loss before resume', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'pickle-pipeline-runner-loss.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const launchOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-pipeline.js'),
+    '--skip-anatomy',
+    '--skip-szechuan',
+    'pipeline runner loss task',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const sessionDir = sessionDirFromLaunchOutput(launchOutput);
+  const statePath = path.join(sessionDir, 'state.json');
+  const launchedState = readJsonFile(statePath);
+
+  assert.equal(launchedState.active, true);
+  assert.equal(launchedState.tmux_runner_pid, 4242);
+  assert.equal(launchedState.last_exit_reason, null);
+
+  const resumeOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-pipeline.js'),
+    '--resume',
+    sessionDir,
+    '--resume-ready-only',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  assert.match(resumeOutput, /Pickle pipeline launched/);
+
+  const resumedState = readJsonFile(statePath);
+  assert.ok(resumedState.history.some((entry) => entry.step === 'runner_lost'));
+  assert.equal(resumedState.active, true);
+  assert.equal(resumedState.last_exit_reason, null);
+});
+
+test('pickle-pipeline does not launch nested tmux sessions for szechuan', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const tmuxLog = path.join(dataRoot, 'pipeline-szechuan-tmux.jsonl');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline szechuan without nested tmux',
+    phases: ['pickle', 'szechuan-sauce'],
+    szechuan: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  assert.equal(fs.existsSync(tmuxLog), false);
+});
+
+test('pickle-pipeline preserves anatomy-park dirty-tree auto-commit semantics', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  runGit(projectDir, ['add', 'index.js']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 2;\n');
+
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline anatomy dirty preflight task',
+    phases: ['pickle', 'anatomy-park'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+  const loopLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.notEqual(afterHead, beforeHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.equal(commitSubject, 'anatomy-park: auto-commit dirty tree before start');
+  assert.match(loopLog, /preflight auto-committed:/);
+});
+
+test('pickle-pipeline records cancel against anatomy and does not advance', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_HANG_MS: '2000',
+  });
+
+  const sessionDir = createPipelineSession({
+    env,
+    projectDir,
+    task: 'pipeline anatomy cancel task',
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  const child = spawn('node', [path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
+    cwd: projectDir,
+    env: {
+      ...process.env,
+      ...env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  await waitFor(() => {
+    const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'), null);
+    return pipelineState?.phase_statuses?.['anatomy-park'] === 'running';
+  }, { message: 'pipeline did not enter anatomy-park' });
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`pipeline-runner exited with ${code}`));
+    });
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
+
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.step, 'paused');
+  assert.equal(state.pipeline_phase, 'anatomy-park');
+  assert.equal(pipelineState.current_phase, 'anatomy-park');
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'cancelled');
+  assert.equal(pipelineState.phase_statuses['szechuan-sauce'], 'todo');
+  assert.equal(pipelineState.last_exit_reason, 'cancelled');
+
+  const failingDataRoot = makeTempRoot();
+  const failingProjectDir = makeTempRoot('pickle-rick-project-');
+  const failingFakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(failingFakeBin);
+  const failingEnv = prependPath(failingFakeBin, {
+    PICKLE_DATA_ROOT: failingDataRoot,
+    FAKE_LOOP_FAIL_AT: '1',
+    FAKE_LOOP_ERROR_MESSAGE: 'fake anatomy failure',
+  });
+
+  const failingSessionDir = createPipelineSession({
+    env: failingEnv,
+    projectDir: failingProjectDir,
+    task: 'pipeline anatomy failure task',
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
+    anatomy: {
+      max_iterations: 0,
+      stall_limit: 2,
+      dry_run: false,
+    },
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), failingSessionDir], {
+      env: failingEnv,
+      cwd: failingProjectDir,
+    }),
+    /fake anatomy failure/,
+  );
+
+  const failingState = readJsonFile(path.join(failingSessionDir, 'state.json'));
+  const failingPipelineState = readJsonFile(path.join(failingSessionDir, 'pipeline-state.json'));
+
+  assert.equal(failingState.last_exit_reason, 'error');
+  assert.equal(failingState.pipeline_phase, 'anatomy-park');
+  assert.equal(failingPipelineState.current_phase, 'anatomy-park');
+  assert.equal(failingPipelineState.phase_statuses.pickle, 'done');
+  assert.equal(failingPipelineState.phase_statuses['anatomy-park'], 'failed');
+  assert.equal(failingPipelineState.phase_statuses['szechuan-sauce'], 'todo');
+  assert.equal(failingPipelineState.last_exit_reason, 'error');
 });
 
 test('loop-runner auto-commits a dirty anatomy-park git tree before the first iteration', () => {

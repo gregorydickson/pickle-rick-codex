@@ -90,6 +90,62 @@ sync_runtime_source_tree() {
   cp -R "$repo_root/tests" "$runtime_root/"
 }
 
+write_pickle_pipeline_skill() {
+  local skills_root="$1"
+  local runtime_root="$2"
+  local skill_dir="$skills_root/pickle-pipeline"
+
+  mkdir -p "$skill_dir"
+  cat > "$skill_dir/SKILL.md" <<'EOF'
+---
+name: pickle-pipeline
+description: "Launch the proven detached Pickle Rick pipeline that runs pickle, then optional anatomy-park and szechuan-sauce phases in one tmux session."
+metadata:
+  short-description: "Detached multi-phase pipeline mode"
+---
+
+# Pickle Rick Pipeline
+
+Launch from a task string:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js "ship the feature"`
+
+Launch from an existing PRD:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --prd ./prd.md`
+
+Resume the latest pipeline session for the current repo:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --resume`
+
+Resume a specific pipeline session:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --resume <session-dir>`
+
+Skip downstream phases explicitly:
+
+`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js "ship the feature" --skip-anatomy --skip-szechuan`
+
+## Behavior
+
+1. Verifies `tmux` is available before detach
+2. Bootstraps the Pickle Rick session from a task string or PRD
+3. Writes the immutable pipeline contract to `pipeline.json`
+4. Launches one detached tmux session that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce`
+5. Refuses resume-time contract mutation for target, bootstrap source, task/PRD, phases, and skip flags
+6. Rolls back launch state if tmux accepts commands but the pipeline runner never starts
+7. Creates a monitor window whose runner pane tails `pipeline-runner.log`
+8. Prints `tmux attach` instructions
+
+## Use It When
+
+- You want the proven detached path for a task that should flow through multiple Pickle Rick phases
+- You want one tmux session and one monitor across `pickle`, `anatomy-park`, and `szechuan-sauce`
+- You need resumable pipeline state with status output that shows phase metadata
+EOF
+  render_runtime_root_in_tree "$skill_dir" "$runtime_root"
+}
+
 install_skill_tree() {
   local skills_root="$1"
   local runtime_root="$2"
@@ -103,6 +159,7 @@ install_skill_tree() {
     cp -R "$skill_dir" "$skills_root/"
   done
   shopt -u nullglob
+  write_pickle_pipeline_skill "$skills_root" "$runtime_root"
   render_runtime_root_in_tree "$skills_root" "$runtime_root"
 }
 
@@ -251,6 +308,7 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   copy_item lib
 fi
 sync_runtime_source_tree "$target_root"
+write_pickle_pipeline_skill "$target_root/.codex/skills" "$target_root"
 if [[ "$runtime_is_installed_source" -eq 0 || "$repo_is_checkout" -eq 0 ]]; then
   render_runtime_root_in_tree "$target_root" "$target_root" "sessions,activity"
 fi

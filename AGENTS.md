@@ -33,16 +33,17 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 - Open any project in Codex after the install; the persona is active when Codex reads the global instructions and the `pickle` skill is available
 - If you want a repo-local override, run `bash install.sh --project <path-to-project>`
 - Existing `AGENTS.md` and `CLAUDE.md` content is preserved below the managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
-- Use `pickle` for the full autonomous loop, or invoke `pickle-prd`, `pickle-refine`, and `pickle-orchestrate` directly for subflows
+- Use `pickle` for the full autonomous loop, `pickle-pipeline` for the detached proven multi-phase path, or invoke `pickle-prd`, `pickle-refine`, and `pickle-orchestrate` directly for subflows
 
 ## Skills
 
 - `pickle` is the primary entrypoint for the autonomous loop
+- `pickle-pipeline` launches one detached tmux session that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce`
 - `pickle-tmux` bootstraps from a PRD or resumes a prepared session in detached tmux with a live monitor
 - `pickle-prd` drafts the PRD
 - `pickle-refine` runs three analyst passes, synthesizes the result, and decomposes the PRD into tickets
 - `pickle-orchestrate` runs multi-ticket sequential orchestration
-- `pickle-status` and `pickle-metrics` expose runtime state
+- `pickle-status` and `pickle-metrics` expose runtime state, including pipeline metadata for pipeline sessions
 - `pickle-cancel` and `pickle-retry` manage session recovery
 - `pickle-microverse` launches the detached metric-convergence tmux loop
 - `szechuan-sauce` launches the detached principle-driven cleanup tmux loop

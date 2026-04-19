@@ -1,6 +1,9 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import path from 'node:path';
 import { formatDuration } from '../lib/pickle-utils.js';
+import { readPipelineContract } from '../lib/pipeline.js';
+import { readPipelineState } from '../lib/pipeline-state.js';
 import { getRunStartEpoch, resolveSessionForCwd } from '../lib/session.js';
 import { loadCircuitState } from '../lib/circuit-breaker.js';
 import { StateManager } from '../lib/state-manager.js';
@@ -30,6 +33,57 @@ function ticketVerification(ticket) {
   return 'npm test';
 }
 
+function phaseProgressLabel(pipeline) {
+  return `${pipeline.currentPhaseLabel} (${pipeline.completedPhases} / ${pipeline.totalPhases})`;
+}
+
+function loadPipelineMetadata(sessionDir, state, manager) {
+  const hasPipelineFiles = fs.existsSync(path.join(sessionDir, 'pipeline.json'))
+    || fs.existsSync(path.join(sessionDir, 'pipeline-state.json'));
+  const shouldInspectPipeline = hasPipelineFiles || state.pipeline_mode === true || Array.isArray(state.pipeline_phases);
+  if (!shouldInspectPipeline) {
+    return null;
+  }
+
+  let contract = null;
+  let pipelineState = null;
+  try {
+    contract = readPipelineContract(sessionDir);
+  } catch {
+    contract = null;
+  }
+
+  if (contract) {
+    try {
+      pipelineState = readPipelineState(sessionDir, manager, contract);
+    } catch {
+      pipelineState = null;
+    }
+  }
+
+  const phases = contract?.phases || (Array.isArray(state.pipeline_phases) ? state.pipeline_phases : []);
+  if (phases.length === 0) {
+    return null;
+  }
+
+  const phaseStatuses = pipelineState?.phase_statuses
+    || Object.fromEntries(phases.map((phase) => [phase, phase === state.pipeline_phase ? 'running' : 'todo']));
+  const completedPhases = phases.filter((phase) => phaseStatuses[phase] === 'done').length;
+  const currentPhase = pipelineState?.current_phase ?? state.pipeline_phase ?? null;
+
+  return {
+    bootstrapPrd: contract?.bootstrap_prd ?? state.pipeline_bootstrap_prd ?? null,
+    bootstrapSource: contract?.bootstrap_source ?? state.pipeline_bootstrap_source ?? null,
+    currentPhaseLabel: currentPhase ?? 'complete',
+    completedPhases: currentPhase == null ? phases.length : completedPhases + 1,
+    phaseStatuses,
+    phases,
+    target: contract?.target ?? state.pipeline_target ?? null,
+    task: contract?.task ?? state.pipeline_task ?? null,
+    totalPhases: contract?.phases?.length ?? state.pipeline_total_phases ?? phases.length,
+  };
+}
+
 export async function renderStatus(cwd, options = {}) {
   const sessionDir = options.sessionDir || await resolveSessionForCwd(cwd, { last: options.last });
   if (!sessionDir) {
@@ -38,6 +92,7 @@ export async function renderStatus(cwd, options = {}) {
 
   const manager = new StateManager();
   const state = manager.read(path.join(sessionDir, 'state.json'));
+  const pipeline = loadPipelineMetadata(sessionDir, state, manager);
   const runNotStarted = state.active === false && state.last_exit_reason == null
     && state.run_started_at == null && state.run_start_time_epoch == null;
   const elapsed = runNotStarted
@@ -53,6 +108,12 @@ export async function renderStatus(cwd, options = {}) {
     `Active: ${state.active ? 'Yes' : 'No'}`,
     `Tmux Mode: ${state.tmux_mode ? 'Yes' : 'No'}`,
     `Step: ${state.step || 'unknown'}`,
+    pipeline ? `Pipeline Phase: ${phaseProgressLabel(pipeline)}` : null,
+    pipeline ? `Pipeline Phases: ${pipeline.phases.map((phase) => `${phase}=${pipeline.phaseStatuses[phase] || 'todo'}`).join(' | ')}` : null,
+    pipeline?.bootstrapSource ? `Pipeline Bootstrap: ${pipeline.bootstrapSource}` : null,
+    pipeline?.task ? `Pipeline Task: ${pipeline.task}` : null,
+    pipeline?.bootstrapPrd ? `Pipeline PRD: ${pipeline.bootstrapPrd}` : null,
+    pipeline?.target ? `Pipeline Target: ${pipeline.target}` : null,
     `Iteration: ${state.iteration} / ${formatIterationLimit(state.max_iterations)}`,
     `Ticket: ${currentLabel}`,
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,

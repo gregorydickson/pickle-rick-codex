@@ -474,3 +474,58 @@ setTimeout(() => {
   assert.equal(result.cancelled, false);
   assert.equal(result.lastMessage, '');
 });
+
+test('runCodexExecMonitored treats observed success as success even if the process exits non-zero afterward', async () => {
+  const runtimeDir = makeTempRoot('pickle-rick-codex-bin-');
+  const artifactDir = makeTempRoot('pickle-rick-artifacts-');
+  const artifactPath = path.join(artifactDir, 'phase.txt');
+  const codexPath = path.join(runtimeDir, 'codex');
+
+  fs.writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+
+setTimeout(() => {
+  fs.writeFileSync(${JSON.stringify(artifactPath)}, 'phase-complete\\n');
+  if (outputLastMessagePath) {
+    fs.writeFileSync(outputLastMessagePath, '<promise>IMPLEMENT_COMPLETE</promise>');
+  }
+  console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+  setTimeout(() => process.exit(23), 150);
+}, 50);
+`,
+    { mode: 0o755 },
+  );
+  fs.chmodSync(codexPath, 0o755);
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'run implement phase',
+    timeoutMs: 2_000,
+    outputLastMessagePath: path.join(artifactDir, 'phase.last-message.txt'),
+    successSignalGraceMs: 500,
+    successPollMs: 25,
+    successCheck: ({ lastMessage }) =>
+      fs.existsSync(artifactPath) && /<promise>\s*IMPLEMENT_COMPLETE\s*<\/promise>/.test(lastMessage),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminatedAfterSuccess, false);
+  assert.match(result.lastMessage, /IMPLEMENT_COMPLETE/);
+});
