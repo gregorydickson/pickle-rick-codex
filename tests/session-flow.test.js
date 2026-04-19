@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -9,6 +10,20 @@ import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
 import { updateSessionMap } from '../lib/session-map.js';
 import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
+
+function runGit(repoDir, args) {
+  return execFileSync('git', args, {
+    cwd: repoDir,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function initGitRepo(repoDir) {
+  runGit(repoDir, ['init']);
+  runGit(repoDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+}
 
 function createStaleSessionFakeTmux(binDir, sessionName) {
   const staleFile = path.join(binDir, 'fake-tmux-stale-session.txt');
@@ -1385,6 +1400,90 @@ test('loop-runner passes the persisted iteration budget to anatomy-park prompts 
   const prompt = fs.readFileSync(path.join(sessionDir, 'loop-iteration-1.txt'), 'utf8');
   assert.match(prompt, /Iteration: 22 \/ unlimited/);
   assert.doesNotMatch(prompt, /Iteration: 23 \/ 0/);
+});
+
+test('loop-runner auto-commits a dirty anatomy-park git tree before the first iteration', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  runGit(projectDir, ['add', 'index.js']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 2;\n');
+
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy dirty preflight task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+
+  assert.notEqual(afterHead, beforeHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.equal(commitSubject, 'anatomy-park: auto-commit dirty tree before start');
+  assert.match(runnerLog, /preflight auto-committed:/);
+});
+
+test('loop-runner auto-commits anatomy-park fix iterations when the worker leaves tracked changes uncommitted', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  runGit(projectDir, ['add', 'index.js']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_WRITE_SUMMARY: 'changing',
+    FAKE_LOOP_MUTATE_FILE: 'index.js',
+    FAKE_LOOP_APPEND_TEXT: 'export const healed = true;\n',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy fix commit task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+
+  assert.notEqual(afterHead, beforeHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'index.js'), 'utf8'), 'export const value = 1;\nexport const healed = true;\n');
+  assert.match(commitSubject, /^anatomy-park: .* - Fake correctness finding #1, trap door$/);
+  assert.match(runnerLog, /anatomy-park auto-committed:/);
+  assert.match(runnerLog, /iteration 1 progress: .*head_sha/);
 });
 
 test('loop-runner counts anatomy-park summary updates as progress and writes stop summaries', () => {

@@ -4,6 +4,12 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { refinePrd } from './spawn-refinement-team.js';
+import {
+  acquireCwdReservationLocks,
+  acquireLaunchLock,
+  assertNoTmuxReservationForCwds,
+  getReservedCwdsForSession,
+} from '../lib/detached-launch.js';
 import { setupSession } from '../lib/setup-session.js';
 import { appendHistory } from '../lib/session.js';
 import { findLastSessionForCwd, getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
@@ -114,43 +120,6 @@ function assertResumeSessionNotRunning(sessionDir) {
   if (isProcessAlive(Number(state?.tmux_runner_pid))) {
     throw new Error(`Session is already running under tmux runner pid ${state.tmux_runner_pid}.`);
   }
-}
-
-function launchLockPath(sessionDir) {
-  return path.join(sessionDir, '.tmux-launch.lock');
-}
-
-function acquireLaunchLock(sessionDir) {
-  const lockPath = launchLockPath(sessionDir);
-  let fd;
-  try {
-    fd = fs.openSync(lockPath, 'wx', 0o600);
-  } catch (error) {
-    if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
-      const rawLock = fs.readFileSync(lockPath, 'utf8').trim();
-      const lockPid = Number(rawLock);
-      if (Number.isInteger(lockPid) && isProcessAlive(lockPid)) {
-        throw new Error(`A tmux launch is already in progress for ${sessionDir}.`);
-      }
-      fs.rmSync(lockPath, { force: true });
-      fd = fs.openSync(lockPath, 'wx', 0o600);
-    } else {
-      throw error;
-    }
-  }
-  fs.writeFileSync(fd, String(process.pid));
-  return () => {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Ignore close failures during teardown.
-    }
-    try {
-      fs.rmSync(lockPath, { force: true });
-    } catch {
-      // Ignore cleanup failures.
-    }
-  };
 }
 
 function copyPrdIntoSession(sessionDir, prdSource) {

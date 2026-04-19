@@ -4,6 +4,14 @@ import path from 'node:path';
 import { runCodexExecMonitored, assertCodexSucceeded } from '../lib/codex.js';
 import { loadConfig } from '../lib/config.js';
 import { logActivity } from '../lib/activity-logger.js';
+import {
+  commitTrackedChanges,
+  getHeadSha,
+  isGitRepo,
+  isWorkingTreeDirty,
+  resetGitIndex,
+  stageTrackedChanges,
+} from '../lib/git-utils.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
 import { buildLoopPrompt } from '../lib/prompts.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../lib/session.js';
@@ -45,6 +53,20 @@ function normalizeLoopMessage(message) {
     .trim();
 }
 
+function safeErrorMessage(error) {
+  if (typeof error?.stderr === 'string' && error.stderr.trim()) {
+    return error.stderr.trim();
+  }
+  if (Buffer.isBuffer(error?.stderr)) {
+    const stderr = error.stderr.toString('utf8').trim();
+    if (stderr) return stderr;
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
 function summarizeVerification(summary) {
   if (Array.isArray(summary.verification)) {
     return summary.verification;
@@ -60,6 +82,75 @@ function summarizeTrapDoors(summary) {
     return summary.trap_doors.map((entry) => String(entry).trim()).filter(Boolean);
   }
   return [];
+}
+
+function anatomyParkSummary(sessionDir) {
+  return readJsonFile(summaryPaths(sessionDir, 'anatomy-park').json, {});
+}
+
+function anatomyParkCommitMessage(sessionDir, loopConfig, iteration) {
+  const summary = anatomyParkSummary(sessionDir);
+  const targetLabel = path.basename(path.resolve(loopConfig.target || 'target')) || 'target';
+  const finding = normalizeLoopMessage(
+    summary.highest_severity_finding
+    || summary.finding_family
+    || `iteration ${iteration}`,
+  );
+  const trapDoorSuffix = summarizeTrapDoors(summary).length ? ', trap door' : '';
+  return `anatomy-park: ${targetLabel} - ${finding}${trapDoorSuffix}`;
+}
+
+function anatomyParkProgressReasons(workingDir, reasons) {
+  if (!isGitRepo(workingDir)) {
+    return reasons;
+  }
+  return reasons.filter((reason) => reason !== 'worktree_fingerprint');
+}
+
+function ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, workingDir) {
+  if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
+    return;
+  }
+  if (!isWorkingTreeDirty(workingDir)) {
+    return;
+  }
+  if (!isGitRepo(workingDir)) {
+    throw new Error('Working tree is dirty - not a git repo, cannot auto-commit before anatomy-park start');
+  }
+
+  appendRunnerLog(sessionDir, 'working tree is dirty before anatomy-park start; auto-committing tracked changes');
+  try {
+    stageTrackedChanges(workingDir);
+    commitTrackedChanges(workingDir, 'anatomy-park: auto-commit dirty tree before start');
+    appendRunnerLog(sessionDir, `preflight auto-committed: ${getHeadSha(workingDir)}`);
+  } catch (error) {
+    resetGitIndex(workingDir);
+    throw new Error(`Working tree is dirty and anatomy-park preflight auto-commit failed: ${safeErrorMessage(error)}`);
+  }
+}
+
+function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, beforeSnapshot, iteration) {
+  if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
+    return false;
+  }
+  if (!isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
+    return false;
+  }
+  if (beforeSnapshot.head_sha && getHeadSha(workingDir) !== beforeSnapshot.head_sha) {
+    return false;
+  }
+
+  appendRunnerLog(sessionDir, 'no anatomy-park commit detected after iteration; auto-committing tracked changes');
+  try {
+    stageTrackedChanges(workingDir);
+    commitTrackedChanges(workingDir, anatomyParkCommitMessage(sessionDir, loopConfig, iteration));
+    appendRunnerLog(sessionDir, `anatomy-park auto-committed: ${getHeadSha(workingDir)}`);
+    return true;
+  } catch (error) {
+    resetGitIndex(workingDir);
+    appendRunnerLog(sessionDir, `anatomy-park auto-commit failed: ${safeErrorMessage(error)}`);
+    return false;
+  }
 }
 
 function stopSummaryFromState(state, loopConfig, exitReason, sessionDir) {
@@ -122,8 +213,10 @@ export async function runLoop(sessionDir) {
   const manager = new StateManager();
   const config = loadConfig();
   const loopConfig = readLoopConfig(sessionDir);
+  const initialState = manager.read(statePath);
 
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
+  ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, initialState.working_dir);
   manager.update(statePath, (state) => {
     state.active = true;
     state.tmux_runner_pid = process.pid;
@@ -212,6 +305,14 @@ export async function runLoop(sessionDir) {
       const lastMessage = result.lastMessage || '';
       appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} finished`);
 
+      autoCommitAnatomyParkIteration(
+        sessionDir,
+        loopConfig,
+        state.working_dir,
+        beforeSnapshot,
+        state.iteration + 1,
+      );
+
       const afterSnapshot = captureProgressSnapshot({
         sessionDir,
         workingDir: state.working_dir,
@@ -219,7 +320,10 @@ export async function runLoop(sessionDir) {
         step: loopConfig.mode,
         currentTicket: manager.read(statePath).current_ticket,
       });
-      const progressReasons = diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot');
+      const progressReasons = anatomyParkProgressReasons(
+        state.working_dir,
+        diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot'),
+      );
       const latest = manager.update(statePath, (current) => {
         current.loop_stall_count = progressReasons.length ? 0 : Number(current.loop_stall_count || 0) + 1;
         current.last_loop_message = lastMessage.trim();

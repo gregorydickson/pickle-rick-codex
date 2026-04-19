@@ -124,6 +124,14 @@ if (prompt.includes('Loop mode:')) {
   fs.writeFileSync(path.join(sessionDir, 'loop-iteration-' + current + '.txt'), prompt);
   const loopModeMatch = prompt.match(/Loop mode: ([^\\n]+)/);
   const loopMode = loopModeMatch ? loopModeMatch[1].trim() : 'loop';
+  const loopMutateFile = process.env.FAKE_LOOP_MUTATE_FILE || '';
+  if (loopMutateFile) {
+    const targetPath = path.resolve(process.cwd(), loopMutateFile);
+    const existing = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : '';
+    const suffix = process.env.FAKE_LOOP_APPEND_TEXT || '';
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, existing + suffix);
+  }
   if (process.env.FAKE_LOOP_WRITE_SUMMARY === 'changing' || process.env.FAKE_LOOP_WRITE_SUMMARY === 'static') {
     const summaryVariant = process.env.FAKE_LOOP_WRITE_SUMMARY;
     const summaryId = summaryVariant === 'changing' ? current : 1;

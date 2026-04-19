@@ -10,6 +10,7 @@ import {
   checkPatchApply,
   createPatchFromWorktree,
   createTicketWorktree,
+  getWorkingTreeFingerprint,
   removeTicketWorktree,
 } from '../lib/git-utils.js';
 import { makeTempRoot } from './helpers.js';
@@ -117,4 +118,17 @@ test('classifyPatchApplyError keeps merge failures distinct from malformed patch
     classifyPatchApplyError('error: patch failed: feature-flags.ts:1\nerror: feature-flags.ts: patch does not apply'),
     'patch-conflict',
   );
+});
+
+test('getWorkingTreeFingerprint tracks file edits outside git worktrees', () => {
+  const workingDir = makeTempRoot('pickle-rick-git-utils-plain-dir-');
+  const targetFile = path.join(workingDir, 'notes.txt');
+
+  fs.writeFileSync(targetFile, 'alpha\n');
+  const before = getWorkingTreeFingerprint(workingDir);
+
+  fs.writeFileSync(targetFile, 'beta\n');
+  const after = getWorkingTreeFingerprint(workingDir);
+
+  assert.notEqual(before, after);
 });
