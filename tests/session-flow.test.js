@@ -733,6 +733,29 @@ test('session-map reclaims fresh malformed non-empty locks before timing out', a
   }
 });
 
+test('session-map reclaims fresh malformed structured locks before timing out', async () => {
+  const dataRoot = makeTempRoot();
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  const lockPath = path.join(dataRoot, 'current_sessions.json.lock');
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 'oops', ts: Date.now() }));
+
+  try {
+    await updateSessionMap('/tmp/project-a', '/tmp/session-a');
+    assert.deepEqual(
+      readJsonFile(path.join(dataRoot, 'current_sessions.json')),
+      { '/tmp/project-a': '/tmp/session-a' },
+    );
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
+});
+
 test('retry-ticket reactivates the session and resets the ticket state', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
