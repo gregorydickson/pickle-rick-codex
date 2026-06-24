@@ -1023,6 +1023,104 @@ test('spawn-morty still blocks scoped package-manager test failures when the sam
   );
 });
 
+test('spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-prefix-scoped-package-baseline-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  writeJson(path.join(packageDir, 'package.json'), {
+    name: 'prefix-scoped-package-baseline',
+    private: true,
+    scripts: {
+      test: 'node --test',
+    },
+  });
+  fs.writeFileSync(path.join(packageDir, 'tests', 'scoped-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline', () => {
+  assert.equal(9, 10);
+});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'prefixed scoped package failure baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'prefixed scoped package failure baseline',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Prefixed scoped package failure baseline',
+        description: 'Scoped package-manager verification with --prefix must keep explicit target failures blocking.',
+        acceptance_criteria: ['A targeted npm --prefix test failure still blocks the ticket even if it is persisted in the baseline.'],
+        verification: ['npm --prefix packages/app test -- tests/scoped-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'npm --prefix packages/app test -- tests/scoped-red.test.js';
+  const scope = buildVerificationCommandScope(command, projectDir);
+  assert.equal(scope.key, 'package-test:packages/app/tests/scoped-red.test.js');
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [scope.key]: {
+          command,
+          scope,
+          failures: [
+            {
+              identity: 'packages/app/tests/scoped-red.test.js::spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline',
+              file: 'packages/app/tests/scoped-red.test.js',
+              testName: 'spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline',
+              in_scope: true,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = buildVerificationFailureSet({
+    command,
+    cwd: projectDir,
+    stdout: [
+      '> test',
+      '> node --test tests/scoped-red.test.js',
+      '',
+      '✖ spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline (0.6055ms)',
+      'ℹ tests 1',
+      'ℹ fail 1',
+      '',
+      '✖ failing tests:',
+      '',
+      'test at tests/scoped-red.test.js:3:1',
+      '✖ spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline (0.6055ms)',
+    ].join('\n'),
+    stderr: '',
+    exitCode: 1,
+  });
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['packages/app/tests/scoped-red.test.js::spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline'],
+  );
+});
+
 test('spawn-morty migrates legacy scoped package-manager baseline keys before subtracting known unrelated failures', { concurrency: false }, () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-prefix-package-baseline-project-');
