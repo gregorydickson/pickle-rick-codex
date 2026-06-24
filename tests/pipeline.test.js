@@ -316,3 +316,54 @@ test('baseline green', () => {});
     [],
   );
 });
+
+test('finishPipelinePhase with omitted exitReason derives consistent success state', () => {
+  const sessionDir = makeTempRoot();
+  const workingDir = '/tmp/pipeline-working-dir';
+  writeSessionState(sessionDir, workingDir);
+  writePipelineContract(sessionDir, {
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'anatomy-park'],
+    bootstrap_source: 'task',
+    task: 'consistent exit reason',
+  });
+
+  beginPipelinePhase(sessionDir, 'pickle', {
+    startedAt: '2026-04-19T00:10:00.000Z',
+  });
+
+  const result = finishPipelinePhase(sessionDir, 'pickle');
+  const pipelineState = readPipelineState(sessionDir);
+
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.last_exit_reason, 'success');
+  assert.equal(result.state.last_exit_reason, 'success');
+  assert.equal(result.state.step, 'anatomy-park');
+});
+
+test('finishPipelinePhase with omitted exitReason completes the pipeline on the last phase', () => {
+  const sessionDir = makeTempRoot();
+  const workingDir = '/tmp/pipeline-working-dir';
+  writeSessionState(sessionDir, workingDir);
+  writePipelineContract(sessionDir, {
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'complete pipeline',
+  });
+
+  beginPipelinePhase(sessionDir, 'pickle', {
+    startedAt: '2026-04-19T00:10:00.000Z',
+  });
+
+  const result = finishPipelinePhase(sessionDir, 'pickle');
+  const pipelineState = readPipelineState(sessionDir);
+
+  assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.last_exit_reason, 'success');
+  assert.equal(pipelineState.current_phase, null);
+  assert.ok(pipelineState.completed_at);
+  assert.equal(result.state.step, 'complete');
+});

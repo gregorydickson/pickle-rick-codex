@@ -9,6 +9,7 @@ import {
   getTicketById,
   readManifest,
   summarizeTickets,
+  ticketDependencyIds,
   validateRefinementManifest,
   writeManifest,
   writeTicketFiles,
@@ -644,4 +645,68 @@ test('ticket rematerialization preserves operational frontmatter needed by statu
   assert.equal(ticket.frontmatter.failure_reason, 'verification failed');
   assert.equal(ticket.frontmatter.retry_requested_at, '2026-04-15T13:00:00.000Z');
   assert.match(ticket.content, /config_change: true/);
+});
+
+test('ticketDependencyIds treats any case of none as empty for scalar dependencies', () => {
+  for (const spelling of ['none', 'None', 'NONE', 'nOnE']) {
+    assert.deepEqual(ticketDependencyIds({ depends_on: spelling }), [], `spelling "${spelling}" should produce empty deps`);
+  }
+});
+
+test('ticketDependencyIds treats any case of none as empty for array dependencies', () => {
+  assert.deepEqual(ticketDependencyIds({ depends_on: ['none'] }), []);
+  assert.deepEqual(ticketDependencyIds({ depends_on: ['None'] }), []);
+  assert.deepEqual(ticketDependencyIds({ depends_on: ['NONE', 'T1'] }), ['t1']);
+  assert.deepEqual(ticketDependencyIds({ depends_on: ['T1', 'none', 'T2'] }), ['t1', 't2']);
+});
+
+test('enrichRefinementManifest treats case-insensitive none dependencies as empty', () => {
+  const enriched = enrichRefinementManifest({
+    tickets: [
+      {
+        id: 'T0',
+        title: 'Root',
+        description: 'root',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: 'None',
+      },
+      {
+        id: 'T1',
+        title: 'Dependent',
+        description: 'depends on T0',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: ['NONE', 'T0'],
+      },
+    ],
+  });
+  assert.deepEqual(ticketDependencyIds(enriched.manifest.tickets[0]), []);
+  assert.deepEqual(ticketDependencyIds(enriched.manifest.tickets[1]), ['t0']);
+});
+
+test('summarizeTickets does not block runnable tickets with case-insensitive none dependencies', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'None dependency ticket',
+        description: 'Should be runnable despite case-variant none dependency.',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: 'None',
+      },
+    ],
+  });
+
+  const summary = summarizeTickets(sessionDir);
+  assert.equal(summary.runnable.length, 1);
+  assert.equal(summary.runnable[0].id, 'ticket-a');
 });

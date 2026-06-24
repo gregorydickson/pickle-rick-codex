@@ -8,7 +8,7 @@ import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { writePipelineContract } from '../lib/pipeline.js';
 import { buildVerificationCommandScope, ensurePipelineState, writeVerificationBaselines } from '../lib/pipeline-state.js';
-import { normalizeVerificationCommands } from '../lib/verification-env.js';
+import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../lib/verification-env.js';
 import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function runGit(repoDir, args) {
@@ -906,9 +906,9 @@ test('spawn-morty infers env vars from braced shell expansions', () => {
       {
         id: 'R1',
         title: 'Braced inferred env verification',
-        description: 'Verification uses a braced shell parameter expansion.',
+        description: 'Verification uses a braced shell parameter expansion without a default.',
         acceptance_criteria: ['Missing env is caught even when the variable is referenced with braces.'],
-        verification: ['test -f "${SIBLING_REPO_ROOT:-}/fixture.dot"'],
+        verification: ['test -f "${SIBLING_REPO_ROOT}/fixture.dot"'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1129,4 +1129,38 @@ test('pickle-tmux infers required env vars from verification commands before lau
   assert.match(ticket.frontmatter.failure_reason, /EXTERNAL_FIXTURE_ROOT/);
   const tmuxLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   assert.ok(!tmuxLines.some((args) => args[0] === 'new-session'));
+});
+
+test('resolveTicketVerificationContract ignores shell-default expansions when inferring required env', () => {
+  const contract = resolveTicketVerificationContract({
+    ticket: {
+      verification: [
+        'echo "${SIBLING_REPO_ROOT:-/default/path}"',
+        'echo "${DATABASE_URL:=fallback}"',
+        'echo "${API_TOKEN:?missing token}"',
+        'echo "${CACHE_DIR-fallback}"',
+      ],
+    },
+    config: null,
+  });
+  const required = (contract?.required || []).map((entry) => entry.name);
+  assert.ok(!required.includes('SIBLING_REPO_ROOT'), `SIBLING_REPO_ROOT should not be required, got: ${required.join(', ')}`);
+  assert.ok(!required.includes('DATABASE_URL'), `DATABASE_URL should not be required, got: ${required.join(', ')}`);
+  assert.ok(!required.includes('API_TOKEN'), `API_TOKEN should not be required, got: ${required.join(', ')}`);
+  assert.ok(!required.includes('CACHE_DIR'), `CACHE_DIR should not be required, got: ${required.join(', ')}`);
+});
+
+test('resolveTicketVerificationContract still infers real unbound variables without defaults', () => {
+  const contract = resolveTicketVerificationContract({
+    ticket: {
+      verification: [
+        'test -f "${SIBLING_REPO_ROOT}/fixture.dot"',
+        'echo "$DATABASE_URL"',
+      ],
+    },
+    config: null,
+  });
+  const required = (contract?.required || []).map((entry) => entry.name);
+  assert.ok(required.includes('SIBLING_REPO_ROOT'), `SIBLING_REPO_ROOT should be required, got: ${required.join(', ')}`);
+  assert.ok(required.includes('DATABASE_URL'), `DATABASE_URL should be required, got: ${required.join(', ')}`);
 });
