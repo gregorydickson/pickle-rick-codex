@@ -13,6 +13,23 @@ const PROTECTED_PATTERNS = [
   /^install\.sh$/,
 ];
 
+function normalizedPathSuffixes(candidate) {
+  const normalized = path.normalize(String(candidate || '')).replace(/\\/g, '/');
+  const trimmed = normalized.replace(/^[./]+/, '');
+  const segments = trimmed.split('/').filter(Boolean);
+  const suffixes = new Set([trimmed]);
+  for (let index = 0; index < segments.length; index += 1) {
+    suffixes.add(segments.slice(index).join('/'));
+  }
+  return [...suffixes].filter(Boolean);
+}
+
+function matchesProtectedPattern(candidate) {
+  return normalizedPathSuffixes(candidate).some((value) =>
+    PROTECTED_PATTERNS.some((pattern) => pattern.test(value)),
+  );
+}
+
 function approve() {
   console.log(JSON.stringify({ decision: 'approve' }));
 }
@@ -44,9 +61,7 @@ async function main() {
   const filePath = payload.tool_input?.file_path || payload.file_path || '';
   const command = payload.tool_input?.command || payload.command || '';
   const candidates = [filePath, ...String(command).split(/\s+/)].filter(Boolean);
-  const blocked = candidates.find((candidate) =>
-    PROTECTED_PATTERNS.some((pattern) => pattern.test(path.normalize(candidate).replace(/^[./]+/, ''))),
-  );
+  const blocked = candidates.find((candidate) => matchesProtectedPattern(candidate));
 
   if (!blocked) {
     approve();

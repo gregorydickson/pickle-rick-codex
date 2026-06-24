@@ -40,3 +40,7 @@ Treat `AGENTS.md` as canonical.
 
 - Keep docs aligned with the guaranteed path and do not default to undocumented native-agent controls
 - Use `config.json` under `~/.codex/pickle-rick/` for Pickle Rick runtime state
+
+## Trap Doors
+
+- `bin/config-protection.js` — INVARIANT: match protected-file regexes against normalized path suffixes, not only a single repo-relative string. BREAKS: absolute-path payloads bypass config guards. ENFORCE: `tests/config-protection.test.js` absolute-path block case. PATTERN_SHAPE: normalized `file_path` or shell token checked once before suffix decomposition.

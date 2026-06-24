@@ -51,6 +51,25 @@ test('config protection blocks protected file writes without an override', () =>
   assert.match(output, /"decision":"block"/);
 });
 
+test('config protection blocks protected file writes when the payload uses an absolute path', () => {
+  const dataRoot = makeTempRoot();
+  createSessionFixture(
+    dataRoot,
+    '---\nid: "ticket-a"\ntitle: "A"\nstatus: "Todo"\n---\n# body\n',
+  );
+
+  const output = runNode(
+    ['bin/config-protection.js'],
+    {
+      env: { PICKLE_DATA_ROOT: dataRoot, PICKLE_ACTIVE_TICKET: 'ticket-a' },
+      input: JSON.stringify({ tool_input: { file_path: path.join(repoRoot, 'package.json') } }),
+    },
+  ).trim();
+
+  assert.match(output, /"decision":"block"/);
+  assert.match(output, /package\.json/);
+});
+
 test('config protection allows protected writes with config_change override', () => {
   const dataRoot = makeTempRoot();
   createSessionFixture(
