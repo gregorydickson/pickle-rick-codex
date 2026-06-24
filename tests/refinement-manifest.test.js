@@ -686,6 +686,56 @@ test('ensureTicketFilesMaterialized rewrites stale ticket files when manifest st
   );
 });
 
+test('summarizeTickets and ensureTicketFilesMaterialized prune obsolete ticket files when the manifest shrinks or empties', () => {
+  const sessionDir = makeTempRoot();
+  const manifest = {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'First Ticket',
+        description: 'first',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'ticket-b',
+        title: 'Second Ticket',
+        description: 'second',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  };
+
+  writeManifest(sessionDir, manifest);
+  writeTicketFiles(sessionDir, manifest);
+
+  writeManifest(sessionDir, { tickets: [manifest.tickets[0]] });
+
+  const shrunkMaterialized = ensureTicketFilesMaterialized(sessionDir);
+  const shrunkSummary = summarizeTickets(sessionDir);
+
+  assert.equal(shrunkMaterialized.length, 1);
+  assert.equal(shrunkSummary.total, 1);
+  assert.equal(shrunkSummary.runnable.length, 1);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md')));
+  assert.equal(fs.existsSync(path.join(sessionDir, 'ticket-b', 'linear_ticket_ticket-b.md')), false);
+
+  writeManifest(sessionDir, { tickets: [] });
+
+  const emptiedMaterialized = ensureTicketFilesMaterialized(sessionDir);
+  const emptiedSummary = summarizeTickets(sessionDir);
+
+  assert.equal(emptiedMaterialized.length, 0);
+  assert.equal(emptiedSummary.total, 0);
+  assert.equal(emptiedSummary.runnable.length, 0);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md')), false);
+});
+
 test('ticketDependencyIds treats any case of none as empty for scalar dependencies', () => {
   for (const spelling of ['none', 'None', 'NONE', 'nOnE']) {
     assert.deepEqual(ticketDependencyIds({ depends_on: spelling }), [], `spelling "${spelling}" should produce empty deps`);
