@@ -492,6 +492,87 @@ process.exit(1);
   assert.match(prompt, /'pnpm' 'exec' 'vitest' 'run' '--config' 'vitest\.config\.mjs' 'tests\/targeted\.test\.ts'/);
 });
 
+test('spawn-morty rewrites npm --prefix scoped vitest verification commands into targeted execution', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-npm-prefix-vitest-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+    name: 'npm-prefix-vitest-fixture',
+    private: true,
+    scripts: {
+      test: 'vitest run --config vitest.config.mjs',
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(packageDir, 'vitest.config.mjs'), 'export default {};\n');
+  fs.writeFileSync(path.join(packageDir, 'tests', 'targeted.test.ts'), 'export {};\n');
+  fs.writeFileSync(path.join(fakeBin, 'npm'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
+const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+if (args[0] === 'test') {
+  fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
+  console.error('broad test wrapper invoked');
+  process.exit(1);
+}
+if (
+  args[0] === 'exec'
+  && args[1] === '--'
+  && args[2] === 'vitest'
+  && args[3] === 'run'
+  && args.includes('--config')
+  && args.includes('tests/targeted.test.ts')
+) {
+  fs.writeFileSync(targetedMarker, args.join(' ') + '\\n');
+  process.exit(0);
+}
+console.error('unexpected npm invocation: ' + args.join(' '));
+process.exit(1);
+`, { mode: 0o755 });
+  fs.chmodSync(path.join(fakeBin, 'npm'), 0o755);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted npm prefix vitest verification'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Targeted npm prefix vitest verification',
+        description: 'Scoped verification should rewrite npm --prefix into a targeted vitest run.',
+        acceptance_criteria: ['Scoped npm --prefix vitest verification runs only the targeted file.'],
+        verification: ['npm --prefix packages/app test -- tests/targeted.test.ts'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+  assert.ok(fs.existsSync(path.join(packageDir, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.match(
+    fs.readFileSync(path.join(packageDir, 'targeted-suite-ran.txt'), 'utf8'),
+    /exec -- vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
+  );
+});
+
 test('normalizeVerificationCommands leaves unknown runners unchanged', () => {
   const projectDir = makeTempRoot('pickle-rick-non-vitest-project-');
   fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
