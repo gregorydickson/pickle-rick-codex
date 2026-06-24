@@ -1274,6 +1274,79 @@ test('spawn-morty preserves absolute --prefix scoped baseline keys across sessio
   assert.deepEqual(remaining, []);
 });
 
+test('spawn-morty preserves scoped baseline subtraction after rewriting npm --prefix vitest verification', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-rewritten-prefix-vitest-baseline-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  writeJson(path.join(packageDir, 'package.json'), {
+    name: 'rewritten-prefix-vitest-baseline',
+    private: true,
+    scripts: {
+      test: 'vitest run --config vitest.config.mjs',
+    },
+  });
+  fs.writeFileSync(path.join(packageDir, 'vitest.config.mjs'), 'export default {};\n');
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'rewritten prefix vitest baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'rewritten prefix vitest baseline',
+  });
+  ensurePipelineState(sessionDir);
+
+  const originalCommand = 'npm --prefix packages/app test -- tests/targeted.test.ts';
+  const rewrittenCommand = normalizeVerificationCommands([originalCommand], { cwd: projectDir })[0];
+  const rewrittenScope = buildVerificationCommandScope(rewrittenCommand, projectDir);
+  assert.equal(rewrittenScope.key, 'package-test:packages/app/tests/targeted.test.ts');
+
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [rewrittenScope.key]: {
+          command: rewrittenCommand,
+          scope: rewrittenScope,
+          failures: [
+            {
+              identity: 'packages/app/tests/unrelated-red.test.ts::known unrelated red',
+              file: 'packages/app/tests/unrelated-red.test.ts',
+              testName: 'known unrelated red',
+              in_scope: false,
+              source: 'vitest',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = buildVerificationFailureSet({
+    command: rewrittenCommand,
+    cwd: projectDir,
+    stdout: [
+      ' FAIL  tests/targeted.test.ts > keeps targeted failures visible',
+      ' FAIL  tests/unrelated-red.test.ts > known unrelated red',
+    ].join('\n'),
+    stderr: '',
+    exitCode: 1,
+  });
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', rewrittenCommand, projectDir, failures);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['packages/app/tests/targeted.test.ts::keeps targeted failures visible'],
+  );
+});
+
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
