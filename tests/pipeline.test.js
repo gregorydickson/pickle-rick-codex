@@ -402,6 +402,49 @@ test('baseline blue', () => {
   assert.ok(Array.isArray(baselines.by_ticket.r2['node-test:tests/baseline-blue.test.js'].failures));
 });
 
+test('ensureBootstrapSessionReady does not rerun verification for terminal tickets when capturing baselines', async () => {
+  const sessionDir = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-pipeline-terminal-baseline-project-');
+  const markerPath = path.join(projectDir, 'done-ticket-ran.txt');
+  writeSessionState(sessionDir, projectDir);
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'skip terminal ticket baseline capture',
+  });
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Pipeline PRD\n');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Already done',
+        description: 'Completed ticket baselines must not re-execute verification.',
+        acceptance_criteria: ['Done tickets are ignored during baseline capture.'],
+        verification: [`node -e "require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')" `],
+        priority: 'P1',
+        status: 'Done',
+      },
+      {
+        id: 'R2',
+        title: 'Runnable ticket',
+        description: 'Keeps the session runnable.',
+        acceptance_criteria: ['Runnable baselines are still captured.'],
+        verification: ['node -e "process.exit(0)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  await ensureBootstrapSessionReady(sessionDir);
+
+  assert.equal(fs.existsSync(markerPath), false);
+  const baselines = readVerificationBaselines(sessionDir);
+  assert.deepEqual(Object.keys(baselines.by_ticket).sort(), ['r2']);
+});
+
 test('finishPipelinePhase with omitted exitReason derives consistent success state', () => {
   const sessionDir = makeTempRoot();
   const workingDir = '/tmp/pipeline-working-dir';
