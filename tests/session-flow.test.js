@@ -3735,3 +3735,49 @@ test('advanced loop resume refuses to relaunch while a tmux launch lock is held'
   assert.equal(state.command_template, 'anatomy-park.md');
   assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
 });
+
+test('advanced loop resume refuses to relaunch while a fresh empty tmux launch lock is held', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  const fakeBin = makeTempRoot('pickle-rick-tmux-bin-');
+  const tmuxLog = path.join(dataRoot, 'tmux-advanced-empty-launch-lock.jsonl');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+
+  const anatomyOutput = runNode([
+    path.join(repoRoot, 'bin/anatomy-park.js'),
+    projectDir,
+  ], { env, cwd: projectDir }).trim();
+  const statePath = anatomyOutput.match(/^State: (.+)$/m)?.[1];
+  assert.ok(statePath);
+  const sessionDir = path.dirname(statePath);
+
+  const originalState = readJsonFile(path.join(sessionDir, 'state.json'));
+  writeJson(path.join(sessionDir, 'state.json'), {
+    ...originalState,
+    active: false,
+    tmux_runner_pid: null,
+    last_exit_reason: 'cancelled',
+  });
+  fs.writeFileSync(path.join(sessionDir, '.tmux-launch.lock'), '');
+  const tmuxLogBeforeResume = fs.readFileSync(tmuxLog, 'utf8');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/anatomy-park.js'), '--resume'], {
+      env,
+      cwd: projectDir,
+    }),
+    new RegExp(`A tmux launch is already in progress for ${sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`),
+  );
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.tmux_runner_pid, null);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(fs.readFileSync(path.join(sessionDir, '.tmux-launch.lock'), 'utf8'), '');
+  assert.equal(fs.readFileSync(tmuxLog, 'utf8'), `${tmuxLogBeforeResume}["-V"]\n`);
+});
