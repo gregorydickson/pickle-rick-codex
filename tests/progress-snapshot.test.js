@@ -148,6 +148,30 @@ test('progress snapshot detects ticket-local artifacts inside the ticket directo
   assert.deepEqual(diffProgressSnapshot(before, after), ['progress_artifact:r1/plan.md']);
 });
 
+test('progress snapshot treats phase and ticket advancement as progress even without file churn', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+
+  const before = captureProgressSnapshot({
+    sessionDir,
+    workingDir: repoDir,
+    mode: null,
+    step: 'research',
+    currentTicket: 'r1',
+  });
+  const after = captureProgressSnapshot({
+    sessionDir,
+    workingDir: repoDir,
+    mode: null,
+    step: 'plan',
+    currentTicket: 'r2',
+  });
+
+  assert.deepEqual(diffProgressSnapshot(before, after), ['step', 'current_ticket']);
+});
+
 test('circuit breaker ignores iteration churn but resets on shared progress signals', () => {
   const repoDir = makeTempRoot('pickle-rick-progress-repo-');
   const sessionDir = makeTempRoot('pickle-rick-progress-session-');
@@ -224,6 +248,36 @@ test('circuit breaker treats ticket phase promise artifacts as progress', () => 
     circuitBreakerConfig: { no_progress_threshold: 1, half_open_after: 1, same_error_threshold: 5 },
   });
   assert.equal(second.state, 'CLOSED');
+});
+
+test('circuit breaker treats step and ticket advancement as progress', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+
+  recordIteration(sessionDir, {
+    working_dir: repoDir,
+    step: 'research',
+    current_ticket: 'r1',
+    iteration: 1,
+    loop_mode: null,
+  }, {
+    circuitBreakerConfig: { no_progress_threshold: 1, half_open_after: 1, same_error_threshold: 5 },
+  });
+
+  const advanced = recordIteration(sessionDir, {
+    working_dir: repoDir,
+    step: 'plan',
+    current_ticket: 'r2',
+    iteration: 2,
+    loop_mode: null,
+  }, {
+    circuitBreakerConfig: { no_progress_threshold: 1, half_open_after: 1, same_error_threshold: 5 },
+  });
+
+  assert.equal(advanced.state, 'CLOSED');
+  assert.equal(advanced.consecutive_no_progress, 0);
 });
 
 test('status stays clear of false progress-stalled output when ticket artifacts advance', async () => {
