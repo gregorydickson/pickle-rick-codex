@@ -132,6 +132,42 @@ setTimeout(() => {
   assert.match(fs.readFileSync(path.join(sessionDir, 'prd.md'), 'utf8'), /Fresh draft after stale cleanup/);
 });
 
+test('draft-prd does not advance to refine when codex fails before producing a PRD', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+console.error('fake draft failure');
+process.exit(1);
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'draft failing task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/draft-prd.js'), sessionDir, 'draft failing task'], {
+      cwd: projectDir,
+      env,
+    }),
+    /PRD drafting failed: fake draft failure/,
+  );
+
+  assert.equal(fs.existsSync(path.join(sessionDir, 'prd.md')), false);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'prd');
+});
+
 test('spawn-refinement-team writes the manifest and ticket files', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

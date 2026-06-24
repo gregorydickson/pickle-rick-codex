@@ -51,10 +51,9 @@ export async function draftPrd(sessionDir, task, options = {}) {
       fs.existsSync(prdPath) && hasPromiseToken(lastMessage, 'PRD_COMPLETE'),
   });
 
+  assertCodexSucceeded(result, 'PRD drafting failed');
   if (!fs.existsSync(prdPath)) {
     writeFallbackPrd(prdPath, task);
-  } else {
-    assertCodexSucceeded(result, 'PRD drafting failed');
   }
 
   manager.update(statePath, (current) => {
