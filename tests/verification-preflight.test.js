@@ -1274,6 +1274,68 @@ test('spawn-morty preserves absolute --prefix scoped baseline keys across sessio
   assert.deepEqual(remaining, []);
 });
 
+test('spawn-morty migrates legacy absolute node --test baseline keys against the session working dir', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-absolute-node-baseline-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  const targetedPath = path.join(projectDir, 'tests', 'targeted-red.test.js');
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'absolute node test baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'absolute node test baseline',
+  });
+  ensurePipelineState(sessionDir);
+
+  const command = `node --test ${targetedPath}`;
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [`command:${command}`]: {
+          command,
+          scope: {
+            key: `command:${command}`,
+            kind: 'command',
+            command,
+            targets: [],
+          },
+          failures: [
+            {
+              identity: 'tests/unrelated-red.test.js::known unrelated red',
+              file: 'tests/unrelated-red.test.js',
+              testName: 'known unrelated red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = [
+    {
+      identity: 'tests/unrelated-red.test.js::known unrelated red',
+      file: 'tests/unrelated-red.test.js',
+      testName: 'known unrelated red',
+      in_scope: false,
+      source: 'node-test',
+    },
+  ];
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(remaining, []);
+});
+
 test('spawn-morty preserves scoped baseline subtraction after rewriting npm --prefix vitest verification', { concurrency: false }, () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-rewritten-prefix-vitest-baseline-project-');
