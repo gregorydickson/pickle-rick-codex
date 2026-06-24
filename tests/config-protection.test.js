@@ -107,6 +107,25 @@ test('config protection blocks install.sh when it is invoked through a shell com
   assert.match(output, /install\.sh/);
 });
 
+test('config protection blocks quoted protected paths when they are passed through a shell command', () => {
+  const dataRoot = makeTempRoot();
+  createSessionFixture(
+    dataRoot,
+    '---\nid: "ticket-a"\ntitle: "A"\nstatus: "Todo"\n---\n# body\n',
+  );
+
+  const output = runNode(
+    ['bin/config-protection.js'],
+    {
+      env: { PICKLE_DATA_ROOT: dataRoot, PICKLE_ACTIVE_TICKET: 'ticket-a' },
+      input: JSON.stringify({ tool_input: { command: "python patch.py './AGENTS.md'" } }),
+    },
+  ).trim();
+
+  assert.match(output, /"decision":"block"/);
+  assert.match(output, /AGENTS\.md/);
+});
+
 test('loadConfig falls back to safe defaults when nested config shapes are malformed', () => {
   const dataRoot = makeTempRoot();
   const configPath = path.join(dataRoot, 'config.json');

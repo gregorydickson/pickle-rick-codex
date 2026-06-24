@@ -13,8 +13,20 @@ const PROTECTED_PATTERNS = [
   /^install\.sh$/,
 ];
 
+function unwrapShellToken(candidate) {
+  let value = String(candidate || '').trim();
+  if (!value) return '';
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith('\'') && value.endsWith('\''))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return value;
+}
+
 function normalizedPathSuffixes(candidate) {
-  const normalized = path.normalize(String(candidate || '')).replace(/\\/g, '/');
+  const normalized = path.normalize(unwrapShellToken(candidate)).replace(/\\/g, '/');
   const trimmed = normalized.replace(/^[./]+/, '');
   const segments = trimmed.split('/').filter(Boolean);
   const suffixes = new Set([trimmed]);
