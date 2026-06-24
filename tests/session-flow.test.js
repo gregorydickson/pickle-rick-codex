@@ -620,6 +620,40 @@ test('session-map lock fails closed when the lock cannot be acquired', async () 
   }
 });
 
+test('session-map does not steal a stale-looking lock from a live owner', async () => {
+  const dataRoot = makeTempRoot();
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  const lockPath = path.join(dataRoot, 'current_sessions.json.lock');
+  const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  holder.unref();
+
+  try {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: holder.pid, ts: Date.now() - 6_000 }));
+    const staleSeconds = (Date.now() - 6_000) / 1000;
+    fs.utimesSync(lockPath, staleSeconds, staleSeconds);
+
+    await assert.rejects(
+      () => updateSessionMap('/tmp/project-a', '/tmp/session-a'),
+      /Failed to acquire session map lock/,
+    );
+    assert.equal(fs.existsSync(path.join(dataRoot, 'current_sessions.json')), false);
+  } finally {
+    try {
+      holder.kill('SIGTERM');
+    } catch {
+      // Ignore teardown failures from already-exited helpers.
+    }
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
+});
+
 test('retry-ticket reactivates the session and resets the ticket state', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
