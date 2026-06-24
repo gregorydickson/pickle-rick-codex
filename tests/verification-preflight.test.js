@@ -1023,6 +1023,94 @@ test('spawn-morty still blocks scoped package-manager test failures when the sam
   );
 });
 
+test('spawn-morty migrates legacy scoped package-manager baseline keys before subtracting known unrelated failures', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-prefix-package-baseline-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  writeJson(path.join(packageDir, 'package.json'), {
+    name: 'prefix-scoped-package-baseline',
+    private: true,
+    scripts: {
+      test: 'node --test',
+    },
+  });
+  fs.writeFileSync(path.join(packageDir, 'tests', 'scoped-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('spawn-morty migrates legacy scoped package-manager baseline keys before subtracting known unrelated failures', () => {
+  assert.equal(7, 8);
+});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'prefix scoped package failure baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'prefix scoped package failure baseline',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Prefix scoped package failure baseline',
+        description: 'Scoped package-manager verification must keep explicit prefixed target failures blocking.',
+        acceptance_criteria: ['A targeted npm --prefix test failure still blocks the ticket even if it is persisted in the baseline.'],
+        verification: ['npm --prefix packages/app test -- tests/scoped-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'npm --prefix packages/app test -- tests/scoped-red.test.js';
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [`command:${command}`]: {
+          command,
+          scope: {
+            key: `command:${command}`,
+            kind: 'command',
+            command,
+            targets: [],
+          },
+          failures: [
+            {
+              identity: 'packages/app/tests/unrelated-red.test.js::known unrelated red',
+              file: 'packages/app/tests/unrelated-red.test.js',
+              testName: 'known unrelated red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = [
+    {
+      identity: 'packages/app/tests/unrelated-red.test.js::known unrelated red',
+      file: 'packages/app/tests/unrelated-red.test.js',
+      testName: 'known unrelated red',
+      in_scope: false,
+      source: 'node-test',
+    },
+  ];
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(remaining, []);
+});
+
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
