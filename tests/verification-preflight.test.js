@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { runTicket, subtractBaselineFailures } from '../bin/spawn-morty.js';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { writePipelineContract } from '../lib/pipeline.js';
-import { buildVerificationCommandScope, ensurePipelineState, writeVerificationBaselines } from '../lib/pipeline-state.js';
+import { buildVerificationCommandScope, buildVerificationFailureSet, ensurePipelineState, writeVerificationBaselines } from '../lib/pipeline-state.js';
 import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../lib/verification-env.js';
 import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
@@ -923,6 +923,103 @@ test('scoped red', () => {
   assert.deepEqual(
     remaining.map((failure) => failure.identity),
     ['tests/scoped-red.test.js::scoped red'],
+  );
+});
+
+test('spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-scoped-package-baseline-project-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  writeJson(path.join(projectDir, 'package.json'), {
+    name: 'scoped-package-baseline',
+    private: true,
+    scripts: {
+      test: 'node --test',
+    },
+  });
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'scoped-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline', () => {
+  assert.equal(7, 8);
+});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'scoped package failure baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'scoped package failure baseline',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Scoped package failure baseline',
+        description: 'Scoped package-manager verification must keep explicit target failures blocking.',
+        acceptance_criteria: ['A targeted package-manager test failure still blocks the ticket even if it is persisted in the baseline.'],
+        verification: ['npm test -- tests/scoped-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'npm test -- tests/scoped-red.test.js';
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [buildVerificationCommandScope(command, projectDir).key]: {
+          command,
+          scope: buildVerificationCommandScope(command, projectDir),
+          failures: [
+            {
+              identity: 'tests/scoped-red.test.js::spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline',
+              file: 'tests/scoped-red.test.js',
+              testName: 'spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline',
+              in_scope: true,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const verificationResult = spawnSync('npm', ['test', '--', 'tests/scoped-red.test.js'], {
+    cwd: projectDir,
+    env: {
+      ...env,
+      NODE_OPTIONS: '',
+    },
+    encoding: 'utf8',
+  });
+  assert.notEqual(verificationResult.status, 0);
+
+  const failures = buildVerificationFailureSet({
+    command,
+    cwd: projectDir,
+    stdout: verificationResult.stdout || '',
+    stderr: verificationResult.stderr || '',
+    exitCode: verificationResult.status ?? 1,
+  });
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['tests/scoped-red.test.js::spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline'],
   );
 });
 
