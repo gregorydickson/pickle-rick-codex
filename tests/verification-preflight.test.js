@@ -31,6 +31,14 @@ function writePreflightManifest(sessionDir, verificationEnv, verification = ['no
   });
 }
 
+function buildVerificationWriteCommand(targetPath, contents) {
+  return `node -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(targetPath)}, ${JSON.stringify(contents)})`)}`;
+}
+
+function buildVerificationReadCommand(targetPath, expectedContents) {
+  return `node -e ${JSON.stringify(`const fs = require('node:fs'); if (fs.readFileSync(${JSON.stringify(targetPath)}, 'utf8') !== ${JSON.stringify(expectedContents)}) process.exit(1);`)}`;
+}
+
 test('pickle-tmux resume fails fast on missing GITHUB_PACKAGES_TOKEN and recovers on resume once provided', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -238,6 +246,94 @@ test('spawn-morty works directly in the current branch working tree', () => {
   assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\nuser-change\nagent-change\n');
   assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
   assert.equal(ticket.status, 'Done');
+});
+
+test('spawn-morty executes object-wrapped verification commands after shared normalization', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'object wrapped verification execution'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  const proofPath = path.join(sessionDir, 'verification-proof.txt');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Object wrapped verification execution',
+        description: 'Executor uses normalized object-wrapped verification commands.',
+        acceptance_criteria: ['Object wrapped verification commands execute without executor-local parsing.'],
+        verification: {
+          commands: [
+            {
+              command: buildVerificationWriteCommand(proofPath, 'verified\n'),
+              expect: { exitCode: 0 },
+            },
+            {
+              command: buildVerificationReadCommand(proofPath, 'verified\n'),
+              expect: { exitCode: 0 },
+            },
+          ],
+        },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+  assert.equal(fs.readFileSync(proofPath, 'utf8'), 'verified\n');
+});
+
+test('spawn-morty executes array-of-object verification commands after shared normalization', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'array object verification execution'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  const proofPath = path.join(sessionDir, 'verification-proof.txt');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Array object verification execution',
+        description: 'Executor uses normalized array-of-object verification commands.',
+        acceptance_criteria: ['Array object verification commands execute without executor-local parsing.'],
+        verification: [
+          { command: buildVerificationWriteCommand(proofPath, 'verified\n') },
+          { command: buildVerificationReadCommand(proofPath, 'verified\n') },
+        ],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+  assert.equal(fs.readFileSync(proofPath, 'utf8'), 'verified\n');
 });
 
 test('spawn-morty stops phases promptly after writing phase promise tokens', () => {
@@ -493,6 +589,32 @@ test('spawn-morty accepts array-of-object verification commands during preflight
     }),
     /preflight-missing-env: SIBLING_REPO_ROOT is required for verification/,
   );
+});
+
+test('spawn-morty fails fast on invalid verification manifests before worker execution', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'invalid verification execution'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writePreflightManifest(sessionDir, null, { commands: [{ expect: { exitCode: 0 } }] });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /ticket r1 has invalid verification manifest: expected one or more verification commands/,
+  );
+
+  assert.equal(fs.existsSync(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'r1.research.last-message.txt')), false);
 });
 
 test('spawn-morty infers sibling roots from repo wrapper verification commands', () => {

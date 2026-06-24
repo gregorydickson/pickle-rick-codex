@@ -25,16 +25,9 @@ import {
   assertTicketVerificationReady,
   isPreflightError,
   isVerificationContractError,
+  normalizeVerificationCommands,
   VerificationContractError,
 } from '../lib/verification-env.js';
-
-function splitVerificationCommands(ticket) {
-  if (Array.isArray(ticket.verification)) return ticket.verification;
-  if (typeof ticket.verify === 'string' && ticket.verify.trim()) {
-    return ticket.verify.split('&&').map((item) => item.trim()).filter(Boolean);
-  }
-  return ['npm test'];
-}
 
 function phasePromiseToken(phase) {
   return `${String(phase || '').toUpperCase()}_COMPLETE`;
@@ -272,6 +265,14 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
+  const verificationCommands = normalizeVerificationCommands(manifestTicket.verification, { verify: manifestTicket.verify });
+  if (verificationCommands.length === 0) {
+    throw new Error(`ticket ${normalizedTicketId} has invalid verification manifest: expected one or more verification commands`);
+  }
+  const normalizedTicket = {
+    ...manifestTicket,
+    verification: verificationCommands,
+  };
 
   const config = loadConfig();
   const workingDir = state.working_dir;
@@ -309,7 +310,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
 
   try {
     verificationReady = assertTicketVerificationReady({
-      ticket: manifestTicket,
+      ticket: normalizedTicket,
       config,
     });
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
@@ -345,7 +346,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         prompt: buildTicketPhasePrompt({
           phase,
           ticket: {
-            ...manifestTicket,
+            ...normalizedTicket,
             verificationContract: verificationReady.contract,
           },
           sessionDir,
@@ -379,7 +380,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       recordIteration(sessionDir, manager.read(statePath));
     }
 
-    for (const command of splitVerificationCommands(manifestTicket)) {
+    for (const command of verificationCommands) {
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }
@@ -395,7 +396,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       } catch (error) {
         if (
           !(error instanceof CancellationError)
-          && shouldClassifyVerificationContractFailure(manifestTicket, command)
+          && shouldClassifyVerificationContractFailure(normalizedTicket, command)
           && !isPreflightError(error)
         ) {
           throw new VerificationContractError({
@@ -415,7 +416,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       tmuxMode,
       baselineTreeClean,
       ticketId: normalizedTicketId,
-      ticket: manifestTicket,
+      ticket: normalizedTicket,
       config,
     });
 
