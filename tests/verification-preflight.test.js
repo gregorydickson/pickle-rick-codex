@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
+import { buildTicketPhasePrompt } from '../lib/prompts.js';
+import { normalizeVerificationCommands } from '../lib/verification-env.js';
 import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function runGit(repoDir, args) {
@@ -334,6 +336,118 @@ test('spawn-morty executes array-of-object verification commands after shared no
   const result = JSON.parse(output);
   assert.equal(result.status, 'done');
   assert.equal(fs.readFileSync(proofPath, 'utf8'), 'verified\n');
+});
+
+test('spawn-morty rewrites scoped vitest verification commands into targeted execution', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-vitest-project-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
+    name: 'vitest-fixture',
+    private: true,
+    scripts: {
+      test: 'vitest run --config vitest.config.mjs',
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(projectDir, 'vitest.config.mjs'), 'export default {};\n');
+  fs.writeFileSync(path.join(projectDir, 'tests', 'targeted.test.ts'), 'export {};\n');
+  fs.writeFileSync(path.join(fakeBin, 'pnpm'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
+const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+if (args[0] === 'test') {
+  fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
+  console.error('broad test wrapper invoked');
+  process.exit(1);
+}
+if (
+  args[0] === 'exec'
+  && args[1] === 'vitest'
+  && args[2] === 'run'
+  && args.includes('--config')
+  && args.includes('tests/targeted.test.ts')
+) {
+  fs.writeFileSync(targetedMarker, args.join(' ') + '\\n');
+  process.exit(0);
+}
+console.error('unexpected pnpm invocation: ' + args.join(' '));
+process.exit(1);
+`, { mode: 0o755 });
+  fs.chmodSync(path.join(fakeBin, 'pnpm'), 0o755);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted vitest verification'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Targeted vitest verification',
+        description: 'Scoped verification should rewrite into a targeted vitest run.',
+        acceptance_criteria: ['Scoped vitest verification runs only the targeted file.'],
+        verification: ['pnpm test -- tests/targeted.test.ts'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const result = JSON.parse(output);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const prompt = buildTicketPhasePrompt({
+    phase: 'implement',
+    ticket: {
+      id: 'R1',
+      title: 'Targeted vitest verification',
+      description: 'Scoped verification should rewrite into a targeted vitest run.',
+      acceptance_criteria: ['Scoped vitest verification runs only the targeted file.'],
+      verification: ['pnpm test -- tests/targeted.test.ts'],
+    },
+    sessionDir,
+    workingDir: projectDir,
+  });
+
+  assert.equal(result.status, 'done');
+  assert.equal(ticket.status, 'Done');
+  assert.ok(fs.existsSync(path.join(projectDir, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.match(
+    fs.readFileSync(path.join(projectDir, 'targeted-suite-ran.txt'), 'utf8'),
+    /exec vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
+  );
+  assert.match(prompt, /'pnpm' 'exec' 'vitest' 'run' '--config' 'vitest\.config\.mjs' 'tests\/targeted\.test\.ts'/);
+});
+
+test('normalizeVerificationCommands leaves unknown runners unchanged', () => {
+  const projectDir = makeTempRoot('pickle-rick-non-vitest-project-');
+  fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
+    name: 'non-vitest-fixture',
+    private: true,
+    scripts: {
+      test: 'node custom-runner.js',
+    },
+  }, null, 2));
+
+  const commands = normalizeVerificationCommands(['pnpm test -- tests/targeted.test.ts'], {
+    cwd: projectDir,
+  });
+
+  assert.deepEqual(commands, ['pnpm test -- tests/targeted.test.ts']);
 });
 
 test('spawn-morty stops phases promptly after writing phase promise tokens', () => {

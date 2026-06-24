@@ -260,12 +260,19 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
   const manifest = readManifest(sessionDir);
+  const config = loadConfig();
+  const workingDir = state.working_dir;
+  const tmuxMode = Boolean(state.tmux_mode);
+  const runnerMode = options.runnerMode || null;
   const normalizedTicketId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
   const manifestTicket = manifest.tickets.find((ticket) => normalizeTicketId(ticket.id, ticket.id) === normalizedTicketId);
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
-  const verificationCommands = normalizeVerificationCommands(manifestTicket.verification, { verify: manifestTicket.verify });
+  const verificationCommands = normalizeVerificationCommands(manifestTicket.verification, {
+    verify: manifestTicket.verify,
+    cwd: workingDir,
+  });
   if (verificationCommands.length === 0) {
     throw new Error(`ticket ${normalizedTicketId} has invalid verification manifest: expected one or more verification commands`);
   }
@@ -274,10 +281,6 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
     verification: verificationCommands,
   };
 
-  const config = loadConfig();
-  const workingDir = state.working_dir;
-  const tmuxMode = Boolean(state.tmux_mode);
-  const runnerMode = options.runnerMode || null;
   let verificationReady = null;
   let baselineFingerprint = '';
   let baselineTreeClean = true;
