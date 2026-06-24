@@ -2075,6 +2075,53 @@ test('pickle-pipeline marks abrupt runner loss before resume', () => {
   assert.equal(resumedState.last_exit_reason, null);
 });
 
+test('pickle-tmux marks abrupt runner loss before resume', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  const tmuxLog = path.join(dataRoot, 'pickle-tmux-runner-loss.jsonl');
+  const prdSource = path.join(projectDir, 'runner-loss-prd.md');
+  createFakeCodex(fakeBin);
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_TMUX_LOG: tmuxLog,
+  });
+  fs.writeFileSync(prdSource, '# Runner Loss PRD\n\n## Summary\nResume should record abrupt tmux runner loss.\n');
+
+  const launchOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-tmux.js'),
+    '--prd',
+    prdSource,
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const sessionDir = sessionDirFromLaunchOutput(launchOutput);
+  const statePath = path.join(sessionDir, 'state.json');
+  const launchedState = readJsonFile(statePath);
+
+  assert.equal(launchedState.active, true);
+  assert.equal(launchedState.tmux_runner_pid, 4242);
+  assert.equal(launchedState.last_exit_reason, null);
+
+  const resumeOutput = runNode([
+    path.join(repoRoot, 'bin/pickle-tmux.js'),
+    '--resume',
+    sessionDir,
+    '--resume-ready-only',
+  ], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  assert.match(resumeOutput, /Pickle Rick tmux mode launched/);
+
+  const resumedState = readJsonFile(statePath);
+  assert.ok(resumedState.history.some((entry) => entry.step === 'runner_lost'));
+  assert.equal(resumedState.active, true);
+  assert.equal(resumedState.last_exit_reason, null);
+});
+
 test('pickle-pipeline does not launch nested tmux sessions for szechuan', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

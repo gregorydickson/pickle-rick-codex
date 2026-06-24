@@ -9,6 +9,7 @@ import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../li
 import {
   assertBootstrapSessionNotRunning,
   ensureBootstrapSessionReady,
+  isProcessAlive,
   materializeBootstrapSession,
   recordBootstrapPreflightBlocked,
   resolveBootstrapResumeSessionDir,
@@ -85,6 +86,29 @@ function usage() {
   ].join('\n');
 }
 
+function markAbruptRunnerLossBeforeResume(sessionDir, manager = new StateManager()) {
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = manager.read(statePath);
+  const runnerPid = Number(state.tmux_runner_pid);
+  if (state.active !== true || !Number.isInteger(runnerPid) || runnerPid <= 0 || isProcessAlive(runnerPid)) {
+    return;
+  }
+
+  manager.update(statePath, (current) => {
+    current.active = false;
+    current.tmux_runner_pid = null;
+    current.tmux_session_name = null;
+    current.worker_pid = null;
+    current.active_child_pid = null;
+    current.active_child_kind = null;
+    current.active_child_command = null;
+    current.last_exit_reason = 'runner_lost';
+    current.step = 'paused';
+    appendHistory(current, 'runner_lost', current.current_ticket || undefined);
+    return current;
+  });
+}
+
 async function main(argv) {
   if (argv.includes('--help')) {
     console.log(usage());
@@ -94,7 +118,11 @@ async function main(argv) {
   ensureTmuxAvailable();
   const onFailure = parseFailureMode(argv);
   const parsed = parseArgs(argv);
-  assertBootstrapSessionNotRunning(resolveBootstrapResumeSessionDir(parsed.resume));
+  const resumeSessionDir = resolveBootstrapResumeSessionDir(parsed.resume);
+  if (parsed.resume) {
+    markAbruptRunnerLossBeforeResume(resumeSessionDir);
+  }
+  assertBootstrapSessionNotRunning(resumeSessionDir);
   const sessionDir = await materializeBootstrapSession({
     prdPath: parsed.prdPath,
     resume: parsed.resume,
