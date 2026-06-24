@@ -2645,6 +2645,48 @@ test('loop-runner auto-commits anatomy-park iterations that add a new regression
   assert.match(runGit(projectDir, ['show', '--stat', '--format=', 'HEAD']), /tests\/generated-regression\.test\.js/);
 });
 
+test('loop-runner anatomy auto-commit preserves pre-existing untracked files outside the iteration diff', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  fs.writeFileSync(path.join(projectDir, 'preflight.txt'), 'tracked before anatomy\n');
+  fs.writeFileSync(path.join(projectDir, 'scratch.txt'), 'leave me untracked\n');
+  runGit(projectDir, ['add', 'index.js', 'preflight.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  fs.appendFileSync(path.join(projectDir, 'preflight.txt'), 'tracked dirty change\n');
+
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_WRITE_SUMMARY: 'changing',
+    FAKE_LOOP_MUTATE_FILE: 'tests/generated-regression.test.js',
+    FAKE_LOOP_APPEND_TEXT: 'export const regression = true;\n',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy untracked isolation task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const status = runGit(projectDir, ['status', '--porcelain']);
+  const headStat = runGit(projectDir, ['show', '--stat', '--format=', 'HEAD']);
+
+  assert.equal(status, '?? scratch.txt');
+  assert.match(headStat, /tests\/generated-regression\.test\.js/);
+  assert.doesNotMatch(headStat, /scratch\.txt/);
+});
+
 test('loop-runner counts anatomy-park summary updates as progress and writes stop summaries', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

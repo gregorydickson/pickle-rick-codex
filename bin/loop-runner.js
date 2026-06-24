@@ -10,8 +10,9 @@ import {
   getHeadSha,
   isGitRepo,
   isWorkingTreeDirty,
+  listUntrackedFiles,
   resetGitIndex,
-  stageAllChanges,
+  stagePaths,
   stageTrackedChanges,
 } from '../lib/git-utils.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
@@ -150,7 +151,7 @@ function ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, workingDir) {
   }
 }
 
-function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, beforeSnapshot, iteration) {
+function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, beforeSnapshot, iteration, beforeUntrackedFiles = []) {
   if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
     return false;
   }
@@ -163,7 +164,11 @@ function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, befo
 
   appendRunnerLog(sessionDir, 'no anatomy-park commit detected after iteration; auto-committing iteration changes');
   try {
-    stageAllChanges(workingDir);
+    const baselineUntracked = new Set(beforeUntrackedFiles);
+    const newUntrackedFiles = listUntrackedFiles(workingDir)
+      .filter((relativePath) => !baselineUntracked.has(relativePath));
+    stageTrackedChanges(workingDir);
+    stagePaths(workingDir, newUntrackedFiles);
     commitTrackedChanges(workingDir, anatomyParkCommitMessage(sessionDir, loopConfig, iteration));
     appendRunnerLog(sessionDir, `anatomy-park auto-committed: ${getHeadSha(workingDir)}`);
     return true;
@@ -268,6 +273,9 @@ export async function runLoop(sessionDir) {
         step: state.step,
         currentTicket: state.current_ticket,
       });
+      const beforeUntrackedFiles = isGitRepo(state.working_dir)
+        ? listUntrackedFiles(state.working_dir)
+        : [];
       manager.update(statePath, (current) => {
         current.iteration += 1;
         current.step = loopConfig.mode;
@@ -322,6 +330,7 @@ export async function runLoop(sessionDir) {
         state.working_dir,
         beforeSnapshot,
         state.iteration + 1,
+        beforeUntrackedFiles,
       );
 
       const afterSnapshot = captureProgressSnapshot({
