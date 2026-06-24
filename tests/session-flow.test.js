@@ -802,6 +802,24 @@ test('pickle-tmux --resume refines an existing PRD-only session before launch', 
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
 });
 
+test('pickle-tmux --resume fails cleanly when no session can be resolved', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
+  createFakeTmux(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume'], {
+      env,
+      cwd: projectDir,
+    }),
+    /No session found to resume\./,
+  );
+});
+
 test('pickle-tmux honors an explicit --resume session when --resume-ready-only is set', async () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

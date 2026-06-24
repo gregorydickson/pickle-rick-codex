@@ -87,6 +87,9 @@ function usage() {
 }
 
 function markAbruptRunnerLossBeforeResume(sessionDir, manager = new StateManager()) {
+  if (!sessionDir) {
+    return;
+  }
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
   const runnerPid = Number(state.tmux_runner_pid);
@@ -120,6 +123,9 @@ async function main(argv) {
   const parsed = parseArgs(argv);
   const resumeSessionDir = resolveBootstrapResumeSessionDir(parsed.resume);
   if (parsed.resume) {
+    if (!resumeSessionDir) {
+      throw new Error('No session found to resume.');
+    }
     markAbruptRunnerLossBeforeResume(resumeSessionDir);
   }
   assertBootstrapSessionNotRunning(resumeSessionDir);
