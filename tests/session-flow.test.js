@@ -2873,6 +2873,59 @@ process.exit(0);
   assert.doesNotMatch(log, /finished: success/);
 });
 
+test('cancel stops a live pipeline child before pipeline teardown clears runtime pids', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { ...process.env, PICKLE_DATA_ROOT: dataRoot };
+  const sessionDir = createPipelineSession({ env, projectDir });
+  const statePath = path.join(sessionDir, 'state.json');
+  const runner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  runner.unref();
+
+  const originalState = readJsonFile(statePath);
+  writeJson(statePath, {
+    ...originalState,
+    active: true,
+    pipeline_mode: true,
+    pipeline_phase: 'pickle',
+    pipeline_total_phases: 2,
+    pipeline_phase_index: 0,
+    active_child_pid: runner.pid,
+    active_child_kind: 'verification',
+    active_child_command: 'node -e "setInterval(() => {}, 1000)"',
+  });
+
+  try {
+    runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+      env,
+      cwd: projectDir,
+    });
+
+    await waitFor(() => {
+      try {
+        process.kill(runner.pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, { message: 'pipeline child was not terminated by cancel' });
+
+    const state = readJsonFile(statePath);
+    assert.equal(state.active, false);
+    assert.equal(state.last_exit_reason, 'cancelled');
+    assert.equal(state.active_child_pid, null);
+    assert.equal(state.pipeline_mode, true);
+  } finally {
+    try {
+      process.kill(runner.pid, 'SIGTERM');
+    } catch {
+      // The expected path already terminated the child.
+    }
+  }
+});
+
 test('pickle-microverse launches detached tmux loop and writes loop config', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

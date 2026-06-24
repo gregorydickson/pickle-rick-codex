@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { deactivateSession, resolveSessionForCwd } from '../lib/session.js';
+import { deactivateSession, loadSessionState, resolveSessionForCwd } from '../lib/session.js';
 
 function signalProcess(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -11,6 +11,12 @@ function signalProcess(pid) {
   } catch {
     return false;
   }
+}
+
+function runtimePids(state) {
+  return [...new Set([
+    Number(state?.active_child_pid),
+  ].filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid))];
 }
 
 async function main(argv) {
@@ -34,8 +40,13 @@ async function main(argv) {
     return;
   }
 
-  const state = await deactivateSession(resolved, 'cancelled');
-  signalProcess(state.active_child_pid);
+  const stateBeforeCancel = loadSessionState(resolved);
+  const pidsToSignal = runtimePids(stateBeforeCancel);
+
+  await deactivateSession(resolved, 'cancelled');
+  pidsToSignal.forEach((pid) => {
+    signalProcess(pid);
+  });
   console.log(`Cancelled ${resolved}`);
 }
 
