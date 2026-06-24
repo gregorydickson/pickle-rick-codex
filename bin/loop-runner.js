@@ -11,6 +11,7 @@ import {
   isGitRepo,
   isWorkingTreeDirty,
   resetGitIndex,
+  stageAllChanges,
   stageTrackedChanges,
 } from '../lib/git-utils.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
@@ -150,9 +151,9 @@ function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, befo
     return false;
   }
 
-  appendRunnerLog(sessionDir, 'no anatomy-park commit detected after iteration; auto-committing tracked changes');
+  appendRunnerLog(sessionDir, 'no anatomy-park commit detected after iteration; auto-committing iteration changes');
   try {
-    stageTrackedChanges(workingDir);
+    stageAllChanges(workingDir);
     commitTrackedChanges(workingDir, anatomyParkCommitMessage(sessionDir, loopConfig, iteration));
     appendRunnerLog(sessionDir, `anatomy-park auto-committed: ${getHeadSha(workingDir)}`);
     return true;
