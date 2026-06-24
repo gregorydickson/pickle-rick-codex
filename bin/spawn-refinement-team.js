@@ -163,6 +163,7 @@ export async function refinePrd(sessionDir, options = {}) {
         fs.existsSync(manifestPath) &&
         hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
     });
+    assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
     analystResults = [fallbackResult];
   }
 

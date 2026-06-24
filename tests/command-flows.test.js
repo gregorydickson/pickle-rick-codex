@@ -282,6 +282,98 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
 });
 
+test('spawn-refinement-team stops when analyst fallback refinement fails before synthesis', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+const addDirs = [];
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  } else if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const refinedPath = path.join(sessionDir, 'prd_refined.md');
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+if (prompt.includes('Refinement analyst role:')) {
+  console.error('fake analyst failure');
+  process.exit(1);
+} else if (prompt.includes('Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.')) {
+  console.error('fake fallback failure');
+  process.exit(1);
+} else if (prompt.includes('You are synthesizing parallel PRD refinement analyst reports')) {
+  fs.writeFileSync(refinedPath, '# Synthesized Refined PRD\\n');
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      generated_at: '2026-06-24T00:00:00.000Z',
+      source: 'masked-synthesis',
+      tickets: [
+        {
+          id: 'ticket-001',
+          title: 'Should never materialize',
+          description: 'Synthesis should not run after a failed fallback refinement.',
+          acceptance_criteria: ['Unreachable.'],
+          verification: ['npm test'],
+          priority: 'P1',
+          status: 'Todo'
+        }
+      ]
+    }, null, 2),
+  );
+  if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>REFINEMENT_COMPLETE</promise>');
+  process.exit(0);
+}
+
+console.error('unexpected prompt');
+process.exit(1);
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(
+    path.join(sessionDir, 'prd.md'),
+    '# PRD\n\n## Summary\nRefinement test\n\n## Task Breakdown\n| Order | ID | Title | Priority | Phase | Depends On |\n|---|---|---|---|---|---|\n| 10 | ticket-001 | Harden tests | P1 | 0 | none |\n',
+  );
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+      cwd: projectDir,
+      env,
+    }),
+    /PRD refinement failed: fake fallback failure/,
+  );
+
+  assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'refine:fallback');
+});
+
 test('spawn-refinement-team exits promptly after success artifacts even if codex lingers', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
