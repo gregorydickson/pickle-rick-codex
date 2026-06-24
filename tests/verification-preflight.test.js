@@ -1489,6 +1489,89 @@ test('spawn-morty preserves scoped baseline subtraction after rewriting npm --pr
   );
 });
 
+test('spawn-morty preserves pnpm --filter scoped baseline subtraction for package node-test verification', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-filtered-package-baseline-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  writeJson(path.join(packageDir, 'package.json'), {
+    name: '@loanlight/app',
+    private: true,
+    scripts: {
+      test: 'node --test',
+    },
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'filtered package baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'filtered package baseline',
+  });
+  ensurePipelineState(sessionDir);
+
+  const command = 'pnpm --filter @loanlight/app test -- tests/targeted.test.js';
+  const scope = buildVerificationCommandScope(command, projectDir);
+  assert.equal(scope.key, 'package-test:packages/app/tests/targeted.test.js');
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [scope.key]: {
+          command,
+          scope,
+          failures: [
+            {
+              identity: 'packages/app/tests/unrelated-red.test.js::known unrelated red',
+              file: 'packages/app/tests/unrelated-red.test.js',
+              testName: 'known unrelated red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = buildVerificationFailureSet({
+    command,
+    cwd: projectDir,
+    stdout: [
+      '> test',
+      '> node --test tests/targeted.test.js',
+      '',
+      '✖ keeps targeted failures visible (0.6055ms)',
+      '✖ known unrelated red (0.1234ms)',
+      'ℹ tests 2',
+      'ℹ fail 2',
+      '',
+      '✖ failing tests:',
+      '',
+      'test at tests/targeted.test.js:3:1',
+      '✖ keeps targeted failures visible (0.6055ms)',
+      '',
+      'test at tests/unrelated-red.test.js:3:1',
+      '✖ known unrelated red (0.1234ms)',
+    ].join('\n'),
+    stderr: '',
+    exitCode: 1,
+  });
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['packages/app/tests/targeted.test.js::keeps targeted failures visible'],
+  );
+});
+
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
