@@ -1209,6 +1209,71 @@ test('spawn-morty migrates legacy scoped package-manager baseline keys before su
   assert.deepEqual(remaining, []);
 });
 
+test('spawn-morty preserves absolute --prefix scoped baseline keys across session-state normalization', { concurrency: false }, () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-absolute-prefix-package-baseline-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  writeJson(path.join(packageDir, 'package.json'), {
+    name: 'absolute-prefix-scoped-package-baseline',
+    private: true,
+    scripts: {
+      test: 'node --test',
+    },
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'absolute prefix scoped package failure baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'absolute prefix scoped package failure baseline',
+  });
+  ensurePipelineState(sessionDir);
+
+  const command = `npm --prefix ${packageDir} test -- tests/scoped-red.test.js`;
+  const scope = buildVerificationCommandScope(command, projectDir);
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [scope.key]: {
+          command,
+          scope,
+          failures: [
+            {
+              identity: 'packages/app/tests/unrelated-red.test.js::known unrelated red',
+              file: 'packages/app/tests/unrelated-red.test.js',
+              testName: 'known unrelated red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const failures = [
+    {
+      identity: 'packages/app/tests/unrelated-red.test.js::known unrelated red',
+      file: 'packages/app/tests/unrelated-red.test.js',
+      testName: 'known unrelated red',
+      in_scope: false,
+      source: 'node-test',
+    },
+  ];
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
+
+  assert.deepEqual(remaining, []);
+});
+
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
