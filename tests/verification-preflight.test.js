@@ -14,7 +14,7 @@ function runGit(repoDir, args) {
   });
 }
 
-function writePreflightManifest(sessionDir, verificationEnv, verificationCommand = 'node -e "process.exit(0)"') {
+function writePreflightManifest(sessionDir, verificationEnv, verification = ['node -e "process.exit(0)"']) {
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
       {
@@ -22,7 +22,7 @@ function writePreflightManifest(sessionDir, verificationEnv, verificationCommand
         title: 'Env-gated ticket',
         description: 'Requires deterministic verification env.',
         acceptance_criteria: ['Verification can run with the required env contract.'],
-        verification: [verificationCommand],
+        verification,
         verification_env: verificationEnv,
         priority: 'P1',
         status: 'Todo',
@@ -431,6 +431,60 @@ test('spawn-morty infers env vars from braced shell expansions', () => {
       },
     ],
   });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /preflight-missing-env: SIBLING_REPO_ROOT is required for verification/,
+  );
+});
+
+test('spawn-morty accepts object-shaped verification commands during preflight', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'object verification preflight'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writePreflightManifest(
+    sessionDir,
+    null,
+    { commands: ['test -f "$SIBLING_REPO_ROOT/fixture.dot"'] },
+  );
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: repoRoot,
+    }),
+    /preflight-missing-env: SIBLING_REPO_ROOT is required for verification/,
+  );
+});
+
+test('spawn-morty accepts array-of-object verification commands during preflight', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'array object verification preflight'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writePreflightManifest(
+    sessionDir,
+    null,
+    [{ command: 'test -f "$SIBLING_REPO_ROOT/fixture.dot"' }],
+  );
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {

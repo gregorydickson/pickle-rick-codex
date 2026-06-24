@@ -8,6 +8,7 @@ import { getRunStartEpoch, resolveSessionForCwd } from '../lib/session.js';
 import { loadCircuitState } from '../lib/circuit-breaker.js';
 import { StateManager } from '../lib/state-manager.js';
 import { getTicketById, summarizeTickets } from '../lib/tickets.js';
+import { normalizeVerificationCommands } from '../lib/verification-env.js';
 
 function formatIterationLimit(maxIterations) {
   return Number.isInteger(maxIterations) && maxIterations > 0 ? String(maxIterations) : 'unlimited';
@@ -26,10 +27,8 @@ function latestFailureReason(tickets) {
 
 function ticketVerification(ticket) {
   if (!ticket) return null;
-  if (typeof ticket.verify === 'string' && ticket.verify.trim()) return ticket.verify.trim();
-  if (Array.isArray(ticket.verification) && ticket.verification.length > 0) {
-    return ticket.verification.join(' && ');
-  }
+  const commands = normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
+  if (commands.length > 0) return commands.join(' && ');
   return 'npm test';
 }
 

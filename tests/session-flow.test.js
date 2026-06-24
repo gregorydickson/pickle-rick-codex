@@ -339,18 +339,30 @@ test('status command shows ticket counts, title, verification, and last failure'
   const projectDir = makeTempRoot('pickle-rick-project-');
   const env = { PICKLE_DATA_ROOT: dataRoot };
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'status details task'], { env, cwd: projectDir }).trim();
-  const ticketDir = path.join(sessionDir, 'ticket-a');
-  const blockedDir = path.join(sessionDir, 'ticket-b');
-  fs.mkdirSync(ticketDir, { recursive: true });
-  fs.mkdirSync(blockedDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(ticketDir, 'linear_ticket_ticket-a.md'),
-    '---\nid: "ticket-a"\ntitle: "Current Ticket"\nstatus: "In Progress"\norder: 1\nverify: "npm test && npm run lint"\n---\n# body\n',
-  );
-  fs.writeFileSync(
-    path.join(blockedDir, 'linear_ticket_ticket-b.md'),
-    '---\nid: "ticket-b"\ntitle: "Blocked Ticket"\nstatus: "Blocked"\norder: 2\nfailure_reason: "verification failed"\nfailed_at: "2026-04-15T12:00:00.000Z"\nverify: "npm test"\n---\n# body\n',
-  );
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'Current Ticket',
+        description: 'Current work',
+        acceptance_criteria: ['It works'],
+        verification: [{ command: 'npm test' }, { command: 'npm run lint' }],
+        priority: 'P1',
+        status: 'In Progress',
+      },
+      {
+        id: 'ticket-b',
+        title: 'Blocked Ticket',
+        description: 'Blocked work',
+        acceptance_criteria: ['It works'],
+        verify: 'npm test',
+        priority: 'P1',
+        status: 'Blocked',
+        failure_reason: 'verification failed',
+        failed_at: '2026-04-15T12:00:00.000Z',
+      },
+    ],
+  });
 
   writeJson(path.join(sessionDir, 'state.json'), {
     active: true,

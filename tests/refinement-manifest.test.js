@@ -100,6 +100,99 @@ test('readManifest and writeTicketFiles normalize uppercase ticket ids and persi
   assert.equal(getTicketById(sessionDir, 'R1')?.id, 'r1');
 });
 
+test('readManifest normalizes verification variants and persists canonical string arrays', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'A1',
+        title: 'Array verification',
+        description: 'already normalized',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A2',
+        title: 'String verification',
+        description: 'split string',
+        acceptance_criteria: ['It works'],
+        verification: 'npm test && npm run lint',
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A3',
+        title: 'Object verification',
+        description: 'commands wrapper',
+        acceptance_criteria: ['It works'],
+        verification: { commands: ['npm test', 'npm run lint'] },
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A4',
+        title: 'Array object verification',
+        description: 'command objects',
+        acceptance_criteria: ['It works'],
+        verification: [{ command: 'npm test' }, { command: 'npm run lint' }],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A5',
+        title: 'Legacy verify',
+        description: 'verify fallback',
+        acceptance_criteria: ['It works'],
+        verify: 'npm test && npm run lint',
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A6',
+        title: 'Empty verification',
+        description: 'empty stays empty',
+        acceptance_criteria: ['It works'],
+        verification: '',
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'A7',
+        title: 'Garbage verification',
+        description: 'garbage degrades safely',
+        acceptance_criteria: ['It works'],
+        verification: { nope: true },
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const manifest = readManifest(sessionDir);
+  assert.deepEqual(manifest.tickets.map((ticket) => ticket.verification), [
+    ['npm test'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    [],
+    [],
+  ]);
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  assert.deepEqual(persisted.tickets.map((ticket) => ticket.verification), [
+    ['npm test'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    ['npm test', 'npm run lint'],
+    [],
+    [],
+  ]);
+});
+
 test('normalizeManifestTicketIds rewrites dependency references to canonical ids', () => {
   const sessionDir = makeTempRoot();
   writeManifest(sessionDir, {
