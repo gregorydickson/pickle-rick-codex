@@ -647,6 +647,45 @@ test('ticket rematerialization preserves operational frontmatter needed by statu
   assert.match(ticket.content, /config_change: true/);
 });
 
+test('ensureTicketFilesMaterialized rewrites stale ticket files when manifest status changes without an id change', () => {
+  const sessionDir = makeTempRoot();
+  const baseManifest = {
+    tickets: [
+      {
+        id: 'ticket-a',
+        title: 'Config Ticket',
+        description: 'first',
+        acceptance_criteria: ['It works'],
+        verification: ['npm test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  };
+
+  writeManifest(sessionDir, baseManifest);
+  writeTicketFiles(sessionDir, baseManifest);
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        ...baseManifest.tickets[0],
+        status: 'Skipped',
+      },
+    ],
+  });
+
+  const materialized = ensureTicketFilesMaterialized(sessionDir);
+  const summary = summarizeTickets(sessionDir);
+
+  assert.equal(materialized[0].status, 'Skipped');
+  assert.equal(summary.queued, 0);
+  assert.equal(summary.skipped, 1);
+  assert.match(
+    fs.readFileSync(path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md'), 'utf8'),
+    /status: "Skipped"/,
+  );
+});
+
 test('ticketDependencyIds treats any case of none as empty for scalar dependencies', () => {
   for (const spelling of ['none', 'None', 'NONE', 'nOnE']) {
     assert.deepEqual(ticketDependencyIds({ depends_on: spelling }), [], `spelling "${spelling}" should produce empty deps`);
