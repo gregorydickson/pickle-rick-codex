@@ -25,6 +25,50 @@ function unwrapShellToken(candidate) {
   return value;
 }
 
+function tokenizeShellWords(command) {
+  const tokens = [];
+  let current = '';
+  let quote = null;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else if (char === '\\' && quote === '"' && index + 1 < command.length) {
+        index += 1;
+        current += command[index];
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '\\' && index + 1 < command.length) {
+      index += 1;
+      current += command[index];
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (current) {
+    tokens.push(current);
+  }
+  return tokens;
+}
+
 function normalizedPathSuffixes(candidate) {
   const normalized = path.normalize(unwrapShellToken(candidate)).replace(/\\/g, '/');
   const trimmed = normalized.replace(/^[./]+/, '');
@@ -72,7 +116,7 @@ async function main() {
 
   const filePath = payload.tool_input?.file_path || payload.file_path || '';
   const command = payload.tool_input?.command || payload.command || '';
-  const candidates = [filePath, ...String(command).split(/\s+/)].filter(Boolean);
+  const candidates = [filePath, ...tokenizeShellWords(String(command))].filter(Boolean);
   const blocked = candidates.find((candidate) => matchesProtectedPattern(candidate));
 
   if (!blocked) {

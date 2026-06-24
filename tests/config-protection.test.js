@@ -126,6 +126,26 @@ test('config protection blocks quoted protected paths when they are passed throu
   assert.match(output, /AGENTS\.md/);
 });
 
+test('config protection blocks quoted protected paths when the shell path includes spaces', () => {
+  const dataRoot = makeTempRoot();
+  createSessionFixture(
+    dataRoot,
+    '---\nid: "ticket-a"\ntitle: "A"\nstatus: "Todo"\n---\n# body\n',
+  );
+
+  const protectedPath = path.join(repoRoot, 'space dir', 'AGENTS.md');
+  const output = runNode(
+    ['bin/config-protection.js'],
+    {
+      env: { PICKLE_DATA_ROOT: dataRoot, PICKLE_ACTIVE_TICKET: 'ticket-a' },
+      input: JSON.stringify({ tool_input: { command: `python patch.py "${protectedPath}"` } }),
+    },
+  ).trim();
+
+  assert.match(output, /"decision":"block"/);
+  assert.match(output, /AGENTS\.md/);
+});
+
 test('loadConfig falls back to safe defaults when nested config shapes are malformed', () => {
   const dataRoot = makeTempRoot();
   const configPath = path.join(dataRoot, 'config.json');
