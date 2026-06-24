@@ -317,6 +317,91 @@ test('baseline green', () => {});
   );
 });
 
+test('ensureBootstrapSessionReady backfills baselines for tickets added after the first capture pass', async () => {
+  const sessionDir = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-pipeline-baseline-backfill-project-');
+  writeSessionState(sessionDir, projectDir);
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'backfill verification baselines',
+  });
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('baseline red', () => {
+  assert.equal(1, 2);
+});
+`);
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-blue.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('baseline blue', () => {
+  assert.equal(3, 4);
+});
+`);
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Pipeline PRD\n');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Capture first baseline',
+        description: 'Persist the first structured failing baseline.',
+        acceptance_criteria: ['First baseline failures are persisted.'],
+        verification: ['node --test tests/baseline-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  await ensureBootstrapSessionReady(sessionDir);
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Capture first baseline',
+        description: 'Persist the first structured failing baseline.',
+        acceptance_criteria: ['First baseline failures are persisted.'],
+        verification: ['node --test tests/baseline-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'R2',
+        title: 'Capture second baseline',
+        description: 'Persist the later-added structured failing baseline.',
+        acceptance_criteria: ['Later-added baseline failures are persisted.'],
+        verification: ['node --test tests/baseline-blue.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  await ensureBootstrapSessionReady(sessionDir);
+
+  const baselines = readVerificationBaselines(sessionDir);
+  assert.ok(baselines.captured_at);
+  assert.deepEqual(
+    Object.keys(baselines.by_ticket).sort(),
+    ['r1', 'r2'],
+  );
+  assert.equal(
+    baselines.by_ticket.r2['node-test:tests/baseline-blue.test.js'].scope.key,
+    'node-test:tests/baseline-blue.test.js',
+  );
+  assert.equal(
+    baselines.by_ticket.r2['node-test:tests/baseline-blue.test.js'].command,
+    'node --test tests/baseline-blue.test.js',
+  );
+  assert.ok(Array.isArray(baselines.by_ticket.r2['node-test:tests/baseline-blue.test.js'].failures));
+});
+
 test('finishPipelinePhase with omitted exitReason derives consistent success state', () => {
   const sessionDir = makeTempRoot();
   const workingDir = '/tmp/pipeline-working-dir';
