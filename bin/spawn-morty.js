@@ -28,6 +28,11 @@ import {
   normalizeVerificationCommands,
   VerificationContractError,
 } from '../lib/verification-env.js';
+import {
+  buildVerificationFailureSet,
+  isPipelineSession,
+  readTicketVerificationBaseline,
+} from '../lib/pipeline-state.js';
 
 function phasePromiseToken(phase) {
   return `${String(phase || '').toUpperCase()}_COMPLETE`;
@@ -78,6 +83,33 @@ function safeErrorMessage(error) {
     return error.message;
   }
   return String(error);
+}
+
+class VerificationCommandError extends Error {
+  constructor({ command, stdout, stderr, exitCode, failures }) {
+    const output = String(stderr || stdout || command).trim();
+    super(`verification-command-failed: ${output || command}`);
+    this.name = 'VerificationCommandError';
+    this.command = command;
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.exitCode = exitCode;
+    this.failures = Array.isArray(failures) ? failures : [];
+  }
+}
+
+export function subtractBaselineFailures(sessionDir, ticketId, command, cwd, failures) {
+  if (!isPipelineSession(sessionDir)) {
+    return failures;
+  }
+  const baseline = readTicketVerificationBaseline(sessionDir, ticketId, command, { cwd });
+  if (!baseline || !Array.isArray(baseline.failures) || baseline.failures.length === 0) {
+    return failures;
+  }
+  const baselineIdentities = new Set(
+    baseline.failures.map((failure) => String(failure?.identity || '').trim()).filter(Boolean),
+  );
+  return failures.filter((failure) => failure?.in_scope === true || !baselineIdentities.has(failure.identity));
 }
 
 function appendRunnerLog(sessionDir, runnerMode, message) {
@@ -246,8 +278,21 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
         return;
       }
       if (code !== 0) {
-        const output = Buffer.concat(stderrChunks).toString('utf8') || Buffer.concat(stdoutChunks).toString('utf8');
-        settle(reject, new Error(`verification-command-failed: ${output || command}`));
+        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+        const stderr = Buffer.concat(stderrChunks).toString('utf8');
+        settle(reject, new VerificationCommandError({
+          command,
+          stdout,
+          stderr,
+          exitCode: code,
+          failures: buildVerificationFailureSet({
+            command,
+            cwd,
+            stdout,
+            stderr,
+            exitCode: code,
+          }),
+        }));
         return;
       }
       settle(resolve, undefined);
@@ -397,6 +442,19 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
           env: verificationReady.env,
         });
       } catch (error) {
+        if (error instanceof VerificationCommandError) {
+          const remainingFailures = subtractBaselineFailures(
+            sessionDir,
+            normalizedTicketId,
+            command,
+            workingDir,
+            error.failures,
+          );
+          if (remainingFailures.length === 0) {
+            continue;
+          }
+          error.failures = remainingFailures;
+        }
         if (
           !(error instanceof CancellationError)
           && shouldClassifyVerificationContractFailure(normalizedTicket, command)

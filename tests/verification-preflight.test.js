@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { runTicket, subtractBaselineFailures } from '../bin/spawn-morty.js';
 import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
+import { writePipelineContract } from '../lib/pipeline.js';
+import { buildVerificationCommandScope, ensurePipelineState, writeVerificationBaselines } from '../lib/pipeline-state.js';
 import { normalizeVerificationCommands } from '../lib/verification-env.js';
 import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
@@ -39,6 +42,25 @@ function buildVerificationWriteCommand(targetPath, contents) {
 
 function buildVerificationReadCommand(targetPath, expectedContents) {
   return `node -e ${JSON.stringify(`const fs = require('node:fs'); if (fs.readFileSync(${JSON.stringify(targetPath)}, 'utf8') !== ${JSON.stringify(expectedContents)}) process.exit(1);`)}`;
+}
+
+async function runTicketWithEnv(sessionDir, ticketId, envPatch) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(envPatch || {})) {
+    previous.set(key, Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined);
+    process.env[key] = value;
+  }
+  try {
+    return await runTicket(sessionDir, ticketId);
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 test('pickle-tmux resume fails fast on missing GITHUB_PACKAGES_TOKEN and recovers on resume once provided', () => {
@@ -533,6 +555,257 @@ test('spawn-morty distinguishes normal verification command failure from preflig
   assert.equal(ticket.status, 'Blocked');
   assert.equal(ticket.frontmatter.failure_kind, 'command_failed');
   assert.match(ticket.frontmatter.failure_reason, /verification-command-failed:/);
+});
+
+test('spawn-morty subtracts persisted broad node --test baseline failures before blocking a pipeline ticket', { concurrency: false }, async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-broad-baseline-project-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('baseline red', () => {
+  assert.equal(1, 2);
+});
+`);
+  fs.writeFileSync(path.join(projectDir, 'tests', 'ticket-pass.test.js'), `
+import test from 'node:test';
+test('ticket pass', () => {});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'subtract known reds'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'subtract known reds',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Subtract known reds',
+        description: 'Broad node --test runs should ignore matching baseline reds.',
+        acceptance_criteria: ['Known unrelated reds do not block the ticket.'],
+        verification: ['node --test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'node --test';
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [buildVerificationCommandScope(command, projectDir).key]: {
+          command,
+          scope: buildVerificationCommandScope(command, projectDir),
+          failures: [
+            {
+              identity: 'tests/baseline-red.test.js::baseline red',
+              file: 'tests/baseline-red.test.js',
+              testName: 'baseline red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const result = await runTicketWithEnv(sessionDir, 'r1', env);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(result.status, 'done');
+  assert.equal(ticket.status, 'Done');
+});
+
+test('spawn-morty still blocks a broad node --test ticket when verification reports a new failure outside the baseline', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-broad-new-red-project-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('baseline red', () => {
+  assert.equal(1, 2);
+});
+`);
+  fs.writeFileSync(path.join(projectDir, 'tests', 'new-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('new red', () => {
+  assert.equal(3, 4);
+});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'new failure outside baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'new failure outside baseline',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'New failure outside baseline',
+        description: 'Broad node --test runs should still block on new reds.',
+        acceptance_criteria: ['New failures still block the ticket.'],
+        verification: ['node --test'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'node --test';
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [buildVerificationCommandScope(command, projectDir).key]: {
+          command,
+          scope: buildVerificationCommandScope(command, projectDir),
+          failures: [
+            {
+              identity: 'tests/baseline-red.test.js::baseline red',
+              file: 'tests/baseline-red.test.js',
+              testName: 'baseline red',
+              in_scope: false,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, [
+    {
+      identity: 'tests/baseline-red.test.js::baseline red',
+      file: 'tests/baseline-red.test.js',
+      testName: 'baseline red',
+      in_scope: false,
+      source: 'node-test',
+    },
+    {
+      identity: 'tests/new-red.test.js::new red',
+      file: 'tests/new-red.test.js',
+      testName: 'new red',
+      in_scope: false,
+      source: 'node-test',
+    },
+  ]);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['tests/new-red.test.js::new red'],
+  );
+});
+
+test('spawn-morty still blocks explicit in-scope node --test failures even when the same identity exists in the baseline', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-scoped-baseline-project-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'scoped-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('scoped red', () => {
+  assert.equal(5, 6);
+});
+`);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'scoped failure baseline'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'scoped failure baseline',
+  });
+  ensurePipelineState(sessionDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Scoped failure baseline',
+        description: 'Explicit node --test targets remain blocking even if they were red in the baseline.',
+        acceptance_criteria: ['In-scope failures still block the ticket.'],
+        verification: ['node --test tests/scoped-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const command = 'node --test tests/scoped-red.test.js';
+  writeVerificationBaselines(sessionDir, {
+    captured_at: '2026-06-24T00:00:00.000Z',
+    by_ticket: {
+      r1: {
+        [buildVerificationCommandScope(command, projectDir).key]: {
+          command,
+          scope: buildVerificationCommandScope(command, projectDir),
+          failures: [
+            {
+              identity: 'tests/scoped-red.test.js::scoped red',
+              file: 'tests/scoped-red.test.js',
+              testName: 'scoped red',
+              in_scope: true,
+              source: 'node-test',
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, [
+    {
+      identity: 'tests/scoped-red.test.js::scoped red',
+      file: 'tests/scoped-red.test.js',
+      testName: 'scoped red',
+      in_scope: true,
+      source: 'node-test',
+    },
+  ]);
+
+  assert.deepEqual(
+    remaining.map((failure) => failure.identity),
+    ['tests/scoped-red.test.js::scoped red'],
+  );
 });
 
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {

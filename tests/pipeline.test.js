@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { readJsonFile } from '../lib/pickle-utils.js';
+import { ensureBootstrapSessionReady } from '../lib/pipeline-bootstrap.js';
 import {
   assertPipelineResumeCompatible,
   createPipelineContract,
@@ -15,6 +17,7 @@ import {
   cancelPipelineSession,
   ensurePipelineState,
   finishPipelinePhase,
+  readVerificationBaselines,
   readPipelineState,
 } from '../lib/pipeline-state.js';
 
@@ -246,4 +249,70 @@ test('finishPipelinePhase keeps verification-contract failures blocked on the cu
   assert.equal(pipelineState.current_phase, 'pickle');
   assert.equal(pipelineState.phase_statuses.pickle, 'failed');
   assert.equal(pipelineState.last_exit_reason, 'verification-contract-failed');
+});
+
+test('ensureBootstrapSessionReady captures verification baselines by ticket id and command scope for pipeline sessions', async () => {
+  const sessionDir = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-pipeline-baseline-project-');
+  writeSessionState(sessionDir, projectDir);
+  writePipelineContract(sessionDir, {
+    working_dir: projectDir,
+    target: projectDir,
+    phases: ['pickle'],
+    bootstrap_source: 'task',
+    task: 'capture verification baselines',
+  });
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-red.test.js'), `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+test('baseline red', () => {
+  assert.equal(1, 2);
+});
+`);
+  fs.writeFileSync(path.join(projectDir, 'tests', 'baseline-green.test.js'), `
+import test from 'node:test';
+test('baseline green', () => {});
+`);
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Pipeline PRD\n');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Capture failing baseline',
+        description: 'Persist the structured failing baseline.',
+        acceptance_criteria: ['Baseline failures are persisted.'],
+        verification: ['node --test tests/baseline-red.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'R2',
+        title: 'Capture passing baseline',
+        description: 'Persist the structured passing baseline.',
+        acceptance_criteria: ['Passing baselines are persisted.'],
+        verification: ['node --test tests/baseline-green.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  await ensureBootstrapSessionReady(sessionDir);
+
+  const baselines = readVerificationBaselines(sessionDir);
+  assert.ok(baselines.captured_at);
+  assert.deepEqual(
+    Object.keys(baselines.by_ticket).sort(),
+    ['r1', 'r2'],
+  );
+  assert.equal(
+    baselines.by_ticket.r1['node-test:tests/baseline-red.test.js'].scope.key,
+    'node-test:tests/baseline-red.test.js',
+  );
+  assert.ok(Array.isArray(baselines.by_ticket.r1['node-test:tests/baseline-red.test.js'].failures));
+  assert.deepEqual(
+    baselines.by_ticket.r2['node-test:tests/baseline-green.test.js'].failures,
+    [],
+  );
 });
