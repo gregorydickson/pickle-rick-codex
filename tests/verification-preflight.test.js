@@ -360,6 +360,43 @@ test('spawn-morty executes array-of-object verification commands after shared no
   assert.equal(fs.readFileSync(proofPath, 'utf8'), 'verified\n');
 });
 
+test('spawn-morty preserves quoted && inside string-form verification commands', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'quoted verification command'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  const proofPath = path.join(sessionDir, 'verification-proof.txt');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Quoted verification command',
+        description: 'String verification should only split on shell-level && operators.',
+        acceptance_criteria: ['Quoted logical operators inside a single verification command are preserved.'],
+        verification: `node -e ${JSON.stringify(`const fs = require('node:fs'); const ok = true && true; if (!ok) process.exit(1); fs.writeFileSync(${JSON.stringify(proofPath)}, 'verified\\n');`)}`,
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+  assert.equal(fs.readFileSync(proofPath, 'utf8'), 'verified\n');
+});
+
 test('spawn-morty rewrites scoped vitest verification commands into targeted execution', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');

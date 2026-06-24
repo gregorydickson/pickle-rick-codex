@@ -44,3 +44,4 @@ Treat `AGENTS.md` as canonical.
 ## Trap Doors
 
 - `bin/config-protection.js` — INVARIANT: match protected-file regexes against normalized path suffixes, not only a single repo-relative string. BREAKS: absolute-path payloads bypass config guards. ENFORCE: `tests/config-protection.test.js` absolute-path block case. PATTERN_SHAPE: normalized `file_path` or shell token checked once before suffix decomposition.
+- `lib/verification-env.js` — INVARIANT: split string-form verification only on unquoted shell `&&`. BREAKS: quoted `node -e` logic is rewritten into multiple commands. ENFORCE: `tests/verification-preflight.test.js` quoted verification case. PATTERN_SHAPE: command-list parser scanning `&&` without quote/escape tracking.
