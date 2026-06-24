@@ -1583,6 +1583,80 @@ test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLE
   assert.match(fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8'), /loop-runner finished: success/);
 });
 
+test('loop-runner continues after TASK_COMPLETED and waits for LOOP_COMPLETE', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const countPath = path.join(dataRoot, 'loop-task-completed-count.txt');
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+
+const countPath = ${JSON.stringify(countPath)};
+const current = Number(fs.existsSync(countPath) ? fs.readFileSync(countPath, 'utf8') : '0') + 1;
+fs.writeFileSync(countPath, String(current));
+
+const lastMessage = current === 1
+  ? '<promise>TASK_COMPLETED</promise>'
+  : '<promise>LOOP_COMPLETE</promise>';
+
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, lastMessage);
+}
+
+console.log(JSON.stringify({
+  usage: {
+    input_tokens: 1,
+    output_tokens: 1,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  },
+}));
+console.log(lastMessage);
+`,
+  );
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'loop task completed contract'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 5,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.iteration, 2);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '2');
+  assert.match(fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8'), /iteration 1 finished/);
+  assert.match(fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8'), /iteration 2 finished/);
+});
+
 test('loop-runner clears active state after a worker failure', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');

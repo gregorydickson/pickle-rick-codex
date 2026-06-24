@@ -41,20 +41,30 @@ function summaryPaths(sessionDir, mode) {
   };
 }
 
+function readLastMessageArtifact(outputLastMessagePath) {
+  if (!outputLastMessagePath || !fs.existsSync(outputLastMessagePath)) {
+    return '';
+  }
+  return fs.readFileSync(outputLastMessagePath, 'utf8');
+}
+
 function loopSuccessCheck(outputLastMessagePath) {
+  const tokens = ['LOOP_COMPLETE', 'TASK_COMPLETED', 'CONTINUE'];
   return ({ stdout, lastMessage }) => {
-    if (hasPromiseToken(lastMessage, 'LOOP_COMPLETE') || hasPromiseToken(lastMessage, 'TASK_COMPLETED') || hasPromiseToken(lastMessage, 'CONTINUE')) {
-      return true;
-    }
-    if (hasPromiseToken(stdout, 'LOOP_COMPLETE') || hasPromiseToken(stdout, 'TASK_COMPLETED') || hasPromiseToken(stdout, 'CONTINUE')) {
-      return true;
-    }
-    return outputLastMessagePath && (
-      hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'LOOP_COMPLETE')
-      || hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'TASK_COMPLETED')
-      || hasPromiseToken(fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '', 'CONTINUE')
+    const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
+    return tokens.some((token) =>
+      hasPromiseToken(lastMessage, token)
+      || hasPromiseToken(stdout, token)
+      || hasPromiseToken(persistedMessage, token),
     );
   };
+}
+
+function loopShouldExit(outputLastMessagePath, result) {
+  const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
+  return hasPromiseToken(result?.lastMessage, 'LOOP_COMPLETE')
+    || hasPromiseToken(result?.stdout, 'LOOP_COMPLETE')
+    || hasPromiseToken(persistedMessage, 'LOOP_COMPLETE');
 }
 
 function normalizeLoopMessage(message) {
@@ -334,7 +344,7 @@ export async function runLoop(sessionDir) {
         appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} progress: ${progressReasons.join(',')}`);
       }
 
-      if (/<promise>LOOP_COMPLETE<\/promise>|<promise>TASK_COMPLETED<\/promise>/.test(lastMessage)) {
+      if (loopShouldExit(outputLastMessagePath, result)) {
         exitReason = 'success';
         break;
       }
