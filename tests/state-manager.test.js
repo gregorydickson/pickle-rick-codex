@@ -65,6 +65,23 @@ test('StateManager update steals stale lock files', () => {
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('StateManager update reclaims fresh malformed non-empty lock files', () => {
+  const tempRoot = makeTempRoot();
+  const statePath = path.join(tempRoot, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify(defaultState(tempRoot)));
+  const lockPath = `${statePath}.lock`;
+  fs.writeFileSync(lockPath, 'not-a-pid');
+  const manager = new StateManager({ acquireTimeoutMs: 100 });
+
+  const updated = manager.update(statePath, (state) => {
+    state.iteration = 1;
+    return state;
+  });
+
+  assert.equal(updated.iteration, 1);
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
 test('StateManager does not steal a legacy stale-looking lock from a live owner', () => {
   const tempRoot = makeTempRoot();
   const statePath = path.join(tempRoot, 'state.json');
