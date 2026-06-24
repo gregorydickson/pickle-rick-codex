@@ -65,6 +65,27 @@ test('StateManager update steals stale lock files', () => {
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('StateManager does not steal a legacy stale-looking lock from a live owner', () => {
+  const tempRoot = makeTempRoot();
+  const statePath = path.join(tempRoot, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify(defaultState(tempRoot)));
+  const lockPath = `${statePath}.lock`;
+  fs.writeFileSync(lockPath, `${process.pid}`);
+  const staleTime = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockPath, staleTime, staleTime);
+  const manager = new StateManager({ staleLockThresholdMs: 1, acquireTimeoutMs: 100 });
+
+  assert.throws(
+    () => manager.update(statePath, (state) => {
+      state.iteration = 1;
+      return state;
+    }),
+    (error) => error.code === 'LOCK_FAILED',
+  );
+
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), `${process.pid}`);
+});
+
 test('StateManager transaction rolls back all files when mutation fails', () => {
   const tempRoot = makeTempRoot();
   const firstPath = path.join(tempRoot, 'first.json');
