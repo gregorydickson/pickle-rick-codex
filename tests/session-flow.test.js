@@ -463,6 +463,28 @@ test('status renders pipeline metadata without regressing non-pipeline sessions'
   assert.match(pipelineStatus, /Pipeline Bootstrap: task/);
   assert.match(pipelineStatus, /Pipeline Task: pipeline session task/);
   assert.match(pipelineStatus, new RegExp(`Pipeline Target: ${realProjectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+  writeJson(path.join(pipelineSession, 'pipeline-state.json'), {
+    schema_version: 1,
+    current_phase: 'anatomy-park',
+    current_phase_index: 1,
+    phase_statuses: {
+      pickle: 'done',
+      'anatomy-park': 'failed',
+      'szechuan-sauce': 'todo',
+    },
+    started_at: '2026-04-19T00:00:00.000Z',
+    phase_started_at: null,
+    completed_at: null,
+    last_error: 'anatomy failed',
+    last_exit_reason: 'error',
+  });
+
+  const failedPipelineStatus = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', pipelineSession], {
+    env,
+  }).trim();
+  assert.match(failedPipelineStatus, /Pipeline Phase: anatomy-park \(1 \/ 3\)/);
+  assert.match(failedPipelineStatus, /Pipeline Phases: pickle=done \| anatomy-park=failed \| szechuan-sauce=todo/);
 });
 
 test('cancel marks the session inactive and removes the session map entry', () => {

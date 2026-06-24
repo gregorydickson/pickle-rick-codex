@@ -33,7 +33,13 @@ function ticketVerification(ticket) {
 }
 
 function phaseProgressLabel(pipeline) {
-  return `${pipeline.currentPhaseLabel} (${pipeline.completedPhases} / ${pipeline.totalPhases})`;
+  const currentStatus = pipeline.currentPhaseLabel === 'complete'
+    ? null
+    : pipeline.phaseStatuses[pipeline.currentPhaseLabel] || null;
+  const countedPhases = pipeline.currentPhaseLabel !== 'complete' && currentStatus === 'running'
+    ? pipeline.completedPhases + 1
+    : pipeline.completedPhases;
+  return `${pipeline.currentPhaseLabel} (${countedPhases} / ${pipeline.totalPhases})`;
 }
 
 function loadPipelineMetadata(sessionDir, state, manager) {
@@ -74,7 +80,7 @@ function loadPipelineMetadata(sessionDir, state, manager) {
     bootstrapPrd: contract?.bootstrap_prd ?? state.pipeline_bootstrap_prd ?? null,
     bootstrapSource: contract?.bootstrap_source ?? state.pipeline_bootstrap_source ?? null,
     currentPhaseLabel: currentPhase ?? 'complete',
-    completedPhases: currentPhase == null ? phases.length : completedPhases + 1,
+    completedPhases: currentPhase == null ? phases.length : completedPhases,
     phaseStatuses,
     phases,
     target: contract?.target ?? state.pipeline_target ?? null,
