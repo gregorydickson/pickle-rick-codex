@@ -1152,6 +1152,46 @@ test('spawn-morty classifies verification contract execution failures separately
   assert.match(ticket.frontmatter.failure_reason, /research\/proof\.txt/);
 });
 
+test('spawn-morty blocks timed-out verification commands instead of treating signal exits as passing verification', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: {
+      worker_timeout_seconds: 1,
+    },
+  });
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'timed verification command'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Timed verification command',
+        description: 'Verification timeouts must remain blocking failures.',
+        acceptance_criteria: ['Timed-out verification commands block the ticket.'],
+        verification: ['node -e "setTimeout(() => process.exit(0), 2000)"'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  await assert.rejects(async () => {
+    await runTicketWithEnv(sessionDir, 'r1', env);
+  });
+
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'command_failed');
+});
+
 test('spawn-morty infers required env vars from verification commands', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
