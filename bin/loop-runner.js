@@ -8,6 +8,7 @@ import { logActivity } from '../lib/activity-logger.js';
 import {
   commitTrackedChanges,
   getHeadSha,
+  getWorkingTreeStatus,
   isGitRepo,
   isWorkingTreeDirty,
   listUntrackedFiles,
@@ -138,6 +139,14 @@ function ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, workingDir) {
   }
   if (!isGitRepo(workingDir)) {
     throw new Error('Working tree is dirty - not a git repo, cannot auto-commit before anatomy-park start');
+  }
+  const statusLines = getWorkingTreeStatus(workingDir)
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  if (statusLines.length > 0 && statusLines.every((line) => line.startsWith('?? '))) {
+    appendRunnerLog(sessionDir, 'working tree has only pre-existing untracked files before anatomy-park start; skipping tracked preflight commit');
+    return;
   }
 
   appendRunnerLog(sessionDir, 'working tree is dirty before anatomy-park start; auto-committing tracked changes');

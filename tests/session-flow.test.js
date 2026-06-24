@@ -2556,6 +2556,46 @@ test('loop-runner auto-commits a dirty anatomy-park git tree before the first it
   assert.match(runnerLog, /preflight auto-committed:/);
 });
 
+test('loop-runner ignores untracked-only anatomy-park preflight dirt', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
+  runGit(projectDir, ['add', 'index.js']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  fs.writeFileSync(path.join(projectDir, 'scratch.txt'), 'leave me untracked\n');
+
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+  });
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'anatomy untracked-only preflight task'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park',
+    target: projectDir,
+    stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+
+  assert.equal(afterHead, beforeHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '?? scratch.txt');
+  assert.match(runnerLog, /working tree has only pre-existing untracked files before anatomy-park start; skipping tracked preflight commit/);
+  assert.doesNotMatch(runnerLog, /preflight auto-committed:/);
+  assert.match(runnerLog, /loop-runner finished: success/);
+});
+
 test('loop-runner auto-commits anatomy-park fix iterations when the worker leaves tracked changes uncommitted', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
