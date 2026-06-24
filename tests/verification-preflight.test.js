@@ -573,6 +573,86 @@ process.exit(1);
   );
 });
 
+test('spawn-morty rewrites pnpm --filter scoped vitest verification commands into targeted execution', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-pnpm-filter-vitest-project-');
+  const packageDir = path.join(projectDir, 'packages', 'app');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+  });
+
+  fs.mkdirSync(path.join(packageDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+    name: '@loanlight/app',
+    private: true,
+    scripts: {
+      test: 'vitest run --config vitest.config.mjs',
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(packageDir, 'vitest.config.mjs'), 'export default {};\n');
+  fs.writeFileSync(path.join(packageDir, 'tests', 'targeted.test.ts'), 'export {};\n');
+  fs.writeFileSync(path.join(fakeBin, 'pnpm'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
+const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+if (args[0] === '--filter' && args[2] === 'test') {
+  fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
+  console.error('broad filtered test wrapper invoked');
+  process.exit(1);
+}
+if (
+  args[0] === 'exec'
+  && args[1] === 'vitest'
+  && args[2] === 'run'
+  && args.includes('--config')
+  && args.includes('tests/targeted.test.ts')
+) {
+  fs.writeFileSync(targetedMarker, args.join(' ') + '\\n');
+  process.exit(0);
+}
+console.error('unexpected pnpm invocation: ' + args.join(' '));
+process.exit(1);
+`, { mode: 0o755 });
+  fs.chmodSync(path.join(fakeBin, 'pnpm'), 0o755);
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted pnpm filter vitest verification'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Targeted pnpm filter vitest verification',
+        description: 'Scoped verification should rewrite pnpm --filter into a targeted vitest run.',
+        acceptance_criteria: ['Scoped pnpm --filter vitest verification runs only the targeted file.'],
+        verification: ['pnpm --filter @loanlight/app test -- tests/targeted.test.ts'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  const result = JSON.parse(output);
+  assert.equal(result.status, 'done');
+  assert.ok(fs.existsSync(path.join(packageDir, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.match(
+    fs.readFileSync(path.join(packageDir, 'targeted-suite-ran.txt'), 'utf8'),
+    /exec vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
+  );
+});
+
 test('normalizeVerificationCommands leaves unknown runners unchanged', () => {
   const projectDir = makeTempRoot('pickle-rick-non-vitest-project-');
   fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
