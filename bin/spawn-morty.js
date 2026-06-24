@@ -10,11 +10,13 @@ import { recordIteration } from '../lib/circuit-breaker.js';
 import {
   commitTrackedChanges,
   getHeadSha,
+  hasTrackedWorkingTreeChanges,
   getWorkingTreeFingerprint,
   isGitRepo,
   isWorkingTreeDirty,
+  listUntrackedFiles,
   resetGitIndex,
-  stageAllChanges,
+  stageTrackedChangesAndNewPaths,
 } from '../lib/git-utils.js';
 import { buildTicketPhasePrompt } from '../lib/prompts.js';
 import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
@@ -138,18 +140,25 @@ function autoCommitDetachedTicketChanges({
   runnerMode,
   workingDir,
   tmuxMode,
-  baselineTreeClean,
+  baselineTrackedClean,
+  baselineUntrackedFiles,
   ticketId,
   ticket,
   config,
 }) {
-  if (!tmuxMode || !baselineTreeClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
+  if (!tmuxMode || !baselineTrackedClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
+    return;
+  }
+
+  const currentUntrackedFiles = listUntrackedFiles(workingDir);
+  const newUntrackedFiles = currentUntrackedFiles.filter((filePath) => !baselineUntrackedFiles.includes(filePath));
+  if (!hasTrackedWorkingTreeChanges(workingDir) && newUntrackedFiles.length === 0) {
     return;
   }
 
   appendRunnerLog(sessionDir, runnerMode, `no clean commit boundary detected for ${ticketId}; auto-committing ticket changes`);
   try {
-    stageAllChanges(workingDir);
+    stageTrackedChangesAndNewPaths(workingDir, newUntrackedFiles);
     commitTrackedChanges(workingDir, ticketCommitMessage(ticketId, ticket));
     const head = getHeadSha(workingDir);
     appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-committed: ${head}`);
@@ -328,7 +337,8 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
 
   let verificationReady = null;
   let baselineFingerprint = '';
-  let baselineTreeClean = true;
+  let baselineTrackedClean = true;
+  let baselineUntrackedFiles = [];
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
   function finalizeSuccess(applied) {
@@ -362,7 +372,8 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       config,
     });
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
-    baselineTreeClean = !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir);
+    baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
+    baselineUntrackedFiles = isGitRepo(workingDir) ? listUntrackedFiles(workingDir) : [];
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -475,7 +486,8 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       runnerMode,
       workingDir,
       tmuxMode,
-      baselineTreeClean,
+      baselineTrackedClean,
+      baselineUntrackedFiles,
       ticketId: normalizedTicketId,
       ticket: normalizedTicket,
       config,

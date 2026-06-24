@@ -1533,6 +1533,61 @@ test('mux-runner auto-commits completed tmux tickets and leaves a clean tree', (
   assert.match(log, /ticket r1 auto-committed:/);
 });
 
+test('mux-runner preserves pre-existing untracked files while auto-committing tracked ticket changes', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  fs.writeFileSync(path.join(projectDir, 'scratch.txt'), 'leave me untracked\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  const beforeHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'commit boundary with untracked scratch'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'R1',
+        title: 'Commit boundary with untracked scratch',
+        description: 'Detached tmux tickets should auto-commit tracked work without sweeping or blocking on baseline untracked files.',
+        acceptance_criteria: ['Tracked ticket changes are committed while pre-existing untracked files remain outside the commit.'],
+        verification: [
+          'node -e "const fs = require(\'fs\'); const text = fs.readFileSync(\'feature.txt\', \'utf8\'); if (text !== \'base\\nagent-change\\n\') process.exit(1)"',
+        ],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
+    env,
+    cwd: projectDir,
+  });
+
+  const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+  const headStat = runGit(projectDir, ['show', '--stat', '--format=', 'HEAD']);
+  const status = runGit(projectDir, ['status', '--porcelain']);
+
+  assert.notEqual(afterHead, beforeHead);
+  assert.equal(commitSubject, 'pickle: r1 - Commit boundary with untracked scratch');
+  assert.equal(status, '?? scratch.txt');
+  assert.match(headStat, /feature\.txt/);
+  assert.doesNotMatch(headStat, /scratch\.txt/);
+});
+
 test('mux-runner preserves ticket failure when max_time would block a retry', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
