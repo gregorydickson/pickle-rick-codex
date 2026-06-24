@@ -5,15 +5,16 @@
 
 **Updated 2026-06-24.** Established this ledger. The repo's foundational delivery is the full
 **`pickle-pipeline` port** (`prds/pickle-pipeline-port.md`) — detached `pickle → anatomy-park →
-szechuan-sauce` over sequential `codex exec`. Now entering **field-hardening from real runs**: the first
-pre-PR-review run surfaced two ticket-verification defects (LOA-1568) that abort the pipeline before any
-remediation lands.
+szechuan-sauce` over sequential `codex exec`. **Field-hardening underway:** LOA-1568 (the two
+ticket-verification defects that aborted the pipeline) is **shipped in `v0.2.16-beta.1`** via a full
+self-hosted pipeline run (the runtime fixing its own verification path). Beta carries 22 deferred citadel
+findings (all mechanical/advisory, suite 208/0) tracked as `citadel-cleanup` before a stable `v0.2.16`.
 
 ## Status
 
 | Item | Value |
 |---|---|
-| Version | **0.2.15** (`package.json`) |
+| Version | **0.2.16-beta.1** (`package.json`) — released as GitHub prerelease 2026-06-24 |
 | Runtime data root | `~/.codex/pickle-rick/` (override `PICKLE_DATA_ROOT`) |
 | Source → deploy | `lib/*.js` (plain JS, no compile) → `bash install.sh` (`cp -R`) → `~/.codex/pickle-rick/` |
 | Guaranteed path | sequential `codex exec`; native multi-agent only after local validation |
@@ -28,7 +29,8 @@ drain row — field runs are the evidence that drives the work. Keep docs aligne
 
 | # | Item | Pri | State | Source |
 |---|------|-----|-------|--------|
-| LOA-1568 | **Harden ticket verification** — (1) object-shaped `verification` (`{commands:[…]}`) hard-crashes the runner via an unguarded `.map` at `lib/prompts.js:83`; the cited "defensive" helper `ticketVerificationCommands` has **no object branch** and exists in **two divergent copies** (`tickets.js:179` default `['npm test']` vs `verification-env.js:108` default `[]`), neither object-aware, with no normalization at `writeManifest`. (2) verification runs the **whole** suite (`pnpm test -- <path>` does not filter in vitest), so one pre-existing unrelated red blocks every ticket; **no base-commit baseline/quarantine** exists. Fix = ONE object-aware normalizer at the manifest chokepoint + pinned refine schema + fail-fast validation + scoped `exec vitest run <path>` emission + base-commit baseline-subtraction (port the claude sibling's `convergence-gate` pattern). | **P1** | **READY TO BUILD** — validated against source 2026-06-24 (v0.2.15). Urgent: aborts on ticket #1 with no remediation; currently needs a hand-edited `refinement_manifest.json` + skipped tests every run. | `p1-harden-ticket-verification-loa-1568.md` |
+| LOA-1568 | **Harden ticket verification** — object-shaped `verification` crash + full-suite gate trip + no base-commit baseline. Corrected fix plan (dual `/ll:pr-review` + Codex review) moved the chokepoint to the read path, caught the third executing helper (`bin/spawn-morty.js`), and relocated baseline subtraction to the result layer. | **P1** | ✅ **SHIPPED v0.2.16-beta.1** — pipeline session `2026-06-24-f66adb81`: 6 pickle commits (D1–D4 + adjacents) + 37 anatomy-park trap-door fixes; tests 208/0 (+48). | `p1-fix-plan-ticket-verification-loa-1568.md` (corrects `p1-harden-ticket-verification-loa-1568.md`) |
+| citadel-cleanup | **Citadel findings cleanup (post-beta debt)** — 22 open citadel findings from the LOA-1568 run: 16 brace-free `if` (CLAUDE.md-banned, mechanical) in `verification-env.js`/`pipeline-state.js`/`status.js`/a test, 4 orphan test files (no inbound ENFORCE ref), 1 Critical AC-4 coverage heuristic misfire (test-only AC → likely false positive), 1 Low ordering artifact. **No correctness defects** (suite 208/0). Clears the path beta→stable `v0.2.16`. | **P3** (1 P2 triage) | **READY TO BUILD** — mechanical; candidate for `morty-gate-remediator`. Blocks promotion of the beta to stable. | `p3-citadel-findings-cleanup-v0.2.16-beta.md` |
 
 ## Foundational PRDs
 
