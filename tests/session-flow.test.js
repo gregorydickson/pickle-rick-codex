@@ -620,12 +620,12 @@ test('canceling an older session does not clear a newer cwd mapping', () => {
   assert.equal(resolved, secondSession);
 });
 
-test('session-map lock fails closed when the lock cannot be acquired', async () => {
+test('session-map lock fails closed while a fresh empty startup lock is present', async () => {
   const dataRoot = makeTempRoot();
   const previousRoot = process.env.PICKLE_DATA_ROOT;
   process.env.PICKLE_DATA_ROOT = dataRoot;
   const lockPath = path.join(dataRoot, 'current_sessions.json.lock');
-  fs.writeFileSync(lockPath, 'busy\n');
+  fs.writeFileSync(lockPath, '');
 
   try {
     await assert.rejects(
@@ -702,6 +702,29 @@ test('session-map does not steal a legacy stale-looking lock from a live owner',
     } catch {
       // Ignore teardown failures from already-exited helpers.
     }
+    if (previousRoot === undefined) {
+      delete process.env.PICKLE_DATA_ROOT;
+    } else {
+      process.env.PICKLE_DATA_ROOT = previousRoot;
+    }
+  }
+});
+
+test('session-map reclaims fresh malformed non-empty locks before timing out', async () => {
+  const dataRoot = makeTempRoot();
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  const lockPath = path.join(dataRoot, 'current_sessions.json.lock');
+  fs.writeFileSync(lockPath, 'not-a-pid');
+
+  try {
+    await updateSessionMap('/tmp/project-a', '/tmp/session-a');
+    assert.deepEqual(
+      readJsonFile(path.join(dataRoot, 'current_sessions.json')),
+      { '/tmp/project-a': '/tmp/session-a' },
+    );
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
     if (previousRoot === undefined) {
       delete process.env.PICKLE_DATA_ROOT;
     } else {
