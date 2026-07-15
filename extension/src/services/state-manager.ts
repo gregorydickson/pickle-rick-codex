@@ -14,15 +14,15 @@ export const STALE_LOCK_THRESHOLD_MS = 30_000;
 
 const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 
-function sleepSync(milliseconds) {
+function sleepSync(milliseconds: number): void {
   Atomics.wait(sleepBuffer, 0, 0, milliseconds);
 }
 
-function lockPath(statePath) {
+function lockPath(statePath: string): string {
   return `${statePath}.lock`;
 }
 
-function processAlive(pid) {
+function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -32,13 +32,19 @@ function processAlive(pid) {
   }
 }
 
-function parseStructuredLockPayload(raw) {
-  const payload = JSON.parse(raw);
+interface StructuredLockPayload {
+  pid: number;
+  ts: number;
+}
+
+function parseStructuredLockPayload(raw: string): StructuredLockPayload {
+  const payload = JSON.parse(raw) as unknown;
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('legacy lock format');
   }
-  const pid = Number(payload.pid);
-  const ts = Number(payload.ts);
+  const obj = payload as Record<string, unknown>;
+  const pid = Number(obj.pid);
+  const ts = Number(obj.ts);
   if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(ts) || ts <= 0) {
     throw new Error('malformed lock payload');
   }
@@ -46,7 +52,8 @@ function parseStructuredLockPayload(raw) {
 }
 
 export class StateError extends Error {
-  constructor(code, message) {
+  code: string;
+  constructor(code: string, message: string) {
     super(message);
     this.name = 'StateError';
     this.code = code;
@@ -54,22 +61,55 @@ export class StateError extends Error {
 }
 
 export class LockError extends StateError {
-  constructor(message) {
+  constructor(message: string) {
     super('LOCK_FAILED', message);
     this.name = 'LockError';
   }
 }
 
 export class TransactionError extends StateError {
-  constructor(message, rollbackErrors = []) {
+  rollbackErrors: Error[];
+  constructor(message: string, rollbackErrors: Error[] = []) {
     super('WRITE_FAILED', message);
     this.name = 'TransactionError';
     this.rollbackErrors = rollbackErrors;
   }
 }
 
+/**
+ * Shape of every JSON state blob persisted by StateManager. The index signature
+ * keeps the loose runtime behaviour (callers freely read/mutate arbitrary keys)
+ * while `schema_version` is typed for the schema guard.
+ */
+export interface PersistedState {
+  schema_version?: number;
+  [key: string]: unknown;
+}
+
+export type StateMutator = (state: PersistedState) => PersistedState | null | undefined;
+
+export interface StateManagerOptions {
+  schemaVersion?: number;
+  retryBaseMs?: number;
+  acquireTimeoutMs?: number;
+  staleLockThresholdMs?: number;
+}
+
+interface ResolvedStateManagerOptions {
+  schemaVersion: number;
+  retryBaseMs: number;
+  acquireTimeoutMs: number;
+  staleLockThresholdMs: number;
+}
+
+export interface UpdateOptions {
+  createDefault?: () => PersistedState;
+}
+
 export class StateManager {
-  constructor(options = {}) {
+  options: ResolvedStateManagerOptions;
+
+  constructor(options: StateManagerOptions = {}) {
     this.options = {
       schemaVersion: STATE_SCHEMA_VERSION,
       retryBaseMs: LOCK_RETRY_BACKOFF_BASE_MS,
@@ -79,7 +119,7 @@ export class StateManager {
     };
   }
 
-  acquireLock(statePath) {
+  acquireLock(statePath: string): void {
     ensureDir(path.dirname(statePath));
     const filePath = lockPath(statePath);
     const deadline = Date.now() + this.options.acquireTimeoutMs;
@@ -108,7 +148,7 @@ export class StateManager {
     throw new LockError(`Failed to acquire lock for ${statePath}`);
   }
 
-  tryStealStaleLock(filePath) {
+  tryStealStaleLock(filePath: string): boolean {
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       const payload = parseStructuredLockPayload(raw);
@@ -136,16 +176,16 @@ export class StateManager {
     }
   }
 
-  releaseLock(statePath) {
+  releaseLock(statePath: string): void {
     fs.rmSync(lockPath(statePath), { force: true });
   }
 
-  read(statePath) {
+  read(statePath: string): PersistedState {
     if (!fs.existsSync(statePath)) {
       throw new StateError('MISSING', `State file not found: ${statePath}`);
     }
 
-    let parsed;
+    let parsed: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     } catch (error) {
@@ -156,21 +196,24 @@ export class StateManager {
       throw new StateError('CORRUPT', `State file must contain a JSON object: ${statePath}`);
     }
 
-    if (parsed.schema_version === undefined) {
-      parsed.schema_version = this.options.schemaVersion;
+    const state = parsed as PersistedState;
+    let schemaVersion = state.schema_version;
+    if (schemaVersion === undefined) {
+      schemaVersion = this.options.schemaVersion;
+      state.schema_version = schemaVersion;
     }
 
-    if (parsed.schema_version > this.options.schemaVersion) {
+    if (schemaVersion > this.options.schemaVersion) {
       throw new StateError(
         'SCHEMA_MISMATCH',
-        `State schema ${parsed.schema_version} is newer than supported ${this.options.schemaVersion}`,
+        `State schema ${schemaVersion} is newer than supported ${this.options.schemaVersion}`,
       );
     }
 
-    return parsed;
+    return state;
   }
 
-  readOrReinitialize(statePath, createDefault) {
+  readOrReinitialize(statePath: string, createDefault: () => PersistedState): PersistedState {
     try {
       return this.read(statePath);
     } catch (error) {
@@ -189,7 +232,7 @@ export class StateManager {
     }
   }
 
-  update(statePath, mutator, options = {}) {
+  update(statePath: string, mutator: StateMutator, options: UpdateOptions = {}): PersistedState {
     this.acquireLock(statePath);
     try {
       const state = options.createDefault
@@ -204,7 +247,7 @@ export class StateManager {
     }
   }
 
-  forceWrite(statePath, state) {
+  forceWrite(statePath: string, state: PersistedState): void {
     try {
       state.schema_version ??= this.options.schemaVersion;
       atomicWriteJson(statePath, state);
@@ -213,10 +256,10 @@ export class StateManager {
     }
   }
 
-  transaction(filePaths, mutator) {
+  transaction(filePaths: string[], mutator: (states: PersistedState[]) => PersistedState[] | null | undefined): PersistedState[] {
     const ordered = [...filePaths].sort();
-    const locked = [];
-    const original = new Map();
+    const locked: string[] = [];
+    const original = new Map<string, string | null>();
 
     try {
       for (const filePath of ordered) {
@@ -235,7 +278,7 @@ export class StateManager {
       }
       return result;
     } catch (error) {
-      const rollbackErrors = [];
+      const rollbackErrors: Error[] = [];
       for (const filePath of ordered) {
         const snapshot = original.get(filePath);
         try {
@@ -245,7 +288,7 @@ export class StateManager {
             fs.writeFileSync(filePath, snapshot);
           }
         } catch (rollbackError) {
-          rollbackErrors.push(rollbackError);
+          rollbackErrors.push(rollbackError as Error);
         }
       }
       throw new TransactionError(safeErrorMessage(error), rollbackErrors);

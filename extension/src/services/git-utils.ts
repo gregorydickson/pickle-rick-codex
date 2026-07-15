@@ -4,12 +4,18 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { atomicWriteFile, ensureDir, slugify } from './pickle-utils.js';
 
-function runGit(args, cwd, options = {}) {
+interface RunGitOptions {
+  timeout?: number;
+  trim?: boolean;
+  allowFailure?: boolean;
+}
+
+function runGit(args: string[], cwd: string, options: RunGitOptions = {}): string {
   try {
     const output = execFileSync('git', args, {
       cwd,
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'] as ('ignore' | 'pipe')[],
       timeout: options.timeout ?? 15_000,
     });
     return options.trim === false ? output : output.trim();
@@ -19,50 +25,50 @@ function runGit(args, cwd, options = {}) {
   }
 }
 
-export function isGitRepo(cwd) {
+export function isGitRepo(cwd: string): boolean {
   return runGit(['rev-parse', '--is-inside-work-tree'], cwd, { allowFailure: true }) === 'true';
 }
 
-export function getRepoRoot(cwd) {
+export function getRepoRoot(cwd: string): string | null {
   return runGit(['rev-parse', '--show-toplevel'], cwd, { allowFailure: true }) || null;
 }
 
-export function getHeadSha(cwd) {
+export function getHeadSha(cwd: string): string {
   return runGit(['rev-parse', 'HEAD'], cwd, { allowFailure: true }) || '';
 }
 
-function hasResolvableHead(cwd) {
+function hasResolvableHead(cwd: string): boolean {
   return runGit(['rev-parse', '--verify', 'HEAD'], cwd, { allowFailure: true }) !== '';
 }
 
-export function getWorkingTreeStatus(cwd) {
+export function getWorkingTreeStatus(cwd: string): string {
   return runGit(['status', '--porcelain'], cwd, { allowFailure: true }) || '';
 }
 
-function porcelainStatusLines(status) {
+function porcelainStatusLines(status: string): string[] {
   return String(status || '')
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean);
 }
 
-export function isWorkingTreeDirty(cwd) {
+export function isWorkingTreeDirty(cwd: string): boolean {
   return getWorkingTreeStatus(cwd) !== '';
 }
 
-export function hasTrackedWorkingTreeChanges(cwd) {
+export function hasTrackedWorkingTreeChanges(cwd: string): boolean {
   return porcelainStatusLines(getWorkingTreeStatus(cwd)).some((line) => !line.startsWith('?? '));
 }
 
-export function stageTrackedChanges(cwd) {
+export function stageTrackedChanges(cwd: string): void {
   runGit(['add', '-u'], cwd);
 }
 
-export function stageAllChanges(cwd) {
+export function stageAllChanges(cwd: string): void {
   runGit(['add', '-A'], cwd);
 }
 
-export function listUntrackedFiles(cwd) {
+export function listUntrackedFiles(cwd: string): string[] {
   const output = runGit(['ls-files', '--others', '--exclude-standard', '-z'], cwd, {
     allowFailure: true,
     trim: false,
@@ -73,19 +79,23 @@ export function listUntrackedFiles(cwd) {
     .sort();
 }
 
-export function stagePaths(cwd, paths) {
+export function stagePaths(cwd: string, paths: string[]): void {
   if (!Array.isArray(paths) || paths.length === 0) {
     return;
   }
   runGit(['add', '--', ...paths], cwd);
 }
 
-export function stageTrackedChangesAndNewPaths(cwd, paths = []) {
+export function stageTrackedChangesAndNewPaths(cwd: string, paths: string[] = []): void {
   stageTrackedChanges(cwd);
   stagePaths(cwd, paths);
 }
 
-function commitArgs(message, options = {}) {
+interface CommitOptions {
+  allowEmpty?: boolean;
+}
+
+function commitArgs(message: string, options: CommitOptions = {}): string[] {
   const args = [
     '-c',
     'user.name=Pickle Rick',
@@ -100,17 +110,17 @@ function commitArgs(message, options = {}) {
   return args;
 }
 
-export function commitTrackedChanges(cwd, message, options = {}) {
+export function commitTrackedChanges(cwd: string, message: string, options: CommitOptions = {}): string {
   return runGit(commitArgs(message, options), cwd);
 }
 
-export function resetGitIndex(cwd) {
+export function resetGitIndex(cwd: string): void {
   runGit(['reset'], cwd, { allowFailure: true });
 }
 
-function appendFilesystemEntryFingerprint(hash, rootDir, relativePath = '') {
+function appendFilesystemEntryFingerprint(hash: crypto.Hash, rootDir: string, relativePath: string = ''): void {
   const absolutePath = relativePath ? path.join(rootDir, relativePath) : rootDir;
-  let stat = null;
+  let stat: fs.Stats;
   try {
     stat = fs.lstatSync(absolutePath);
   } catch {
@@ -151,13 +161,13 @@ function appendFilesystemEntryFingerprint(hash, rootDir, relativePath = '') {
   hash.update('\0');
 }
 
-function getFilesystemFingerprint(cwd) {
+function getFilesystemFingerprint(cwd: string): string {
   const hash = crypto.createHash('sha256');
   appendFilesystemEntryFingerprint(hash, cwd);
   return hash.digest('hex');
 }
 
-export function getWorkingTreeFingerprint(cwd) {
+export function getWorkingTreeFingerprint(cwd: string): string {
   if (!isGitRepo(cwd)) {
     return getFilesystemFingerprint(cwd);
   }
@@ -194,7 +204,7 @@ export function getWorkingTreeFingerprint(cwd) {
   return hash.digest('hex');
 }
 
-function worktreeExists(worktreeDir) {
+function worktreeExists(worktreeDir: string): boolean {
   try {
     fs.lstatSync(worktreeDir);
     return true;
@@ -203,22 +213,22 @@ function worktreeExists(worktreeDir) {
   }
 }
 
-function removeExistingWorktree(repoDir, worktreeDir) {
+function removeExistingWorktree(repoDir: string, worktreeDir: string): void {
   if (!worktreeExists(worktreeDir)) return;
   runGit(['worktree', 'remove', '--force', worktreeDir], repoDir, { allowFailure: true });
   fs.rmSync(worktreeDir, { recursive: true, force: true });
 }
 
-function shouldLinkBootstrapFile(fileName) {
+function shouldLinkBootstrapFile(fileName: string): boolean {
   return fileName === '.env.local' || /\.env\.[^.]+\.local$/.test(fileName);
 }
 
-function collectBootstrapArtifacts(repoDir) {
-  const artifacts = [];
-  const queue = ['.'];
+function collectBootstrapArtifacts(repoDir: string): string[] {
+  const artifacts: string[] = [];
+  const queue: string[] = ['.'];
 
   while (queue.length > 0) {
-    const relativeDir = queue.shift();
+    const relativeDir = queue.shift()!;
     const absoluteDir = relativeDir === '.'
       ? repoDir
       : path.join(repoDir, relativeDir);
@@ -248,7 +258,7 @@ function collectBootstrapArtifacts(repoDir) {
   return artifacts;
 }
 
-function linkBootstrapArtifacts(repoDir, worktreeDir) {
+function linkBootstrapArtifacts(repoDir: string, worktreeDir: string): void {
   for (const relativePath of collectBootstrapArtifacts(repoDir)) {
     const sourcePath = path.join(repoDir, relativePath);
     const targetPath = path.join(worktreeDir, relativePath);
@@ -260,12 +270,12 @@ function linkBootstrapArtifacts(repoDir, worktreeDir) {
   }
 }
 
-function copyRepoSnapshot(repoDir, worktreeDir) {
+function copyRepoSnapshot(repoDir: string, worktreeDir: string): void {
   ensureDir(worktreeDir);
-  const queue = ['.'];
+  const queue: string[] = ['.'];
 
   while (queue.length > 0) {
-    const relativeDir = queue.shift();
+    const relativeDir = queue.shift()!;
     const sourceDir = relativeDir === '.'
       ? repoDir
       : path.join(repoDir, relativeDir);
@@ -301,7 +311,13 @@ function copyRepoSnapshot(repoDir, worktreeDir) {
   }
 }
 
-function createSnapshotWorktree({ repoDir, sessionDir, ticketId }) {
+interface SnapshotWorktreeInput {
+  repoDir: string;
+  sessionDir: string;
+  ticketId: string;
+}
+
+function createSnapshotWorktree({ repoDir, sessionDir, ticketId }: SnapshotWorktreeInput): { worktreeDir: string; baseSha: string } {
   const worktreeRoot = ensureDir(path.join(sessionDir, 'worktrees'));
   const worktreeDir = path.join(worktreeRoot, `${slugify(ticketId) || 'ticket'}-snapshot`);
   removeExistingWorktree(repoDir, worktreeDir);
@@ -323,7 +339,19 @@ function createSnapshotWorktree({ repoDir, sessionDir, ticketId }) {
   return { worktreeDir, baseSha };
 }
 
-export function createTicketWorktree({ repoDir, sessionDir, ticketId, baseRef = 'HEAD' }) {
+export interface CreateTicketWorktreeInput {
+  repoDir: string;
+  sessionDir: string;
+  ticketId: string;
+  baseRef?: string;
+}
+
+export interface TicketWorktree {
+  worktreeDir: string;
+  baseSha: string;
+}
+
+export function createTicketWorktree({ repoDir, sessionDir, ticketId, baseRef = 'HEAD' }: CreateTicketWorktreeInput): TicketWorktree {
   if (!hasResolvableHead(repoDir)) {
     return createSnapshotWorktree({ repoDir, sessionDir, ticketId });
   }
@@ -336,18 +364,18 @@ export function createTicketWorktree({ repoDir, sessionDir, ticketId, baseRef = 
   return { worktreeDir, baseSha };
 }
 
-export function removeTicketWorktree(worktreeDir) {
+export function removeTicketWorktree(worktreeDir: string): void {
   const repoDir = getRepoRoot(worktreeDir) || worktreeDir;
   runGit(['worktree', 'remove', '--force', worktreeDir], repoDir, { allowFailure: true });
   fs.rmSync(worktreeDir, { recursive: true, force: true });
 }
 
-export function worktreeHasDiff(worktreeDir, baseSha) {
+export function worktreeHasDiff(worktreeDir: string, baseSha: string): boolean {
   const diff = runGit(['diff', '--stat', baseSha], worktreeDir, { allowFailure: true });
   return diff.length > 0;
 }
 
-export function createPatchFromWorktree(worktreeDir, baseSha, outputPath) {
+export function createPatchFromWorktree(worktreeDir: string, baseSha: string, outputPath: string): string {
   const patch = runGit(['diff', '--binary', baseSha], worktreeDir, {
     allowFailure: true,
     trim: false,
@@ -356,7 +384,20 @@ export function createPatchFromWorktree(worktreeDir, baseSha, outputPath) {
   return outputPath;
 }
 
-export function checkPatchApply(targetDir, patchPath) {
+export interface PatchApplyResult {
+  ok: boolean;
+  error: string;
+}
+
+function extractExecErrorStderr(error: unknown): string {
+  const candidate = error as { stderr?: unknown };
+  if (typeof candidate.stderr === 'string') return candidate.stderr;
+  if (Buffer.isBuffer(candidate.stderr)) return candidate.stderr.toString('utf8');
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+export function checkPatchApply(targetDir: string, patchPath: string): PatchApplyResult {
   try {
     const args = hasResolvableHead(targetDir)
       ? ['apply', '--check', '--3way', patchPath]
@@ -364,18 +405,12 @@ export function checkPatchApply(targetDir, patchPath) {
     runGit(args, targetDir);
     return { ok: true, error: '' };
   } catch (error) {
-    const stderr = typeof error?.stderr === 'string'
-      ? error.stderr
-      : Buffer.isBuffer(error?.stderr)
-        ? error.stderr.toString('utf8')
-        : error instanceof Error
-          ? error.message
-          : String(error);
+    const stderr = extractExecErrorStderr(error);
     return { ok: false, error: stderr.trim() };
   }
 }
 
-export function classifyPatchApplyError(errorText) {
+export function classifyPatchApplyError(errorText: unknown): string {
   const text = String(errorText || '');
   if (
     /corrupt patch/i.test(text)
@@ -389,18 +424,18 @@ export function classifyPatchApplyError(errorText) {
   return 'patch-conflict';
 }
 
-export function canApplyPatch(targetDir, patchPath) {
+export function canApplyPatch(targetDir: string, patchPath: string): boolean {
   return checkPatchApply(targetDir, patchPath).ok;
 }
 
-export function applyPatch(targetDir, patchPath) {
+export function applyPatch(targetDir: string, patchPath: string): void {
   const args = hasResolvableHead(targetDir)
     ? ['apply', '--3way', patchPath]
     : ['apply', patchPath];
   runGit(args, targetDir);
 }
 
-export function writePatchSummary(sessionDir, ticketId, patchPath, details = {}) {
+export function writePatchSummary(sessionDir: string, ticketId: string, patchPath: string, details: Record<string, unknown> = {}): string {
   const outputPath = path.join(sessionDir, `${slugify(ticketId) || 'ticket'}.patch.json`);
   fs.writeFileSync(outputPath, JSON.stringify({ ticketId, patchPath, ...details }, null, 2));
   return outputPath;

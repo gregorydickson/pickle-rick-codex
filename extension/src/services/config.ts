@@ -6,8 +6,9 @@ import {
   getDataRoot,
   readJsonFile,
 } from './pickle-utils.js';
+import type { Config } from '../types/index.js';
 
-export const DEFAULT_CONFIG = {
+export const DEFAULT_CONFIG: Config = {
   runtime: {
     command: process.env.PICKLE_CODEX_BIN || 'codex',
     model: null,
@@ -37,59 +38,65 @@ export const DEFAULT_CONFIG = {
   },
 };
 
-function deepMerge(base, override) {
+function deepMerge<T>(base: T, override: unknown): T {
   if (Array.isArray(base) || Array.isArray(override)) {
-    return override === undefined ? structuredClone(base) : structuredClone(override);
+    return override === undefined ? structuredClone(base) : structuredClone(override) as T;
   }
 
-  if (base && typeof base === 'object' && override && typeof override === 'object') {
-    const output = { ...base };
+  if (isPlainObject(base) && isPlainObject(override)) {
+    const output: Record<string, unknown> = { ...base };
     for (const [key, value] of Object.entries(override)) {
       output[key] = key in output ? deepMerge(output[key], value) : structuredClone(value);
     }
-    return output;
+    return output as T;
   }
 
-  return override === undefined ? base : override;
+  return (override === undefined ? base : override) as T;
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function normalizeString(value, fallback) {
+function normalizeString(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
-function normalizeNullableString(value, fallback) {
+function normalizeNullableString(value: unknown, fallback: string | null): string | null {
   if (value === null) return null;
   return typeof value === 'string' ? value : fallback;
 }
 
-function normalizeBoolean(value, fallback) {
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
 
-function normalizeInteger(value, fallback, options = {}) {
-  if (!Number.isFinite(value)) return fallback;
+interface NormalizeIntegerOptions {
+  min?: number;
+}
+
+function normalizeInteger(value: unknown, fallback: number, options: NormalizeIntegerOptions = {}): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
   const normalized = Math.trunc(value);
   if (!Number.isSafeInteger(normalized)) return fallback;
   if (options.min !== undefined && normalized < options.min) return fallback;
   return normalized;
 }
 
-function normalizeStringArray(value, fallback) {
+function normalizeStringArray(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return structuredClone(fallback);
-  return value.filter((entry) => typeof entry === 'string' && entry.trim()).map((entry) => entry.trim());
+  return value
+    .filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
+    .map((entry) => entry.trim());
 }
 
-function normalizeObjectOrNull(value, fallback = null) {
+function normalizeObjectOrNull(value: unknown, fallback: Record<string, unknown> | null = null): Record<string, unknown> | null {
   if (value === null) return null;
   if (isPlainObject(value)) return structuredClone(value);
   return fallback;
 }
 
-function normalizeConfig(raw) {
+function normalizeConfig(raw: unknown): Config {
   const defaults = structuredClone(DEFAULT_CONFIG);
   if (!isPlainObject(raw)) {
     return defaults;
@@ -100,7 +107,7 @@ function normalizeConfig(raw) {
   const circuitBreaker = isPlainObject(rawDefaults.circuit_breaker) ? rawDefaults.circuit_breaker : {};
   const hooks = isPlainObject(raw.hooks) ? raw.hooks : {};
 
-  return deepMerge(defaults, {
+  return deepMerge<Config>(defaults, {
     runtime: {
       command: normalizeString(runtime.command, defaults.runtime.command),
       model: normalizeNullableString(runtime.model, defaults.runtime.model),
@@ -151,10 +158,13 @@ function normalizeConfig(raw) {
   });
 }
 
-function shouldMigrateLegacyMaxTimeConfig(raw) {
+type LegacyMaxTimeConfig = Record<string, unknown> & { defaults: Record<string, unknown> };
+
+function shouldMigrateLegacyMaxTimeConfig(raw: unknown): raw is LegacyMaxTimeConfig {
   if (!isPlainObject(raw)) return false;
   const legacyDefaultMaxTime = 120;
-  if (!isPlainObject(raw.defaults) || raw.defaults.max_time_minutes !== legacyDefaultMaxTime) {
+  const rawDefaults = raw.defaults;
+  if (!isPlainObject(rawDefaults) || rawDefaults.max_time_minutes !== legacyDefaultMaxTime) {
     return false;
   }
 
@@ -169,17 +179,17 @@ function shouldMigrateLegacyMaxTimeConfig(raw) {
   );
 }
 
-export function loadConfig(configPath = getConfigPath()) {
-  const raw = readJsonFile(configPath, {});
+export function loadConfig(configPath: string = getConfigPath()): Config {
+  const raw = readJsonFile<unknown>(configPath, {});
   return normalizeConfig(raw);
 }
 
-export function ensureConfigFile(configPath = getConfigPath()) {
+export function ensureConfigFile(configPath: string = getConfigPath()): Config {
   ensureDir(getDataRoot());
   if (!fs.existsSync(configPath)) {
     atomicWriteJson(configPath, DEFAULT_CONFIG);
   } else {
-    const raw = readJsonFile(configPath, null);
+    const raw = readJsonFile<unknown>(configPath, null);
     if (shouldMigrateLegacyMaxTimeConfig(raw)) {
       atomicWriteJson(configPath, {
         ...raw,
@@ -193,7 +203,7 @@ export function ensureConfigFile(configPath = getConfigPath()) {
   return loadConfig(configPath);
 }
 
-export function saveConfig(config, configPath = getConfigPath()) {
+export function saveConfig(config: unknown, configPath: string = getConfigPath()): void {
   ensureDir(getDataRoot());
   atomicWriteJson(configPath, normalizeConfig(config));
 }
