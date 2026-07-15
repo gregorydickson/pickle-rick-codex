@@ -22,11 +22,26 @@ import {
 } from '../services/pipeline.js';
 import { ensurePipelineState } from '../services/pipeline-state.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
-import { StateManager } from '../services/state-manager.js';
+import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
-import { isPreflightError } from '../services/verification-env.js';
+import { isPreflightError, type PreflightError } from '../services/verification-env.js';
+import type { TicketSummary } from '../services/tickets.js';
+import type { PipelineContract } from '../types/index.js';
 
-function parseFailureMode(argv) {
+interface PicklePipelineArgs {
+  taskPrompt: string | null;
+  resume: string | null;
+  prdPath: string | null;
+  resumeReadyOnly: boolean;
+  maxTime: string | null;
+  workerTimeout: string | null;
+  skipAnatomy: boolean;
+  skipAnatomySpecified: boolean;
+  skipSzechuan: boolean;
+  skipSzechuanSpecified: boolean;
+}
+
+function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
   if (!modeArg) return 'retry-once';
   const [, mode] = modeArg.split('=');
@@ -36,8 +51,8 @@ function parseFailureMode(argv) {
   return mode;
 }
 
-function parseArgs(argv) {
-  const parsed = {
+function parseArgs(argv: string[]): PicklePipelineArgs {
+  const parsed: PicklePipelineArgs = {
     taskPrompt: null,
     resume: null,
     prdPath: null,
@@ -49,7 +64,7 @@ function parseArgs(argv) {
     skipSzechuan: false,
     skipSzechuanSpecified: false,
   };
-  const taskParts = [];
+  const taskParts: string[] = [];
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -111,7 +126,7 @@ function parseArgs(argv) {
   return parsed;
 }
 
-function usage() {
+function usage(): string {
   return [
     'Usage:',
     '  node bin/pickle-pipeline.js "task string" [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
@@ -121,7 +136,7 @@ function usage() {
   ].join('\n');
 }
 
-function buildPipelinePhases(parsed) {
+function buildPipelinePhases(parsed: PicklePipelineArgs): string[] {
   const phases = ['pickle'];
   if (!parsed.skipAnatomy) {
     phases.push('anatomy-park');
@@ -132,7 +147,7 @@ function buildPipelinePhases(parsed) {
   return phases;
 }
 
-function createPipelineLaunchContract(state, parsed) {
+function createPipelineLaunchContract(state: PersistedState, parsed: PicklePipelineArgs): PipelineContract {
   const phases = buildPipelinePhases(parsed);
   return createPipelineContract({
     working_dir: state.working_dir,
@@ -148,13 +163,13 @@ function createPipelineLaunchContract(state, parsed) {
   });
 }
 
-function assertResumeSkipFlagsUnchanged(parsed) {
+function assertResumeSkipFlagsUnchanged(parsed: PicklePipelineArgs): void {
   if (parsed.skipAnatomySpecified || parsed.skipSzechuanSpecified) {
     throw new Error('Cannot change pipeline skip flags on resume.');
   }
 }
 
-function markAbruptRunnerLossBeforeResume(sessionDir, manager = new StateManager()) {
+function markAbruptRunnerLossBeforeResume(sessionDir: string, manager: StateManager = new StateManager()): void {
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
   const runnerPid = Number(state.tmux_runner_pid);
@@ -177,7 +192,7 @@ function markAbruptRunnerLossBeforeResume(sessionDir, manager = new StateManager
   });
 }
 
-function createResumeValidationContract(existingPipeline, cwd) {
+function createResumeValidationContract(existingPipeline: PipelineContract, cwd: string): PipelineContract {
   return createPipelineContract({
     ...existingPipeline,
     working_dir: cwd,
@@ -185,7 +200,7 @@ function createResumeValidationContract(existingPipeline, cwd) {
   });
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   if (argv.includes('--help')) {
     console.log(usage());
     return;
@@ -212,7 +227,7 @@ async function main(argv) {
   const sessionDir = await materializeBootstrapSession({
     prdPath: parsed.prdPath,
     taskPrompt: parsed.taskPrompt,
-    resume: parsed.resume,
+    resume: parsed.resume ?? undefined,
     maxTime: parsed.maxTime,
     workerTimeout: parsed.workerTimeout,
   });
@@ -228,23 +243,23 @@ async function main(argv) {
 
   const releaseLock = acquireLaunchLock(sessionDir);
   const runtimeRoot = getRuntimeRoot();
-  let previousSessionDir = null;
+  let previousSessionDir: string | null;
 
   try {
-    let state;
-    let summary;
+    let state: PersistedState;
+    let summary: TicketSummary;
     try {
       ({ state, summary } = await ensureBootstrapSessionReady(sessionDir, { resumeReadyOnly: parsed.resumeReadyOnly }));
     } catch (error) {
       if (isPreflightError(error)) {
-        recordBootstrapPreflightBlocked(sessionDir, error);
+        recordBootstrapPreflightBlocked(sessionDir, error as PreflightError);
       }
       throw error;
     }
 
     assertBootstrapSessionNotRunning(sessionDir);
-    previousSessionDir = getSessionForCwd(state.working_dir);
-    await updateSessionMap(state.working_dir, sessionDir);
+    previousSessionDir = getSessionForCwd(state.working_dir as string);
+    await updateSessionMap(state.working_dir as string, sessionDir);
 
     const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
     const runnerDescriptor = getRunnerDescriptor('pipeline');
@@ -269,7 +284,7 @@ async function main(argv) {
 
     try {
       clearTmuxSession(sessionName);
-      runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir]);
+      runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
 
@@ -324,9 +339,9 @@ async function main(argv) {
       });
       try {
         if (previousSessionDir) {
-          await updateSessionMap(state.working_dir, previousSessionDir);
+          await updateSessionMap(state.working_dir as string, previousSessionDir);
         } else {
-          await removeSessionMapEntry(state.working_dir, sessionDir);
+          await removeSessionMapEntry(state.working_dir as string, sessionDir);
         }
       } catch {
         // Best-effort map rollback for failed tmux launches.

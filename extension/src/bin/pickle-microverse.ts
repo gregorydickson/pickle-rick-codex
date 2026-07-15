@@ -1,19 +1,36 @@
 #!/usr/bin/env node
 import { launchDetachedLoop } from '../services/detached-launch.js';
 
-function parseArgs(argv) {
-  let metric = null;
+type DetachedLoopConfig = Parameters<typeof launchDetachedLoop>[0]['loopConfig'];
+
+interface MicroverseArgs {
+  metric: string | null;
+  metricSpecified: boolean;
+  goal: string | null;
+  goalSpecified: boolean;
+  task: string | null;
+  taskSpecified: boolean;
+  direction: string;
+  directionSpecified: boolean;
+  stallLimit: number;
+  stallLimitSpecified: boolean;
+  maxIterations: number | null;
+  resume: string | null;
+}
+
+function parseArgs(argv: string[]): MicroverseArgs {
+  let metric: string | null = null;
   let metricSpecified = false;
-  let goal = null;
+  let goal: string | null = null;
   let goalSpecified = false;
-  let task = null;
+  let task: string | null = null;
   let taskSpecified = false;
   let direction = 'higher';
   let directionSpecified = false;
   let stallLimit = 5;
   let stallLimitSpecified = false;
-  let maxIterations = null;
-  let resume = null;
+  let maxIterations: number | null = null;
+  let resume: string | null = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -76,7 +93,7 @@ function parseArgs(argv) {
   };
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv);
   const setupArgs = ['--tmux', '--command-template', 'microverse.md'];
   if (parsed.resume) {
@@ -86,10 +103,10 @@ async function main(argv) {
     }
   } else {
     if (Number.isInteger(parsed.maxIterations)) setupArgs.push('--max-iterations', String(parsed.maxIterations));
-    setupArgs.push('--task', parsed.task);
+    setupArgs.push('--task', parsed.task ?? '');
   }
 
-  const loopConfig = {
+  const loopConfig: DetachedLoopConfig = {
     mode: 'microverse',
   };
   if (!parsed.resume || parsed.taskSpecified) {

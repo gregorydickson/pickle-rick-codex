@@ -4,18 +4,20 @@ import path from 'node:path';
 import { launchDetachedLoop } from '../services/detached-launch.js';
 import { prepareSzechuanSaucePhase } from '../services/pipeline-phase-setup.js';
 
-function parseArgs(argv) {
-  let focus = null;
+type SzechuanSauceArgs = Parameters<typeof prepareSzechuanSaucePhase>[0];
+
+function parseArgs(argv: string[]): SzechuanSauceArgs {
+  let focus: string | null = null;
   let focusSpecified = false;
-  let domain = null;
+  let domain: string | null = null;
   let domainSpecified = false;
   let dryRun = false;
   let dryRunSpecified = false;
   let stallLimit = 5;
   let stallLimitSpecified = false;
-  let maxIterations = null;
-  let resume = null;
-  const targetParts = [];
+  let maxIterations: number | null = null;
+  let resume: string | null = null;
+  const targetParts: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -72,7 +74,7 @@ function parseArgs(argv) {
   };
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv);
   const { setupArgs, loopConfig, sessionCwd } = prepareSzechuanSaucePhase(parsed);
 

@@ -4,14 +4,16 @@ import path from 'node:path';
 import { launchDetachedLoop } from '../services/detached-launch.js';
 import { prepareAnatomyParkPhase } from '../services/pipeline-phase-setup.js';
 
-function parseArgs(argv) {
+type AnatomyParkArgs = Parameters<typeof prepareAnatomyParkPhase>[0];
+
+function parseArgs(argv: string[]): AnatomyParkArgs {
   let dryRun = false;
   let dryRunSpecified = false;
   let stallLimit = 3;
   let stallLimitSpecified = false;
-  let maxIterations = null;
-  let resume = null;
-  const targetParts = [];
+  let maxIterations: number | null = null;
+  let resume: string | null = null;
+  const targetParts: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -56,7 +58,7 @@ function parseArgs(argv) {
   };
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv);
   const { setupArgs, loopConfig, sessionCwd } = prepareAnatomyParkPhase(parsed);
 
