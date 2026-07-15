@@ -10,7 +10,48 @@ import { findLastSessionForCwd, getSessionForCwd, removeSessionMapEntry, session
 import { StateManager } from './state-manager.js';
 import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from './tmux.js';
 
-function parseResumeTarget(setupArgs) {
+interface LoopConfig {
+  mode: string;
+  target?: string;
+  [key: string]: unknown;
+}
+
+interface ExistingLoopConfig {
+  mode?: string;
+  target?: string;
+  [key: string]: unknown;
+}
+
+interface TmuxReservationState {
+  session_map_cwds?: string[];
+  working_dir?: string;
+  tmux_runner_pid?: unknown;
+}
+
+type TmuxReservationKind = 'runner' | 'launch';
+
+interface TmuxReservation {
+  kind: TmuxReservationKind;
+  pid: number;
+  sessionDir: string;
+}
+
+interface ReservationLookupOptions {
+  excludeSessionDir?: string;
+}
+
+type ReleaseLock = () => void;
+
+interface LaunchDetachedLoopOptions {
+  setupArgs: string[];
+  loopConfig: LoopConfig;
+  onFailure?: string;
+  banner?: string;
+  sessionCwd?: string | null;
+  sessionMapCwd?: string | null;
+}
+
+function parseResumeTarget(setupArgs: string[]): string | null {
   const resumeIndex = setupArgs.indexOf('--resume');
   if (resumeIndex === -1) return null;
   const explicitSessionDir = setupArgs[resumeIndex + 1];
@@ -20,7 +61,7 @@ function parseResumeTarget(setupArgs) {
   return '__LAST__';
 }
 
-function resolveResumeSessionDir(setupArgs, cwd = fs.realpathSync(process.cwd())) {
+function resolveResumeSessionDir(setupArgs: string[], cwd: string = fs.realpathSync(process.cwd())): string | null {
   const resumeTarget = parseResumeTarget(setupArgs);
   if (!resumeTarget) return null;
   if (resumeTarget !== '__LAST__') {
@@ -29,11 +70,11 @@ function resolveResumeSessionDir(setupArgs, cwd = fs.realpathSync(process.cwd())
   return getSessionForCwd(cwd) || findLastSessionForCwd(cwd);
 }
 
-function assertCompatibleLoopResume(sessionDir, expectedMode) {
+function assertCompatibleLoopResume(sessionDir: string | null, expectedMode: string): void {
   if (!sessionDir) {
     return;
   }
-  const existingConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'), null);
+  const existingConfig = readJsonFile<{ mode?: string }>(path.join(sessionDir, 'loop_config.json'), null);
   const existingMode = existingConfig?.mode || null;
   if (!existingMode) {
     throw new Error(`Cannot resume ${expectedMode}: ${sessionDir} is not an advanced loop session.`);
@@ -43,7 +84,11 @@ function assertCompatibleLoopResume(sessionDir, expectedMode) {
   }
 }
 
-function assertResumeTargetUnchanged(sessionDir, loopConfig, existingConfig) {
+function assertResumeTargetUnchanged(
+  sessionDir: string | null,
+  loopConfig: LoopConfig,
+  existingConfig: ExistingLoopConfig | null | undefined,
+): void {
   if (!sessionDir || !loopConfig || typeof loopConfig.target !== 'string' || !loopConfig.target) {
     return;
   }
@@ -60,7 +105,7 @@ function assertResumeTargetUnchanged(sessionDir, loopConfig, existingConfig) {
   }
 }
 
-function processAlive(pid) {
+function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }
@@ -72,19 +117,19 @@ function processAlive(pid) {
   }
 }
 
-function assertLoopSessionNotRunning(sessionDir) {
+function assertLoopSessionNotRunning(sessionDir: string | null): void {
   if (!sessionDir) {
     return;
   }
-  const state = readJsonFile(path.join(sessionDir, 'state.json'), null);
+  const state = readJsonFile<{ tmux_runner_pid?: unknown }>(path.join(sessionDir, 'state.json'), null);
   const runnerPid = Number(state?.tmux_runner_pid);
   if (processAlive(runnerPid)) {
     throw new Error(`Session is already running under tmux runner pid ${runnerPid}.`);
   }
 }
 
-export function getReservedCwdsForSession(sessionDir, fallbackCwds = []) {
-  const state = readJsonFile(path.join(sessionDir, 'state.json'), null);
+export function getReservedCwdsForSession(sessionDir: string, fallbackCwds: string[] = []): string[] {
+  const state = readJsonFile<{ session_map_cwds?: unknown; working_dir?: unknown }>(path.join(sessionDir, 'state.json'), null);
   return uniqueCwds([
     ...(Array.isArray(state?.session_map_cwds) ? state.session_map_cwds : []),
     state?.working_dir,
@@ -92,18 +137,18 @@ export function getReservedCwdsForSession(sessionDir, fallbackCwds = []) {
   ]);
 }
 
-function launchLockPath(sessionDir) {
+function launchLockPath(sessionDir: string): string {
   return path.join(sessionDir, '.tmux-launch.lock');
 }
 
-function cwdReservationLockPath(cwd) {
+function cwdReservationLockPath(cwd: string): string {
   const digest = crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 16);
   return path.join(getSessionsRoot(), `.tmux-cwd-${digest}.lock`);
 }
 
-function findTmuxReservationForCwd(cwd, options = {}) {
+function findTmuxReservationForCwd(cwd: string, options: ReservationLookupOptions = {}): TmuxReservation | null {
   const excluded = options.excludeSessionDir ? path.resolve(options.excludeSessionDir) : null;
-  let entries = [];
+  let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(getSessionsRoot(), { withFileTypes: true });
   } catch {
@@ -114,7 +159,7 @@ function findTmuxReservationForCwd(cwd, options = {}) {
     if (!entry.isDirectory()) continue;
     const sessionDir = path.join(getSessionsRoot(), entry.name);
     if (excluded && path.resolve(sessionDir) === excluded) continue;
-    const state = readJsonFile(path.join(sessionDir, 'state.json'), null);
+    const state = readJsonFile<TmuxReservationState>(path.join(sessionDir, 'state.json'), null);
     if (!state || !sessionStateMatchesCwd(state, cwd)) continue;
 
     const runnerPid = Number(state.tmux_runner_pid);
@@ -144,7 +189,7 @@ function findTmuxReservationForCwd(cwd, options = {}) {
   return null;
 }
 
-function assertNoTmuxReservationForCwd(cwd, options = {}) {
+function assertNoTmuxReservationForCwd(cwd: string, options: ReservationLookupOptions = {}): void {
   const reservation = findTmuxReservationForCwd(cwd, options);
   if (!reservation) {
     return;
@@ -155,7 +200,7 @@ function assertNoTmuxReservationForCwd(cwd, options = {}) {
   throw new Error(`A tmux runner is already active for ${cwd} under session ${reservation.sessionDir} (pid ${reservation.pid}).`);
 }
 
-export function assertNoTmuxReservationForCwds(cwds, options = {}) {
+export function assertNoTmuxReservationForCwds(cwds: string[], options: ReservationLookupOptions = {}): void {
   for (const cwd of uniqueCwds(cwds)) {
     assertNoTmuxReservationForCwd(cwd, options);
   }
@@ -163,9 +208,9 @@ export function assertNoTmuxReservationForCwds(cwds, options = {}) {
 
 const PID_LOCK_WRITE_GRACE_MS = 30_000;
 
-function acquirePidLock(lockPath, busyMessage) {
+function acquirePidLock(lockPath: string, busyMessage: string): ReleaseLock {
   ensureDir(path.dirname(lockPath));
-  let fd = null;
+  let fd: number | null = null;
   for (let attempts = 0; attempts < 3; attempts += 1) {
     try {
       fd = fs.openSync(lockPath, 'wx', 0o600);
@@ -194,10 +239,10 @@ function acquirePidLock(lockPath, busyMessage) {
         // Another launcher removed the lock between open and inspection.
       }
       if (Number.isInteger(lockPid) && processAlive(lockPid)) {
-        throw new Error(busyMessage);
+        throw new Error(busyMessage, { cause: error });
       }
       if (!rawLock && lockAgeMs <= PID_LOCK_WRITE_GRACE_MS) {
-        throw new Error(busyMessage);
+        throw new Error(busyMessage, { cause: error });
       }
       fs.rmSync(lockPath, { force: true });
     }
@@ -220,12 +265,12 @@ function acquirePidLock(lockPath, busyMessage) {
   };
 }
 
-export function acquireLaunchLock(sessionDir) {
+export function acquireLaunchLock(sessionDir: string): ReleaseLock {
   return acquirePidLock(launchLockPath(sessionDir), `A tmux launch is already in progress for ${sessionDir}.`);
 }
 
-export function acquireCwdReservationLocks(cwds) {
-  const releases = [];
+export function acquireCwdReservationLocks(cwds: string[]): ReleaseLock {
+  const releases: ReleaseLock[] = [];
   try {
     for (const cwd of uniqueCwds(cwds).sort()) {
       releases.push(acquirePidLock(cwdReservationLockPath(cwd), `A tmux launch is already in progress for ${cwd}.`));
@@ -243,8 +288,8 @@ export function acquireCwdReservationLocks(cwds) {
   };
 }
 
-function uniqueCwds(values) {
-  return [...new Set(values.filter((value) => typeof value === 'string' && value))];
+function uniqueCwds(values: unknown[]): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === 'string' && Boolean(value)))];
 }
 
 export async function launchDetachedLoop({
@@ -254,7 +299,7 @@ export async function launchDetachedLoop({
   banner = 'Detached loop launched.',
   sessionCwd = null,
   sessionMapCwd = null,
-}) {
+}: LaunchDetachedLoopOptions): Promise<string> {
   ensureTmuxAvailable();
   const launcherCwd = fs.realpathSync(process.cwd());
   const effectiveSessionCwd = fs.realpathSync(sessionCwd || launcherCwd);
@@ -280,7 +325,7 @@ export async function launchDetachedLoop({
   } else {
     assertNoTmuxReservationForCwds(reservedCwds);
   }
-  let releaseLock = resumeSessionDir ? acquireLaunchLock(resumeSessionDir) : null;
+  let releaseLock: ReleaseLock | null = resumeSessionDir ? acquireLaunchLock(resumeSessionDir) : null;
   try {
     const { sessionDir, state } = await setupSession(setupArgs, {
       updateSessionMap: false,
@@ -293,7 +338,7 @@ export async function launchDetachedLoop({
     releaseLock ??= acquireLaunchLock(sessionDir);
     const previousSessionDir = getSessionForCwd(effectiveSessionMapCwd);
     const runtimeRoot = getRuntimeRoot();
-    const existingConfig = readJsonFile(path.join(sessionDir, 'loop_config.json'), {}) || {};
+    const existingConfig = readJsonFile<ExistingLoopConfig>(path.join(sessionDir, 'loop_config.json'), {}) || {};
     if (resumed) {
       assertResumeTargetUnchanged(sessionDir, loopConfig, existingConfig);
     }
@@ -303,7 +348,7 @@ export async function launchDetachedLoop({
     atomicWriteJson(path.join(sessionDir, 'loop_config.json'), mergedConfig);
     const sessionName = `${loopConfig.mode}-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
     const statePath = path.join(sessionDir, 'state.json');
-    const runnerDescriptor = getRunnerDescriptor(mergedConfig.mode);
+    const runnerDescriptor = getRunnerDescriptor(mergedConfig.mode as string);
     const runnerLogPath = path.join(sessionDir, runnerDescriptor.runnerLog);
     const manager = new StateManager();
     let launchStarted = false;
@@ -318,7 +363,7 @@ export async function launchDetachedLoop({
         current.active_child_kind = null;
         current.active_child_command = null;
         current.last_exit_reason = null;
-        current.session_map_cwds = uniqueCwds([...(current.session_map_cwds || []), ...sessionMapCwds]);
+        current.session_map_cwds = uniqueCwds([...((current.session_map_cwds as string[] | undefined) || []), ...sessionMapCwds]);
         appendHistory(current, 'tmux_launch_requested', current.current_ticket || undefined);
         return current;
       });
