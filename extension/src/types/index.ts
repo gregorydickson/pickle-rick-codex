@@ -208,17 +208,39 @@ export interface PipelineContract {
 
 export type PipelinePhaseStatus = 'todo' | 'running' | 'done' | 'cancelled' | 'failed';
 
-export interface VerificationBaselineEntry {
-  schema_version: number;
-  captured_at: string | null;
-  working_dir: string;
-  failures: Array<{ name: string; file: string }>;
+// ---------------------------------------------------------------------------
+// Verification command scope & failure set (services/pipeline-state)
+// ---------------------------------------------------------------------------
+
+export type VerificationScopeKind = 'command' | 'node-test' | 'package-test';
+
+export interface VerificationCommandScope {
+  key: string;
+  kind: VerificationScopeKind;
+  command: string;
+  targets: string[];
 }
+
+export interface VerificationFailure {
+  identity: string;
+  file: string | null;
+  testName: string | null;
+  in_scope: boolean;
+  source: string;
+}
+
+export interface VerificationBaselineEntry {
+  command: string;
+  scope: VerificationCommandScope;
+  failures: VerificationFailure[];
+}
+
+export type VerificationBaselineCommandMap = Record<string, VerificationBaselineEntry>;
 
 export interface VerificationBaselines {
   schema_version: number;
   captured_at: string | null;
-  by_ticket: Record<string, Record<string, VerificationBaselineEntry>>;
+  by_ticket: Record<string, VerificationBaselineCommandMap>;
 }
 
 export interface PipelineState {
@@ -450,4 +472,89 @@ export interface CaptureProgressSnapshotArgs {
   mode: ProgressMode;
   step?: string | null;
   currentTicket?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Circuit Breaker (services/circuit-breaker)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal view of a session-state object needed by `recordIteration`. Kept
+ * structural so callers can pass either a full {@link SessionState} or a
+ * partial lookalike without importing the full interface.
+ */
+export interface CircuitIterationState {
+  working_dir: string;
+  step: string;
+  current_ticket: string | null;
+  loop_mode?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RecordIterationOptions {
+  circuitBreakerConfig?: Partial<CircuitBreakerConfig>;
+  error?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline State options (services/pipeline-state)
+// ---------------------------------------------------------------------------
+
+export interface PipelineStateOptions {
+  stateManager?: import('../services/state-manager.js').StateManager;
+  pipeline?: PipelineContract;
+}
+
+export interface BeginPipelinePhaseOptions extends PipelineStateOptions {
+  startedAt?: string;
+}
+
+export interface FinishPipelinePhaseOptions extends PipelineStateOptions {
+  exitReason?: string;
+  lastError?: string | null;
+  completedAt?: string;
+  failedTicketId?: string;
+}
+
+export interface CancelPipelineSessionOptions extends PipelineStateOptions {
+  phase?: string | null;
+  cancelledAt?: string;
+  exitReason?: string;
+  lastError?: string | null;
+}
+
+export interface WritePipelineStateOptions extends PipelineStateOptions {
+  /** Marker field kept to preserve the named export; no additional fields. */
+  _write?: never;
+}
+
+export interface WriteVerificationBaselinesOptions extends PipelineStateOptions {
+  /** Marker field kept to preserve the named export; no additional fields. */
+  _write?: never;
+}
+
+export interface ReadTicketVerificationBaselineOptions {
+  stateManager?: import('../services/state-manager.js').StateManager;
+  pipeline?: PipelineContract;
+  cwd?: string;
+}
+
+export interface BuildVerificationFailureSetArgs {
+  command: string;
+  cwd?: string;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+}
+
+export type PipelineStateMutator = (
+  pipelineState: PipelineState,
+  sessionState: import('../services/state-manager.js').PersistedState,
+  pipeline: PipelineContract,
+) => void;
+
+export interface TransitionPipelineStateResult {
+  state: import('../services/state-manager.js').PersistedState;
+  pipelineState: PipelineState;
+  pipeline: PipelineContract;
 }

@@ -2,8 +2,18 @@ import path from 'node:path';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { loadConfig } from './config.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from './progress-snapshot.js';
+import type {
+  CircuitBreakerConfig,
+  CircuitHistoryEntry,
+  CircuitIterationState,
+  CircuitState,
+  CircuitStateName,
+  ProgressMode,
+  ProgressSnapshot,
+  RecordIterationOptions,
+} from '../types/index.js';
 
-export function normalizeErrorSignature(input) {
+export function normalizeErrorSignature(input: unknown): string {
   return String(input || '')
     .replace(/\/[\w./-]+/g, '<PATH>')
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g, '<TIME>')
@@ -15,7 +25,7 @@ export function normalizeErrorSignature(input) {
     .slice(0, 200);
 }
 
-export function freshCircuitState() {
+export function freshCircuitState(): CircuitState {
   return {
     state: 'CLOSED',
     last_change: new Date().toISOString(),
@@ -30,28 +40,29 @@ export function freshCircuitState() {
   };
 }
 
-export function loadCircuitState(sessionDir) {
+export function loadCircuitState(sessionDir: string): CircuitState {
   const filePath = path.join(sessionDir, 'circuit_breaker.json');
-  const parsed = readJsonFile(filePath, null);
+  const parsed = readJsonFile<Record<string, unknown>>(filePath, null);
   if (!parsed || typeof parsed !== 'object') {
     return freshCircuitState();
   }
-  return { ...freshCircuitState(), ...parsed };
+  return { ...freshCircuitState(), ...parsed } as CircuitState;
 }
 
-export function saveCircuitState(sessionDir, circuitState) {
+export function saveCircuitState(sessionDir: string, circuitState: CircuitState): void {
   atomicWriteJson(path.join(sessionDir, 'circuit_breaker.json'), circuitState);
 }
 
-function recordTransition(circuitState, nextState, reason) {
+function recordTransition(circuitState: CircuitState, nextState: CircuitStateName, reason: string): void {
   if (circuitState.state === nextState) return;
   const timestamp = new Date().toISOString();
-  circuitState.history.push({
+  const entry: CircuitHistoryEntry = {
     from: circuitState.state,
     to: nextState,
     timestamp,
     reason,
-  });
+  };
+  circuitState.history.push(entry);
   circuitState.state = nextState;
   circuitState.last_change = timestamp;
   circuitState.reason = nextState === 'CLOSED' ? '' : reason;
@@ -64,9 +75,13 @@ function recordTransition(circuitState, nextState, reason) {
   }
 }
 
-export function recordIteration(sessionDir, state, options = {}) {
+export function recordIteration(
+  sessionDir: string,
+  state: CircuitIterationState,
+  options: RecordIterationOptions = {},
+): CircuitState {
   const config = loadConfig();
-  const circuitConfig = {
+  const circuitConfig: CircuitBreakerConfig = {
     ...config.defaults.circuit_breaker,
     ...(options.circuitBreakerConfig || {}),
   };
@@ -74,11 +89,14 @@ export function recordIteration(sessionDir, state, options = {}) {
   const snapshot = captureProgressSnapshot({
     sessionDir,
     workingDir: state.working_dir,
-    mode: state.loop_mode || null,
+    mode: (state.loop_mode || null) as ProgressMode,
     step: state.step,
     currentTicket: state.current_ticket,
   });
-  const progressReasons = diffProgressSnapshot(circuitState.last_snapshot, snapshot).filter((reason) => reason !== 'initial_snapshot');
+  const progressReasons = diffProgressSnapshot(
+    circuitState.last_snapshot as ProgressSnapshot | null,
+    snapshot,
+  ).filter((reason) => reason !== 'initial_snapshot');
   const progress = progressReasons.length > 0;
   const errorSignature = options.error ? normalizeErrorSignature(options.error) : null;
 
