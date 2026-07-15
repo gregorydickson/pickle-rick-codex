@@ -1,6 +1,12 @@
 import { describeVerificationContract, normalizeVerificationCommands } from './verification-env.js';
+import type { Ticket, VerificationContract } from '../types/index.js';
 
-export function buildDraftPrdPrompt({ task, sessionDir }) {
+export interface DraftPrdPromptInput {
+  task: string;
+  sessionDir: string;
+}
+
+export function buildDraftPrdPrompt({ task, sessionDir }: DraftPrdPromptInput): string {
   return [
     'You are drafting a PRD for the Pickle Rick Codex runtime.',
     `Write the PRD to ${sessionDir}/prd.md.`,
@@ -12,7 +18,12 @@ export function buildDraftPrdPrompt({ task, sessionDir }) {
   ].join('\n\n');
 }
 
-export function buildRefinePrdPrompt({ sessionDir, prdPath }) {
+export interface RefinePrdPromptInput {
+  sessionDir: string;
+  prdPath: string;
+}
+
+export function buildRefinePrdPrompt({ sessionDir, prdPath }: RefinePrdPromptInput): string {
   return [
     'Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.',
     `Read ${prdPath}.`,
@@ -31,7 +42,19 @@ export function buildRefinePrdPrompt({ sessionDir, prdPath }) {
   ].join('\n\n');
 }
 
-export function buildRefinementAnalystPrompt({ role, focus, prdPath, analysisPath }) {
+export interface RefinementAnalystPromptInput {
+  role: string;
+  focus: string;
+  prdPath: string;
+  analysisPath: string;
+}
+
+export function buildRefinementAnalystPrompt({
+  role,
+  focus,
+  prdPath,
+  analysisPath,
+}: RefinementAnalystPromptInput): string {
   return [
     'You are one of three parallel PRD refinement analysts for the Pickle Rick Codex runtime.',
     `Refinement analyst role: ${role}`,
@@ -47,7 +70,17 @@ export function buildRefinementAnalystPrompt({ role, focus, prdPath, analysisPat
   ].join('\n\n');
 }
 
-export function buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystReports }) {
+export interface RefinementSynthesisPromptInput {
+  sessionDir: string;
+  prdPath: string;
+  analystReports: string[];
+}
+
+export function buildRefinementSynthesisPrompt({
+  sessionDir,
+  prdPath,
+  analystReports,
+}: RefinementSynthesisPromptInput): string {
   return [
     'You are synthesizing parallel PRD refinement analyst reports into final executable artifacts for the Pickle Rick Codex runtime.',
     `Read ${prdPath}`,
@@ -63,15 +96,30 @@ export function buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystRep
     'Parity-style port work must preserve full mirrored proof obligations, not only a benchmark slice.',
     'Resolve analyst disagreements explicitly in favor of the most truthful runnable plan.',
     'Return <promise>REFINEMENT_COMPLETE</promise> when both files are written.',
-    'Stop immediately after writing the files and the promise token. Do not continue with extra analysis or follow-up turns.',
+    'Stop immediately after writing the files and the promise token. Do not continue with extra analysis, follow-up turns.',
   ].join('\n\n');
 }
 
-export function buildTicketPhasePrompt({ phase, ticket, sessionDir, workingDir, tmuxMode = false }) {
+export interface TicketPhasePromptInput {
+  phase: string;
+  ticket: Ticket;
+  sessionDir: string;
+  workingDir: string;
+  tmuxMode?: boolean;
+}
+
+export function buildTicketPhasePrompt({
+  phase,
+  ticket,
+  sessionDir,
+  workingDir,
+  tmuxMode = false,
+}: TicketPhasePromptInput): string {
   const verificationCommands = normalizeVerificationCommands(ticket?.verification, {
     verify: ticket?.verify,
     cwd: workingDir,
   });
+  const verificationContract = (ticket?.verificationContract ?? null) as VerificationContract | null | undefined;
   return [
     `You are executing the "${phase}" phase for ticket ${ticket.id}: ${ticket.title}.`,
     `Session dir: ${sessionDir}`,
@@ -85,8 +133,8 @@ export function buildTicketPhasePrompt({ phase, ticket, sessionDir, workingDir, 
     `Ticket description:\n${ticket.description || 'No description provided.'}`,
     `Acceptance criteria:\n${(ticket.acceptance_criteria || []).map((item) => `- ${item}`).join('\n')}`,
     `Verification commands:\n${(verificationCommands.length > 0 ? verificationCommands : ['npm test']).map((item) => `- ${item}`).join('\n')}`,
-    ticket.verificationContract
-      ? `Verification env contract:\n${describeVerificationContract(ticket.verificationContract)}`
+    verificationContract
+      ? `Verification env contract:\n${describeVerificationContract(verificationContract)}`
       : null,
     `Return <promise>${phase.toUpperCase()}_COMPLETE</promise> when this phase is finished.`,
     'Stop immediately after writing any phase-result artifacts and the promise token.',
@@ -94,9 +142,41 @@ export function buildTicketPhasePrompt({ phase, ticket, sessionDir, workingDir, 
   ].filter(Boolean).join('\n\n');
 }
 
-export function buildLoopPrompt({ mode, sessionDir, workingDir, state, loopConfig }) {
+export interface LoopPromptState {
+  iteration?: number;
+  max_iterations?: number;
+  original_prompt: string;
+}
+
+export interface LoopPromptConfig {
+  task?: string;
+  metric?: string;
+  goal?: string;
+  direction?: string;
+  stall_limit?: number;
+  target?: string;
+  focus?: string;
+  domain?: string;
+  dry_run?: boolean;
+}
+
+export interface LoopPromptInput {
+  mode: string;
+  sessionDir: string;
+  workingDir: string;
+  state: LoopPromptState;
+  loopConfig: LoopPromptConfig;
+}
+
+export function buildLoopPrompt({
+  mode,
+  sessionDir,
+  workingDir,
+  state,
+  loopConfig,
+}: LoopPromptInput): string {
   const iteration = Number.isInteger(state.iteration) ? state.iteration : 0;
-  const maxIterations = Number.isInteger(state.max_iterations) && state.max_iterations > 0
+  const maxIterations = Number.isInteger(state.max_iterations) && (state.max_iterations ?? 0) > 0
     ? state.max_iterations
     : 'unlimited';
   const common = [

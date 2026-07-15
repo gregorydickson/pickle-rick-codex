@@ -1,17 +1,23 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { getRunnerDescriptor } from './runner-descriptors.js';
+import { getRunnerDescriptor, type NormalizedRunnerDescriptor } from './runner-descriptors.js';
 
-export function shellQuote(value) {
+export interface TmuxCallOptions {
+  timeoutMs?: number;
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+}
+
+export function shellQuote(value: unknown): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-export function getRuntimeRoot() {
+export function getRuntimeRoot(): string {
   return path.resolve(new URL('..', import.meta.url).pathname);
 }
 
-export function ensureTmuxAvailable() {
+export function ensureTmuxAvailable(): string {
   const result = spawnSync('tmux', ['-V'], {
     encoding: 'utf8',
     timeout: 10_000,
@@ -22,7 +28,7 @@ export function ensureTmuxAvailable() {
   return (result.stdout || result.stderr || '').trim();
 }
 
-export function tmuxSessionExists(sessionName, options = {}) {
+export function tmuxSessionExists(sessionName: string, options: TmuxCallOptions = {}): boolean {
   const result = spawnSync('tmux', ['has-session', '-t', sessionName], {
     encoding: 'utf8',
     timeout: options.timeoutMs ?? 10_000,
@@ -32,13 +38,13 @@ export function tmuxSessionExists(sessionName, options = {}) {
   return result.status === 0;
 }
 
-export function clearTmuxSession(sessionName, options = {}) {
+export function clearTmuxSession(sessionName: string, options: TmuxCallOptions = {}): boolean {
   if (!tmuxSessionExists(sessionName, options)) return false;
   runTmux(['kill-session', '-t', sessionName], options);
   return true;
 }
 
-export function runTmux(args, options = {}) {
+export function runTmux(args: string[], options: TmuxCallOptions = {}): string {
   const result = spawnSync('tmux', args, {
     encoding: 'utf8',
     timeout: options.timeoutMs ?? 30_000,
@@ -51,32 +57,51 @@ export function runTmux(args, options = {}) {
   return result.stdout.trim();
 }
 
-function readJson(filePath) {
+function readJson<T = unknown>(filePath: string): T | null {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
   } catch {
     return null;
   }
 }
 
-function runnerStarted(state, sessionName) {
-  return state?.active === true
-    && state?.tmux_session_name === sessionName
-    && Number.isInteger(state?.tmux_runner_pid)
-    && state.tmux_runner_pid > 0;
+interface RunnerStartedState {
+  active?: boolean;
+  tmux_session_name?: string;
+  tmux_runner_pid?: number;
 }
 
-export async function waitForTmuxRunnerStart(sessionDir, sessionName, mode, options = {}) {
+function runnerStarted(state: RunnerStartedState | null, sessionName: string): boolean {
+  return Boolean(
+    state?.active === true
+      && state?.tmux_session_name === sessionName
+      && Number.isInteger(state?.tmux_runner_pid)
+      && (state?.tmux_runner_pid ?? 0) > 0,
+  );
+}
+
+export interface WaitForTmuxRunnerStartOptions {
+  timeoutMs?: number;
+  intervalMs?: number;
+  existingLogSizeBytes?: number;
+}
+
+export async function waitForTmuxRunnerStart(
+  sessionDir: string,
+  sessionName: string,
+  mode: string,
+  options: WaitForTmuxRunnerStartOptions = {},
+): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 5_000;
   const intervalMs = options.intervalMs ?? 100;
   const existingLogSizeBytes = options.existingLogSizeBytes ?? 0;
-  const descriptor = getRunnerDescriptor(mode);
+  const descriptor: NormalizedRunnerDescriptor = getRunnerDescriptor(mode);
   const statePath = path.join(sessionDir, 'state.json');
   const runnerLogPath = path.join(sessionDir, descriptor.runnerLog);
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    if (runnerStarted(readJson(statePath), sessionName)) {
+    if (runnerStarted(readJson<RunnerStartedState>(statePath), sessionName)) {
       return;
     }
     if (fs.existsSync(runnerLogPath)) {

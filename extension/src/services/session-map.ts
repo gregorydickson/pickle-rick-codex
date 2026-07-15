@@ -7,7 +7,39 @@ import {
   readJsonFile,
 } from './pickle-utils.js';
 
-function processAlive(pid) {
+/**
+ * A session-map entry value: maps a cwd string to the session directory path.
+ * Persisted as `current_sessions.json` under the codex data root.
+ */
+type SessionMap = Record<string, string>;
+
+/**
+ * The minimal subset of a session state artifact consulted by the session map
+ * (cwd aliases, liveness, and start time). Kept narrow so the session map does
+ * not couple to the full {@link SessionState} shape.
+ */
+interface SessionMapEntryState {
+  active?: boolean;
+  started_at?: string;
+  session_map_cwds?: string[];
+  working_dir?: string;
+}
+
+/**
+ * State consulted by {@link sessionStateMatchesCwd}. Only the cwd-alias fields
+ * are read.
+ */
+interface CwdMatchableState {
+  session_map_cwds?: string[];
+  working_dir?: string;
+}
+
+interface StructuredLockPayload {
+  pid: number;
+  ts: number;
+}
+
+function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }
@@ -19,24 +51,25 @@ function processAlive(pid) {
   }
 }
 
-function sessionMapLockPayload() {
+function sessionMapLockPayload(): string {
   return JSON.stringify({ pid: process.pid, ts: Date.now() });
 }
 
-function parseStructuredLockPayload(raw) {
-  const payload = JSON.parse(raw);
+function parseStructuredLockPayload(raw: string): StructuredLockPayload {
+  const payload = JSON.parse(raw) as unknown;
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('legacy lock format');
   }
-  const pid = Number(payload.pid);
-  const ts = Number(payload.ts);
+  const record = payload as Record<string, unknown>;
+  const pid = Number(record.pid);
+  const ts = Number(record.ts);
   if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(ts) || ts <= 0) {
     throw new Error('malformed lock payload');
   }
   return { pid, ts };
 }
 
-function clearStaleSessionMapLock(filePath, staleMs) {
+function clearStaleSessionMapLock(filePath: string, staleMs: number): boolean {
   try {
     const raw = fs.readFileSync(filePath, 'utf8');
     const payload = parseStructuredLockPayload(raw);
@@ -68,12 +101,12 @@ function clearStaleSessionMapLock(filePath, staleMs) {
   }
 }
 
-export function sessionStateMatchesCwd(state, cwd) {
+export function sessionStateMatchesCwd(state: CwdMatchableState, cwd: string): boolean {
   if (typeof cwd !== 'string' || !cwd) {
     return false;
   }
 
-  const aliases = [];
+  const aliases: string[] = [];
   if (Array.isArray(state?.session_map_cwds)) {
     aliases.push(...state.session_map_cwds);
   }
@@ -84,16 +117,16 @@ export function sessionStateMatchesCwd(state, cwd) {
   return aliases.includes(cwd);
 }
 
-function sleep(milliseconds) {
+function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export async function withSessionMapLock(callback) {
+export async function withSessionMapLock<T>(callback: () => T | Promise<T>): Promise<T> {
   const filePath = `${getSessionMapPath()}.lock`;
   const deadline = Date.now() + 3_000;
   const staleMs = 5_000;
   let locked = false;
-  let lastError = null;
+  let lastError: unknown = null;
 
   while (!locked) {
     try {
@@ -110,7 +143,7 @@ export async function withSessionMapLock(callback) {
     } catch (error) {
       lastError = error;
       if (Date.now() >= deadline) {
-        throw new Error(`Failed to acquire session map lock: ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(`Failed to acquire session map lock: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
       }
       await sleep(50);
     }
@@ -129,17 +162,20 @@ export async function withSessionMapLock(callback) {
   }
 }
 
-export async function updateSessionMap(cwd, sessionDir) {
-  await withSessionMapLock(async () => {
-    const sessionMap = readJsonFile(getSessionMapPath(), {}) || {};
+export async function updateSessionMap(cwd: string, sessionDir: string): Promise<void> {
+  await withSessionMapLock(() => {
+    const sessionMap = readJsonFile<SessionMap>(getSessionMapPath(), {}) ?? {};
     sessionMap[cwd] = sessionDir;
     atomicWriteJson(getSessionMapPath(), sessionMap);
   });
 }
 
-export async function removeSessionMapEntry(cwd, expectedSessionDir = null) {
-  await withSessionMapLock(async () => {
-    const sessionMap = readJsonFile(getSessionMapPath(), {}) || {};
+export async function removeSessionMapEntry(
+  cwd: string,
+  expectedSessionDir: string | null = null,
+): Promise<void> {
+  await withSessionMapLock(() => {
+    const sessionMap = readJsonFile<SessionMap>(getSessionMapPath(), {}) ?? {};
     if (expectedSessionDir && sessionMap[cwd] && sessionMap[cwd] !== expectedSessionDir) {
       return;
     }
@@ -148,30 +184,31 @@ export async function removeSessionMapEntry(cwd, expectedSessionDir = null) {
   });
 }
 
-export function getSessionForCwd(cwd) {
-  const sessionMap = readJsonFile(getSessionMapPath(), {}) || {};
+export function getSessionForCwd(cwd: string): string | null {
+  const sessionMap = readJsonFile<SessionMap>(getSessionMapPath(), {}) ?? {};
   const sessionDir = sessionMap[cwd];
   return sessionDir && fs.existsSync(sessionDir) ? sessionDir : null;
 }
 
-export function listSessions() {
-  const sessionMap = readJsonFile(getSessionMapPath(), {}) || {};
+export function listSessions(): Array<{ cwd: string; sessionDir: string }> {
+  const sessionMap = readJsonFile<SessionMap>(getSessionMapPath(), {}) ?? {};
   return Object.entries(sessionMap).map(([cwd, sessionDir]) => ({ cwd, sessionDir }));
 }
 
-export async function pruneSessionMap(maxAgeDays = 7) {
+export async function pruneSessionMap(maxAgeDays: number = 7): Promise<void> {
   const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  await withSessionMapLock(async () => {
-    const sessionMap = readJsonFile(getSessionMapPath(), {}) || {};
+  await withSessionMapLock(() => {
+    const sessionMap = readJsonFile<SessionMap>(getSessionMapPath(), {}) ?? {};
     let changed = false;
 
     for (const [cwd, sessionDir] of Object.entries(sessionMap)) {
       const statePath = path.join(sessionDir, 'state.json');
       try {
-        const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as SessionMapEntryState;
         if (state.active === true) continue;
-        const startedMs = Number.isFinite(new Date(state.started_at).getTime())
-          ? new Date(state.started_at).getTime()
+        const startedAt = state.started_at ?? '';
+        const startedMs = Number.isFinite(new Date(startedAt).getTime())
+          ? new Date(startedAt).getTime()
           : fs.statSync(sessionDir).mtimeMs;
         if (startedMs < cutoff) {
           delete sessionMap[cwd];
@@ -189,8 +226,8 @@ export async function pruneSessionMap(maxAgeDays = 7) {
   });
 }
 
-export function findLastSessionForCwd(cwd) {
-  let newest = null;
+export function findLastSessionForCwd(cwd: string): string | null {
+  let newest: string | null = null;
   let newestTime = 0;
   try {
     const entries = fs.readdirSync(getSessionsRoot(), { withFileTypes: true });
@@ -199,10 +236,11 @@ export function findLastSessionForCwd(cwd) {
       const sessionDir = path.join(getSessionsRoot(), entry.name);
       const statePath = path.join(sessionDir, 'state.json');
       try {
-        const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as SessionMapEntryState;
         if (!sessionStateMatchesCwd(state, cwd)) continue;
-        const startedMs = Number.isFinite(new Date(state.started_at).getTime())
-          ? new Date(state.started_at).getTime()
+        const startedAt = state.started_at ?? '';
+        const startedMs = Number.isFinite(new Date(startedAt).getTime())
+          ? new Date(startedAt).getTime()
           : 0;
         if (startedMs > newestTime) {
           newest = sessionDir;
