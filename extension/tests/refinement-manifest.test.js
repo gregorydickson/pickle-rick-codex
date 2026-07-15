@@ -1,3 +1,4 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,7 +14,7 @@ import {
   validateRefinementManifest,
   writeManifest,
   writeTicketFiles,
-} from '../lib/tickets.js';
+} from '../services/tickets.js';
 import { makeTempRoot } from './helpers.js';
 
 test('fallbackRefinePrd builds tickets from the PRD task breakdown table', () => {

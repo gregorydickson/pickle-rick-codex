@@ -1,6 +1,7 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
+import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 
 test('runner descriptors map advanced loop modes onto the shared loop runner', () => {
   const descriptor = getRunnerDescriptor('anatomy-park');

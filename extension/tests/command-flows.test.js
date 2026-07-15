@@ -1,10 +1,11 @@
+// @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runCodexExecMonitored } from '../lib/codex.js';
-import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
+import { runCodexExecMonitored } from '../services/codex.js';
+import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { makeTempRoot, repoRoot, runNode, createFakeCodex, prependPath, waitFor, writeExecutable } from './helpers.js';
 
 test('validate-codex reports the configured codex version and guaranteed path', () => {

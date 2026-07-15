@@ -1,8 +1,9 @@
+// @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
+import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import {
   createFakeCodex,
   createFakeTmux,

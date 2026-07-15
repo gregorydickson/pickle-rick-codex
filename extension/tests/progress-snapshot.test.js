@@ -1,12 +1,13 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderStatus } from '../bin/status.js';
-import { recordIteration, loadCircuitState } from '../lib/circuit-breaker.js';
-import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
-import { StateManager } from '../lib/state-manager.js';
+import { recordIteration, loadCircuitState } from '../services/circuit-breaker.js';
+import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
+import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot } from './helpers.js';
 
 function runGit(cwd, args) {

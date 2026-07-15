@@ -1,8 +1,9 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildMetricsReport, formatMetricsReport, parseMetricsArgs } from '../lib/metrics.js';
+import { buildMetricsReport, formatMetricsReport, parseMetricsArgs } from '../services/metrics.js';
 import { makeTempRoot, runNode } from './helpers.js';
 
 function formatDate(value) {

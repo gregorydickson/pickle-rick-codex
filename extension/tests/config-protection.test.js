@@ -1,8 +1,9 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureConfigFile, loadConfig } from '../lib/config.js';
+import { ensureConfigFile, loadConfig } from '../services/config.js';
 import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 
 function createSessionFixture(dataRoot, ticketContent) {

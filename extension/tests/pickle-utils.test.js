@@ -1,3 +1,4 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,7 +10,7 @@ import {
   parseTicketFile,
   statusSymbol,
   updateFrontmatter,
-} from '../lib/pickle-utils.js';
+} from '../services/pickle-utils.js';
 import { makeTempRoot } from './helpers.js';
 
 test('getDataRoot uses PICKLE_DATA_ROOT when set', () => {

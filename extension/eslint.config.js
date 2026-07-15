@@ -15,6 +15,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['bin/**', 'services/**', 'types/**', 'tests/**', '*.js', 'eslint.config.js', 'eslint-plugin-pickle/**'],
+    ignores: ['bin/**', 'services/**', 'types/**', 'tests/**', '*.js', 'src/**/*.js', 'eslint.config.js', 'eslint-plugin-pickle/**'],
   },
 );

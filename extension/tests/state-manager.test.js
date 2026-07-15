@@ -1,8 +1,9 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { StateManager } from '../lib/state-manager.js';
+import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot } from './helpers.js';
 
 function defaultState(sessionDir) {

@@ -1,3 +1,4 @@
+// @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -5,10 +6,10 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { launchDetachedLoop } from '../lib/detached-launch.js';
-import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
-import { listRunnerDescriptors } from '../lib/runner-descriptors.js';
-import { updateSessionMap } from '../lib/session-map.js';
+import { launchDetachedLoop } from '../services/detached-launch.js';
+import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
+import { listRunnerDescriptors } from '../services/runner-descriptors.js';
+import { updateSessionMap } from '../services/session-map.js';
 import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 

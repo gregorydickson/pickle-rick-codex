@@ -1,14 +1,15 @@
+// @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { runTicket, subtractBaselineFailures } from '../bin/spawn-morty.js';
-import { parseTicketFile, readJsonFile } from '../lib/pickle-utils.js';
-import { buildTicketPhasePrompt } from '../lib/prompts.js';
-import { writePipelineContract } from '../lib/pipeline.js';
-import { buildVerificationCommandScope, buildVerificationFailureSet, ensurePipelineState, writeVerificationBaselines } from '../lib/pipeline-state.js';
-import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../lib/verification-env.js';
+import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
+import { buildTicketPhasePrompt } from '../services/prompts.js';
+import { writePipelineContract } from '../services/pipeline.js';
+import { buildVerificationCommandScope, buildVerificationFailureSet, ensurePipelineState, writeVerificationBaselines } from '../services/pipeline-state.js';
+import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../services/verification-env.js';
 import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function runGit(repoDir, args) {

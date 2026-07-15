@@ -1,3 +1,4 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { makeTempRoot, runNode } from './helpers.js';

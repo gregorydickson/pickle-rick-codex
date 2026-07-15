@@ -1,17 +1,18 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
-import { readJsonFile } from '../lib/pickle-utils.js';
-import { ensureBootstrapSessionReady } from '../lib/pipeline-bootstrap.js';
+import { readJsonFile } from '../services/pickle-utils.js';
+import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import {
   assertPipelineResumeCompatible,
   createPipelineContract,
   resolveNextPipelinePhase,
   validatePipelineContract,
   writePipelineContract,
-} from '../lib/pipeline.js';
+} from '../services/pipeline.js';
 import {
   beginPipelinePhase,
   cancelPipelineSession,
@@ -19,7 +20,7 @@ import {
   finishPipelinePhase,
   readVerificationBaselines,
   readPipelineState,
-} from '../lib/pipeline-state.js';
+} from '../services/pipeline-state.js';
 
 function writeSessionState(sessionDir, workingDir) {
   writeJson(path.join(sessionDir, 'state.json'), {

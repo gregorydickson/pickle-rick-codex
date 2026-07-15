@@ -1,8 +1,9 @@
+// @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { repoRoot, makeTempRoot, runBash, runNode } from './helpers.js';
+import { projectRoot, makeTempRoot, runBash, runNode } from './helpers.js';
 
 function countMatches(content, pattern) {
   return [...content.matchAll(pattern)].length;
@@ -22,7 +23,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   fs.writeFileSync(path.join(codexHome, 'AGENTS.md'), '# Existing Global Instructions\n');
   fs.writeFileSync(path.join(codexHome, 'CLAUDE.md'), '# Existing Global Claude Instructions\n');
   const output = runBash(['install.sh'], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -93,7 +94,7 @@ test('install.sh writes managed marker blocks on first install and remains idemp
   const installRoot = path.join(codexHome, 'pickle-rick-runtime');
 
   runBash(['install.sh'], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -107,7 +108,7 @@ test('install.sh writes managed marker blocks on first install and remains idemp
   assert.equal(countMatches(firstClaude, /PICKLE_RICK_CLAUDE_END/g), 1);
 
   runBash(['install.sh'], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -125,7 +126,7 @@ test('install.sh --project preserves existing project codex state while adding r
   fs.writeFileSync(path.join(projectDir, 'CLAUDE.md'), '# Existing Claude Instructions\n');
 
   const output = runBash(['install.sh', '--project', projectDir], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -165,7 +166,7 @@ test('installed runtime install.sh supports documented --project usage', () => {
   fs.writeFileSync(path.join(projectDir, 'AGENTS.md'), '# Existing Project Instructions\n');
 
   runBash(['install.sh'], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -193,7 +194,7 @@ test('install.sh --enable-hooks renders project hooks to the installed runtime r
   const installRoot = path.join(codexHome, 'pickle-rick-runtime');
   const projectDir = makeTempRoot('pickle-rick-project-');
   const output = runBash(['install.sh', '--project', projectDir, '--enable-hooks'], {
-    cwd: repoRoot,
+    cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
   });
 
@@ -210,7 +211,7 @@ test('install.sh rejects unknown arguments', () => {
   const codexHome = makeTempRoot('pickle-rick-codex-home-');
   const installRoot = path.join(codexHome, 'pickle-rick-runtime');
   assert.throws(
-    () => runBash(['install.sh', '--bogus'], { cwd: repoRoot, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } }),
+    () => runBash(['install.sh', '--bogus'], { cwd: projectRoot, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } }),
     /Unknown argument: --bogus/,
   );
 });

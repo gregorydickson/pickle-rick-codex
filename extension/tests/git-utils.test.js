@@ -1,3 +1,4 @@
+// @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,7 +13,7 @@ import {
   createTicketWorktree,
   getWorkingTreeFingerprint,
   removeTicketWorktree,
-} from '../lib/git-utils.js';
+} from '../services/git-utils.js';
 import { makeTempRoot } from './helpers.js';
 
 function runGit(repoDir, args) {

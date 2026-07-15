@@ -2,9 +2,14 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { listRunnerDescriptors } from '../lib/runner-descriptors.js';
+import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 
+// repoRoot resolves to the extension/ package root (parent of extension/tests/).
+// runNode/runBash bin invocations therefore target the COMPILED extension/bin/*.js.
 export const repoRoot = path.resolve(new URL('..', import.meta.url).pathname);
+
+// projectRoot is the git repository root (parent of extension/), where install.sh lives.
+export const projectRoot = path.resolve(repoRoot, '..');
 
 export function makeTempRoot(prefix = 'pickle-rick-codex-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
