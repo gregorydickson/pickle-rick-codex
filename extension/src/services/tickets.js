@@ -206,13 +206,17 @@ function pruneObsoleteTicketFiles(fileTickets, manifestTickets) {
 export function ensureTicketFilesMaterialized(sessionDir, manifest = readManifest(sessionDir)) {
   const fileTickets = listTickets(sessionDir);
   const manifestTickets = manifest.tickets || [];
+  if (manifestTickets.length === 0) {
+    if (!fs.existsSync(getManifestPath(sessionDir))) {
+      return fileTickets;
+    }
+    pruneObsoleteTicketFiles(fileTickets, manifestTickets);
+    return [];
+  }
   if (fileTicketsCoverManifest(fileTickets, manifestTickets)) {
     return fileTickets;
   }
   pruneObsoleteTicketFiles(fileTickets, manifestTickets);
-  if (manifestTickets.length === 0) {
-    return [];
-  }
   writeTicketFiles(sessionDir, manifest);
   return listTickets(sessionDir);
 }
