@@ -544,7 +544,7 @@ export interface BuildVerificationFailureSetArgs {
   cwd?: string;
   stdout?: string;
   stderr?: string;
-  exitCode?: number;
+  exitCode?: number | null;
 }
 
 export type PipelineStateMutator = (

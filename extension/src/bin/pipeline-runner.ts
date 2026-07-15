@@ -13,18 +13,26 @@ import { readJsonFile } from '../services/pickle-utils.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
+import type { PipelineContract, PipelinePhase } from '../types/index.js';
 
-function parseFailureMode(argv) {
+type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSession>[2];
+
+interface RunPipelineOptions {
+  onFailure?: string;
+  [key: string]: unknown;
+}
+
+function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
   if (!modeArg) return 'abort';
-  const [, mode] = modeArg.split('=');
+  const mode = modeArg.split('=')[1] ?? '';
   if (!['abort', 'skip', 'retry-once'].includes(mode)) {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
 }
 
-function appendRunnerLog(sessionDir, message) {
+function appendRunnerLog(sessionDir: string, message: string): void {
   const descriptor = getRunnerDescriptor('pipeline');
   fs.appendFileSync(
     path.join(sessionDir, descriptor.runnerLog),
@@ -33,19 +41,19 @@ function appendRunnerLog(sessionDir, message) {
   );
 }
 
-function phaseFailureMessage(phase, exitReason) {
+function phaseFailureMessage(phase: string, exitReason: string): string | null {
   return exitReason === 'success' ? null : `${phase} phase exited with ${exitReason}`;
 }
 
-function isBlockingExitReason(exitReason) {
+function isBlockingExitReason(exitReason: string): boolean {
   return exitReason === 'verification-contract-failed' || String(exitReason).startsWith('preflight-');
 }
 
-function readSessionExitReason(sessionDir) {
-  return readJsonFile(path.join(sessionDir, 'state.json'), {})?.last_exit_reason || 'error';
+function readSessionExitReason(sessionDir: string): string {
+  return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
 }
 
-async function runPipelinePhase(sessionDir, phase, executePhase) {
+async function runPipelinePhase(sessionDir: string, phase: PipelinePhase, executePhase: () => Promise<string>): Promise<string> {
   beginPipelinePhase(sessionDir, phase);
   try {
     const exitReason = await executePhase();
@@ -70,7 +78,12 @@ async function runPipelinePhase(sessionDir, phase, executePhase) {
   }
 }
 
-async function runPipelineLoopPhase(sessionDir, phase, pipeline, preparePhase) {
+async function runPipelineLoopPhase(
+  sessionDir: string,
+  phase: PipelinePhase,
+  pipeline: PipelineContract,
+  preparePhase: PreparePipelineLoopPhase,
+): Promise<string> {
   return await runPipelinePhase(sessionDir, phase, async () => {
     await preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase);
     await runLoop(sessionDir);
@@ -78,7 +91,7 @@ async function runPipelineLoopPhase(sessionDir, phase, pipeline, preparePhase) {
   });
 }
 
-export async function runPipeline(sessionDir, options = {}) {
+export async function runPipeline(sessionDir: string, options: RunPipelineOptions = {}): Promise<string> {
   const pipeline = readPipelineContract(sessionDir);
   let pipelineState = ensurePipelineState(sessionDir, pipeline);
   let nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
@@ -134,7 +147,7 @@ export async function runPipeline(sessionDir, options = {}) {
   }
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/pipeline-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');

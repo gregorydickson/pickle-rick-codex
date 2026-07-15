@@ -7,7 +7,7 @@ import { loadConfig } from '../services/config.js';
 import { getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
-import { StateManager } from '../services/state-manager.js';
+import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
   areTicketDependenciesSatisfied,
   listTickets,
@@ -18,39 +18,46 @@ import {
 import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
 import { runTicket } from './spawn-morty.js';
 
-function appendRunnerLog(sessionDir, mode, message) {
+interface RunSequentialOptions {
+  onFailure?: string;
+  runnerMode?: string;
+  timeoutMs?: number;
+  [key: string]: unknown;
+}
+
+function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
   const descriptor = getRunnerDescriptor(mode);
   const filePath = path.join(sessionDir, descriptor.runnerLog);
   fs.appendFileSync(filePath, `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
 }
 
-function parseFailureMode(argv) {
+function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
   if (!modeArg) return 'abort';
-  const [, mode] = modeArg.split('=');
+  const mode = modeArg.split('=')[1] ?? '';
   if (!['abort', 'skip', 'retry-once'].includes(mode)) {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
 }
 
-function shouldStop(state) {
+function shouldStop(state: PersistedState): string | null {
   if (state.active === false) {
-    return state.last_exit_reason || 'cancelled';
+    return (state.last_exit_reason as string | null) || 'cancelled';
   }
-  if (Number.isInteger(state.max_iterations) && state.max_iterations > 0 && state.iteration >= state.max_iterations) {
+  if (Number.isInteger(state.max_iterations) && (state.max_iterations as number) > 0 && (state.iteration as number) >= (state.max_iterations as number)) {
     return 'max_iterations';
   }
-  if (Number.isFinite(state.max_time_minutes) && state.max_time_minutes > 0) {
+  if (Number.isFinite(state.max_time_minutes) && (state.max_time_minutes as number) > 0) {
     const elapsedMinutes = (Date.now() / 1000 - getRunStartEpoch(state)) / 60;
-    if (elapsedMinutes >= state.max_time_minutes) {
+    if (elapsedMinutes >= (state.max_time_minutes as number)) {
       return 'max_time';
     }
   }
   return null;
 }
 
-export async function runSequential(sessionDir, options = {}) {
+export async function runSequential(sessionDir: string, options: RunSequentialOptions = {}): Promise<string> {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const failureMode = options.onFailure || 'abort';
@@ -59,7 +66,7 @@ export async function runSequential(sessionDir, options = {}) {
   const runnerLabel = runnerDescriptor.runnerStartMarker.replace(/\s+started$/, '');
   const config = loadConfig();
   let exitReason = 'success';
-  let failedTicketId = null;
+  let failedTicketId: string | null = null;
 
   appendRunnerLog(sessionDir, runnerMode, runnerDescriptor.runnerStartMarker);
   enterMuxRunnerPhase(manager, statePath, { markRunStart });
@@ -129,20 +136,20 @@ export async function runSequential(sessionDir, options = {}) {
       } catch (error) {
         const cancelled = manager.read(statePath).active === false;
         if (cancelled) {
-          exitReason = manager.read(statePath).last_exit_reason || 'cancelled';
+          exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} stopped: ${exitReason}`);
           break;
         }
         if (isPreflightError(error)) {
           failedTicketId = ticket.id;
-          exitReason = error.kind;
-          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight blocked: ${error.message}`);
+          exitReason = (error as { kind: string }).kind;
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight blocked: ${(error as Error).message}`);
           break;
         }
         if (isVerificationContractError(error)) {
           failedTicketId = ticket.id;
-          exitReason = error.kind;
-          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract blocked: ${error.message}`);
+          exitReason = (error as { kind: string }).kind;
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract blocked: ${(error as Error).message}`);
           appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} stopping on ${ticket.id} without retry`);
           break;
         }
@@ -194,7 +201,7 @@ export async function runSequential(sessionDir, options = {}) {
   return finalReason;
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');

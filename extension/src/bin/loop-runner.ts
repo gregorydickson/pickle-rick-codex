@@ -17,24 +17,39 @@ import {
   stageTrackedChanges,
 } from '../services/git-utils.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
-import { buildLoopPrompt } from '../services/prompts.js';
+import { buildLoopPrompt, type LoopPromptConfig, type LoopPromptState } from '../services/prompts.js';
 import { appendHistory, getRunStartEpoch } from '../services/session.js';
 import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../services/pipeline-phase-setup.js';
-import { StateManager } from '../services/state-manager.js';
+import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { readJsonFile } from '../services/pickle-utils.js';
+import type {
+  Config,
+  CodexSpawnResult,
+  ProgressSnapshot,
+  SuccessCheck,
+} from '../types/index.js';
 
-function appendRunnerLog(sessionDir, message) {
+type LoopConfig = ReturnType<typeof readLoopConfig>;
+
+interface SummaryPaths {
+  json: string;
+  markdown: string;
+  stopJson: string;
+  stopMarkdown: string;
+}
+
+function appendRunnerLog(sessionDir: string, message: string): void {
   fs.appendFileSync(path.join(sessionDir, 'loop-runner.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
 }
 
-function getWorkerTimeoutMs(state, config) {
+function getWorkerTimeoutMs(state: PersistedState, config: Config): number {
   const timeoutSeconds = Number.isFinite(state?.worker_timeout_seconds)
     ? Number(state.worker_timeout_seconds)
     : config.defaults.worker_timeout_seconds;
   return timeoutSeconds * 1000;
 }
 
-function summaryPaths(sessionDir, mode) {
+function summaryPaths(sessionDir: string, mode: string): SummaryPaths {
   return {
     json: path.join(sessionDir, `${mode}-summary.json`),
     markdown: path.join(sessionDir, `${mode}-summary.md`),
@@ -43,14 +58,14 @@ function summaryPaths(sessionDir, mode) {
   };
 }
 
-function readLastMessageArtifact(outputLastMessagePath) {
+function readLastMessageArtifact(outputLastMessagePath: string): string {
   if (!outputLastMessagePath || !fs.existsSync(outputLastMessagePath)) {
     return '';
   }
   return fs.readFileSync(outputLastMessagePath, 'utf8');
 }
 
-function loopSuccessCheck(outputLastMessagePath) {
+function loopSuccessCheck(outputLastMessagePath: string): SuccessCheck {
   const tokens = ['LOOP_COMPLETE', 'TASK_COMPLETED', 'CONTINUE'];
   return ({ stdout, lastMessage }) => {
     const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
@@ -62,27 +77,28 @@ function loopSuccessCheck(outputLastMessagePath) {
   };
 }
 
-function loopShouldExit(outputLastMessagePath, result) {
+function loopShouldExit(outputLastMessagePath: string, result: CodexSpawnResult): boolean {
   const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
   return hasPromiseToken(result?.lastMessage, 'LOOP_COMPLETE')
     || hasPromiseToken(result?.stdout, 'LOOP_COMPLETE')
     || hasPromiseToken(persistedMessage, 'LOOP_COMPLETE');
 }
 
-function normalizeLoopMessage(message) {
+function normalizeLoopMessage(message: unknown): string {
   return String(message || '')
     .replace(/<promise>[^<]+<\/promise>/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function safeErrorMessage(error) {
-  if (typeof error?.stderr === 'string' && error.stderr.trim()) {
-    return error.stderr.trim();
+function safeErrorMessage(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null | undefined)?.stderr;
+  if (typeof stderr === 'string' && stderr.trim()) {
+    return stderr.trim();
   }
-  if (Buffer.isBuffer(error?.stderr)) {
-    const stderr = error.stderr.toString('utf8').trim();
-    if (stderr) return stderr;
+  if (Buffer.isBuffer(stderr)) {
+    const text = stderr.toString('utf8').trim();
+    if (text) return text;
   }
   if (error instanceof Error && error.message) {
     return error.message;
@@ -90,9 +106,9 @@ function safeErrorMessage(error) {
   return String(error);
 }
 
-function summarizeVerification(summary) {
+function summarizeVerification(summary: Record<string, unknown>): string[] {
   if (Array.isArray(summary.verification)) {
-    return summary.verification;
+    return summary.verification as string[];
   }
   if (typeof summary.verification === 'string' && summary.verification.trim()) {
     return [summary.verification.trim()];
@@ -100,18 +116,18 @@ function summarizeVerification(summary) {
   return [];
 }
 
-function summarizeTrapDoors(summary) {
+function summarizeTrapDoors(summary: Record<string, unknown>): string[] {
   if (Array.isArray(summary.trap_doors)) {
     return summary.trap_doors.map((entry) => String(entry).trim()).filter(Boolean);
   }
   return [];
 }
 
-function anatomyParkSummary(sessionDir) {
-  return readJsonFile(summaryPaths(sessionDir, 'anatomy-park').json, {});
+function anatomyParkSummary(sessionDir: string): Record<string, unknown> {
+  return readJsonFile<Record<string, unknown>>(summaryPaths(sessionDir, 'anatomy-park').json, {}) ?? {};
 }
 
-function anatomyParkCommitMessage(sessionDir, loopConfig, iteration) {
+function anatomyParkCommitMessage(sessionDir: string, loopConfig: LoopConfig, iteration: number): string {
   const summary = anatomyParkSummary(sessionDir);
   const targetLabel = path.basename(path.resolve(loopConfig.target || 'target')) || 'target';
   const finding = normalizeLoopMessage(
@@ -123,14 +139,14 @@ function anatomyParkCommitMessage(sessionDir, loopConfig, iteration) {
   return `anatomy-park: ${targetLabel} - ${finding}${trapDoorSuffix}`;
 }
 
-function anatomyParkProgressReasons(workingDir, reasons) {
+function anatomyParkProgressReasons(workingDir: string, reasons: string[]): string[] {
   if (!isGitRepo(workingDir)) {
     return reasons;
   }
   return reasons.filter((reason) => reason !== 'worktree_fingerprint');
 }
 
-function ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, workingDir) {
+function ensureAnatomyParkPreflightCommit(sessionDir: string, loopConfig: LoopConfig, workingDir: string): void {
   if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
     return;
   }
@@ -156,11 +172,18 @@ function ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, workingDir) {
     appendRunnerLog(sessionDir, `preflight auto-committed: ${getHeadSha(workingDir)}`);
   } catch (error) {
     resetGitIndex(workingDir);
-    throw new Error(`Working tree is dirty and anatomy-park preflight auto-commit failed: ${safeErrorMessage(error)}`);
+    throw new Error(`Working tree is dirty and anatomy-park preflight auto-commit failed: ${safeErrorMessage(error)}`, { cause: error });
   }
 }
 
-function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, beforeSnapshot, iteration, beforeUntrackedFiles = []) {
+function autoCommitAnatomyParkIteration(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  workingDir: string,
+  beforeSnapshot: ProgressSnapshot,
+  iteration: number,
+  beforeUntrackedFiles: string[] = [],
+): boolean {
   if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
     return false;
   }
@@ -188,9 +211,9 @@ function autoCommitAnatomyParkIteration(sessionDir, loopConfig, workingDir, befo
   }
 }
 
-function stopSummaryFromState(state, loopConfig, exitReason, sessionDir) {
+function stopSummaryFromState(state: PersistedState, loopConfig: LoopConfig, exitReason: string, sessionDir: string) {
   const paths = summaryPaths(sessionDir, loopConfig.mode);
-  const persistedSummary = readJsonFile(paths.json, {});
+  const persistedSummary = readJsonFile<Record<string, unknown>>(paths.json, {}) ?? {};
   const lastMessage = normalizeLoopMessage(state.last_loop_message);
   return {
     mode: loopConfig.mode,
@@ -211,7 +234,7 @@ function stopSummaryFromState(state, loopConfig, exitReason, sessionDir) {
   };
 }
 
-function writeStopSummaryArtifacts(sessionDir, loopConfig, state, exitReason) {
+function writeStopSummaryArtifacts(sessionDir: string, loopConfig: LoopConfig, state: PersistedState, exitReason: string): void {
   const paths = summaryPaths(sessionDir, loopConfig.mode);
   const summary = stopSummaryFromState(state, loopConfig, exitReason, sessionDir);
   fs.writeFileSync(paths.stopJson, JSON.stringify(summary, null, 2));
@@ -243,7 +266,7 @@ function writeStopSummaryArtifacts(sessionDir, loopConfig, state, exitReason) {
   fs.writeFileSync(paths.stopMarkdown, markdown);
 }
 
-export async function runLoop(sessionDir) {
+export async function runLoop(sessionDir: string): Promise<void> {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
   const config = loadConfig();
@@ -251,25 +274,25 @@ export async function runLoop(sessionDir) {
   const initialState = manager.read(statePath);
 
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
-  ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, initialState.working_dir);
+  ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, initialState.working_dir as string);
   enterLoopRunnerPhase(manager, statePath, loopConfig.mode);
 
   let exitReason = 'success';
-  let thrownError = null;
+  let thrownError: unknown = null;
   try {
     while (true) {
       const state = manager.read(statePath);
       if (state.active === false) {
-        exitReason = state.last_exit_reason || 'cancelled';
+        exitReason = (state.last_exit_reason as string | null) || 'cancelled';
         break;
       }
-      if (Number.isInteger(state.max_iterations) && state.max_iterations > 0 && state.iteration >= state.max_iterations) {
+      if (Number.isInteger(state.max_iterations) && (state.max_iterations as number) > 0 && (state.iteration as number) >= (state.max_iterations as number)) {
         exitReason = 'max_iterations';
         break;
       }
-      if (Number.isFinite(state.max_time_minutes) && state.max_time_minutes > 0) {
+      if (Number.isFinite(state.max_time_minutes) && (state.max_time_minutes as number) > 0) {
         const elapsedMinutes = (Date.now() / 1000 - getRunStartEpoch(state)) / 60;
-        if (elapsedMinutes >= state.max_time_minutes) {
+        if (elapsedMinutes >= (state.max_time_minutes as number)) {
           exitReason = 'max_time';
           break;
         }
@@ -277,30 +300,30 @@ export async function runLoop(sessionDir) {
 
       const beforeSnapshot = captureProgressSnapshot({
         sessionDir,
-        workingDir: state.working_dir,
+        workingDir: state.working_dir as string,
         mode: loopConfig.mode,
-        step: state.step,
-        currentTicket: state.current_ticket,
+        step: state.step as string | null,
+        currentTicket: state.current_ticket as string | null,
       });
-      const beforeUntrackedFiles = isGitRepo(state.working_dir)
-        ? listUntrackedFiles(state.working_dir)
+      const beforeUntrackedFiles = isGitRepo(state.working_dir as string)
+        ? listUntrackedFiles(state.working_dir as string)
         : [];
       manager.update(statePath, (current) => {
-        current.iteration += 1;
+        current.iteration = (current.iteration as number) + 1;
         current.step = loopConfig.mode;
         appendHistory(current, loopConfig.mode, current.current_ticket || undefined);
         return current;
       });
 
-      const outputLastMessagePath = path.join(sessionDir, `${loopConfig.mode}.${state.iteration + 1}.last-message.txt`);
+      const outputLastMessagePath = path.join(sessionDir, `${loopConfig.mode}.${(state.iteration as number) + 1}.last-message.txt`);
       const result = await runCodexExecMonitored({
-        cwd: state.working_dir,
+        cwd: state.working_dir as string,
         prompt: buildLoopPrompt({
           mode: loopConfig.mode,
           sessionDir,
-          workingDir: state.working_dir,
-          state: manager.read(statePath),
-          loopConfig,
+          workingDir: state.working_dir as string,
+          state: manager.read(statePath) as unknown as LoopPromptState,
+          loopConfig: loopConfig as unknown as LoopPromptConfig,
         }),
         timeoutMs: getWorkerTimeoutMs(state, config),
         outputLastMessagePath,
@@ -325,32 +348,32 @@ export async function runLoop(sessionDir) {
         return current;
       });
       if (result.cancelled || manager.read(statePath).active === false) {
-        exitReason = manager.read(statePath).last_exit_reason || 'cancelled';
+        exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
         break;
       }
       assertCodexSucceeded(result, `${loopConfig.mode} iteration failed`);
 
       const lastMessage = result.lastMessage || '';
-      appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} finished`);
+      appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} finished`);
 
       autoCommitAnatomyParkIteration(
         sessionDir,
         loopConfig,
-        state.working_dir,
+        state.working_dir as string,
         beforeSnapshot,
-        state.iteration + 1,
+        (state.iteration as number) + 1,
         beforeUntrackedFiles,
       );
 
       const afterSnapshot = captureProgressSnapshot({
         sessionDir,
-        workingDir: state.working_dir,
+        workingDir: state.working_dir as string,
         mode: loopConfig.mode,
         step: loopConfig.mode,
-        currentTicket: manager.read(statePath).current_ticket,
+        currentTicket: manager.read(statePath).current_ticket as string | null,
       });
       const progressReasons = anatomyParkProgressReasons(
-        state.working_dir,
+        state.working_dir as string,
         diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot'),
       );
       const latest = manager.update(statePath, (current) => {
@@ -359,21 +382,21 @@ export async function runLoop(sessionDir) {
         return current;
       });
       if (progressReasons.length) {
-        appendRunnerLog(sessionDir, `iteration ${state.iteration + 1} progress: ${progressReasons.join(',')}`);
+        appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} progress: ${progressReasons.join(',')}`);
       }
 
       if (loopShouldExit(outputLastMessagePath, result)) {
         exitReason = 'success';
         break;
       }
-      if (latest.loop_stall_count >= Number(loopConfig.stall_limit || 5)) {
+      if ((latest.loop_stall_count as number) >= Number(loopConfig.stall_limit || 5)) {
         exitReason = 'stalled';
         break;
       }
     }
   } catch (error) {
     exitReason = manager.read(statePath).active === false
-      ? (manager.read(statePath).last_exit_reason || 'cancelled')
+      ? ((manager.read(statePath).last_exit_reason as string | null) || 'cancelled')
       : 'error';
     if (exitReason !== 'cancelled') {
       thrownError = error;
@@ -397,7 +420,7 @@ export async function runLoop(sessionDir) {
   }
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const [sessionDir] = argv;
   if (!sessionDir) {
     throw new Error('Usage: node bin/loop-runner.js <session-dir>');

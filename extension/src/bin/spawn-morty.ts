@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,7 @@ import {
 import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { appendHistory } from '../services/session.js';
-import { StateManager } from '../services/state-manager.js';
+import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
 import {
   assertTicketVerificationReady,
@@ -35,24 +35,33 @@ import {
   isPipelineSession,
   readTicketVerificationBaseline,
 } from '../services/pipeline-state.js';
+import type {
+  CircuitIterationState,
+  Config,
+  ConfigVerificationInput,
+  SuccessCheck,
+  Ticket,
+  VerificationEnvResult,
+  VerificationFailure,
+} from '../types/index.js';
 
-function phasePromiseToken(phase) {
+function phasePromiseToken(phase: string): string {
   return `${String(phase || '').toUpperCase()}_COMPLETE`;
 }
 
-function phaseSuccessCheck(phase, outputLastMessagePath) {
+function phaseSuccessCheck(phase: string, outputLastMessagePath: string): SuccessCheck {
   const token = phasePromiseToken(phase);
   return ({ stdout, lastMessage }) => {
     if (hasPromiseToken(lastMessage, token)) return true;
     if (hasPromiseToken(stdout, token)) return true;
-    return outputLastMessagePath && hasPromiseToken(
+    return Boolean(outputLastMessagePath && hasPromiseToken(
       fs.existsSync(outputLastMessagePath) ? fs.readFileSync(outputLastMessagePath, 'utf8') : '',
       token,
-    );
+    ));
   };
 }
 
-function ticketHasVerificationContracts(ticket) {
+function ticketHasVerificationContracts(ticket: Ticket | null | undefined): boolean {
   return Boolean(
     ticket?.freeze_contract
     || (Array.isArray(ticket?.output_artifacts) && ticket.output_artifacts.length > 0)
@@ -60,26 +69,27 @@ function ticketHasVerificationContracts(ticket) {
   );
 }
 
-function commandReferencesContractArtifacts(ticket, command) {
+function commandReferencesContractArtifacts(ticket: Ticket | null | undefined, command: string): boolean {
   const contractPaths = [
     ...(Array.isArray(ticket?.output_artifacts) ? ticket.output_artifacts : []),
     ...(Array.isArray(ticket?.proof_corpus) ? ticket.proof_corpus : []),
     ticket?.freeze_contract?.artifact_path,
   ].filter(Boolean);
-  return contractPaths.some((artifactPath) => String(command || '').includes(artifactPath));
+  return contractPaths.some((artifactPath) => String(command || '').includes(String(artifactPath)));
 }
 
-function shouldClassifyVerificationContractFailure(ticket, command) {
+function shouldClassifyVerificationContractFailure(ticket: Ticket | null | undefined, command: string): boolean {
   return ticketHasVerificationContracts(ticket) || commandReferencesContractArtifacts(ticket, command);
 }
 
-function safeErrorMessage(error) {
-  if (typeof error?.stderr === 'string' && error.stderr.trim()) {
-    return error.stderr.trim();
+function safeErrorMessage(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null | undefined)?.stderr;
+  if (typeof stderr === 'string' && stderr.trim()) {
+    return stderr.trim();
   }
-  if (Buffer.isBuffer(error?.stderr)) {
-    const stderr = error.stderr.toString('utf8').trim();
-    if (stderr) return stderr;
+  if (Buffer.isBuffer(stderr)) {
+    const text = stderr.toString('utf8').trim();
+    if (text) return text;
   }
   if (error instanceof Error && error.message) {
     return error.message;
@@ -87,8 +97,22 @@ function safeErrorMessage(error) {
   return String(error);
 }
 
+interface VerificationCommandErrorInput {
+  command: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  failures?: VerificationFailure[];
+}
+
 class VerificationCommandError extends Error {
-  constructor({ command, stdout, stderr, exitCode, failures }) {
+  command: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  failures: VerificationFailure[];
+
+  constructor({ command, stdout, stderr, exitCode, failures }: VerificationCommandErrorInput) {
     const output = String(stderr || stdout || command).trim();
     super(`verification-command-failed: ${output || command}`);
     this.name = 'VerificationCommandError';
@@ -100,7 +124,13 @@ class VerificationCommandError extends Error {
   }
 }
 
-export function subtractBaselineFailures(sessionDir, ticketId, command, cwd, failures) {
+export function subtractBaselineFailures(
+  sessionDir: string,
+  ticketId: string,
+  command: string,
+  cwd: string,
+  failures: VerificationFailure[],
+): VerificationFailure[] {
   if (!isPipelineSession(sessionDir)) {
     return failures;
   }
@@ -114,7 +144,7 @@ export function subtractBaselineFailures(sessionDir, ticketId, command, cwd, fai
   return failures.filter((failure) => failure?.in_scope === true || !baselineIdentities.has(failure.identity));
 }
 
-function appendRunnerLog(sessionDir, runnerMode, message) {
+function appendRunnerLog(sessionDir: string, runnerMode: string | null, message: string): void {
   if (!runnerMode) return;
   const descriptor = getRunnerDescriptor(runnerMode);
   fs.appendFileSync(
@@ -124,15 +154,27 @@ function appendRunnerLog(sessionDir, runnerMode, message) {
   );
 }
 
-function normalizeCommitSubject(value, fallback) {
+function normalizeCommitSubject(value: unknown, fallback: string): string {
   const normalized = String(value || '')
     .replace(/\s+/g, ' ')
     .trim();
   return normalized || fallback;
 }
 
-function ticketCommitMessage(ticketId, ticket) {
+function ticketCommitMessage(ticketId: string, ticket: Ticket | null | undefined): string {
   return `pickle: ${ticketId} - ${normalizeCommitSubject(ticket?.title, 'completed ticket')}`;
+}
+
+interface AutoCommitDetachedTicketChangesInput {
+  sessionDir: string;
+  runnerMode: string | null;
+  workingDir: string;
+  tmuxMode: boolean;
+  baselineTrackedClean: boolean;
+  baselineUntrackedFiles: string[];
+  ticketId: string;
+  ticket: Ticket;
+  config: Config;
 }
 
 function autoCommitDetachedTicketChanges({
@@ -145,7 +187,7 @@ function autoCommitDetachedTicketChanges({
   ticketId,
   ticket,
   config,
-}) {
+}: AutoCommitDetachedTicketChangesInput): void {
   if (!tmuxMode || !baselineTrackedClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
     return;
   }
@@ -172,7 +214,7 @@ function autoCommitDetachedTicketChanges({
   } catch (error) {
     resetGitIndex(workingDir);
     appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-commit failed: ${safeErrorMessage(error)}`);
-    throw new Error(`Ticket ${ticketId} completed but auto-commit failed: ${safeErrorMessage(error)}`);
+    throw new Error(`Ticket ${ticketId} completed but auto-commit failed: ${safeErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -183,22 +225,22 @@ class CancellationError extends Error {
   }
 }
 
-function readCurrentState(manager, statePath) {
+function readCurrentState(manager: StateManager, statePath: string): PersistedState {
   return manager.read(statePath);
 }
 
-function isSessionCancelled(manager, statePath) {
+function isSessionCancelled(manager: StateManager, statePath: string): boolean {
   return readCurrentState(manager, statePath).active === false;
 }
 
-function updateActiveChild(statePath, manager, fields) {
+function updateActiveChild(statePath: string, manager: StateManager, fields: Record<string, unknown>): void {
   manager.update(statePath, (current) => {
     Object.assign(current, fields);
     return current;
   });
 }
 
-function terminateChild(child, signal) {
+function terminateChild(child: ChildProcess | null | undefined, signal: NodeJS.Signals): void {
   const pid = Number(child?.pid || 0);
   if (!Number.isInteger(pid) || pid <= 0) return;
   if (process.platform !== 'win32') {
@@ -210,20 +252,36 @@ function terminateChild(child, signal) {
     }
   }
   try {
-    child.kill(signal);
+    child?.kill(signal);
   } catch {
     // Ignore teardown failures.
   }
 }
 
-async function runVerificationCommand({ command, cwd, timeoutMs, manager, statePath, env }) {
-  return await new Promise((resolve, reject) => {
+interface RunVerificationCommandOptions {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+  manager: StateManager;
+  statePath: string;
+  env: Record<string, string | undefined>;
+}
+
+async function runVerificationCommand({
+  command,
+  cwd,
+  timeoutMs,
+  manager,
+  statePath,
+  env,
+}: RunVerificationCommandOptions): Promise<void> {
+  return await new Promise<void>((resolve, reject) => {
     let settled = false;
-    let timeoutTimer = null;
-    let cancelTimer = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    let cancelTimer: NodeJS.Timeout | null = null;
     let forcedByCancel = false;
-    const stdoutChunks = [];
-    const stderrChunks = [];
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     const child = spawn(process.env.SHELL || 'zsh', ['-lc', command], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -237,7 +295,7 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
       active_child_command: command,
     });
 
-    const cleanup = () => {
+    const cleanup = (): void => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (cancelTimer) clearInterval(cancelTimer);
       updateActiveChild(statePath, manager, {
@@ -247,7 +305,7 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
       });
     };
 
-    const settle = (handler, value) => {
+    const settle = (handler: (value?: unknown) => void, value?: unknown): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -278,8 +336,8 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
       }
     }, 100);
 
-    child.stdout.on('data', (chunk) => stdoutChunks.push(Buffer.from(chunk)));
-    child.stderr.on('data', (chunk) => stderrChunks.push(Buffer.from(chunk)));
+    child.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)));
+    child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
     child.on('error', (error) => settle(reject, error));
     child.on('close', (code) => {
       if (forcedByCancel || isSessionCancelled(manager, statePath)) {
@@ -304,18 +362,30 @@ async function runVerificationCommand({ command, cwd, timeoutMs, manager, stateP
         }));
         return;
       }
-      settle(resolve, undefined);
+      settle(resolve as (value?: unknown) => void, undefined);
     });
   });
 }
 
-export async function runTicket(sessionDir, ticketId, options = {}) {
+interface RunTicketOptions {
+  runnerMode?: string | null;
+  timeoutMs?: number;
+  [key: string]: unknown;
+}
+
+interface RunTicketResult {
+  status: string;
+  applied: boolean;
+  reason?: string;
+}
+
+export async function runTicket(sessionDir: string, ticketId: string, options: RunTicketOptions = {}): Promise<RunTicketResult> {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
   const manifest = readManifest(sessionDir);
   const config = loadConfig();
-  const workingDir = state.working_dir;
+  const workingDir = state.working_dir as string;
   const tmuxMode = Boolean(state.tmux_mode);
   const runnerMode = options.runnerMode || null;
   const normalizedTicketId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
@@ -330,18 +400,18 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   if (verificationCommands.length === 0) {
     throw new Error(`ticket ${normalizedTicketId} has invalid verification manifest: expected one or more verification commands`);
   }
-  const normalizedTicket = {
+  const normalizedTicket: Ticket = {
     ...manifestTicket,
     verification: verificationCommands,
   };
 
-  let verificationReady = null;
-  let baselineFingerprint = '';
-  let baselineTrackedClean = true;
-  let baselineUntrackedFiles = [];
+  let verificationReady: VerificationEnvResult;
+  let baselineFingerprint: string;
+  let baselineTrackedClean: boolean;
+  let baselineUntrackedFiles: string[];
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
-  function finalizeSuccess(applied) {
+  function finalizeSuccess(applied: boolean): RunTicketResult {
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Done',
       completed_at: new Date().toISOString(),
@@ -369,7 +439,9 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   try {
     verificationReady = assertTicketVerificationReady({
       ticket: normalizedTicket,
-      config,
+      // Config is a valid verification input at runtime; ConfigDefaults lacks
+      // the index signature ConfigVerificationInput models, so widen via unknown.
+      config: config as unknown as ConfigVerificationInput,
     });
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
     baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
@@ -395,7 +467,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       manager.update(statePath, (current) => {
         current.current_ticket = normalizedTicketId;
         current.step = phase;
-        current.iteration += 1;
+        current.iteration = (current.iteration as number) + 1;
         appendHistory(current, phase, normalizedTicketId);
         return current;
       });
@@ -436,7 +508,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
         throw new CancellationError();
       }
       assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
-      recordIteration(sessionDir, manager.read(statePath));
+      recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
     }
 
     for (const command of verificationCommands) {
@@ -509,11 +581,11 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Todo',
         failed_at: new Date().toISOString(),
-        failure_reason: error.message,
-        failure_kind: error.kind,
+        failure_reason: (error as Error).message,
+        failure_kind: (error as { kind?: unknown }).kind,
       });
-      recordIteration(sessionDir, manager.read(statePath), {
-        error: error.message,
+      recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
+        error: (error as Error).message,
       });
       throw error;
     }
@@ -521,11 +593,11 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Blocked',
         failed_at: new Date().toISOString(),
-        failure_reason: error.message,
-        failure_kind: error.kind,
+        failure_reason: (error as Error).message,
+        failure_kind: (error as { kind?: unknown }).kind,
       });
-      recordIteration(sessionDir, manager.read(statePath), {
-        error: error.message,
+      recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
+        error: (error as Error).message,
       });
       throw error;
     }
@@ -535,7 +607,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
       failure_reason: error instanceof Error ? error.message : String(error),
       failure_kind: 'command_failed',
     });
-    recordIteration(sessionDir, manager.read(statePath), {
+    recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
       error: error instanceof Error ? error.message : String(error),
     });
     throw error;
@@ -549,7 +621,7 @@ export async function runTicket(sessionDir, ticketId, options = {}) {
   }
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const [sessionDir, ticketId] = argv;
   if (!sessionDir || !ticketId) {
     throw new Error('Usage: node bin/spawn-morty.js <session-dir> <ticket-id>');
