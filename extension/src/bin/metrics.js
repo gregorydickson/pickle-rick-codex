@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { buildMetricsReport, formatMetricsReport, parseMetricsArgs } from '../lib/metrics.js';
+import { buildMetricsReport, formatMetricsReport, parseMetricsArgs } from '../services/metrics.js';
 
 function main(argv) {
   if (argv.includes('--help')) {

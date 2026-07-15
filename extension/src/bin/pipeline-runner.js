@@ -2,15 +2,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readPipelineContract, resolveNextPipelinePhase } from '../lib/pipeline.js';
-import { beginPipelinePhase, cancelPipelineSession, ensurePipelineState, finishPipelinePhase } from '../lib/pipeline-state.js';
+import { readPipelineContract, resolveNextPipelinePhase } from '../services/pipeline.js';
+import { beginPipelinePhase, cancelPipelineSession, ensurePipelineState, finishPipelinePhase } from '../services/pipeline-state.js';
 import {
   preparePipelineAnatomyParkPhase,
   preparePipelineLoopPhaseSession,
   preparePipelineSzechuanSaucePhase,
-} from '../lib/pipeline-phase-setup.js';
-import { readJsonFile } from '../lib/pickle-utils.js';
-import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
+} from '../services/pipeline-phase-setup.js';
+import { readJsonFile } from '../services/pickle-utils.js';
+import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
 

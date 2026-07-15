@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { resolveSessionForCwd } from '../lib/session.js';
-import { getTicketById } from '../lib/tickets.js';
+import { resolveSessionForCwd } from '../services/session.js';
+import { getTicketById } from '../services/tickets.js';
 
 const PROTECTED_PATTERNS = [
   /^\.codex\/hooks\/hooks\.json$/,

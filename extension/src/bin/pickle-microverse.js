@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { launchDetachedLoop } from '../lib/detached-launch.js';
+import { launchDetachedLoop } from '../services/detached-launch.js';
 
 function parseArgs(argv) {
   let metric = null;

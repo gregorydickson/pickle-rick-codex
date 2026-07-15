@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { deactivateSession, loadSessionState, resolveSessionForCwd } from '../lib/session.js';
+import { deactivateSession, loadSessionState, resolveSessionForCwd } from '../services/session.js';
 
 function signalProcess(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {

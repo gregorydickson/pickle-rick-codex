@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { launchDetachedLoop } from '../lib/detached-launch.js';
-import { prepareAnatomyParkPhase } from '../lib/pipeline-phase-setup.js';
+import { launchDetachedLoop } from '../services/detached-launch.js';
+import { prepareSzechuanSaucePhase } from '../services/pipeline-phase-setup.js';
 
 function parseArgs(argv) {
+  let focus = null;
+  let focusSpecified = false;
+  let domain = null;
+  let domainSpecified = false;
   let dryRun = false;
   let dryRunSpecified = false;
-  let stallLimit = 3;
+  let stallLimit = 5;
   let stallLimitSpecified = false;
   let maxIterations = null;
   let resume = null;
@@ -15,11 +19,19 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--dry-run') {
+    if (arg === '--focus') {
+      focus = argv[i + 1] || '';
+      focusSpecified = true;
+      i += 1;
+    } else if (arg === '--domain') {
+      domain = argv[i + 1] || '';
+      domainSpecified = true;
+      i += 1;
+    } else if (arg === '--dry-run') {
       dryRun = true;
       dryRunSpecified = true;
     } else if (arg === '--stall-limit') {
-      stallLimit = Number(argv[i + 1] || '3');
+      stallLimit = Number(argv[i + 1] || '5');
       stallLimitSpecified = true;
       i += 1;
     } else if (arg === '--max-iterations') {
@@ -45,6 +57,10 @@ function parseArgs(argv) {
   }
 
   return {
+    focus,
+    focusSpecified,
+    domain,
+    domainSpecified,
     dryRun,
     dryRunSpecified,
     stallLimit,
@@ -58,12 +74,12 @@ function parseArgs(argv) {
 
 async function main(argv) {
   const parsed = parseArgs(argv);
-  const { setupArgs, loopConfig, sessionCwd } = prepareAnatomyParkPhase(parsed);
+  const { setupArgs, loopConfig, sessionCwd } = prepareSzechuanSaucePhase(parsed);
 
   const output = await launchDetachedLoop({
     setupArgs,
     loopConfig,
-    banner: 'Anatomy Park tmux loop launched.',
+    banner: 'Szechuan Sauce tmux loop launched.',
     sessionCwd,
   });
   console.log(output);

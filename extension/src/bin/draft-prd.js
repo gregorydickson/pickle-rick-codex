@@ -2,12 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { logActivity } from '../lib/activity-logger.js';
-import { assertCodexSucceeded, runCodexExecMonitored } from '../lib/codex.js';
-import { loadConfig } from '../lib/config.js';
-import { buildDraftPrdPrompt } from '../lib/prompts.js';
-import { appendHistory } from '../lib/session.js';
-import { StateManager } from '../lib/state-manager.js';
+import { logActivity } from '../services/activity-logger.js';
+import { assertCodexSucceeded, runCodexExecMonitored } from '../services/codex.js';
+import { loadConfig } from '../services/config.js';
+import { buildDraftPrdPrompt } from '../services/prompts.js';
+import { appendHistory } from '../services/session.js';
+import { StateManager } from '../services/state-manager.js';
 
 function hasPromiseToken(text, token) {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { setupSession } from '../lib/setup-session.js';
+import { setupSession } from '../services/setup-session.js';
 
 function fail(message) {
   console.error(`Error: ${message}`);

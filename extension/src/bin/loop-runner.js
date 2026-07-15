@@ -2,9 +2,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from '../lib/codex.js';
-import { loadConfig } from '../lib/config.js';
-import { logActivity } from '../lib/activity-logger.js';
+import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from '../services/codex.js';
+import { loadConfig } from '../services/config.js';
+import { logActivity } from '../services/activity-logger.js';
 import {
   commitTrackedChanges,
   getHeadSha,
@@ -15,13 +15,13 @@ import {
   resetGitIndex,
   stagePaths,
   stageTrackedChanges,
-} from '../lib/git-utils.js';
-import { captureProgressSnapshot, diffProgressSnapshot } from '../lib/progress-snapshot.js';
-import { buildLoopPrompt } from '../lib/prompts.js';
-import { appendHistory, getRunStartEpoch } from '../lib/session.js';
-import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../lib/pipeline-phase-setup.js';
-import { StateManager } from '../lib/state-manager.js';
-import { readJsonFile } from '../lib/pickle-utils.js';
+} from '../services/git-utils.js';
+import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
+import { buildLoopPrompt } from '../services/prompts.js';
+import { appendHistory, getRunStartEpoch } from '../services/session.js';
+import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../services/pipeline-phase-setup.js';
+import { StateManager } from '../services/state-manager.js';
+import { readJsonFile } from '../services/pickle-utils.js';
 
 function appendRunnerLog(sessionDir, message) {
   fs.appendFileSync(path.join(sessionDir, 'loop-runner.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });

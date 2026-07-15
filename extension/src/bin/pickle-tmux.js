@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireLaunchLock } from '../lib/detached-launch.js';
-import { appendHistory } from '../lib/session.js';
-import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../lib/session-map.js';
+import { acquireLaunchLock } from '../services/detached-launch.js';
+import { appendHistory } from '../services/session.js';
+import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../services/session-map.js';
 import {
   assertBootstrapSessionNotRunning,
   ensureBootstrapSessionReady,
@@ -13,11 +13,11 @@ import {
   materializeBootstrapSession,
   recordBootstrapPreflightBlocked,
   resolveBootstrapResumeSessionDir,
-} from '../lib/pipeline-bootstrap.js';
-import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
-import { StateManager } from '../lib/state-manager.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../lib/tmux.js';
-import { isPreflightError } from '../lib/verification-env.js';
+} from '../services/pipeline-bootstrap.js';
+import { getRunnerDescriptor } from '../services/runner-descriptors.js';
+import { StateManager } from '../services/state-manager.js';
+import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { isPreflightError } from '../services/verification-env.js';
 
 function parseFailureMode(argv) {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));

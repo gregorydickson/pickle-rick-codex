@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { getCodexVersion } from '../lib/codex.js';
+import { getCodexVersion } from '../services/codex.js';
 
 try {
   console.log(JSON.stringify({

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import path from 'node:path';
-import { logActivity } from '../lib/activity-logger.js';
-import { loadConfig } from '../lib/config.js';
-import { resolveSessionForCwd } from '../lib/session.js';
-import { StateManager } from '../lib/state-manager.js';
-import { getTicketById, updateTicketStatus } from '../lib/tickets.js';
+import { logActivity } from '../services/activity-logger.js';
+import { loadConfig } from '../services/config.js';
+import { resolveSessionForCwd } from '../services/session.js';
+import { StateManager } from '../services/state-manager.js';
+import { getTicketById, updateTicketStatus } from '../services/tickets.js';
 
 async function main(argv) {
   let cwd = process.cwd();

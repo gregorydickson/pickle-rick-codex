@@ -3,10 +3,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { logActivity } from '../lib/activity-logger.js';
-import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '../lib/codex.js';
-import { loadConfig } from '../lib/config.js';
-import { recordIteration } from '../lib/circuit-breaker.js';
+import { logActivity } from '../services/activity-logger.js';
+import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '../services/codex.js';
+import { loadConfig } from '../services/config.js';
+import { recordIteration } from '../services/circuit-breaker.js';
 import {
   commitTrackedChanges,
   getHeadSha,
@@ -17,24 +17,24 @@ import {
   listUntrackedFiles,
   resetGitIndex,
   stageTrackedChangesAndNewPaths,
-} from '../lib/git-utils.js';
-import { buildTicketPhasePrompt } from '../lib/prompts.js';
-import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
-import { appendHistory } from '../lib/session.js';
-import { StateManager } from '../lib/state-manager.js';
-import { normalizeTicketId, readManifest, updateTicketStatus } from '../lib/tickets.js';
+} from '../services/git-utils.js';
+import { buildTicketPhasePrompt } from '../services/prompts.js';
+import { getRunnerDescriptor } from '../services/runner-descriptors.js';
+import { appendHistory } from '../services/session.js';
+import { StateManager } from '../services/state-manager.js';
+import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
 import {
   assertTicketVerificationReady,
   isPreflightError,
   isVerificationContractError,
   normalizeVerificationCommands,
   VerificationContractError,
-} from '../lib/verification-env.js';
+} from '../services/verification-env.js';
 import {
   buildVerificationFailureSet,
   isPipelineSession,
   readTicketVerificationBaseline,
-} from '../lib/pipeline-state.js';
+} from '../services/pipeline-state.js';
 
 function phasePromiseToken(phase) {
   return `${String(phase || '').toUpperCase()}_COMPLETE`;

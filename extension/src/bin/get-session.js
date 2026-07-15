@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { listSessions } from '../lib/session-map.js';
-import { resolveSessionForCwd } from '../lib/session.js';
+import { listSessions } from '../services/session-map.js';
+import { resolveSessionForCwd } from '../services/session.js';
 
 async function main(argv) {
   if (argv.includes('--help')) {

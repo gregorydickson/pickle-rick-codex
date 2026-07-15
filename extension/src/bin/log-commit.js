@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { logActivity } from '../lib/activity-logger.js';
-import { loadConfig } from '../lib/config.js';
-import { getHeadSha } from '../lib/git-utils.js';
-import { resolveSessionForCwd } from '../lib/session.js';
+import { logActivity } from '../services/activity-logger.js';
+import { loadConfig } from '../services/config.js';
+import { getHeadSha } from '../services/git-utils.js';
+import { resolveSessionForCwd } from '../services/session.js';
 
 async function main() {
   const sessionDir = await resolveSessionForCwd(process.cwd(), { last: true });

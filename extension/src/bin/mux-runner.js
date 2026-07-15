@@ -2,20 +2,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { logActivity } from '../lib/activity-logger.js';
-import { loadConfig } from '../lib/config.js';
-import { getRunStartEpoch, markRunStart } from '../lib/session.js';
-import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../lib/pipeline-bootstrap.js';
-import { getRunnerDescriptor } from '../lib/runner-descriptors.js';
-import { StateManager } from '../lib/state-manager.js';
+import { logActivity } from '../services/activity-logger.js';
+import { loadConfig } from '../services/config.js';
+import { getRunStartEpoch, markRunStart } from '../services/session.js';
+import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
+import { getRunnerDescriptor } from '../services/runner-descriptors.js';
+import { StateManager } from '../services/state-manager.js';
 import {
   areTicketDependenciesSatisfied,
   listTickets,
   summarizeTickets,
   unresolvedTicketDependencies,
   updateTicketStatus,
-} from '../lib/tickets.js';
-import { isPreflightError, isVerificationContractError } from '../lib/verification-env.js';
+} from '../services/tickets.js';
+import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
 import { runTicket } from './spawn-morty.js';
 
 function appendRunnerLog(sessionDir, mode, message) {

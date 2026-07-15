@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { formatDuration } from '../lib/pickle-utils.js';
-import { readPipelineContract } from '../lib/pipeline.js';
-import { readPipelineState } from '../lib/pipeline-state.js';
-import { getRunStartEpoch, resolveSessionForCwd } from '../lib/session.js';
-import { loadCircuitState } from '../lib/circuit-breaker.js';
-import { StateManager } from '../lib/state-manager.js';
-import { getTicketById, summarizeTickets } from '../lib/tickets.js';
-import { normalizeVerificationCommands } from '../lib/verification-env.js';
+import { formatDuration } from '../services/pickle-utils.js';
+import { readPipelineContract } from '../services/pipeline.js';
+import { readPipelineState } from '../services/pipeline-state.js';
+import { getRunStartEpoch, resolveSessionForCwd } from '../services/session.js';
+import { loadCircuitState } from '../services/circuit-breaker.js';
+import { StateManager } from '../services/state-manager.js';
+import { getTicketById, summarizeTickets } from '../services/tickets.js';
+import { normalizeVerificationCommands } from '../services/verification-env.js';
 
 function formatIterationLimit(maxIterations) {
   return Number.isInteger(maxIterations) && maxIterations > 0 ? String(maxIterations) : 'unlimited';
