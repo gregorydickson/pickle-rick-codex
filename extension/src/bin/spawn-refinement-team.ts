@@ -12,6 +12,7 @@ import {
 } from '../services/prompts.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager } from '../services/state-manager.js';
+import type { PersistedState } from '../services/state-manager.js';
 import {
   enrichRefinementManifest,
   fallbackRefinePrd,
@@ -20,12 +21,24 @@ import {
   writeManifest,
   writeTicketFiles,
 } from '../services/tickets.js';
+import type { CodexSpawnResult, CodexUsage, ConfigVerificationInput, RefinementManifest } from '../types/index.js';
 
-function hasPromiseToken(text, token) {
+interface AnalystSpec {
+  role: string;
+  focus: string;
+  analysisPath: string;
+  messagePath: string;
+}
+
+interface RefinePrdOptions {
+  timeoutMs?: number;
+}
+
+function hasPromiseToken(text: string, token: string): boolean {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
 }
 
-function analystSpecs(sessionDir) {
+function analystSpecs(sessionDir: string): AnalystSpec[] {
   return [
     {
       role: 'requirements-gaps',
@@ -48,9 +61,9 @@ function analystSpecs(sessionDir) {
   ];
 }
 
-async function runAnalyst(state, prdPath, spec, timeoutMs) {
+async function runAnalyst(state: PersistedState, prdPath: string, spec: AnalystSpec, timeoutMs: number): Promise<CodexSpawnResult> {
   const result = await runCodexExecMonitored({
-    cwd: state.working_dir,
+    cwd: state.working_dir as string,
     prompt: buildRefinementAnalystPrompt({
       role: spec.role,
       focus: spec.focus,
@@ -69,13 +82,13 @@ async function runAnalyst(state, prdPath, spec, timeoutMs) {
   return result;
 }
 
-async function runSynthesis(state, sessionDir, prdPath, timeoutMs) {
+async function runSynthesis(state: PersistedState, sessionDir: string, prdPath: string, timeoutMs: number): Promise<CodexSpawnResult> {
   const refinedPath = path.join(sessionDir, 'prd_refined.md');
   const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
   const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
   const analystReports = analystSpecs(sessionDir).map((spec) => spec.analysisPath);
   const result = await runCodexExecMonitored({
-    cwd: state.working_dir,
+    cwd: state.working_dir as string,
     prompt: buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystReports }),
     timeoutMs,
     outputLastMessagePath,
@@ -97,7 +110,7 @@ async function runSynthesis(state, sessionDir, prdPath, timeoutMs) {
   return result;
 }
 
-function sumUsage(results) {
+function sumUsage(results: CodexSpawnResult[]): CodexUsage {
   return results.reduce((acc, result) => {
     acc.input_tokens += Number(result?.usage?.input_tokens || 0);
     acc.output_tokens += Number(result?.usage?.output_tokens || 0);
@@ -112,11 +125,11 @@ function sumUsage(results) {
   });
 }
 
-function appendRefineLog(sessionDir, message) {
+function appendRefineLog(sessionDir: string, message: string): void {
   fs.appendFileSync(path.join(sessionDir, 'refine.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
 }
 
-function markRefinePhase(manager, statePath, sessionDir, step, message) {
+function markRefinePhase(manager: StateManager, statePath: string, sessionDir: string, step: string, message: string): void {
   manager.update(statePath, (current) => {
     current.step = step;
     return current;
@@ -125,7 +138,7 @@ function markRefinePhase(manager, statePath, sessionDir, step, message) {
   console.error(`[refine] ${message}`);
 }
 
-export async function refinePrd(sessionDir, options = {}) {
+export async function refinePrd(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
   const prdPath = path.join(sessionDir, 'prd.md');
   if (!fs.existsSync(prdPath)) {
     throw new Error(`PRD not found: ${prdPath}`);
@@ -137,7 +150,7 @@ export async function refinePrd(sessionDir, options = {}) {
   const config = loadConfig();
   const timeoutMs = options.timeoutMs || config.defaults.refinement_timeout_seconds * 1000;
 
-  let analystResults = [];
+  let analystResults: CodexSpawnResult[];
   try {
     markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
     analystResults = await Promise.all(
@@ -152,7 +165,7 @@ export async function refinePrd(sessionDir, options = {}) {
     const refinedPath = path.join(sessionDir, 'prd_refined.md');
     const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
     const fallbackResult = await runCodexExecMonitored({
-      cwd: state.working_dir,
+      cwd: state.working_dir as string,
       prompt: fallbackPrompt,
       timeoutMs,
       outputLastMessagePath,
@@ -175,7 +188,7 @@ export async function refinePrd(sessionDir, options = {}) {
     appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
     manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
   }
-  const enrichedManifest = enrichRefinementManifest(manifest, config);
+  const enrichedManifest = enrichRefinementManifest(manifest, config as unknown as ConfigVerificationInput);
   manifest = enrichedManifest.manifest;
   if (enrichedManifest.changed || !fs.existsSync(path.join(sessionDir, 'refinement_manifest.json'))) {
     writeManifest(sessionDir, manifest);
@@ -214,7 +227,7 @@ export async function refinePrd(sessionDir, options = {}) {
   return manifest;
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const sessionDir = argv[0];
   if (!sessionDir) {
     throw new Error('Usage: node bin/spawn-refinement-team.js <session-dir>');

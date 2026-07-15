@@ -6,10 +6,10 @@ import { resolveSessionForCwd } from '../services/session.js';
 import { StateManager } from '../services/state-manager.js';
 import { getTicketById, updateTicketStatus } from '../services/tickets.js';
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   let cwd = process.cwd();
-  let sessionDir;
-  let ticketId;
+  let sessionDir: string | undefined;
+  let ticketId: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -37,11 +37,11 @@ async function main(argv) {
   if (!targetTicket) {
     throw new Error('No current ticket to retry.');
   }
-  if (!getTicketById(resolved, targetTicket)) {
-    throw new Error(`Unknown ticket: ${targetTicket}`);
+  if (!getTicketById(resolved, targetTicket as string)) {
+    throw new Error(`Unknown ticket: ${targetTicket as string}`);
   }
 
-  updateTicketStatus(resolved, targetTicket, {
+  updateTicketStatus(resolved, targetTicket as string, {
     status: 'Todo',
     retry_requested_at: new Date().toISOString(),
   });
@@ -51,7 +51,7 @@ async function main(argv) {
     current.current_ticket = targetTicket;
     current.last_exit_reason = null;
     current.step = 'research';
-    current.history.push({
+    (current.history as unknown[]).push({
       step: 'retry',
       ticket: targetTicket,
       timestamp: new Date().toISOString(),
@@ -67,7 +67,7 @@ async function main(argv) {
     ticket: targetTicket,
     step: 'retry',
   }, { enabled: config.defaults.activity_logging });
-  console.log(`Retry requested for ${targetTicket}`);
+  console.log(`Retry requested for ${targetTicket as string}`);
 }
 
 main(process.argv.slice(2)).catch((error) => {

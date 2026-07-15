@@ -8,12 +8,22 @@ import { loadConfig } from '../services/config.js';
 import { buildDraftPrdPrompt } from '../services/prompts.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager } from '../services/state-manager.js';
+import type { CodexSpawnResult } from '../types/index.js';
 
-function hasPromiseToken(text, token) {
+interface DraftPrdOptions {
+  timeoutMs?: number;
+}
+
+interface DraftPrdResult {
+  prdPath: string;
+  result: CodexSpawnResult;
+}
+
+function hasPromiseToken(text: string, token: string): boolean {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
 }
 
-function writeFallbackPrd(prdPath, task) {
+function writeFallbackPrd(prdPath: string, task: string): void {
   const fallback = [
     '# PRD',
     '',
@@ -33,7 +43,7 @@ function writeFallbackPrd(prdPath, task) {
   fs.writeFileSync(prdPath, fallback);
 }
 
-export async function draftPrd(sessionDir, task, options = {}) {
+export async function draftPrd(sessionDir: string, task: string, options: DraftPrdOptions = {}): Promise<DraftPrdResult> {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
   const state = manager.read(statePath);
@@ -41,7 +51,7 @@ export async function draftPrd(sessionDir, task, options = {}) {
   const outputLastMessagePath = path.join(sessionDir, 'draft-prd.last-message.txt');
   const prompt = buildDraftPrdPrompt({ task, sessionDir });
   const result = await runCodexExecMonitored({
-    cwd: state.working_dir,
+    cwd: state.working_dir as string,
     prompt,
     timeoutMs: options.timeoutMs || 900_000,
     outputLastMessagePath,
@@ -77,7 +87,7 @@ export async function draftPrd(sessionDir, task, options = {}) {
   return { prdPath, result };
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const sessionDir = argv[0];
   const task = argv.slice(1).join(' ').trim();
   if (!sessionDir || !task) {
