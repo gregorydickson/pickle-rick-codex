@@ -7,7 +7,7 @@ metadata:
 
 # Pickle Rick Status
 
-Run: `node $HOME/.codex/pickle-rick/bin/status.js`
+Run: `node $HOME/.codex/pickle-rick/extension/bin/status.js`
 
 Display current session state including:
 - Active/inactive flag

@@ -9,7 +9,7 @@ metadata:
 
 Run:
 
-`node $HOME/.codex/pickle-rick/bin/retry-ticket.js --ticket <ticket-id>`
+`node $HOME/.codex/pickle-rick/extension/bin/retry-ticket.js --ticket <ticket-id>`
 
 Behavior:
 

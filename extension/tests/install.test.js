@@ -24,13 +24,19 @@ test('install.sh copies the runtime and installs the global persona and skills',
   fs.writeFileSync(path.join(codexHome, 'CLAUDE.md'), '# Existing Global Claude Instructions\n');
   const output = runBash(['install.sh'], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   assert.match(output, /Installed Pickle Rick Codex runtime to:/);
   assert.match(output, /Installed Pickle Rick persona and skills into:/);
-  assert.match(output, new RegExp(`node ${escapeRegex(installRoot)}/bin/setup\\.js`));
-  assert.ok(fs.existsSync(path.join(installRoot, 'bin', 'setup.js')));
+  assert.match(output, new RegExp(`node ${escapeRegex(installRoot)}/extension/bin/setup\\.js`));
+  assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'bin', 'setup.js')));
+  assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'bin', 'tmux-monitor.sh')));
+  assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'services', 'pickle-utils.js')));
+  assert.equal(fs.existsSync(path.join(installRoot, 'extension', 'src')), false);
+  assert.equal(fs.existsSync(path.join(installRoot, 'extension', 'tests')), false);
+  assert.equal(fs.existsSync(path.join(installRoot, 'extension', 'node_modules')), false);
+  assert.equal(fs.existsSync(path.join(installRoot, 'extension', 'tsconfig.json')), false);
   assert.ok(fs.existsSync(path.join(installRoot, '.codex-plugin', 'plugin.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'skills', 'pickle', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'skills', 'pickle-pipeline', 'SKILL.md')));
@@ -77,14 +83,14 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.readdirSync(path.join(installRoot, 'tests')).filter((entry) => entry.endsWith('.test.js')).length > 0);
 
   const sessionDir = runNode(
-    [path.join(installRoot, 'bin', 'setup.js'), 'installed runtime smoke test'],
-    { cwd: realProjectDir, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } },
+    [path.join(installRoot, 'extension', 'bin', 'setup.js'), 'installed runtime smoke test'],
+    { cwd: realProjectDir, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' } },
   ).trim();
   assert.match(sessionDir, new RegExp(`^${escapeRegex(installRoot)}/sessions/`));
 
   const resolved = runNode(
-    [path.join(installRoot, 'bin', 'get-session.js'), '--cwd', realProjectDir],
-    { cwd: realProjectDir, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } },
+    [path.join(installRoot, 'extension', 'bin', 'get-session.js'), '--cwd', realProjectDir],
+    { cwd: realProjectDir, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' } },
   ).trim();
   assert.equal(resolved, sessionDir);
 });
@@ -95,7 +101,7 @@ test('install.sh writes managed marker blocks on first install and remains idemp
 
   runBash(['install.sh'], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   const firstAgents = fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8');
@@ -109,7 +115,7 @@ test('install.sh writes managed marker blocks on first install and remains idemp
 
   runBash(['install.sh'], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   assert.equal(fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8'), firstAgents);
@@ -127,7 +133,7 @@ test('install.sh --project preserves existing project codex state while adding r
 
   const output = runBash(['install.sh', '--project', projectDir], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   assert.match(output, /global Pickle Rick install remains available in every workspace/);
@@ -167,12 +173,12 @@ test('installed runtime install.sh supports documented --project usage', () => {
 
   runBash(['install.sh'], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   const output = runBash([path.join(installRoot, 'install.sh'), '--project', projectDir, '--enable-hooks'], {
     cwd: installRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   assert.match(output, /Copied project-facing \.codex assets to:/);
@@ -195,7 +201,7 @@ test('install.sh --enable-hooks renders project hooks to the installed runtime r
   const projectDir = makeTempRoot('pickle-rick-project-');
   const output = runBash(['install.sh', '--project', projectDir, '--enable-hooks'], {
     cwd: projectRoot,
-    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome },
+    env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
   });
 
   assert.match(output, /project-local hooks were installed from a rendered template/);
@@ -211,7 +217,7 @@ test('install.sh rejects unknown arguments', () => {
   const codexHome = makeTempRoot('pickle-rick-codex-home-');
   const installRoot = path.join(codexHome, 'pickle-rick-runtime');
   assert.throws(
-    () => runBash(['install.sh', '--bogus'], { cwd: projectRoot, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome } }),
+    () => runBash(['install.sh', '--bogus'], { cwd: projectRoot, env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' } }),
     /Unknown argument: --bogus/,
   );
 });

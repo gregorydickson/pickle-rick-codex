@@ -6,8 +6,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
+    "prebuild": "bash scripts/copy-shell-assets.sh",
+    "build": "tsc",
     "audit:test-tiers": "bash scripts/audit-test-tiers.sh",
-    "pretest": "npm run audit:test-tiers",
+    "pretest": "npm run build && npm run audit:test-tiers",
     "test": "npm run test:fast && npm run test:integration",
     "test:fast": "node bin/test-runner.js --tier fast --test-concurrency=8",
     "test:integration": "node bin/test-runner.js --tier integration --test-concurrency=4"

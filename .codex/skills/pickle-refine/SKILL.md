@@ -11,7 +11,7 @@ Decompose a PRD into atomic, implementable tickets on the guaranteed `codex exec
 
 Run:
 
-`node $HOME/.codex/pickle-rick/bin/spawn-refinement-team.js <session-dir>`
+`node $HOME/.codex/pickle-rick/extension/bin/spawn-refinement-team.js <session-dir>`
 
 The runtime runs three focused analyst passes first:
 

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node $HOME/.codex/pickle-rick/bin/session-start.js",
+            "command": "node $HOME/.codex/pickle-rick/extension/bin/session-start.js",
             "timeout": 5,
             "statusMessage": "Initializing Pickle Rick session..."
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node $HOME/.codex/pickle-rick/bin/stop-hook.js",
+            "command": "node $HOME/.codex/pickle-rick/extension/bin/stop-hook.js",
             "timeout": 10,
             "statusMessage": "Running Pickle Rick stop hook..."
           }
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node $HOME/.codex/pickle-rick/bin/log-commit.js",
+            "command": "node $HOME/.codex/pickle-rick/extension/bin/log-commit.js",
             "timeout": 5,
             "async": false
           }
@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node $HOME/.codex/pickle-rick/bin/config-protection.js",
+            "command": "node $HOME/.codex/pickle-rick/extension/bin/config-protection.js",
             "timeout": 5,
             "statusMessage": "Validating file safety..."
           }

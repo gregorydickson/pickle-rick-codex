@@ -9,7 +9,7 @@ metadata:
 
 Run:
 
-`node $HOME/.codex/pickle-rick/bin/mux-runner.js <session-dir> --on-failure=retry-once`
+`node $HOME/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry-once`
 
 ## Loop Engine
 

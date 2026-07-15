@@ -11,15 +11,15 @@ Iterative metric optimization loop: measure -> compare -> accept/revert -> repea
 
 Launch the detached tmux runner:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"`
 
 Or use a qualitative goal:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --goal "<goal>" --task "<task>"`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --goal "<goal>" --task "<task>"`
 
 Resume:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-microverse.js --resume`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --resume`
 
 ## Process
 

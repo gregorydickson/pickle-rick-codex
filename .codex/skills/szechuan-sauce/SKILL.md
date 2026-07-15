@@ -11,7 +11,7 @@ Principle-driven iterative code cleanup.
 
 Launch the detached tmux runner:
 
-`node $HOME/.codex/pickle-rick/bin/szechuan-sauce.js <target>`
+`node $HOME/.codex/pickle-rick/extension/bin/szechuan-sauce.js <target>`
 
 Optional flags:
 

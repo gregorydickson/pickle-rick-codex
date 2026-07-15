@@ -87,7 +87,7 @@ sync_runtime_source_tree() {
   rm -rf "$runtime_root/.codex/skills" "$runtime_root/.codex/hooks" "$runtime_root/tests"
   cp -R "$repo_root/.codex/skills" "$runtime_root/.codex/"
   cp -R "$repo_root/.codex/hooks" "$runtime_root/.codex/"
-  cp -R "$repo_root/tests" "$runtime_root/"
+  cp -R "$repo_root/extension/tests" "$runtime_root/tests"
 }
 
 write_pickle_pipeline_skill() {
@@ -108,23 +108,23 @@ metadata:
 
 Launch from a task string:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js "ship the feature"`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js "ship the feature"`
 
 Launch from an existing PRD:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --prd ./prd.md`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --prd ./prd.md`
 
 Resume the latest pipeline session for the current repo:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --resume`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume`
 
 Resume a specific pipeline session:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js --resume <session-dir>`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume <session-dir>`
 
 Skip downstream phases explicitly:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-pipeline.js "ship the feature" --skip-anatomy --skip-szechuan`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js "ship the feature" --skip-anatomy --skip-szechuan`
 
 ## Behavior
 
@@ -283,6 +283,22 @@ if [[ -n "$project_dir" ]]; then
   fi
 fi
 
+# --- BUILD (source-checkout mode only) ---
+# Compile the TypeScript runtime before deploy. The installed runtime copy has no
+# src/tsconfig/node_modules (the deploy rsync excludes them), so it cannot and must
+# not rebuild — it deploys its already-compiled extension/ as-is. Set
+# PICKLE_INSTALL_SKIP_BUILD=1 to deploy a pre-built tree without recompiling.
+if [[ "$runtime_is_installed_source" -eq 0 && "${PICKLE_INSTALL_SKIP_BUILD:-0}" != "1" && -d "$repo_root/extension/src" ]]; then
+  echo "Building Pickle Rick Codex runtime (extension/)..."
+  ( cd "$repo_root/extension" && npm install --no-fund --no-audit )
+  # Force-clean stale compiled twins so a stale tsc cache can never be deployed.
+  rm -rf "$repo_root/extension/bin" "$repo_root/extension/services" "$repo_root/extension/types"
+  rm -f "$repo_root/extension/.tsbuildinfo"
+  ( cd "$repo_root/extension" && npx tsc )
+  # tsc does not emit .sh; stage shell assets from src/scripts/ into the compiled bin/.
+  bash "$repo_root/extension/scripts/copy-shell-assets.sh"
+fi
+
 mkdir -p "$target_root"
 mkdir -p "$codex_home"
 
@@ -304,8 +320,18 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   copy_item .codex-plugin
   copy_item docs
   copy_item images
-  copy_item bin
-  copy_item lib
+  # Deploy the compiled TypeScript runtime. rsync extension/ excluding sources,
+  # tests, dev deps, and tsconfig so only the freshly compiled runtime
+  # (bin/*.js, services/*.js, types/*.js, bin/*.sh, package.json) lands under
+  # $target_root/extension/. --delete-excluded keeps the deployed tree clean and
+  # idempotent across reinstalls.
+  mkdir -p "$target_root/extension"
+  rsync -a --delete --delete-excluded \
+    --exclude='node_modules' \
+    --exclude='src' \
+    --exclude='tests' \
+    --exclude='tsconfig.json' \
+    "$repo_root/extension/" "$target_root/extension/"
 fi
 sync_runtime_source_tree "$target_root"
 write_pickle_pipeline_skill "$target_root/.codex/skills" "$target_root"
@@ -358,7 +384,7 @@ echo "  open any project in Codex and invoke the Pickle Rick skills"
 echo "  project bootstrap is optional and only needed for repo-local overrides"
 echo
 echo "Guaranteed path:"
-echo "  node $target_root/bin/setup.js \"<task>\""
-echo "  node $target_root/bin/draft-prd.js <session-dir> \"<task>\""
-echo "  node $target_root/bin/spawn-refinement-team.js <session-dir>"
-echo "  node $target_root/bin/mux-runner.js <session-dir>"
+echo "  node $target_root/extension/bin/setup.js \"<task>\""
+echo "  node $target_root/extension/bin/draft-prd.js <session-dir> \"<task>\""
+echo "  node $target_root/extension/bin/spawn-refinement-team.js <session-dir>"
+echo "  node $target_root/extension/bin/mux-runner.js <session-dir>"

@@ -12,11 +12,11 @@ You are entering the Pickle Rick autonomous engineering lifecycle for a Codex wo
 ## Behavior
 
 1. Confirm Pickle Rick was installed with `bash install.sh` or a compatible repo-local override
-2. Check for an existing session: `node $HOME/.codex/pickle-rick/bin/get-session.js --last`
-3. If no session exists, create one: `node $HOME/.codex/pickle-rick/bin/setup.js "<task>"`
-4. Draft the PRD: `node $HOME/.codex/pickle-rick/bin/draft-prd.js <session-dir> "<task>"`
-5. Refine the PRD into tickets: `node $HOME/.codex/pickle-rick/bin/spawn-refinement-team.js <session-dir>`
-6. Execute tickets sequentially: `node $HOME/.codex/pickle-rick/bin/mux-runner.js <session-dir>`
+2. Check for an existing session: `node $HOME/.codex/pickle-rick/extension/bin/get-session.js --last`
+3. If no session exists, create one: `node $HOME/.codex/pickle-rick/extension/bin/setup.js "<task>"`
+4. Draft the PRD: `node $HOME/.codex/pickle-rick/extension/bin/draft-prd.js <session-dir> "<task>"`
+5. Refine the PRD into tickets: `node $HOME/.codex/pickle-rick/extension/bin/spawn-refinement-team.js <session-dir>`
+6. Execute tickets sequentially: `node $HOME/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir>`
 7. Inspect or control the run with `status`, `metrics`, `cancel`, and `retry`
 
 ## Execution Contract

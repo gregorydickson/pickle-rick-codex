@@ -9,7 +9,7 @@ metadata:
 
 Run:
 
-`node $HOME/.codex/pickle-rick/bin/cancel.js`
+`node $HOME/.codex/pickle-rick/extension/bin/cancel.js`
 
 Behavior:
 

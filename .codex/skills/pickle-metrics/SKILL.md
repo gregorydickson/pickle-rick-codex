@@ -7,7 +7,7 @@ metadata:
 
 # Pickle Rick Metrics
 
-Run: `node $HOME/.codex/pickle-rick/bin/metrics.js`
+Run: `node $HOME/.codex/pickle-rick/extension/bin/metrics.js`
 
 Accepts flags: `--days N`, `--since YYYY-MM-DD`, `--weekly`, `--json`
 

@@ -11,7 +11,7 @@ Trace data flows through a subsystem, find correctness bugs, fix one issue at a 
 
 Launch the detached tmux runner:
 
-`node $HOME/.codex/pickle-rick/bin/anatomy-park.js <target>`
+`node $HOME/.codex/pickle-rick/extension/bin/anatomy-park.js <target>`
 
 Optional flags:
 

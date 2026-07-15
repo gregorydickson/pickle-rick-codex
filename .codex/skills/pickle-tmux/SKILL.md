@@ -9,23 +9,23 @@ metadata:
 
 Bootstrap from an existing PRD file:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --prd ./prd.md`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-tmux.js --prd ./prd.md`
 
 Alias:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --bootstrap-from ./prd.md`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-tmux.js --bootstrap-from ./prd.md`
 
 Resume the latest session for the current repo:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --resume`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-tmux.js --resume`
 
 Resume a specific session:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --resume <session-dir>`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-tmux.js --resume <session-dir>`
 
 Resume only if the session is already fully prepared:
 
-`node $HOME/.codex/pickle-rick/bin/pickle-tmux.js --resume <session-dir> --resume-ready-only`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-tmux.js --resume <session-dir> --resume-ready-only`
 
 ## Behavior
 
