@@ -3,8 +3,65 @@ import path from 'node:path';
 import { appendHistory, markRunStart } from './session.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { setupSession } from './setup-session.js';
+import { StateManager, type PersistedState } from './state-manager.js';
+import type { PipelineContract } from '../types/index.js';
 
-export function resolveLoopTargetCwd(target) {
+interface LoopConfig {
+  mode: string;
+  target?: string;
+  [key: string]: unknown;
+}
+
+interface LoopPhaseField {
+  key: string;
+  value: unknown;
+  specified?: boolean;
+}
+
+interface BuildLoopPhaseSetupOptions {
+  mode: string;
+  resume?: string | null;
+  maxIterations?: number | null;
+  task: string;
+  commandTemplate: string;
+  target?: string | null;
+  targetSpecified?: boolean;
+  fields?: LoopPhaseField[];
+}
+
+interface LoopPhaseSetup {
+  setupArgs: string[];
+  loopConfig: LoopConfig;
+  sessionCwd: string | null;
+}
+
+interface AnatomyParkParsed {
+  resume?: string | null;
+  maxIterations?: number | null;
+  target: string;
+  targetSpecified?: boolean;
+  dryRun?: boolean;
+  dryRunSpecified?: boolean;
+  stallLimit?: number | null;
+  stallLimitSpecified?: boolean;
+}
+
+interface SzechuanSauceParsed {
+  resume?: string | null;
+  maxIterations?: number | null;
+  target: string;
+  targetSpecified?: boolean;
+  focus?: string | null;
+  focusSpecified?: boolean;
+  domain?: string | null;
+  domainSpecified?: boolean;
+  dryRun?: boolean;
+  dryRunSpecified?: boolean;
+  stallLimit?: number | null;
+  stallLimitSpecified?: boolean;
+}
+
+export function resolveLoopTargetCwd(target: string): string {
   const resolvedTarget = fs.realpathSync(path.resolve(target));
   return fs.statSync(resolvedTarget).isDirectory() ? resolvedTarget : path.dirname(resolvedTarget);
 }
@@ -18,7 +75,7 @@ export function buildLoopPhaseSetup({
   target = null,
   targetSpecified = false,
   fields = [],
-} = {}) {
+}: BuildLoopPhaseSetupOptions): LoopPhaseSetup {
   const setupArgs = ['--tmux', '--command-template', commandTemplate];
   if (resume) {
     setupArgs.push('--resume');
@@ -32,7 +89,7 @@ export function buildLoopPhaseSetup({
     setupArgs.push('--task', task);
   }
 
-  const loopConfig = { mode };
+  const loopConfig: LoopConfig = { mode };
   if (target && (!resume || targetSpecified)) {
     loopConfig.target = path.resolve(target);
   }
@@ -49,7 +106,7 @@ export function buildLoopPhaseSetup({
   };
 }
 
-export function prepareAnatomyParkPhase(parsed) {
+export function prepareAnatomyParkPhase(parsed: AnatomyParkParsed): LoopPhaseSetup {
   return buildLoopPhaseSetup({
     mode: 'anatomy-park',
     resume: parsed.resume,
@@ -65,21 +122,21 @@ export function prepareAnatomyParkPhase(parsed) {
   });
 }
 
-export function preparePipelineAnatomyParkPhase(pipeline) {
+export function preparePipelineAnatomyParkPhase(pipeline: PipelineContract): LoopPhaseSetup {
   const anatomy = pipeline.anatomy || {};
   return prepareAnatomyParkPhase({
     dryRun: Boolean(anatomy.dry_run),
     dryRunSpecified: Object.hasOwn(anatomy, 'dry_run'),
-    stallLimit: Number.isInteger(anatomy.stall_limit) ? anatomy.stall_limit : 3,
+    stallLimit: Number.isInteger(anatomy.stall_limit) ? (anatomy.stall_limit as number) : 3,
     stallLimitSpecified: Object.hasOwn(anatomy, 'stall_limit'),
-    maxIterations: Number.isInteger(anatomy.max_iterations) ? anatomy.max_iterations : null,
+    maxIterations: Number.isInteger(anatomy.max_iterations) ? (anatomy.max_iterations as number) : null,
     resume: null,
     target: pipeline.target,
     targetSpecified: true,
   });
 }
 
-export function preparePipelineSzechuanSaucePhase(pipeline) {
+export function preparePipelineSzechuanSaucePhase(pipeline: PipelineContract): LoopPhaseSetup {
   const szechuan = pipeline.szechuan || {};
   return prepareSzechuanSaucePhase({
     focus: typeof szechuan.focus === 'string' ? szechuan.focus : null,
@@ -88,16 +145,16 @@ export function preparePipelineSzechuanSaucePhase(pipeline) {
     domainSpecified: Object.hasOwn(szechuan, 'domain'),
     dryRun: Boolean(szechuan.dry_run),
     dryRunSpecified: Object.hasOwn(szechuan, 'dry_run'),
-    stallLimit: Number.isInteger(szechuan.stall_limit) ? szechuan.stall_limit : 5,
+    stallLimit: Number.isInteger(szechuan.stall_limit) ? (szechuan.stall_limit as number) : 5,
     stallLimitSpecified: Object.hasOwn(szechuan, 'stall_limit'),
-    maxIterations: Number.isInteger(szechuan.max_iterations) ? szechuan.max_iterations : null,
+    maxIterations: Number.isInteger(szechuan.max_iterations) ? (szechuan.max_iterations as number) : null,
     resume: null,
     target: pipeline.target,
     targetSpecified: true,
   });
 }
 
-export function prepareSzechuanSaucePhase(parsed) {
+export function prepareSzechuanSaucePhase(parsed: SzechuanSauceParsed): LoopPhaseSetup {
   return buildLoopPhaseSetup({
     mode: 'szechuan-sauce',
     resume: parsed.resume,
@@ -115,15 +172,19 @@ export function prepareSzechuanSaucePhase(parsed) {
   });
 }
 
-export function readLoopConfig(sessionDir) {
-  const config = readJsonFile(path.join(sessionDir, 'loop_config.json'), null);
+export function readLoopConfig(sessionDir: string): LoopConfig {
+  const config = readJsonFile<LoopConfig>(path.join(sessionDir, 'loop_config.json'), null);
   if (!config || !config.mode) {
     throw new Error(`Missing loop_config.json in ${sessionDir}`);
   }
   return config;
 }
 
-export async function preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase) {
+export async function preparePipelineLoopPhaseSession(
+  sessionDir: string,
+  pipeline: PipelineContract,
+  preparePhase: (pipeline: PipelineContract) => LoopPhaseSetup,
+): Promise<LoopConfig> {
   const { setupArgs, loopConfig } = preparePhase(pipeline);
   await setupSession(['--resume', sessionDir, ...setupArgs], {
     cwd: pipeline.working_dir,
@@ -133,7 +194,11 @@ export async function preparePipelineLoopPhaseSession(sessionDir, pipeline, prep
   return loopConfig;
 }
 
-export function enterLoopRunnerPhase(manager, statePath, loopMode) {
+export function enterLoopRunnerPhase(
+  manager: StateManager,
+  statePath: string,
+  loopMode: string,
+): PersistedState {
   return manager.update(statePath, (state) => {
     state.active = true;
     state.tmux_runner_pid = process.pid;
@@ -146,15 +211,19 @@ export function enterLoopRunnerPhase(manager, statePath, loopMode) {
     state.active_child_kind = null;
     state.active_child_command = null;
     markRunStart(state);
-    appendHistory(state, `${loopMode}_runner_start`, state.current_ticket || undefined);
+    appendHistory(state, `${loopMode}_runner_start`, (state.current_ticket as string | null) || undefined);
     return state;
   });
 }
 
-export function exitLoopRunnerPhase(manager, statePath, exitReason) {
+export function exitLoopRunnerPhase(
+  manager: StateManager,
+  statePath: string,
+  exitReason: string,
+): string {
   const state = manager.update(statePath, (current) => {
-    const finalReason = current.active === false && current.last_exit_reason
-      ? current.last_exit_reason
+    const finalReason: string = current.active === false && current.last_exit_reason
+      ? (current.last_exit_reason as string)
       : exitReason;
     current.active = false;
     current.tmux_runner_pid = null;
@@ -163,8 +232,8 @@ export function exitLoopRunnerPhase(manager, statePath, exitReason) {
     current.active_child_command = null;
     current.last_exit_reason = finalReason;
     current.step = finalReason === 'success' ? 'complete' : 'paused';
-    appendHistory(current, finalReason === 'success' ? 'complete' : finalReason, current.current_ticket || undefined);
+    appendHistory(current, finalReason === 'success' ? 'complete' : finalReason, (current.current_ticket as string | null) || undefined);
     return current;
   });
-  return state.last_exit_reason;
+  return state.last_exit_reason as string;
 }
