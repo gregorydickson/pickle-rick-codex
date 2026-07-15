@@ -2,39 +2,44 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { ParsedTicket } from '../types/index.js';
 
-export const STATE_SCHEMA_VERSION = 1;
+export { STATE_SCHEMA_VERSION } from '../types/index.js';
 
-export function safeErrorMessage(error) {
+export function safeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function getDataRoot() {
+export function getDataRoot(): string {
   return process.env.PICKLE_DATA_ROOT || path.join(os.homedir(), '.codex', 'pickle-rick');
 }
 
-export function getSessionsRoot() {
+export function getSessionsRoot(): string {
   return path.join(getDataRoot(), 'sessions');
 }
 
-export function getActivityRoot() {
+export function getActivityRoot(): string {
   return path.join(getDataRoot(), 'activity');
 }
 
-export function getConfigPath() {
+export function getConfigPath(): string {
   return path.join(getDataRoot(), 'config.json');
 }
 
-export function getSessionMapPath() {
+export function getSessionMapPath(): string {
   return path.join(getDataRoot(), 'current_sessions.json');
 }
 
-export function ensureDir(dirPath, mode = 0o700) {
+export function ensureDir(dirPath: string, mode: number = 0o700): string {
   fs.mkdirSync(dirPath, { recursive: true, mode });
   return dirPath;
 }
 
-export function atomicWriteFile(filePath, content, options = {}) {
+interface AtomicWriteOptions {
+  mode?: number;
+}
+
+export function atomicWriteFile(filePath: string, content: string, options: AtomicWriteOptions = {}): void {
   const directory = path.dirname(filePath);
   const mode = options.mode ?? 0o600;
   ensureDir(directory);
@@ -52,25 +57,25 @@ export function atomicWriteFile(filePath, content, options = {}) {
   }
 }
 
-export function atomicWriteJson(filePath, value, options = {}) {
+export function atomicWriteJson<T>(filePath: string, value: T, options: AtomicWriteOptions = {}): void {
   atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`, options);
 }
 
-export function readJsonFile(filePath, fallback = null) {
+export function readJsonFile<T = unknown>(filePath: string, fallback: T | null = null): T | null {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
   } catch {
     return fallback;
   }
 }
 
-export function backupFile(filePath, suffix = 'bak') {
+export function backupFile(filePath: string, suffix: string = 'bak'): string {
   const backupPath = `${filePath}.${suffix}.${Date.now()}`;
   fs.copyFileSync(filePath, backupPath);
   return backupPath;
 }
 
-export function formatDuration(totalSeconds) {
+export function formatDuration(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds || 0));
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
@@ -81,7 +86,7 @@ export function formatDuration(totalSeconds) {
   return `${minutes}m ${remainder}s`;
 }
 
-export function statusSymbol(status) {
+export function statusSymbol(status: string | null | undefined): string {
   const normalized = String(status ?? '').trim().replace(/^["']|["']$/g, '').toLowerCase();
   if (normalized === 'done') return '[x]';
   if (normalized === 'in progress') return '[~]';
@@ -89,7 +94,7 @@ export function statusSymbol(status) {
   return '[ ]';
 }
 
-export function slugify(value) {
+export function slugify(value: string | null | undefined): string {
   return String(value ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -97,7 +102,13 @@ export function slugify(value) {
     .slice(0, 64);
 }
 
-export function extractFrontmatter(content) {
+interface ExtractedFrontmatter {
+  body: string;
+  start: number;
+  end: number;
+}
+
+export function extractFrontmatter(content: string): ExtractedFrontmatter | null {
   const openLength = content.startsWith('---\r\n') ? 5 : content.startsWith('---\n') ? 4 : 0;
   if (openLength === 0) return null;
   const closeIndex = content.indexOf('\n---', openLength);
@@ -112,11 +123,11 @@ export function extractFrontmatter(content) {
   return { body: content.slice(openLength, closeIndex), start: 0, end };
 }
 
-export function parseFrontmatter(content) {
+export function parseFrontmatter(content: string): Record<string, string> | null {
   const frontmatter = extractFrontmatter(content);
   if (!frontmatter) return null;
 
-  const parsed = {};
+  const parsed: Record<string, string> = {};
   for (const rawLine of frontmatter.body.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
@@ -131,12 +142,12 @@ export function parseFrontmatter(content) {
   return parsed;
 }
 
-export function updateFrontmatter(content, updates) {
+export function updateFrontmatter(content: string, updates: Record<string, unknown>): string {
   const frontmatter = extractFrontmatter(content);
   if (!frontmatter) return content;
 
   const lines = frontmatter.body.split(/\r?\n/);
-  const seen = new Set();
+  const seen = new Set<string>();
   const rewritten = lines.map((line) => {
     const separator = line.indexOf(':');
     if (separator === -1) return line;
@@ -155,7 +166,7 @@ export function updateFrontmatter(content, updates) {
   return `---\n${rewritten.join('\n')}\n---\n${content.slice(frontmatter.end)}`;
 }
 
-export function readTextFile(filePath, fallback = null) {
+export function readTextFile(filePath: string, fallback: string | null = null): string | null {
   try {
     return fs.readFileSync(filePath, 'utf8');
   } catch {
@@ -163,7 +174,7 @@ export function readTextFile(filePath, fallback = null) {
   }
 }
 
-export function listTicketFiles(sessionDir) {
+export function listTicketFiles(sessionDir: string): string[] {
   try {
     const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
     return entries
@@ -183,7 +194,7 @@ export function listTicketFiles(sessionDir) {
   }
 }
 
-export function parseTicketFile(filePath) {
+export function parseTicketFile(filePath: string): ParsedTicket | null {
   const content = readTextFile(filePath);
   if (!content) return null;
   const frontmatter = parseFrontmatter(content);
@@ -201,6 +212,6 @@ export function parseTicketFile(filePath) {
   };
 }
 
-export function nowIso() {
+export function nowIso(): string {
   return new Date().toISOString();
 }

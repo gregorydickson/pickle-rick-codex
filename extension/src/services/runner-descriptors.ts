@@ -1,4 +1,13 @@
-const RUNNER_DESCRIPTORS = Object.freeze({
+export interface RunnerDescriptor {
+  runnerBin: string;
+  runnerLog: string;
+  runnerStartMarker: string;
+  monitorMode: string;
+}
+
+export type RunnerMode = 'pickle' | 'loop' | 'pipeline';
+
+const RUNNER_DESCRIPTORS: Readonly<Record<RunnerMode, Readonly<RunnerDescriptor>>> = Object.freeze({
   pickle: Object.freeze({
     runnerBin: 'mux-runner.js',
     runnerLog: 'mux-runner.log',
@@ -19,14 +28,18 @@ const RUNNER_DESCRIPTORS = Object.freeze({
   }),
 });
 
-export function normalizeRunnerMode(mode) {
+export function normalizeRunnerMode(mode: string): RunnerMode {
   if (mode === 'pickle' || mode === 'pipeline') {
     return mode;
   }
   return 'loop';
 }
 
-export function getRunnerDescriptor(mode) {
+export interface NormalizedRunnerDescriptor extends RunnerDescriptor {
+  mode: RunnerMode;
+}
+
+export function getRunnerDescriptor(mode: string): NormalizedRunnerDescriptor {
   const runnerMode = normalizeRunnerMode(mode);
   return {
     mode: runnerMode,
@@ -34,6 +47,6 @@ export function getRunnerDescriptor(mode) {
   };
 }
 
-export function listRunnerDescriptors() {
+export function listRunnerDescriptors(): Readonly<Record<RunnerMode, Readonly<RunnerDescriptor>>> {
   return structuredClone(RUNNER_DESCRIPTORS);
 }

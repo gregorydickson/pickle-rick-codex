@@ -1,7 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import type {
+  ConfigVerificationInput,
+  PreflightDiagnostic,
+  TicketVerificationInput,
+  VerificationContract,
+  VerificationEnvMode,
+  VerificationEnvResult,
+  VerificationEnvVarSpec,
+  VerificationRequirement,
+} from '../types/index.js';
 
-const SAFE_REPLACE_ENV_KEYS = [
+const SAFE_REPLACE_ENV_KEYS: readonly string[] = [
   'HOME',
   'LANG',
   'LC_ALL',
@@ -18,7 +28,7 @@ const SAFE_REPLACE_ENV_KEYS = [
   'USER',
 ];
 
-const INFERRED_ENV_IGNORE_KEYS = new Set([
+const INFERRED_ENV_IGNORE_KEYS = new Set<string>([
   ...SAFE_REPLACE_ENV_KEYS,
   'PWD',
   'OLDPWD',
@@ -28,11 +38,11 @@ const INFERRED_ENV_IGNORE_KEYS = new Set([
   'OPTIND',
 ]);
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function parseMaybeJson(value) {
+function parseMaybeJson(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
   if (!trimmed) return value;
@@ -44,11 +54,12 @@ function parseMaybeJson(value) {
   }
 }
 
-function normalizeMode(value) {
-  return ['inherit', 'merge', 'replace'].includes(value) ? value : 'inherit';
+function normalizeMode(value: unknown): VerificationEnvMode {
+  if (value === 'inherit' || value === 'merge' || value === 'replace') return value;
+  return 'inherit';
 }
 
-function normalizeRequirement(value) {
+function normalizeRequirement(value: unknown): VerificationRequirement | null {
   if (typeof value === 'string' && value.trim()) {
     return {
       name: value.trim(),
@@ -66,15 +77,17 @@ function normalizeRequirement(value) {
   };
 }
 
-function normalizeRequiredList(value) {
+function normalizeRequiredList(value: unknown): VerificationRequirement[] {
   if (Array.isArray(value)) {
-    return value.map(normalizeRequirement).filter(Boolean);
+    return value
+      .map(normalizeRequirement)
+      .filter((entry): entry is VerificationRequirement => entry !== null);
   }
   const single = normalizeRequirement(value);
   return single ? [single] : [];
 }
 
-function normalizeVarSpec(value) {
+function normalizeVarSpec(value: unknown): VerificationEnvVarSpec | null {
   const parsed = parseMaybeJson(value);
   if (typeof parsed === 'string') {
     return { type: 'literal', value: parsed };
@@ -96,9 +109,9 @@ function normalizeVarSpec(value) {
   return null;
 }
 
-function normalizeVars(value) {
+function normalizeVars(value: unknown): Record<string, VerificationEnvVarSpec> {
   if (!isPlainObject(value)) return {};
-  const entries = {};
+  const entries: Record<string, VerificationEnvVarSpec> = {};
   for (const [key, spec] of Object.entries(value)) {
     if (typeof key !== 'string' || !key.trim()) continue;
     const normalized = normalizeVarSpec(spec);
@@ -108,9 +121,9 @@ function normalizeVars(value) {
   return entries;
 }
 
-function normalizeVerificationCommandList(value) {
+function normalizeVerificationCommandList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  const commands = [];
+  const commands: string[] = [];
   for (const entry of value) {
     if (typeof entry === 'string' && entry.trim()) {
       commands.push(entry.trim());
@@ -123,10 +136,10 @@ function normalizeVerificationCommandList(value) {
   return commands;
 }
 
-function splitShellCommandList(value) {
-  const commands = [];
+function splitShellCommandList(value: string): string[] {
+  const commands: string[] = [];
   let current = '';
-  let quote = null;
+  let quote: string | null = null;
 
   for (let index = 0; index < value.length; index += 1) {
     const char = value[index];
@@ -172,7 +185,7 @@ function splitShellCommandList(value) {
   return commands;
 }
 
-function normalizeVerificationValue(value) {
+function normalizeVerificationValue(value: unknown): string[] {
   if (Array.isArray(value)) {
     return normalizeVerificationCommandList(value);
   }
@@ -190,10 +203,10 @@ function normalizeVerificationValue(value) {
   return [];
 }
 
-function tokenizeShellWords(command) {
-  const tokens = [];
+function tokenizeShellWords(command: string): string[] {
+  const tokens: string[] = [];
   let current = '';
-  let quote = null;
+  let quote: string | null = null;
 
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index];
@@ -234,11 +247,11 @@ function tokenizeShellWords(command) {
   return tokens;
 }
 
-function shellQuote(value) {
+function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function packageManagerExecArgs(packageManager) {
+function packageManagerExecArgs(packageManager: string): string[] | null {
   if (packageManager === 'pnpm' || packageManager === 'yarn') {
     return [packageManager, 'exec'];
   }
@@ -251,7 +264,13 @@ function packageManagerExecArgs(packageManager) {
   return null;
 }
 
-function extractPackageDirFromTokens(tokens, cwd) {
+interface PackageJson {
+  name?: string;
+  scripts?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+function extractPackageDirFromTokens(tokens: string[], cwd: string): string {
   let packageDir = cwd;
   let pnpmFilter = '';
   for (let index = 1; index < tokens.length; index += 1) {
@@ -288,33 +307,33 @@ function extractPackageDirFromTokens(tokens, cwd) {
   return packageDir;
 }
 
-function normalizePnpmFilterSelector(value) {
+function normalizePnpmFilterSelector(value: unknown): string {
   let normalized = String(value || '').trim();
   if (!normalized) return '';
   normalized = normalized.replace(/^!+/, '');
-  normalized = normalized.replace(/^\.\.\./, '').replace(/\.\.\.$/, '').replace(/\^\.\.\.$/, '');
+  normalized = normalized.replace(/^\.\.\./, '').replace(/\.\.\.$/, '').replace(/^\^\.\.\.$/, '');
   if (normalized.startsWith('{') && normalized.endsWith('}')) {
     normalized = normalized.slice(1, -1).trim();
   }
   return normalized;
 }
 
-function readPackageName(packageDir) {
+function readPackageName(packageDir: string): string {
   const pkg = readPackageJson(packageDir);
   return typeof pkg?.name === 'string' && pkg.name.trim() ? pkg.name.trim() : '';
 }
 
-function findWorkspacePackageDirByName(rootDir, packageName) {
-  const queue = [rootDir];
+function findWorkspacePackageDirByName(rootDir: string, packageName: string): string | null {
+  const queue: string[] = [rootDir];
 
   while (queue.length > 0) {
-    const currentDir = queue.shift();
+    const currentDir = queue.shift()!;
     const currentName = readPackageName(currentDir);
     if (currentName === packageName) {
       return currentDir;
     }
 
-    let entries = [];
+    let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
     } catch {
@@ -331,7 +350,7 @@ function findWorkspacePackageDirByName(rootDir, packageName) {
   return null;
 }
 
-function resolvePnpmFilterPackageDir(cwd, selector) {
+function resolvePnpmFilterPackageDir(cwd: string, selector: string): string | null {
   const normalized = normalizePnpmFilterSelector(selector);
   if (!normalized) {
     return null;
@@ -344,17 +363,17 @@ function resolvePnpmFilterPackageDir(cwd, selector) {
   return findWorkspacePackageDirByName(cwd, normalized);
 }
 
-function readPackageJson(packageDir) {
+function readPackageJson(packageDir: string): PackageJson | null {
   try {
     const packageJsonPath = path.join(packageDir, 'package.json');
     if (!fs.existsSync(packageJsonPath)) return null;
-    return JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    return JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   } catch {
     return null;
   }
 }
 
-function extractVitestScriptArgs(script) {
+function extractVitestScriptArgs(script: unknown): string[] | null {
   if (typeof script !== 'string' || !script.trim()) return null;
   const tokens = tokenizeShellWords(script);
   const vitestIndex = tokens.findIndex((token) => /(?:^|[\\/])vitest(?:\.mjs)?$/.test(token));
@@ -366,7 +385,7 @@ function extractVitestScriptArgs(script) {
   return args;
 }
 
-function rewriteScopedVitestCommand(command, cwd) {
+function rewriteScopedVitestCommand(command: string, cwd: string | undefined): string {
   if (typeof command !== 'string' || !command.trim() || typeof cwd !== 'string' || !cwd.trim()) {
     return command;
   }
@@ -413,11 +432,16 @@ function rewriteScopedVitestCommand(command, cwd) {
   return rewritten.join(' ');
 }
 
-function rewriteScopedVerificationCommands(commands, cwd) {
+function rewriteScopedVerificationCommands(commands: string[], cwd: string | undefined): string[] {
   return commands.map((command) => rewriteScopedVitestCommand(command, cwd));
 }
 
-export function normalizeVerificationCommands(value, options = {}) {
+interface NormalizeVerificationCommandsOptions {
+  cwd?: string;
+  verify?: unknown;
+}
+
+export function normalizeVerificationCommands(value: unknown, options: NormalizeVerificationCommandsOptions = {}): string[] {
   const commands = normalizeVerificationValue(value);
   if (commands.length > 0) return rewriteScopedVerificationCommands(commands, options.cwd);
   if ('verify' in options) {
@@ -426,11 +450,11 @@ export function normalizeVerificationCommands(value, options = {}) {
   return [];
 }
 
-function ticketVerificationCommands(ticket) {
+function ticketVerificationCommands(ticket: TicketVerificationInput | null | undefined): string[] {
   return normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
 }
 
-const REPO_WRAPPER_ENV_RULES = [
+const REPO_WRAPPER_ENV_RULES: readonly { pattern: RegExp; required: readonly string[] }[] = [
   {
     pattern: /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?check:env\b/i,
     required: ['ATTRACTOR_ROOT', 'DIPPIN_ROOT'],
@@ -445,11 +469,11 @@ const REPO_WRAPPER_ENV_RULES = [
   },
 ];
 
-function inferLocallyAssignedEnvNames(command) {
-  const assigned = new Set();
+function inferLocallyAssignedEnvNames(command: string): Set<string> {
+  const assigned = new Set<string>();
   const assignmentPattern = /(?:^|[;&|()]\s*|\s+)(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/g;
 
-  let match;
+  let match: RegExpExecArray | null;
   while ((match = assignmentPattern.exec(command)) !== null) {
     assigned.add(match[1]);
   }
@@ -457,8 +481,8 @@ function inferLocallyAssignedEnvNames(command) {
   return assigned;
 }
 
-function inferWrapperRequiredEnv(command) {
-  const inferred = new Set();
+function inferWrapperRequiredEnv(command: string): Set<string> {
+  const inferred = new Set<string>();
   for (const rule of REPO_WRAPPER_ENV_RULES) {
     if (!rule.pattern.test(command)) continue;
     for (const name of rule.required) {
@@ -468,10 +492,13 @@ function inferWrapperRequiredEnv(command) {
   return inferred;
 }
 
-function inferRequiredEnvFromVerificationCommands(ticket, contract = null) {
-  const inferred = new Map();
+function inferRequiredEnvFromVerificationCommands(
+  ticket: TicketVerificationInput | null | undefined,
+  contract: VerificationContract | null = null,
+): VerificationRequirement[] {
+  const inferred = new Map<string, VerificationRequirement>();
   const commands = ticketVerificationCommands(ticket);
-  const contractVars = new Set(Object.keys(contract?.vars || {}));
+  const contractVars = new Set<string>(Object.keys(contract?.vars || {}));
   const pattern = /(?<!\\)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
 
   for (const command of commands) {
@@ -486,7 +513,7 @@ function inferRequiredEnvFromVerificationCommands(ticket, contract = null) {
       });
     }
 
-    let match;
+    let match: RegExpExecArray | null;
     while ((match = pattern.exec(command)) !== null) {
       const name = match[1] || match[3] || '';
       const expansionRest = match[2] || '';
@@ -505,7 +532,7 @@ function inferRequiredEnvFromVerificationCommands(ticket, contract = null) {
   return [...inferred.values()];
 }
 
-function extractTicketContract(ticket) {
+function extractTicketContract(ticket: TicketVerificationInput | null | undefined): VerificationContract | null {
   const explicitContract = (() => {
     if (ticket?.verification_env != null || ticket?.verificationEnv != null) {
       return normalizeVerificationEnvContract(ticket.verification_env ?? ticket.verificationEnv);
@@ -523,7 +550,7 @@ function extractTicketContract(ticket) {
     return explicitContract;
   }
 
-  const inferredContract = {
+  const inferredContract: VerificationContract = {
     mode: explicitContract?.mode || 'inherit',
     required: inferredRequired,
     vars: {},
@@ -532,12 +559,15 @@ function extractTicketContract(ticket) {
   return mergeContracts(explicitContract, inferredContract);
 }
 
-function mergeContracts(baseContract, ticketContract) {
+function mergeContracts(
+  baseContract: VerificationContract | null,
+  ticketContract: VerificationContract | null,
+): VerificationContract | null {
   if (!baseContract && !ticketContract) return null;
   if (!baseContract) return ticketContract;
   if (!ticketContract) return baseContract;
 
-  const required = new Map(baseContract.required.map((entry) => [entry.name, entry]));
+  const required = new Map<string, VerificationRequirement>(baseContract.required.map((entry) => [entry.name, entry]));
   for (const entry of ticketContract.required) {
     required.set(entry.name, entry);
   }
@@ -552,7 +582,7 @@ function mergeContracts(baseContract, ticketContract) {
   };
 }
 
-export function normalizeVerificationEnvContract(value) {
+export function normalizeVerificationEnvContract(value: unknown): VerificationContract | null {
   const parsed = parseMaybeJson(value);
   if (!isPlainObject(parsed)) return null;
 
@@ -561,7 +591,7 @@ export function normalizeVerificationEnvContract(value) {
     ...normalizeRequiredList(parsed.required_env || parsed.requiredEnv),
   ];
 
-  const byName = new Map();
+  const byName = new Map<string, VerificationRequirement>();
   for (const entry of required) {
     byName.set(entry.name, entry);
   }
@@ -573,14 +603,20 @@ export function normalizeVerificationEnvContract(value) {
   };
 }
 
-export function resolveTicketVerificationContract({ ticket, config }) {
+export function resolveTicketVerificationContract({
+  ticket,
+  config,
+}: {
+  ticket: TicketVerificationInput | null | undefined;
+  config: ConfigVerificationInput | null | undefined;
+}): VerificationContract | null {
   const baseContract = normalizeVerificationEnvContract(config?.defaults?.verification_env);
   const ticketContract = extractTicketContract(ticket);
   return mergeContracts(baseContract, ticketContract);
 }
 
-function pickReplaceBaseEnv(ambientEnv) {
-  const env = {};
+function pickReplaceBaseEnv(ambientEnv: Record<string, string | undefined>): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
   for (const key of SAFE_REPLACE_ENV_KEYS) {
     if (ambientEnv[key] !== undefined) {
       env[key] = ambientEnv[key];
@@ -589,7 +625,7 @@ function pickReplaceBaseEnv(ambientEnv) {
   return env;
 }
 
-function validateRequirement(name, format, value) {
+function validateRequirement(name: string, format: string, value: string | undefined): PreflightDiagnostic | null {
   if (value == null || String(value).trim() === '') {
     return {
       kind: 'preflight-missing-env',
@@ -600,7 +636,6 @@ function validateRequirement(name, format, value) {
 
   if (format === 'url') {
     try {
-      // eslint-disable-next-line no-new
       new URL(String(value));
     } catch {
       return {
@@ -615,7 +650,20 @@ function validateRequirement(name, format, value) {
 }
 
 export class PreflightError extends Error {
-  constructor({ kind, ticketId, prerequisite, message }) {
+  kind: string;
+  ticketId: string | null;
+  prerequisite: string | null;
+  constructor({
+    kind,
+    ticketId,
+    prerequisite,
+    message,
+  }: {
+    kind: string;
+    ticketId?: string | null;
+    prerequisite?: string | null;
+    message: string;
+  }) {
     super(`${kind}: ${message}`);
     this.name = 'PreflightError';
     this.kind = kind;
@@ -624,12 +672,23 @@ export class PreflightError extends Error {
   }
 }
 
-export function isPreflightError(error) {
+export function isPreflightError(error: unknown): boolean {
   return error instanceof PreflightError;
 }
 
 export class VerificationContractError extends Error {
-  constructor({ ticketId, command, message }) {
+  kind: string;
+  ticketId: string | null;
+  command: string | null;
+  constructor({
+    ticketId,
+    command,
+    message,
+  }: {
+    ticketId?: string | null;
+    command?: string | null;
+    message: string;
+  }) {
     super(`verification-contract-failed: ${message}`);
     this.name = 'VerificationContractError';
     this.kind = 'verification-contract-failed';
@@ -638,11 +697,19 @@ export class VerificationContractError extends Error {
   }
 }
 
-export function isVerificationContractError(error) {
+export function isVerificationContractError(error: unknown): boolean {
   return error instanceof VerificationContractError;
 }
 
-export function resolveVerificationEnv({ ticket, config, ambientEnv = process.env }) {
+export function resolveVerificationEnv({
+  ticket,
+  config,
+  ambientEnv = process.env,
+}: {
+  ticket: TicketVerificationInput | null | undefined;
+  config: ConfigVerificationInput | null | undefined;
+  ambientEnv?: NodeJS.ProcessEnv;
+}): VerificationEnvResult {
   const contract = resolveTicketVerificationContract({ ticket, config });
 
   if (!contract) {
@@ -653,7 +720,7 @@ export function resolveVerificationEnv({ ticket, config, ambientEnv = process.en
     };
   }
 
-  const env = contract.mode === 'replace'
+  const env: Record<string, string | undefined> = contract.mode === 'replace'
     ? pickReplaceBaseEnv(ambientEnv)
     : { ...ambientEnv };
 
@@ -667,12 +734,20 @@ export function resolveVerificationEnv({ ticket, config, ambientEnv = process.en
 
   const diagnostics = contract.required
     .map((entry) => validateRequirement(entry.name, entry.format, env[entry.name]))
-    .filter(Boolean);
+    .filter((d): d is PreflightDiagnostic => d !== null);
 
   return { contract, env, diagnostics };
 }
 
-export function assertTicketVerificationReady({ ticket, config, ambientEnv = process.env }) {
+export function assertTicketVerificationReady({
+  ticket,
+  config,
+  ambientEnv = process.env,
+}: {
+  ticket: TicketVerificationInput | null | undefined;
+  config: ConfigVerificationInput | null | undefined;
+  ambientEnv?: NodeJS.ProcessEnv;
+}): VerificationEnvResult {
   const resolved = resolveVerificationEnv({ ticket, config, ambientEnv });
   const first = resolved.diagnostics[0];
   if (first) {
@@ -686,7 +761,7 @@ export function assertTicketVerificationReady({ ticket, config, ambientEnv = pro
   return resolved;
 }
 
-export function describeVerificationContract(contract) {
+export function describeVerificationContract(contract: VerificationContract | null | undefined): string {
   if (!contract) return '';
   const lines = [`mode: ${contract.mode}`];
   if (contract.required.length > 0) {
