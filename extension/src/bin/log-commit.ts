@@ -6,7 +6,7 @@ import { loadConfig } from '../services/config.js';
 import { getHeadSha } from '../services/git-utils.js';
 import { resolveSessionForCwd } from '../services/session.js';
 
-async function main() {
+async function main(): Promise<void> {
   const sessionDir = await resolveSessionForCwd(process.cwd(), { last: true });
   if (!sessionDir) return;
 

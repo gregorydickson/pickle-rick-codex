@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { runSequential } from './mux-runner.js';
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/jar-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');

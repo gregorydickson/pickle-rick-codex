@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { buildMetricsReport, formatMetricsReport, parseMetricsArgs } from '../services/metrics.js';
 
-function main(argv) {
+function main(argv: string[]): void {
   if (argv.includes('--help')) {
     console.log('Usage: node bin/metrics.js [--days N] [--since YYYY-MM-DD] [--weekly] [--json]');
     return;

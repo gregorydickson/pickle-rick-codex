@@ -2,8 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-function findLatestMessageFile(sessionDir) {
-  const candidates = [];
+interface MessageFileCandidate {
+  filePath: string;
+  mtimeMs: number;
+}
+
+function findLatestMessageFile(sessionDir: string): string | null {
+  const candidates: MessageFileCandidate[] = [];
   for (const entry of fs.readdirSync(sessionDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.last-message.txt')) continue;
     const filePath = path.join(sessionDir, entry.name);
@@ -14,7 +19,7 @@ function findLatestMessageFile(sessionDir) {
   return candidates[0]?.filePath || null;
 }
 
-function main(argv) {
+function main(argv: string[]): void {
   const sessionDir = argv[0];
   if (!sessionDir) {
     throw new Error('Usage: node bin/latest-worker-message.js <session-dir>');

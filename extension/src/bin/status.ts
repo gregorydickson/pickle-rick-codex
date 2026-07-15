@@ -7,14 +7,33 @@ import { readPipelineState } from '../services/pipeline-state.js';
 import { getRunStartEpoch, resolveSessionForCwd } from '../services/session.js';
 import { loadCircuitState } from '../services/circuit-breaker.js';
 import { StateManager } from '../services/state-manager.js';
+import type { PersistedState } from '../services/state-manager.js';
 import { getTicketById, summarizeTickets } from '../services/tickets.js';
 import { normalizeVerificationCommands } from '../services/verification-env.js';
+import type { PipelineContract, PipelineState, ParsedTicket, Ticket } from '../types/index.js';
 
-function formatIterationLimit(maxIterations) {
-  return Number.isInteger(maxIterations) && maxIterations > 0 ? String(maxIterations) : 'unlimited';
+interface PipelineMetadata {
+  bootstrapPrd: string | null;
+  bootstrapSource: string | null;
+  currentPhaseLabel: string;
+  completedPhases: number;
+  phaseStatuses: Record<string, string>;
+  phases: string[];
+  target: string | null;
+  task: string | null;
+  totalPhases: number;
 }
 
-function latestFailureReason(tickets) {
+interface RenderStatusOptions {
+  sessionDir?: string;
+  last?: boolean;
+}
+
+function formatIterationLimit(maxIterations: unknown): string {
+  return Number.isInteger(maxIterations) && (maxIterations as number) > 0 ? String(maxIterations) : 'unlimited';
+}
+
+function latestFailureReason(tickets: Ticket[]): string | null {
   const failed = tickets
     .filter((ticket) => Boolean(ticket.frontmatter?.failure_reason || ticket.failure_reason))
     .sort((left, right) =>
@@ -22,17 +41,17 @@ function latestFailureReason(tickets) {
         String(left.frontmatter?.failed_at || left.failed_at || ''),
       ),
     );
-  return failed[0]?.frontmatter?.failure_reason || failed[0]?.failure_reason || null;
+  return failed[0]?.frontmatter?.failure_reason || (failed[0]?.failure_reason as string | undefined) || null;
 }
 
-function ticketVerification(ticket) {
+function ticketVerification(ticket: Ticket | ParsedTicket | null): string | null {
   if (!ticket) return null;
   const commands = normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
   if (commands.length > 0) return commands.join(' && ');
   return 'npm test';
 }
 
-function phaseProgressLabel(pipeline) {
+function phaseProgressLabel(pipeline: PipelineMetadata): string {
   const currentStatus = pipeline.currentPhaseLabel === 'complete'
     ? null
     : pipeline.phaseStatuses[pipeline.currentPhaseLabel] || null;
@@ -42,7 +61,11 @@ function phaseProgressLabel(pipeline) {
   return `${pipeline.currentPhaseLabel} (${countedPhases} / ${pipeline.totalPhases})`;
 }
 
-function loadPipelineMetadata(sessionDir, state, manager) {
+function loadPipelineMetadata(
+  sessionDir: string,
+  state: PersistedState,
+  manager: StateManager,
+): PipelineMetadata | null {
   const hasPipelineFiles = fs.existsSync(path.join(sessionDir, 'pipeline.json'))
     || fs.existsSync(path.join(sessionDir, 'pipeline-state.json'));
   const shouldInspectPipeline = hasPipelineFiles || state.pipeline_mode === true || Array.isArray(state.pipeline_phases);
@@ -50,8 +73,8 @@ function loadPipelineMetadata(sessionDir, state, manager) {
     return null;
   }
 
-  let contract = null;
-  let pipelineState = null;
+  let contract: PipelineContract | null;
+  let pipelineState: PipelineState | null = null;
   try {
     contract = readPipelineContract(sessionDir);
   } catch {
@@ -66,30 +89,31 @@ function loadPipelineMetadata(sessionDir, state, manager) {
     }
   }
 
-  const phases = contract?.phases || (Array.isArray(state.pipeline_phases) ? state.pipeline_phases : []);
+  const phases: string[] = contract?.phases
+    || (Array.isArray(state.pipeline_phases) ? (state.pipeline_phases as string[]) : []);
   if (phases.length === 0) {
     return null;
   }
 
-  const phaseStatuses = pipelineState?.phase_statuses
+  const phaseStatuses: Record<string, string> = pipelineState?.phase_statuses
     || Object.fromEntries(phases.map((phase) => [phase, phase === state.pipeline_phase ? 'running' : 'todo']));
   const completedPhases = phases.filter((phase) => phaseStatuses[phase] === 'done').length;
-  const currentPhase = pipelineState?.current_phase ?? state.pipeline_phase ?? null;
+  const currentPhase = pipelineState?.current_phase ?? (state.pipeline_phase as string | null | undefined) ?? null;
 
   return {
-    bootstrapPrd: contract?.bootstrap_prd ?? state.pipeline_bootstrap_prd ?? null,
-    bootstrapSource: contract?.bootstrap_source ?? state.pipeline_bootstrap_source ?? null,
+    bootstrapPrd: contract?.bootstrap_prd ?? (state.pipeline_bootstrap_prd as string | null) ?? null,
+    bootstrapSource: contract?.bootstrap_source ?? (state.pipeline_bootstrap_source as string | null) ?? null,
     currentPhaseLabel: currentPhase ?? 'complete',
     completedPhases: currentPhase == null ? phases.length : completedPhases,
     phaseStatuses,
     phases,
-    target: contract?.target ?? state.pipeline_target ?? null,
-    task: contract?.task ?? state.pipeline_task ?? null,
-    totalPhases: contract?.phases?.length ?? state.pipeline_total_phases ?? phases.length,
+    target: contract?.target ?? (state.pipeline_target as string | null) ?? null,
+    task: contract?.task ?? (state.pipeline_task as string | null) ?? null,
+    totalPhases: contract?.phases?.length ?? (state.pipeline_total_phases as number) ?? phases.length,
   };
 }
 
-export async function renderStatus(cwd, options = {}) {
+export async function renderStatus(cwd: string, options: RenderStatusOptions = {}): Promise<string> {
   const sessionDir = options.sessionDir || await resolveSessionForCwd(cwd, { last: options.last });
   if (!sessionDir) {
     return 'No active session for this directory.';
@@ -105,14 +129,16 @@ export async function renderStatus(cwd, options = {}) {
     : Math.max(0, Math.floor(Date.now() / 1000) - getRunStartEpoch(state));
   const circuit = loadCircuitState(sessionDir);
   const summary = summarizeTickets(sessionDir);
-  const currentTicket = state.current_ticket ? getTicketById(sessionDir, state.current_ticket) : null;
+  const currentTicket = state.current_ticket ? getTicketById(sessionDir, state.current_ticket as string) : null;
   const nextTicket = currentTicket || summary.runnable[0] || null;
-  const currentLabel = currentTicket ? `${currentTicket.id} - ${currentTicket.title}` : (state.current_ticket || 'none');
+  const currentLabel = currentTicket
+    ? `${currentTicket.id} - ${currentTicket.title}`
+    : ((state.current_ticket as string | undefined) || 'none');
 
   return [
     `Active: ${state.active ? 'Yes' : 'No'}`,
     `Tmux Mode: ${state.tmux_mode ? 'Yes' : 'No'}`,
-    `Step: ${state.step || 'unknown'}`,
+    `Step: ${(state.step as string | undefined) || 'unknown'}`,
     pipeline ? `Pipeline Phase: ${phaseProgressLabel(pipeline)}` : null,
     pipeline ? `Pipeline Phases: ${pipeline.phases.map((phase) => `${phase}=${pipeline.phaseStatuses[phase] || 'todo'}`).join(' | ')}` : null,
     pipeline?.bootstrapSource ? `Pipeline Bootstrap: ${pipeline.bootstrapSource}` : null,
@@ -124,7 +150,7 @@ export async function renderStatus(cwd, options = {}) {
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,
     nextTicket ? `Next Verification: ${ticketVerification(nextTicket)}` : null,
     latestFailureReason(summary.tickets) ? `Last Failure: ${latestFailureReason(summary.tickets)}` : null,
-    state.last_exit_reason ? `Last Exit: ${state.last_exit_reason}` : null,
+    state.last_exit_reason ? `Last Exit: ${state.last_exit_reason as string}` : null,
     `Elapsed: ${formatDuration(elapsed)}`,
     `Session: ${path.basename(sessionDir)}`,
     `Circuit Breaker: ${circuit.state}`,
@@ -132,14 +158,14 @@ export async function renderStatus(cwd, options = {}) {
   ].filter(Boolean).join('\n');
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   if (argv.includes('--help')) {
     console.log('Usage: node bin/status.js [--cwd DIR] [--last] [--session-dir DIR]');
     return;
   }
 
   let cwd = process.cwd();
-  let sessionDir;
+  let sessionDir: string | undefined;
   let last = false;
 
   for (let index = 0; index < argv.length; index += 1) {

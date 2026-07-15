@@ -4,6 +4,15 @@ import path from 'node:path';
 import { resolveSessionForCwd } from '../services/session.js';
 import { getTicketById } from '../services/tickets.js';
 
+interface ConfigProtectionPayload {
+  tool_input?: {
+    file_path?: string;
+    command?: string;
+  };
+  file_path?: string;
+  command?: string;
+}
+
 const PROTECTED_PATTERNS = [
   /^\.codex\/hooks\/hooks\.json$/,
   /^\.codex-plugin\/plugin\.json$/,
@@ -13,7 +22,7 @@ const PROTECTED_PATTERNS = [
   /^install\.sh$/,
 ];
 
-function unwrapShellToken(candidate) {
+function unwrapShellToken(candidate: string): string {
   let value = String(candidate || '').trim();
   if (!value) return '';
   if (
@@ -25,10 +34,10 @@ function unwrapShellToken(candidate) {
   return value;
 }
 
-function tokenizeShellWords(command) {
-  const tokens = [];
+function tokenizeShellWords(command: string): string[] {
+  const tokens: string[] = [];
   let current = '';
-  let quote = null;
+  let quote: string | null = null;
 
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index];
@@ -69,7 +78,7 @@ function tokenizeShellWords(command) {
   return tokens;
 }
 
-function normalizedPathSuffixes(candidate) {
+function normalizedPathSuffixes(candidate: string): string[] {
   const normalized = path.normalize(unwrapShellToken(candidate)).replace(/\\/g, '/');
   const trimmed = normalized.replace(/^[./]+/, '');
   const segments = trimmed.split('/').filter(Boolean);
@@ -80,26 +89,26 @@ function normalizedPathSuffixes(candidate) {
   return [...suffixes].filter(Boolean);
 }
 
-function matchesProtectedPattern(candidate) {
+function matchesProtectedPattern(candidate: string): boolean {
   return normalizedPathSuffixes(candidate).some((value) =>
     PROTECTED_PATTERNS.some((pattern) => pattern.test(value)),
   );
 }
 
-function approve() {
+function approve(): void {
   console.log(JSON.stringify({ decision: 'approve' }));
 }
 
-async function main() {
+async function main(): Promise<void> {
   const raw = fs.readFileSync(0, 'utf8').trim();
   if (!raw) {
     approve();
     return;
   }
 
-  let payload;
+  let payload: ConfigProtectionPayload;
   try {
-    payload = JSON.parse(raw);
+    payload = JSON.parse(raw) as ConfigProtectionPayload;
   } catch {
     approve();
     return;

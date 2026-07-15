@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { setupSession } from '../services/setup-session.js';
 
-function fail(message) {
+function fail(message: string): never {
   console.error(`Error: ${message}`);
   process.exit(1);
 }
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   const { sessionDir } = await setupSession(argv);
   console.log(sessionDir);
 }

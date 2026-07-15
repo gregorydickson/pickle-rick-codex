@@ -2,7 +2,7 @@
 import { listSessions } from '../services/session-map.js';
 import { resolveSessionForCwd } from '../services/session.js';
 
-async function main(argv) {
+async function main(argv: string[]): Promise<void> {
   if (argv.includes('--help')) {
     console.log('Usage: node bin/get-session.js [--cwd DIR] [--last] [--list]');
     return;
