@@ -368,7 +368,7 @@ export async function launchDetachedLoop({
         return current;
       });
       clearTmuxSession(sessionName);
-      runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir]);
+      runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
 

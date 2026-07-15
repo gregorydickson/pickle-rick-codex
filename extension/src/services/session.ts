@@ -18,8 +18,34 @@ import {
   updateSessionMap,
 } from './session-map.js';
 import { StateManager } from './state-manager.js';
+import type { PersistedState } from './state-manager.js';
+import type { Config } from '../types/index.js';
 
-export function getStatePath(sessionDir) {
+export interface SessionResult {
+  sessionDir: string;
+  state: PersistedState;
+}
+
+interface CreateInitialStateArgs {
+  cwd: string;
+  prompt: string;
+  sessionDir: string;
+  config?: Config;
+  overrides?: Record<string, unknown>;
+}
+
+interface CreateSessionArgs {
+  cwd?: string;
+  prompt: string;
+  overrides?: Record<string, unknown>;
+  updateMap?: boolean;
+}
+
+interface ResolveSessionForCwdOptions {
+  last?: boolean;
+}
+
+export function getStatePath(sessionDir: string): string {
   return path.join(sessionDir, 'state.json');
 }
 
@@ -29,10 +55,10 @@ export function createInitialState({
   sessionDir,
   config = loadConfig(),
   overrides = {},
-}) {
+}: CreateInitialStateArgs): PersistedState {
   const now = new Date();
   const epochSeconds = Math.floor(now.getTime() / 1000);
-  const state = {
+  const state: PersistedState = {
     active: true,
     working_dir: cwd,
     step: 'prd',
@@ -77,7 +103,7 @@ export async function createSession({
   prompt,
   overrides = {},
   updateMap = true,
-}) {
+}: CreateSessionArgs): Promise<SessionResult> {
   ensureConfigFile();
   const config = loadConfig();
   const sessionId = `${new Date().toISOString().slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`;
@@ -107,24 +133,28 @@ export async function createSession({
   return { sessionDir, state };
 }
 
-export function loadSessionState(sessionDir, stateManager = new StateManager()) {
+export function loadSessionState(sessionDir: string, stateManager: StateManager = new StateManager()): PersistedState {
   return stateManager.read(getStatePath(sessionDir));
 }
 
-export function readOrInitSessionState(sessionDir, createDefault, stateManager = new StateManager()) {
+export function readOrInitSessionState(
+  sessionDir: string,
+  createDefault: () => PersistedState,
+  stateManager: StateManager = new StateManager(),
+): PersistedState {
   return stateManager.readOrReinitialize(getStatePath(sessionDir), createDefault);
 }
 
-export function appendHistory(state, step, ticket) {
+export function appendHistory(state: PersistedState, step: string, ticket?: unknown): void {
   state.history ??= [];
-  state.history.push({
+  (state.history as unknown[]).push({
     step,
     ticket,
     timestamp: nowIso(),
   });
 }
 
-export function getRunStartEpoch(state) {
+export function getRunStartEpoch(state: PersistedState): number {
   const preciseIso = state.run_started_at || (
     state.active === false && state.last_exit_reason == null
       ? null
@@ -145,13 +175,13 @@ export function getRunStartEpoch(state) {
   return Number(state.start_time_epoch || 0);
 }
 
-export function markRunStart(state, now = new Date()) {
+export function markRunStart(state: PersistedState, now: Date = new Date()): PersistedState {
   state.run_start_time_epoch = Math.floor(now.getTime() / 1000);
   state.run_started_at = now.toISOString();
   return state;
 }
 
-export function normalizeSessionCwd(cwd) {
+export function normalizeSessionCwd(cwd: string): string {
   if (typeof cwd !== 'string' || !cwd) {
     return cwd;
   }
@@ -162,9 +192,9 @@ export function normalizeSessionCwd(cwd) {
   }
 }
 
-export function getSessionMapCwds(state) {
-  const values = [];
-  const pushUnique = (value) => {
+export function getSessionMapCwds(state: PersistedState): string[] {
+  const values: string[] = [];
+  const pushUnique = (value: unknown): void => {
     if (typeof value !== 'string' || !value) {
       return;
     }
@@ -180,7 +210,7 @@ export function getSessionMapCwds(state) {
   return values;
 }
 
-export async function resolveSessionForCwd(cwd, options = {}) {
+export async function resolveSessionForCwd(cwd: string, options: ResolveSessionForCwdOptions = {}): Promise<string | null> {
   const normalizedCwd = normalizeSessionCwd(cwd);
   const direct = getSessionForCwd(normalizedCwd);
   if (direct) return direct;
@@ -194,7 +224,7 @@ export async function resolveSessionForCwd(cwd, options = {}) {
   return null;
 }
 
-export async function deactivateSession(sessionDir, reason = 'cancelled') {
+export async function deactivateSession(sessionDir: string, reason: string = 'cancelled'): Promise<PersistedState> {
   const state = isPipelineSession(sessionDir)
     ? cancelPipelineSession(sessionDir, { exitReason: reason }).state
     : new StateManager().update(
@@ -213,7 +243,7 @@ export async function deactivateSession(sessionDir, reason = 'cancelled') {
   return state;
 }
 
-export function writeSessionFile(sessionDir, fileName, content) {
+export function writeSessionFile(sessionDir: string, fileName: string, content: string): string {
   ensureDir(sessionDir);
   fs.writeFileSync(path.join(sessionDir, fileName), content);
   return path.join(sessionDir, fileName);

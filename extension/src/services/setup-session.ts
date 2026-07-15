@@ -1,22 +1,41 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, getSessionMapCwds } from './session.js';
+import type { SessionResult } from './session.js';
 import { loadConfig } from './config.js';
 import { findLastSessionForCwd, getSessionForCwd, updateSessionMap } from './session-map.js';
 import { StateManager } from './state-manager.js';
 
-function parseArgs(argv) {
-  let maxIterations;
+interface ParsedSetupArgs {
+  resume: string | null;
+  tmuxMode: boolean;
+  commandTemplate: string | null;
+  maxIterations?: number;
+  maxIterationsSpecified: boolean;
+  maxTimeMinutes?: number;
+  maxTimeMinutesSpecified: boolean;
+  workerTimeoutSeconds?: number;
+  workerTimeoutSecondsSpecified: boolean;
+  prompt: string;
+}
+
+interface SetupSessionOptions {
+  cwd?: string;
+  updateSessionMap?: boolean;
+}
+
+function parseArgs(argv: string[]): ParsedSetupArgs {
+  let maxIterations: number | undefined;
   let maxIterationsSpecified = false;
-  let maxTimeMinutes;
+  let maxTimeMinutes: number | undefined;
   let maxTimeMinutesSpecified = false;
-  let workerTimeoutSeconds;
+  let workerTimeoutSeconds: number | undefined;
   let workerTimeoutSecondsSpecified = false;
-  let resume = null;
+  let resume: string | null = null;
   let tmuxMode = false;
-  let commandTemplate = null;
-  let explicitTask = null;
-  const taskParts = [];
+  let commandTemplate: string | null = null;
+  let explicitTask: string | null = null;
+  const taskParts: string[] = [];
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -71,7 +90,7 @@ function parseArgs(argv) {
   };
 }
 
-export async function setupSession(argv, options = {}) {
+export async function setupSession(argv: string[], options: SetupSessionOptions = {}): Promise<SessionResult> {
   const parsed = parseArgs(argv);
   const cwd = fs.realpathSync(options.cwd || process.cwd());
   const shouldUpdateSessionMap = options.updateSessionMap !== false;
