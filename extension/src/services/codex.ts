@@ -1,14 +1,21 @@
 import fs from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
+import type {
+  CodexExecOptions,
+  CodexSpawnResult,
+  CodexUsage,
+  RunSpawnedCommandOptions,
+  SuccessCheckContext,
+} from '../types/index.js';
 
-export function hasPromiseToken(text, token) {
+export function hasPromiseToken(text: unknown, token: unknown): boolean {
   return new RegExp(`<promise>\\s*${String(token).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*<\\/promise>`).test(String(text || ''));
 }
 
-function extractUsageFromJson(stdout) {
-  const usage = {
+function extractUsageFromJson(stdout: unknown): CodexUsage {
+  const usage: CodexUsage = {
     input_tokens: 0,
     output_tokens: 0,
     cache_creation_input_tokens: 0,
@@ -19,7 +26,11 @@ function extractUsageFromJson(stdout) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      const parsed = JSON.parse(trimmed);
+      const parsed = JSON.parse(trimmed) as {
+        usage?: Record<string, unknown>;
+        response?: { usage?: Record<string, unknown> };
+        result?: { usage?: Record<string, unknown> };
+      };
       const candidate = parsed.usage || parsed.response?.usage || parsed.result?.usage || null;
       if (!candidate || typeof candidate !== 'object') continue;
       usage.input_tokens += Number(candidate.input_tokens || 0);
@@ -34,7 +45,7 @@ function extractUsageFromJson(stdout) {
   return usage;
 }
 
-function removeStaleOutputs(paths = []) {
+function removeStaleOutputs(paths: string[] = []): void {
   for (const filePath of new Set(paths.filter(Boolean))) {
     try {
       fs.rmSync(filePath, { force: true });
@@ -44,13 +55,13 @@ function removeStaleOutputs(paths = []) {
   }
 }
 
-function readLastMessage(filePath) {
+function readLastMessage(filePath: string): string {
   return filePath && fs.existsSync(filePath)
     ? fs.readFileSync(filePath, 'utf8')
     : '';
 }
 
-function terminateProcessTree(child, signal) {
+function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   const pid = Number(child?.pid || 0);
   if (!Number.isInteger(pid) || pid <= 0) return;
 
@@ -84,19 +95,19 @@ async function runSpawnedCommand({
   cleanupPaths = [],
   onSpawn,
   cancelCheck,
-}) {
+}: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
   removeStaleOutputs([...cleanupPaths, outputLastMessagePath]);
 
-  const stdoutChunks = [];
-  const stderrChunks = [];
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
 
   return await new Promise((resolve, reject) => {
     let settled = false;
     let successObserved = false;
-    let successGraceTimer = null;
-    let timeoutTimer = null;
-    let pollTimer = null;
-    let cancelTimer = null;
+    let successGraceTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    let pollTimer: NodeJS.Timeout | null = null;
+    let cancelTimer: NodeJS.Timeout | null = null;
     let forcedAfterSuccess = false;
     let forcedByCancel = false;
 
@@ -110,14 +121,14 @@ async function runSpawnedCommand({
     onSpawn?.(child);
     child.stdin.end(input ?? '');
 
-    const cleanup = () => {
+    const cleanup = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (pollTimer) clearInterval(pollTimer);
       if (cancelTimer) clearInterval(cancelTimer);
     };
 
-    const finalize = (result) => {
+    const finalize = (result: Omit<CodexSpawnResult, 'command' | 'args'>): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -128,10 +139,14 @@ async function runSpawnedCommand({
       });
     };
 
-    const currentStdout = () => Buffer.concat(stdoutChunks).toString('utf8');
-    const currentStderr = () => Buffer.concat(stderrChunks).toString('utf8');
+    const currentStdout = (): string => Buffer.concat(stdoutChunks).toString('utf8');
+    const currentStderr = (): string => Buffer.concat(stderrChunks).toString('utf8');
 
-    const scheduleTermination = (signal, followupSignal = null, delayMs = 1_000) => {
+    const scheduleTermination = (
+      signal: NodeJS.Signals,
+      followupSignal: NodeJS.Signals | null = null,
+      delayMs: number = 1_000,
+    ): void => {
       terminateProcessTree(child, signal);
       if (!followupSignal) return;
       setTimeout(() => {
@@ -141,14 +156,15 @@ async function runSpawnedCommand({
       }, delayMs).unref?.();
     };
 
-    const checkForSuccess = () => {
+    const checkForSuccess = (): void => {
       if (successObserved || typeof successCheck !== 'function') return;
+      const ctx: SuccessCheckContext = {
+        stdout: currentStdout(),
+        stderr: currentStderr(),
+        lastMessage: readLastMessage(outputLastMessagePath),
+      };
       try {
-        if (!successCheck({
-          stdout: currentStdout(),
-          stderr: currentStderr(),
-          lastMessage: readLastMessage(outputLastMessagePath),
-        })) {
+        if (!successCheck(ctx)) {
           return;
         }
       } catch {
@@ -185,23 +201,23 @@ async function runSpawnedCommand({
       }, 100);
     }
 
-    child.stdout.on('data', (chunk) => {
+    child.stdout.on('data', (chunk: Buffer) => {
       stdoutChunks.push(Buffer.from(chunk));
       checkForSuccess();
     });
 
-    child.stderr.on('data', (chunk) => {
+    child.stderr.on('data', (chunk: Buffer) => {
       stderrChunks.push(Buffer.from(chunk));
       checkForSuccess();
     });
 
-    child.on('error', (error) => {
+    child.on('error', (error: Error) => {
       if (settled) return;
       cleanup();
       reject(error);
     });
 
-    child.on('close', (code, signal) => {
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       const stdout = currentStdout();
       const stderr = currentStderr();
       const message = readLastMessage(outputLastMessagePath);
@@ -224,9 +240,9 @@ async function runSpawnedCommand({
   });
 }
 
-export function getCodexVersion() {
+export function getCodexVersion(): string {
   const config = loadConfig();
-  const result = spawnSync(config.runtime.command, ['--version'], {
+  const result: SpawnSyncReturns<string> = spawnSync(config.runtime.command, ['--version'], {
     encoding: 'utf8',
     timeout: 10_000,
   });
@@ -236,7 +252,7 @@ export function getCodexVersion() {
   return result.stdout.trim();
 }
 
-function buildCodexExecInvocation(options) {
+function buildCodexExecInvocation(options: CodexExecOptions): { command: string; args: string[] } {
   const config = loadConfig();
   const command = options.command || config.runtime.command;
   const args = ['exec', ...(config.runtime.exec_args || ['--full-auto'])];
@@ -248,7 +264,7 @@ function buildCodexExecInvocation(options) {
     args.push('--skip-git-repo-check');
   }
   if (config.runtime.model || options.model) {
-    args.push('--model', options.model || config.runtime.model);
+    args.push('--model', options.model || config.runtime.model || '');
   }
   if (config.runtime.json_output !== false || options.json) {
     args.push('--json');
@@ -268,11 +284,11 @@ function buildCodexExecInvocation(options) {
   return { command, args };
 }
 
-export async function runCommand(options) {
+export async function runCommand(options: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
   return await runSpawnedCommand(options);
 }
 
-export async function runCodexExec(options) {
+export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpawnResult> {
   const { command, args } = buildCodexExecInvocation(options);
   return await runSpawnedCommand({
     command,
@@ -288,7 +304,7 @@ export async function runCodexExec(options) {
   });
 }
 
-export async function runCodexExecMonitored(options) {
+export async function runCodexExecMonitored(options: CodexExecOptions): Promise<CodexSpawnResult> {
   const { command, args } = buildCodexExecInvocation(options);
   return await runSpawnedCommand({
     command,
@@ -307,7 +323,7 @@ export async function runCodexExecMonitored(options) {
   });
 }
 
-export function assertCodexSucceeded(result, context = 'Codex execution failed') {
+export function assertCodexSucceeded(result: CodexSpawnResult, context: string = 'Codex execution failed'): void {
   if (result.exitCode === 0) return;
   throw new Error(`${context}: ${safeErrorMessage(result.stderr || result.stdout || result.exitCode)}`);
 }

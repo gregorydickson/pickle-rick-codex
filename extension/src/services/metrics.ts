@@ -1,9 +1,17 @@
 import { readActivityLogs } from './activity-logger.js';
+import type { ActivityEvent } from './activity-logger.js';
+import type {
+  MetricsOptions,
+  MetricsRange,
+  MetricsReport,
+  MetricsRow,
+  MetricsTotals,
+} from '../types/index.js';
 
 const DAY_MS = 86_400_000;
 
-export function parseMetricsArgs(argv) {
-  const options = {
+export function parseMetricsArgs(argv: string[]): MetricsOptions {
+  const options: MetricsOptions = {
     days: 7,
     since: null,
     weekly: false,
@@ -16,7 +24,7 @@ export function parseMetricsArgs(argv) {
       options.days = Number(argv[index + 1]);
       index += 1;
     } else if (arg === '--since') {
-      options.since = argv[index + 1];
+      options.since = argv[index + 1] ?? null;
       index += 1;
     } else if (arg === '--weekly') {
       options.weekly = true;
@@ -34,21 +42,21 @@ export function parseMetricsArgs(argv) {
   return options;
 }
 
-function formatDate(value) {
+function formatDate(value: Date): string {
   return value.toISOString().slice(0, 10);
 }
 
-function startOfUtcDay(value) {
+function startOfUtcDay(value: Date): Date {
   return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
 }
 
-function startOfIsoWeek(value) {
+function startOfIsoWeek(value: Date): Date {
   const day = startOfUtcDay(value);
   const weekday = day.getUTCDay() || 7;
   return new Date(day.getTime() - (weekday - 1) * DAY_MS);
 }
 
-function isoWeekLabel(value) {
+function isoWeekLabel(value: Date): string {
   const day = startOfUtcDay(value);
   const weekday = day.getUTCDay() || 7;
   day.setUTCDate(day.getUTCDate() + 4 - weekday);
@@ -57,7 +65,7 @@ function isoWeekLabel(value) {
   return `${day.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
-function emptyMetricsRow(base) {
+function emptyMetricsRow(base: Partial<MetricsRow>): MetricsRow {
   return {
     ...base,
     events: 0,
@@ -69,8 +77,13 @@ function emptyMetricsRow(base) {
   };
 }
 
-function getMetricsBucket(event, weekly) {
-  const timestamp = new Date(event.ts || '');
+interface MetricsBucket {
+  key: string;
+  row: MetricsRow;
+}
+
+function getMetricsBucket(event: ActivityEvent, weekly: boolean): MetricsBucket | null {
+  const timestamp = new Date(String(event.ts ?? ''));
   if (Number.isNaN(timestamp.getTime())) {
     return null;
   }
@@ -96,7 +109,7 @@ function getMetricsBucket(event, weekly) {
   };
 }
 
-export function computeMetricsRange(options) {
+export function computeMetricsRange(options: MetricsOptions): MetricsRange {
   const now = new Date();
   const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const until = new Date(today.getTime() + 86_400_000);
@@ -115,28 +128,29 @@ export function computeMetricsRange(options) {
   };
 }
 
-export function buildMetricsReport(options) {
+export function buildMetricsReport(options: MetricsOptions): MetricsReport {
   const range = computeMetricsRange(options);
   const events = readActivityLogs(range);
   const weekly = options.weekly === true;
-  const report = {
+  const totals: MetricsTotals = {
+    events: events.length,
+    sessions_started: 0,
+    tickets_completed: 0,
+    commits: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
+  const report: MetricsReport = {
     granularity: weekly ? 'week' : 'day',
     since: range.since.toISOString().slice(0, 10),
     until: range.until.toISOString().slice(0, 10),
-    totals: {
-      events: events.length,
-      sessions_started: 0,
-      tickets_completed: 0,
-      commits: 0,
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
-    },
+    totals,
     rows: [],
   };
 
-  const rowsByBucket = new Map();
+  const rowsByBucket = new Map<string, MetricsRow>();
   for (const event of events) {
     const bucket = getMetricsBucket(event, weekly);
     if (!bucket) {
@@ -147,7 +161,7 @@ export function buildMetricsReport(options) {
       rowsByBucket.set(bucket.key, bucket.row);
     }
 
-    const row = rowsByBucket.get(bucket.key);
+    const row = rowsByBucket.get(bucket.key)!;
     row.events += 1;
     if (event.event === 'session_start') row.sessions_started += 1;
     if (event.event === 'ticket_completed') row.tickets_completed += 1;
@@ -155,13 +169,13 @@ export function buildMetricsReport(options) {
     row.input_tokens += Number(event.input_tokens || 0);
     row.output_tokens += Number(event.output_tokens || 0);
 
-    report.totals.sessions_started += event.event === 'session_start' ? 1 : 0;
-    report.totals.tickets_completed += event.event === 'ticket_completed' ? 1 : 0;
-    report.totals.commits += event.event === 'commit' ? 1 : 0;
-    report.totals.input_tokens += Number(event.input_tokens || 0);
-    report.totals.output_tokens += Number(event.output_tokens || 0);
-    report.totals.cache_creation_input_tokens += Number(event.cache_creation_input_tokens || 0);
-    report.totals.cache_read_input_tokens += Number(event.cache_read_input_tokens || 0);
+    totals.sessions_started += event.event === 'session_start' ? 1 : 0;
+    totals.tickets_completed += event.event === 'ticket_completed' ? 1 : 0;
+    totals.commits += event.event === 'commit' ? 1 : 0;
+    totals.input_tokens += Number(event.input_tokens || 0);
+    totals.output_tokens += Number(event.output_tokens || 0);
+    totals.cache_creation_input_tokens += Number(event.cache_creation_input_tokens || 0);
+    totals.cache_read_input_tokens += Number(event.cache_read_input_tokens || 0);
   }
 
   report.rows = [...rowsByBucket.values()].sort((left, right) => {
@@ -172,13 +186,13 @@ export function buildMetricsReport(options) {
   return report;
 }
 
-export function formatMetricsReport(report) {
+export function formatMetricsReport(report: MetricsReport): string {
   if (report.rows.length === 0) {
     const prefix = report.granularity === 'week' ? 'No weekly metrics data found' : 'No metrics data found';
     return `${prefix} for ${report.since} to ${report.until}.`;
   }
 
-  const lines = [
+  const lines: string[] = [
     report.granularity === 'week'
       ? `Weekly Metrics ${report.since} to ${report.until}`
       : `Metrics ${report.since} to ${report.until}`,

@@ -293,3 +293,141 @@ export interface ConfigVerificationInput {
   };
   [key: string]: unknown;
 }
+
+// ---------------------------------------------------------------------------
+// Codex spawn / exec (services/codex)
+// ---------------------------------------------------------------------------
+
+export interface CodexUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+}
+
+export interface CodexSpawnResult {
+  command: string;
+  args: string[];
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  lastMessage: string;
+  usage: CodexUsage;
+  terminatedAfterSuccess: boolean;
+  cancelled: boolean;
+}
+
+export interface SuccessCheckContext {
+  stdout: string;
+  stderr: string;
+  lastMessage: string;
+}
+
+export type SuccessCheck = (ctx: SuccessCheckContext) => boolean;
+export type CancelCheck = () => boolean;
+
+export interface RunSpawnedCommandOptions {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  input?: string;
+  timeoutMs?: number;
+  env?: Record<string, string | undefined>;
+  outputLastMessagePath?: string;
+  successCheck?: SuccessCheck;
+  successSignalGraceMs?: number;
+  successPollMs?: number;
+  cleanupPaths?: string[];
+  onSpawn?: (child: import('node:child_process').ChildProcess) => void;
+  cancelCheck?: CancelCheck;
+}
+
+export interface CodexExecOptions {
+  command?: string;
+  cwd?: string;
+  prompt?: string;
+  timeoutMs?: number;
+  env?: Record<string, string | undefined>;
+  outputLastMessagePath?: string;
+  cleanupPaths?: string[];
+  onSpawn?: (child: import('node:child_process').ChildProcess) => void;
+  cancelCheck?: CancelCheck;
+  successCheck?: SuccessCheck;
+  successSignalGraceMs?: number;
+  successPollMs?: number;
+  model?: string;
+  skipGitRepoCheck?: boolean;
+  addDirs?: string[];
+  json?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (services/metrics)
+// ---------------------------------------------------------------------------
+
+export interface MetricsOptions {
+  days: number;
+  since: string | null;
+  weekly: boolean;
+  json: boolean;
+}
+
+export interface MetricsRange {
+  since: Date;
+  until: Date;
+}
+
+export interface MetricsTotals {
+  events: number;
+  sessions_started: number;
+  tickets_completed: number;
+  commits: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+}
+
+export interface MetricsRow {
+  date?: string;
+  week?: string;
+  start_date?: string;
+  end_date?: string;
+  events: number;
+  sessions_started: number;
+  tickets_completed: number;
+  commits: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface MetricsReport {
+  granularity: 'day' | 'week';
+  since: string;
+  until: string;
+  totals: MetricsTotals;
+  rows: MetricsRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Progress Snapshot (services/progress-snapshot)
+// ---------------------------------------------------------------------------
+
+export type ProgressMode = 'anatomy-park' | 'microverse' | 'szechuan-sauce' | string | null;
+
+export interface ProgressSnapshot {
+  head_sha: string;
+  worktree_fingerprint: string;
+  step: string | null;
+  current_ticket: string | null;
+  progress_artifacts: Record<string, string | null>;
+}
+
+export interface CaptureProgressSnapshotArgs {
+  sessionDir: string;
+  workingDir: string;
+  mode: ProgressMode;
+  step?: string | null;
+  currentTicket?: string | null;
+}

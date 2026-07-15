@@ -2,8 +2,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getHeadSha, getWorkingTreeFingerprint } from './git-utils.js';
+import type { CaptureProgressSnapshotArgs, ProgressMode, ProgressSnapshot } from '../types/index.js';
 
-function canonicalProgressArtifacts(mode) {
+function canonicalProgressArtifacts(mode: ProgressMode): string[] {
   switch (mode) {
     case 'anatomy-park':
       return ['anatomy-park-summary.json', 'anatomy-park-summary.md'];
@@ -16,12 +17,16 @@ function canonicalProgressArtifacts(mode) {
   }
 }
 
-function ticketPhaseArtifactPaths(sessionDir, currentTicket, step) {
+function ticketPhaseArtifactPaths(
+  sessionDir: string | null | undefined,
+  currentTicket: string | null | undefined,
+  step: string | null | undefined,
+): string[] {
   if (!sessionDir || !currentTicket || !step) {
     return [];
   }
 
-  const paths = new Set();
+  const paths = new Set<string>();
   const exactPrefix = `${currentTicket}.${step}.`;
   const ticketDir = path.join(sessionDir, currentTicket);
 
@@ -35,8 +40,8 @@ function ticketPhaseArtifactPaths(sessionDir, currentTicket, step) {
     // Best-effort only.
   }
 
-  const walkTicketDir = (currentDir, relativePrefix = currentTicket) => {
-    let entries = [];
+  const walkTicketDir = (currentDir: string, relativePrefix: string = currentTicket): void => {
+    let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
     } catch {
@@ -61,14 +66,18 @@ function ticketPhaseArtifactPaths(sessionDir, currentTicket, step) {
   return [...paths].sort();
 }
 
-function fileDigest(filePath) {
+function fileDigest(filePath: string): string | null {
   if (!fs.existsSync(filePath)) return null;
   const content = fs.readFileSync(filePath, 'utf8');
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
-function progressArtifactDigests(sessionDir, mode, { currentTicket = null, step = null } = {}) {
-  const digests = {};
+function progressArtifactDigests(
+  sessionDir: string,
+  mode: ProgressMode,
+  { currentTicket = null, step = null }: { currentTicket?: string | null; step?: string | null } = {},
+): Record<string, string | null> {
+  const digests: Record<string, string | null> = {};
   const relativePaths = [
     ...canonicalProgressArtifacts(mode),
     ...ticketPhaseArtifactPaths(sessionDir, currentTicket, step),
@@ -79,7 +88,13 @@ function progressArtifactDigests(sessionDir, mode, { currentTicket = null, step 
   return digests;
 }
 
-export function captureProgressSnapshot({ sessionDir, workingDir, mode, step = null, currentTicket = null }) {
+export function captureProgressSnapshot({
+  sessionDir,
+  workingDir,
+  mode,
+  step = null,
+  currentTicket = null,
+}: CaptureProgressSnapshotArgs): ProgressSnapshot {
   return {
     head_sha: getHeadSha(workingDir),
     worktree_fingerprint: getWorkingTreeFingerprint(workingDir),
@@ -89,12 +104,15 @@ export function captureProgressSnapshot({ sessionDir, workingDir, mode, step = n
   };
 }
 
-export function diffProgressSnapshot(previous, next) {
+export function diffProgressSnapshot(
+  previous: ProgressSnapshot | null,
+  next: ProgressSnapshot,
+): string[] {
   if (!previous) {
     return ['initial_snapshot'];
   }
 
-  const reasons = [];
+  const reasons: string[] = [];
   if ((previous.step || null) !== (next.step || null)) {
     reasons.push('step');
   }
@@ -109,7 +127,7 @@ export function diffProgressSnapshot(previous, next) {
   }
   const previousArtifacts = previous.progress_artifacts || {};
   const nextArtifacts = next.progress_artifacts || {};
-  const artifactKeys = new Set([...Object.keys(previousArtifacts), ...Object.keys(nextArtifacts)]);
+  const artifactKeys = new Set<string>([...Object.keys(previousArtifacts), ...Object.keys(nextArtifacts)]);
   for (const key of artifactKeys) {
     if ((previousArtifacts[key] || null) !== (nextArtifacts[key] || null)) {
       reasons.push(`progress_artifact:${key}`);
