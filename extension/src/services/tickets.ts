@@ -11,29 +11,38 @@ import {
   slugify,
 } from './pickle-utils.js';
 import { normalizeVerificationCommands, resolveTicketVerificationContract } from './verification-env.js';
+import type {
+  ConfigVerificationInput,
+  FreezeContract,
+  ParsedTicket,
+  RefinementManifest,
+  Ticket,
+} from '../types/index.js';
 
-export function getManifestPath(sessionDir) {
+export function getManifestPath(sessionDir: string): string {
   return path.join(sessionDir, 'refinement_manifest.json');
 }
 
-export function normalizeTicketId(value, fallback = 'ticket') {
+export function normalizeTicketId(value: string | null | undefined, fallback: string = 'ticket'): string {
   return slugify(value) || fallback;
 }
 
-function isNoneDependency(value) {
+function isNoneDependency(value: unknown): boolean {
   return typeof value === 'string' && value.trim().toLowerCase() === 'none';
 }
 
-function canonicalTicketId(ticket, index) {
+function canonicalTicketId(ticket: Ticket, index: number): string {
   return normalizeTicketId(ticket.id || ticket.title || `ticket-${index + 1}`, `ticket-${index + 1}`);
 }
 
-export function normalizeManifestTicketIds(manifest) {
+export function normalizeManifestTicketIds(
+  manifest: RefinementManifest,
+): { manifest: RefinementManifest; changed: boolean } {
   let changed = false;
   manifest.tickets ??= [];
-  const idRewrites = new Map();
+  const idRewrites = new Map<string, string>();
   manifest.tickets = manifest.tickets.map((ticket, index) => {
-    let nextTicket = { ...ticket };
+    let nextTicket: Ticket = { ...ticket };
     const aliasDependencies = nextTicket.depends_on ?? nextTicket.dependsOn ?? nextTicket.dependencies;
     if (aliasDependencies !== undefined && nextTicket.depends_on === undefined) {
       nextTicket.depends_on = aliasDependencies;
@@ -81,16 +90,16 @@ export function normalizeManifestTicketIds(manifest) {
   return { manifest, changed };
 }
 
-export function normalizeTicketStatus(status) {
+export function normalizeTicketStatus(status: unknown): string {
   return String(status ?? '').trim().replace(/^["']|["']$/g, '').toLowerCase();
 }
 
-export function isRunnableTicketStatus(status) {
+export function isRunnableTicketStatus(status: unknown): boolean {
   const normalized = normalizeTicketStatus(status);
   return normalized === '' || normalized === 'todo' || normalized === 'in progress';
 }
 
-export function ticketDependencyIds(ticket) {
+export function ticketDependencyIds(ticket: Ticket | null | undefined): string[] {
   const dependencyField = ticket?.depends_on ?? ticket?.dependsOn ?? ticket?.dependencies;
   if (Array.isArray(dependencyField)) {
     return dependencyField
@@ -106,23 +115,39 @@ export function ticketDependencyIds(ticket) {
   return [];
 }
 
-export function unresolvedTicketDependencies(ticket, tickets) {
-  const byId = new Map((tickets || []).map((entry) => [normalizeTicketId(entry.id, entry.id), entry]));
+export function unresolvedTicketDependencies(
+  ticket: Ticket | null | undefined,
+  tickets: Ticket[] | null | undefined,
+): string[] {
+  const byId = new Map<string, Ticket>((tickets || []).map((entry) => [normalizeTicketId(entry.id, entry.id), entry]));
   return ticketDependencyIds(ticket).filter((dependencyId) => {
     const dependency = byId.get(dependencyId);
     return !dependency || normalizeTicketStatus(dependency.status) !== 'done';
   });
 }
 
-export function areTicketDependenciesSatisfied(ticket, tickets) {
+export function areTicketDependenciesSatisfied(
+  ticket: Ticket | null | undefined,
+  tickets: Ticket[] | null | undefined,
+): boolean {
   return unresolvedTicketDependencies(ticket, tickets).length === 0;
 }
 
-export function summarizeTickets(sessionDir) {
+export interface TicketSummary {
+  queued: number;
+  done: number;
+  blocked: number;
+  skipped: number;
+  total: number;
+  runnable: Ticket[];
+  tickets: Ticket[];
+}
+
+export function summarizeTickets(sessionDir: string): TicketSummary {
   const manifest = readManifest(sessionDir);
   const fileTickets = ensureTicketFilesMaterialized(sessionDir, manifest);
-  const sourceTickets = manifest.tickets.length > 0 ? fileTickets : fileTickets.length > 0 ? fileTickets : manifest.tickets;
-  const summary = {
+  const sourceTickets: Ticket[] = manifest.tickets.length > 0 ? fileTickets : fileTickets.length > 0 ? fileTickets : manifest.tickets;
+  const summary: TicketSummary = {
     queued: 0,
     done: 0,
     blocked: 0,
@@ -151,7 +176,7 @@ export function summarizeTickets(sessionDir) {
   return summary;
 }
 
-function renderTicketFileContent(ticket, order, ticketId) {
+function renderTicketFileContent(ticket: Ticket, order: number, ticketId: string): string {
   const verification = ticketVerificationCommands(ticket);
   return [
     ticketFrontmatter(ticket, order),
@@ -169,10 +194,10 @@ function renderTicketFileContent(ticket, order, ticketId) {
   ].join('\n');
 }
 
-function fileTicketsCoverManifest(fileTickets, manifestTickets) {
+function fileTicketsCoverManifest(fileTickets: ParsedTicket[], manifestTickets: Ticket[]): boolean {
   if (manifestTickets.length === 0) return fileTickets.length === 0;
   if (fileTickets.length !== manifestTickets.length) return false;
-  const fileTicketsById = new Map(
+  const fileTicketsById = new Map<string, ParsedTicket>(
     fileTickets.map((ticket) => [normalizeTicketId(ticket.id, ticket.id), ticket]),
   );
   if (fileTicketsById.size !== manifestTickets.length) return false;
@@ -184,8 +209,8 @@ function fileTicketsCoverManifest(fileTickets, manifestTickets) {
   });
 }
 
-function pruneObsoleteTicketFiles(fileTickets, manifestTickets) {
-  const validTicketIds = new Set(
+function pruneObsoleteTicketFiles(fileTickets: ParsedTicket[], manifestTickets: Ticket[]): void {
+  const validTicketIds = new Set<string>(
     (manifestTickets || []).map((ticket, index) => canonicalTicketId(ticket, index)),
   );
 
@@ -203,7 +228,10 @@ function pruneObsoleteTicketFiles(fileTickets, manifestTickets) {
   }
 }
 
-export function ensureTicketFilesMaterialized(sessionDir, manifest = readManifest(sessionDir)) {
+export function ensureTicketFilesMaterialized(
+  sessionDir: string,
+  manifest: RefinementManifest = readManifest(sessionDir),
+): ParsedTicket[] {
   const fileTickets = listTickets(sessionDir);
   const manifestTickets = manifest.tickets || [];
   if (manifestTickets.length === 0) {
@@ -221,8 +249,8 @@ export function ensureTicketFilesMaterialized(sessionDir, manifest = readManifes
   return listTickets(sessionDir);
 }
 
-export function readManifest(sessionDir) {
-  const manifest = readJsonFile(getManifestPath(sessionDir), { tickets: [] }) || { tickets: [] };
+export function readManifest(sessionDir: string): RefinementManifest {
+  const manifest = readJsonFile<RefinementManifest>(getManifestPath(sessionDir), { tickets: [] }) || { tickets: [] };
   const normalized = enrichRefinementManifest(manifest);
   if (normalized.changed) {
     atomicWriteJson(getManifestPath(sessionDir), normalized.manifest);
@@ -230,21 +258,21 @@ export function readManifest(sessionDir) {
   return normalized.manifest;
 }
 
-export function writeManifest(sessionDir, manifest) {
+export function writeManifest(sessionDir: string, manifest: RefinementManifest): string {
   atomicWriteJson(getManifestPath(sessionDir), manifest);
   return getManifestPath(sessionDir);
 }
 
-function ticketVerificationCommands(ticket) {
+function ticketVerificationCommands(ticket: Ticket | null | undefined): string[] {
   const commands = normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
   return commands.length > 0 ? commands : ['npm test'];
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function parseMaybeJson(value) {
+function parseMaybeJson(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
   if (!trimmed) return value;
@@ -256,7 +284,7 @@ function parseMaybeJson(value) {
   }
 }
 
-function firstNonEmptyString(...values) {
+function firstNonEmptyString(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) {
       return value.trim();
@@ -265,7 +293,7 @@ function firstNonEmptyString(...values) {
   return '';
 }
 
-function normalizeRepoRelativePath(value) {
+function normalizeRepoRelativePath(value: unknown): string {
   if (typeof value !== 'string') return '';
   const trimmed = value.trim().replaceAll('\\', '/');
   if (!trimmed || trimmed.startsWith('/') || trimmed.startsWith('$')) return '';
@@ -274,9 +302,9 @@ function normalizeRepoRelativePath(value) {
   return normalized;
 }
 
-function normalizePathList(value) {
+function normalizePathList(value: unknown): string[] {
   const source = Array.isArray(value) ? value : value == null ? [] : [value];
-  const entries = [];
+  const entries: string[] = [];
   for (const item of source) {
     const parsed = parseMaybeJson(item);
     if (typeof parsed === 'string') {
@@ -294,7 +322,7 @@ function normalizePathList(value) {
   return [...new Set(entries)];
 }
 
-function inferSiblingNameFromEnv(value) {
+function inferSiblingNameFromEnv(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) return '';
   return value
     .trim()
@@ -303,7 +331,7 @@ function inferSiblingNameFromEnv(value) {
     .toLowerCase();
 }
 
-function inferSiblingRootEnv(value) {
+function inferSiblingRootEnv(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) return '';
   const upper = value.trim().toUpperCase();
   if (upper.endsWith('_ROOT')) return upper;
@@ -311,7 +339,7 @@ function inferSiblingRootEnv(value) {
   return '';
 }
 
-function normalizeFreezeShaSource(value) {
+function normalizeFreezeShaSource(value: unknown): string {
   const parsed = parseMaybeJson(value);
   if (typeof parsed === 'string' && parsed.trim()) {
     return parsed.trim();
@@ -327,7 +355,7 @@ function normalizeFreezeShaSource(value) {
   return '';
 }
 
-function normalizeFreezeContract(value) {
+function normalizeFreezeContract(value: unknown): FreezeContract | null {
   const parsed = parseMaybeJson(value);
   if (!isPlainObject(parsed)) return null;
 
@@ -372,7 +400,7 @@ function normalizeFreezeContract(value) {
   };
 }
 
-function freezeContractSignature(contract) {
+function freezeContractSignature(contract: FreezeContract | null | undefined): string {
   if (!contract) return '';
   return JSON.stringify({
     artifact_path: contract.artifact_path || '',
@@ -382,13 +410,13 @@ function freezeContractSignature(contract) {
   });
 }
 
-function hasExplicitFreezeShaSource(contract) {
+function hasExplicitFreezeShaSource(contract: FreezeContract | null | undefined): boolean {
   return typeof contract?.sha_source === 'string' && contract.sha_source.trim().length > 0;
 }
 
-function normalizeTicketContracts(ticket) {
+function normalizeTicketContracts(ticket: Ticket): { ticket: Ticket; changed: boolean } {
   let changed = false;
-  const nextTicket = { ...ticket };
+  const nextTicket: Ticket = { ...ticket };
   const verification = normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
   if (JSON.stringify(ticket?.verification) !== JSON.stringify(verification)) {
     changed = true;
@@ -406,7 +434,7 @@ function normalizeTicketContracts(ticket) {
   }
   for (const alias of ['outputArtifacts', 'output_files', 'outputFiles', 'artifacts']) {
     if (alias in nextTicket) {
-      delete nextTicket[alias];
+      delete nextTicket[alias as keyof Ticket];
       changed = true;
     }
   }
@@ -422,7 +450,7 @@ function normalizeTicketContracts(ticket) {
   }
   for (const alias of ['proofCorpus', 'proof_artifacts', 'proofArtifacts', 'corpus']) {
     if (alias in nextTicket) {
-      delete nextTicket[alias];
+      delete nextTicket[alias as keyof Ticket];
       changed = true;
     }
   }
@@ -438,7 +466,7 @@ function normalizeTicketContracts(ticket) {
   }
   for (const alias of ['freezeContract', 'freeze_artifact', 'freezeArtifact']) {
     if (alias in nextTicket) {
-      delete nextTicket[alias];
+      delete nextTicket[alias as keyof Ticket];
       changed = true;
     }
   }
@@ -446,13 +474,13 @@ function normalizeTicketContracts(ticket) {
   return { ticket: nextTicket, changed };
 }
 
-function isFallbackManifestSource(source) {
-  const normalized = String(source || '').trim().toLowerCase();
+function isFallbackManifestSource(source: unknown): boolean {
+  const normalized = String(source ?? '').trim().toLowerCase();
   return normalized === 'fallback-prd-parser' || normalized.endsWith('task-breakdown-parser');
 }
 
-function isPlaceholderAcceptanceCriterion(ticket, criterion) {
-  const trimmed = String(criterion || '').trim();
+function isPlaceholderAcceptanceCriterion(ticket: Ticket | null | undefined, criterion: unknown): boolean {
+  const trimmed = String(criterion ?? '').trim();
   if (!trimmed) return true;
   if (/^the ticket exists\.?$/i.test(trimmed)) return true;
   if (/^implement the requested work\.?$/i.test(trimmed)) return true;
@@ -460,17 +488,20 @@ function isPlaceholderAcceptanceCriterion(ticket, criterion) {
   if (/^satisfy dependenc(?:y|ies)\b/i.test(trimmed)) return true;
   if (/^complete .+ in the guaranteed codex v1 path\.?$/i.test(trimmed)) return true;
   const title = String(ticket?.title || '').trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (title && new RegExp(`^complete ${title}\\.?\$`, 'i').test(trimmed)) return true;
+  if (title && new RegExp(`^complete ${title}\\.?$`, 'i').test(trimmed)) return true;
   return false;
 }
 
-function hasOnlyGenericVerification(ticket) {
+function hasOnlyGenericVerification(ticket: Ticket): boolean {
   const commands = ticketVerificationCommands(ticket).map((command) => command.trim().toLowerCase());
   if (commands.length === 0) return true;
   return commands.every((command) => command === 'npm test' || command === 'bun test');
 }
 
-export function enrichRefinementManifest(manifest, config = null) {
+export function enrichRefinementManifest(
+  manifest: RefinementManifest,
+  config: ConfigVerificationInput | null = null,
+): { manifest: RefinementManifest; changed: boolean } {
   const normalized = normalizeManifestTicketIds(manifest);
   let changed = normalized.changed;
   normalized.manifest.tickets = (normalized.manifest.tickets || []).map((ticket) => {
@@ -497,39 +528,50 @@ export function enrichRefinementManifest(manifest, config = null) {
   return { manifest: normalized.manifest, changed };
 }
 
-function ticketText(ticket) {
+function ticketText(ticket: Ticket | null | undefined): string {
+  const acceptanceCriteria = ticket?.acceptance_criteria;
+  const acceptance = Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [];
   return [
     ticket?.title,
     ticket?.description,
-    ...(Array.isArray(ticket?.acceptance_criteria) ? ticket.acceptance_criteria : []),
+    ...acceptance,
     ...ticketVerificationCommands(ticket),
   ].join('\n');
 }
 
-function ticketNarrativeText(ticket) {
+function ticketNarrativeText(ticket: Ticket | null | undefined): string {
+  const acceptanceCriteria = ticket?.acceptance_criteria;
+  const acceptance = Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [];
   return [
     ticket?.title,
     ticket?.description,
-    ...(Array.isArray(ticket?.acceptance_criteria) ? ticket.acceptance_criteria : []),
+    ...acceptance,
   ].join('\n');
 }
 
-function hasDeclaredVerificationContracts(ticket) {
+function hasDeclaredVerificationContracts(ticket: Ticket): boolean {
   const verificationEnv = ticket?.verification_env;
   return (
     (Array.isArray(ticket?.output_artifacts) && ticket.output_artifacts.length > 0) ||
     (Array.isArray(ticket?.proof_corpus) && ticket.proof_corpus.length > 0) ||
     Boolean(ticket?.freeze_contract) ||
-    Boolean(
-      verificationEnv && (
+    (
+      isPlainObject(verificationEnv) && (
         (Array.isArray(verificationEnv.required) && verificationEnv.required.length > 0) ||
         (isPlainObject(verificationEnv.vars) && Object.keys(verificationEnv.vars).length > 0)
-      ),
+      )
     )
   );
 }
 
-const WRAPPER_CONTRACT_RULES = [
+interface WrapperContractRule {
+  pattern: RegExp;
+  requireAnyContract?: boolean;
+  requireArtifacts?: boolean;
+  requireProofCorpus?: boolean;
+}
+
+const WRAPPER_CONTRACT_RULES: WrapperContractRule[] = [
   {
     pattern: /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?check:env\b/i,
     requireAnyContract: true,
@@ -548,14 +590,14 @@ const WRAPPER_CONTRACT_RULES = [
   },
 ];
 
-function isOpaqueVerificationWrapper(command) {
-  const normalized = String(command || '').trim().toLowerCase();
+function isOpaqueVerificationWrapper(command: unknown): boolean {
+  const normalized = String(command ?? '').trim().toLowerCase();
   if (!normalized) return false;
   if (normalized === 'npm test' || normalized === 'bun test') return false;
   return /^(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?[a-z0-9:_-]+(?:\s|$)/i.test(normalized) || /^make\s+\S+/.test(normalized);
 }
 
-function looksLikeFormatterTicket(ticket) {
+function looksLikeFormatterTicket(ticket: Ticket | null | undefined): boolean {
   if (ticket?.formatter === true || ticket?.formatter_ticket === true || ticket?.formatterTicket === true) {
     return true;
   }
@@ -565,15 +607,15 @@ function looksLikeFormatterTicket(ticket) {
   return /\b(formatter ownership|own formatter|formatting ownership|formatter sweep|prettier sweep)\b/i.test(String(ticket?.description || ''));
 }
 
-function performsFormatterWork(ticket) {
+function performsFormatterWork(ticket: Ticket): boolean {
   return ticketVerificationCommands(ticket).some((command) => /\b(prettier|biome|cargo fmt|gofmt|shfmt|stylua|npm run format|bun run format|pnpm format|yarn format|eslint\b.*--fix)\b/i.test(command));
 }
 
-function looksLikeParityTicket(ticket) {
+function looksLikeParityTicket(ticket: Ticket): boolean {
   return /\b(parity|mirror(?:ed|ing)?|proof corpus|fixtures:sync|validate:attractor)\b/i.test(ticketText(ticket));
 }
 
-function isFreezeProducerTicket(ticket) {
+function isFreezeProducerTicket(ticket: Ticket): boolean {
   if (!ticket?.freeze_contract?.artifact_path || !hasExplicitFreezeShaSource(ticket.freeze_contract)) return false;
   if (/\bfreeze\b/i.test(String(ticket?.title || ''))) {
     return true;
@@ -581,16 +623,16 @@ function isFreezeProducerTicket(ticket) {
   return /\b(record|capture|snapshot)\b/i.test(ticketNarrativeText(ticket));
 }
 
-function looksLikeContractDecisionTicket(ticket) {
+function looksLikeContractDecisionTicket(ticket: Ticket | null | undefined): boolean {
   if (ticket?.contract_decision === true || ticket?.contractDecision === true) {
     return true;
   }
   return /\bcontract[-\s]?decision\b|\bdecide whether\b|\bcommit pin(?:ning)?\b|\bfixed[-\s]?sha\b|\bevolving external\b/i.test(ticketText(ticket));
 }
 
-function contractDecisionArtifacts(ticket) {
+function contractDecisionArtifacts(ticket: Ticket): string[] {
   if (!looksLikeContractDecisionTicket(ticket)) return [];
-  const artifacts = new Set(ticket.output_artifacts || []);
+  const artifacts = new Set<string>(ticket.output_artifacts || []);
   if (ticket.freeze_contract?.artifact_path) {
     artifacts.add(ticket.freeze_contract.artifact_path);
   }
@@ -600,10 +642,10 @@ function contractDecisionArtifacts(ticket) {
   return [...artifacts].filter(Boolean);
 }
 
-function extractRepoRelativePaths(command) {
-  const paths = new Set();
+function extractRepoRelativePaths(command: string): string[] {
+  const paths = new Set<string>();
   const pattern = /(^|[\s"'`(])((?:\.[/])?[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+)(?=$|[\s"'`):])/g;
-  let match;
+  let match: RegExpExecArray | null;
   while ((match = pattern.exec(command)) !== null) {
     const normalized = normalizeRepoRelativePath(match[2]);
     if (normalized) paths.add(normalized);
@@ -611,18 +653,18 @@ function extractRepoRelativePaths(command) {
   return [...paths];
 }
 
-function isGeneratedArtifactPath(filePath) {
+function isGeneratedArtifactPath(filePath: string): boolean {
   return /(^|\/)(?:research|artifacts?|reports?|proof|generated|tmp)\//.test(filePath) || /freeze/i.test(filePath);
 }
 
-function wrapperRulesForTicket(ticket) {
+function wrapperRulesForTicket(ticket: Ticket): WrapperContractRule[] {
   return ticketVerificationCommands(ticket)
     .flatMap((command) => WRAPPER_CONTRACT_RULES.filter((rule) => rule.pattern.test(command)));
 }
 
-export function validateRefinementManifest(manifest) {
-  const issues = [];
-  const tickets = Array.isArray(manifest?.tickets) ? manifest.tickets.map((ticket) => normalizeTicketContracts(ticket).ticket) : [];
+export function validateRefinementManifest(manifest: RefinementManifest | null | undefined): string[] {
+  const issues: string[] = [];
+  const tickets: Ticket[] = Array.isArray(manifest?.tickets) ? manifest!.tickets.map((ticket) => normalizeTicketContracts(ticket).ticket) : [];
 
   if (tickets.length === 0) {
     issues.push('manifest contains zero tickets');
@@ -630,13 +672,13 @@ export function validateRefinementManifest(manifest) {
   }
 
   if (isFallbackManifestSource(manifest?.source)) {
-    issues.push(`manifest source "${manifest.source}" is a fallback parser output and is not safe to execute`);
+    issues.push(`manifest source "${manifest?.source}" is a fallback parser output and is not safe to execute`);
   }
 
-  const ownedArtifacts = new Map();
-  const authoritativeFreezeByArtifact = new Map();
-  const contractDecisionByArtifact = new Map();
-  const formatterOwners = new Set();
+  const ownedArtifacts = new Map<string, string[]>();
+  const authoritativeFreezeByArtifact = new Map<string, { owner: string; contract: FreezeContract; signature: string }>();
+  const contractDecisionByArtifact = new Map<string, string[]>();
+  const formatterOwners = new Set<string>();
   for (const ticket of tickets) {
     for (const artifactPath of ticket.output_artifacts || []) {
       const owners = ownedArtifacts.get(artifactPath) || [];
@@ -655,13 +697,13 @@ export function validateRefinementManifest(manifest) {
     }
 
     if (!isFreezeProducerTicket(ticket)) continue;
-    const artifactPath = ticket.freeze_contract.artifact_path;
+    const artifactPath = ticket.freeze_contract!.artifact_path;
     const signature = freezeContractSignature(ticket.freeze_contract);
     const current = authoritativeFreezeByArtifact.get(artifactPath);
     if (!current) {
       authoritativeFreezeByArtifact.set(artifactPath, {
         owner: ticket.id || ticket.title || 'ticket',
-        contract: ticket.freeze_contract,
+        contract: ticket.freeze_contract!,
         signature,
       });
       continue;
@@ -713,8 +755,8 @@ export function validateRefinementManifest(manifest) {
     if (looksLikeParityTicket(ticket) && (!Array.isArray(ticket.proof_corpus) || ticket.proof_corpus.length === 0)) {
       issues.push(`${label}: parity or mirrored tickets must declare proof_corpus coverage`);
     }
-    if (isFreezeProducerTicket(ticket) && !ownedArtifacts.has(ticket.freeze_contract.artifact_path)) {
-      issues.push(`${label}: freeze producer must declare output_artifacts ownership for "${ticket.freeze_contract.artifact_path}"`);
+    if (isFreezeProducerTicket(ticket) && !ownedArtifacts.has(ticket.freeze_contract!.artifact_path)) {
+      issues.push(`${label}: freeze producer must declare output_artifacts ownership for "${ticket.freeze_contract!.artifact_path}"`);
     }
 
     const referencedPaths = ticketVerificationCommands(ticket).flatMap((command) => extractRepoRelativePaths(command));
@@ -764,9 +806,9 @@ export function validateRefinementManifest(manifest) {
   return issues;
 }
 
-function collectTicketFrontmatter(ticket, order) {
+function collectTicketFrontmatter(ticket: Ticket, order: number): Map<string, unknown> {
   const verification = ticketVerificationCommands(ticket);
-  const entries = new Map([
+  const entries = new Map<string, unknown>([
     ['id', ticket.id],
     ['title', ticket.title],
     ['status', ticket.status || 'Todo'],
@@ -775,7 +817,7 @@ function collectTicketFrontmatter(ticket, order) {
     ['complexity_tier', ticket.complexity_tier || 'medium'],
     ['verify', verification.join(' && ')],
   ]);
-  const excludedKeys = new Set([
+  const excludedKeys = new Set<string>([
     'acceptance_criteria',
     'content',
     'description',
@@ -793,7 +835,7 @@ function collectTicketFrontmatter(ticket, order) {
 
   for (const source of [ticket.frontmatter, ticket]) {
     if (!source || typeof source !== 'object') continue;
-    for (const [key, value] of Object.entries(source)) {
+    for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
       if (excludedKeys.has(key)) continue;
       if (value === undefined || value === null || value === '') continue;
       entries.set(key, value);
@@ -803,7 +845,7 @@ function collectTicketFrontmatter(ticket, order) {
   return entries;
 }
 
-function ticketFrontmatter(ticket, order) {
+function ticketFrontmatter(ticket: Ticket, order: number): string {
   const entries = collectTicketFrontmatter(ticket, order);
   return [
     '---',
@@ -813,13 +855,13 @@ function ticketFrontmatter(ticket, order) {
   ].join('\n');
 }
 
-export function writeTicketFiles(sessionDir, manifest) {
+export function writeTicketFiles(sessionDir: string, manifest: RefinementManifest): string[] {
   const normalized = enrichRefinementManifest(manifest);
   if (normalized.changed || !readJsonFile(getManifestPath(sessionDir), null)) {
     writeManifest(sessionDir, normalized.manifest);
   }
   pruneObsoleteTicketFiles(listTickets(sessionDir), normalized.manifest.tickets || []);
-  const ticketPaths = [];
+  const ticketPaths: string[] = [];
   normalized.manifest.tickets.forEach((ticket, index) => {
     const ticketId = canonicalTicketId(ticket, index);
     const ticketDir = path.join(sessionDir, ticketId);
@@ -832,10 +874,10 @@ export function writeTicketFiles(sessionDir, manifest) {
   return ticketPaths;
 }
 
-export function listTickets(sessionDir) {
+export function listTickets(sessionDir: string): ParsedTicket[] {
   return listTicketFiles(sessionDir)
     .map((filePath) => parseTicketFile(filePath))
-    .filter(Boolean)
+    .filter((ticket: ParsedTicket | null): ticket is ParsedTicket => Boolean(ticket))
     .map((ticket) => ({
       ...ticket,
       id: normalizeTicketId(ticket.id, path.basename(path.dirname(ticket.filePath))),
@@ -843,16 +885,16 @@ export function listTickets(sessionDir) {
     .sort((left, right) => left.order - right.order);
 }
 
-export function getTicketById(sessionDir, ticketId) {
+export function getTicketById(sessionDir: string, ticketId: string): ParsedTicket | null {
   const normalizedId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
   return listTickets(sessionDir).find((ticket) => normalizeTicketId(ticket.id, ticket.id) === normalizedId) || null;
 }
 
-export function getNextRunnableTicket(sessionDir) {
+export function getNextRunnableTicket(sessionDir: string): Ticket | ParsedTicket | null {
   const manifest = readManifest(sessionDir);
   ensureTicketFilesMaterialized(sessionDir, manifest);
   const currentTickets = listTickets(sessionDir);
-  const manifestById = new Map(
+  const manifestById = new Map<string, Ticket>(
     (manifest.tickets || []).map((ticket) => [normalizeTicketId(ticket.id, ticket.id), ticket]),
   );
 
@@ -865,7 +907,7 @@ export function getNextRunnableTicket(sessionDir) {
   return null;
 }
 
-function parseMarkdownTable(sectionContent) {
+function parseMarkdownTable(sectionContent: string): Record<string, string>[] {
   const rows = sectionContent
     .split('\n')
     .map((line) => line.trim())
@@ -874,7 +916,7 @@ function parseMarkdownTable(sectionContent) {
   const headers = rows[0].split('|').map((cell) => cell.trim()).filter(Boolean);
   return rows.slice(2).map((row) => {
     const values = row.split('|').map((cell) => cell.trim()).filter(Boolean);
-    const record = {};
+    const record: Record<string, string> = {};
     headers.forEach((header, index) => {
       record[header] = values[index] || '';
     });
@@ -882,7 +924,7 @@ function parseMarkdownTable(sectionContent) {
   });
 }
 
-function extractSection(markdown, heading) {
+function extractSection(markdown: string, heading: string | RegExp): string {
   const pattern = heading instanceof RegExp
     ? new RegExp(heading.source, heading.flags.includes('m') ? heading.flags : `${heading.flags}m`)
     : new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm');
@@ -893,9 +935,9 @@ function extractSection(markdown, heading) {
   return next === -1 ? markdown.slice(start).trim() : markdown.slice(start, start + next).trim();
 }
 
-export function fallbackRefinePrd(prdText) {
+export function fallbackRefinePrd(prdText: string): RefinementManifest {
   const table = parseMarkdownTable(extractSection(prdText, /^##\s+(?:\d+\.\s+)?Task Breakdown\s*$/m));
-  const tickets = table.map((row) => ({
+  const tickets: Ticket[] = table.map((row) => ({
     id: slugify(row.ID || row.Title || row.ID?.toLowerCase()),
     title: row.Title || row.ID || 'Implementation task',
     description: `Phase ${row.Phase || 'unknown'} task from the PRD.`,
@@ -935,7 +977,11 @@ export function fallbackRefinePrd(prdText) {
   };
 }
 
-export function updateTicketStatus(sessionDir, ticketId, updates) {
+export function updateTicketStatus(
+  sessionDir: string,
+  ticketId: string,
+  updates: Record<string, unknown>,
+): ParsedTicket | null {
   const manifest = readManifest(sessionDir);
   const normalizedId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
   ensureTicketFilesMaterialized(sessionDir, manifest);
@@ -958,13 +1004,13 @@ export function updateTicketStatus(sessionDir, ticketId, updates) {
   if (manifestTicket) {
     Object.assign(manifestTicket, updates);
     if (updates.status) {
-      manifestTicket.status = updates.status;
+      manifestTicket.status = updates.status as string;
     }
     writeManifest(sessionDir, manifest);
   }
   return parseTicketFile(ticket.filePath);
 }
 
-export function readPrd(sessionDir) {
-  return readTextFile(path.join(sessionDir, 'prd.md'), '');
+export function readPrd(sessionDir: string): string {
+  return readTextFile(path.join(sessionDir, 'prd.md'), '') ?? '';
 }

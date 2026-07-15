@@ -130,6 +130,13 @@ export interface Ticket {
   acceptance_criteria?: string[];
   priority?: string;
   phase?: string;
+  // Ticket contract fields (normalized by services/tickets.ts). Kept optional
+  // + typed so the validation/enrichment helpers can iterate them directly;
+  // the index signature below still admits any other ad-hoc field.
+  output_artifacts?: string[];
+  proof_corpus?: string[];
+  freeze_contract?: FreezeContract | null;
+  frontmatter?: Record<string, string>;
   [key: string]: unknown;
 }
 
@@ -148,6 +155,19 @@ export interface ParsedTicket {
   filePath: string;
   content: string;
   frontmatter: Record<string, string>;
+  [key: string]: unknown;
+}
+
+/**
+ * Normalized freeze/pin contract attached to a ticket that produces or
+ * consumes a sibling-repo artifact pinned to a fixed SHA. Emitted by
+ * `normalizeFreezeContract()` in `services/tickets.ts`.
+ */
+export interface FreezeContract {
+  artifact_path: string;
+  sibling: string;
+  root_env: string;
+  sha_source: string;
 }
 
 export interface RefinementManifest {

@@ -1,10 +1,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { STATE_SCHEMA_VERSION, atomicWriteJson, readJsonFile } from './pickle-utils.js';
+import {
+  STATE_SCHEMA_VERSION,
+  atomicWriteJson,
+  readJsonFile,
+} from './pickle-utils.js';
+import type {
+  PipelineBootstrapSource,
+  PipelineContract,
+  PipelinePhase,
+  PipelineSkipFlags,
+} from '../types/index.js';
+
+export { STATE_SCHEMA_VERSION } from '../types/index.js';
 
 export const PIPELINE_SCHEMA_VERSION = STATE_SCHEMA_VERSION;
-export const PIPELINE_PHASES = Object.freeze(['pickle', 'anatomy-park', 'szechuan-sauce']);
-export const PIPELINE_PHASE_ALIAS_MAP = Object.freeze({
+export const PIPELINE_PHASES: readonly PipelinePhase[] = Object.freeze(['pickle', 'anatomy-park', 'szechuan-sauce']);
+export const PIPELINE_PHASE_ALIAS_MAP: Readonly<Record<string, PipelinePhase>> = Object.freeze({
   pickle: 'pickle',
   build: 'pickle',
   anatomy: 'anatomy-park',
@@ -13,7 +25,7 @@ export const PIPELINE_PHASE_ALIAS_MAP = Object.freeze({
   'szechuan-sauce': 'szechuan-sauce',
 });
 
-const RESUME_IMMUTABLE_FIELDS = Object.freeze([
+const RESUME_IMMUTABLE_FIELDS: ReadonlyArray<readonly [keyof PipelineContract, string]> = Object.freeze([
   ['target', 'target'],
   ['working_dir', 'working directory'],
   ['bootstrap_source', 'bootstrap source'],
@@ -23,32 +35,67 @@ const RESUME_IMMUTABLE_FIELDS = Object.freeze([
   ['skip_flags', 'skip flags'],
 ]);
 
+/**
+ * Input shape accepted by {@link createPipelineContract}. All fields are
+ * optional/unknown because the contract is parsed from arbitrary JSON; the
+ * normalizers validate and narrow each field.
+ */
+interface PipelineContractInput {
+  working_dir?: unknown;
+  target?: unknown;
+  phases?: unknown;
+  skip_flags?: unknown;
+  bootstrap_source?: unknown;
+  task?: unknown;
+  bootstrap_prd?: unknown;
+  schema_version?: unknown;
+  pickle?: unknown;
+  anatomy?: unknown;
+  szechuan?: unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * Mirror of the immutable pipeline launch fields projected onto a
+ * {@link SessionState}/pipeline-state artifact by {@link buildPipelineStateMirror}.
+ */
+export interface PipelineStateMirror {
+  pipeline_working_dir: string;
+  pipeline_target: string;
+  pipeline_bootstrap_source: PipelineBootstrapSource;
+  pipeline_bootstrap_prd: string | null;
+  pipeline_task: string | null;
+  pipeline_phases: PipelinePhase[];
+  pipeline_skip_flags: PipelineSkipFlags;
+}
+
 export class PipelineContractError extends Error {
-  constructor(message, code = 'PIPELINE_CONTRACT_INVALID') {
+  code: string;
+  constructor(message: string, code: string = 'PIPELINE_CONTRACT_INVALID') {
     super(message);
     this.name = 'PipelineContractError';
     this.code = code;
   }
 }
 
-export function getPipelinePath(sessionDir) {
+export function getPipelinePath(sessionDir: string): string {
   return path.join(sessionDir, 'pipeline.json');
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isAbsolutePath(value) {
+function isAbsolutePath(value: unknown): boolean {
   return typeof value === 'string' && value.trim() !== '' && path.isAbsolute(value.trim());
 }
 
-function compareJson(left, right) {
+function compareJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export function normalizePipelinePhase(value) {
-  const normalized = String(value || '').trim().toLowerCase();
+export function normalizePipelinePhase(value: unknown): PipelinePhase {
+  const normalized = String(value ?? '').trim().toLowerCase();
   const phase = PIPELINE_PHASE_ALIAS_MAP[normalized];
   if (!phase) {
     throw new PipelineContractError(
@@ -59,12 +106,12 @@ export function normalizePipelinePhase(value) {
   return phase;
 }
 
-export function normalizePipelinePhases(values) {
+export function normalizePipelinePhases(values: unknown): PipelinePhase[] {
   if (!Array.isArray(values) || values.length === 0) {
     throw new PipelineContractError('Pipeline phases must be a non-empty array.', 'PIPELINE_PHASES_INVALID');
   }
 
-  const phases = [];
+  const phases: PipelinePhase[] = [];
   for (const value of values) {
     const phase = normalizePipelinePhase(value);
     if (phases.includes(phase)) {
@@ -75,8 +122,8 @@ export function normalizePipelinePhases(values) {
   return phases;
 }
 
-function normalizeBootstrapSource(value) {
-  const normalized = String(value || '').trim().toLowerCase();
+function normalizeBootstrapSource(value: unknown): PipelineBootstrapSource {
+  const normalized = String(value ?? '').trim().toLowerCase();
   if (normalized === 'task' || normalized === 'prd') {
     return normalized;
   }
@@ -86,9 +133,12 @@ function normalizeBootstrapSource(value) {
   );
 }
 
-function normalizeSkipFlags(value = {}, phases = PIPELINE_PHASES) {
+function normalizeSkipFlags(
+  value: unknown = {},
+  phases: readonly PipelinePhase[] = PIPELINE_PHASES,
+): PipelineSkipFlags {
   const source = isPlainObject(value) ? value : {};
-  const flags = {
+  const flags: PipelineSkipFlags = {
     anatomy: Boolean(source.anatomy ?? !phases.includes('anatomy-park')),
     szechuan: Boolean(source.szechuan ?? !phases.includes('szechuan-sauce')),
   };
@@ -109,7 +159,9 @@ function normalizeSkipFlags(value = {}, phases = PIPELINE_PHASES) {
   return flags;
 }
 
-function normalizeBootstrapFields(contract) {
+function normalizeBootstrapFields(
+  contract: PipelineContractInput,
+): { bootstrap_source: PipelineBootstrapSource; task: string | null; bootstrap_prd: string | null } {
   const bootstrapSource = normalizeBootstrapSource(contract.bootstrap_source);
   const task = typeof contract.task === 'string' && contract.task.trim() ? contract.task.trim() : null;
   const bootstrapPrd = contract.bootstrap_prd == null ? null : String(contract.bootstrap_prd).trim();
@@ -145,38 +197,39 @@ function normalizeBootstrapFields(contract) {
   };
 }
 
-export function createPipelineContract(contract) {
+export function createPipelineContract(contract: unknown): PipelineContract {
   if (!isPlainObject(contract)) {
     throw new PipelineContractError('Pipeline contract must be a JSON object.');
   }
 
-  if (!isAbsolutePath(contract.working_dir)) {
+  const input = contract as PipelineContractInput;
+  if (!isAbsolutePath(input.working_dir)) {
     throw new PipelineContractError('Pipeline working_dir must be an absolute path.', 'PIPELINE_WORKING_DIR_INVALID');
   }
-  if (!isAbsolutePath(contract.target)) {
+  if (!isAbsolutePath(input.target)) {
     throw new PipelineContractError('Pipeline target must be an absolute path.', 'PIPELINE_TARGET_INVALID');
   }
 
-  const phases = normalizePipelinePhases(contract.phases);
-  const bootstrap = normalizeBootstrapFields(contract);
-  const skipFlags = normalizeSkipFlags(contract.skip_flags, phases);
+  const phases = normalizePipelinePhases(input.phases);
+  const bootstrap = normalizeBootstrapFields(input);
+  const skipFlags = normalizeSkipFlags(input.skip_flags, phases);
 
   return {
-    schema_version: Number.isInteger(contract.schema_version)
-      ? contract.schema_version
+    schema_version: Number.isInteger(input.schema_version)
+      ? (input.schema_version as number)
       : PIPELINE_SCHEMA_VERSION,
-    working_dir: path.resolve(contract.working_dir),
-    target: path.resolve(contract.target),
+    working_dir: path.resolve(input.working_dir as string),
+    target: path.resolve(input.target as string),
     phases,
     skip_flags: skipFlags,
     ...bootstrap,
-    pickle: isPlainObject(contract.pickle) ? { ...contract.pickle } : {},
-    anatomy: isPlainObject(contract.anatomy) ? { ...contract.anatomy } : {},
-    szechuan: isPlainObject(contract.szechuan) ? { ...contract.szechuan } : {},
+    pickle: isPlainObject(input.pickle) ? { ...input.pickle } : {},
+    anatomy: isPlainObject(input.anatomy) ? { ...input.anatomy } : {},
+    szechuan: isPlainObject(input.szechuan) ? { ...input.szechuan } : {},
   };
 }
 
-export function validatePipelineContract(contract) {
+export function validatePipelineContract(contract: unknown): PipelineContract {
   const normalized = createPipelineContract(contract);
   if (normalized.schema_version > PIPELINE_SCHEMA_VERSION) {
     throw new PipelineContractError(
@@ -187,7 +240,7 @@ export function validatePipelineContract(contract) {
   return normalized;
 }
 
-export function readPipelineContract(sessionDir) {
+export function readPipelineContract(sessionDir: string): PipelineContract {
   const filePath = getPipelinePath(sessionDir);
   if (!fs.existsSync(filePath)) {
     throw new PipelineContractError(`Missing pipeline.json in ${sessionDir}.`, 'PIPELINE_CONTRACT_MISSING');
@@ -199,13 +252,13 @@ export function readPipelineContract(sessionDir) {
   return validatePipelineContract(parsed);
 }
 
-export function writePipelineContract(sessionDir, contract) {
+export function writePipelineContract(sessionDir: string, contract: unknown): PipelineContract {
   const normalized = validatePipelineContract(contract);
   atomicWriteJson(getPipelinePath(sessionDir), normalized);
   return normalized;
 }
 
-export function buildPipelineStateMirror(contract) {
+export function buildPipelineStateMirror(contract: unknown): PipelineStateMirror {
   const normalized = validatePipelineContract(contract);
   return {
     pipeline_working_dir: normalized.working_dir,
@@ -218,11 +271,14 @@ export function buildPipelineStateMirror(contract) {
   };
 }
 
-export function hasPipelineContract(sessionDir) {
+export function hasPipelineContract(sessionDir: string): boolean {
   return fs.existsSync(getPipelinePath(sessionDir));
 }
 
-export function assertPipelineResumeCompatible(existingContract, requestedContract) {
+export function assertPipelineResumeCompatible(
+  existingContract: unknown,
+  requestedContract: unknown,
+): PipelineContract {
   const existing = validatePipelineContract(existingContract);
   const requested = validatePipelineContract(requestedContract);
 
@@ -238,9 +294,12 @@ export function assertPipelineResumeCompatible(existingContract, requestedContra
   return existing;
 }
 
-export function resolveNextPipelinePhase(contract, pipelineState) {
+export function resolveNextPipelinePhase(
+  contract: unknown,
+  pipelineState: { phase_statuses?: Record<string, unknown> } | null | undefined,
+): PipelinePhase | null {
   const normalizedContract = validatePipelineContract(contract);
-  const phaseStatuses = isPlainObject(pipelineState?.phase_statuses) ? pipelineState.phase_statuses : {};
+  const phaseStatuses = isPlainObject(pipelineState?.phase_statuses) ? pipelineState!.phase_statuses : {};
 
   for (const phase of normalizedContract.phases) {
     if (phaseStatuses[phase] !== 'done') {
