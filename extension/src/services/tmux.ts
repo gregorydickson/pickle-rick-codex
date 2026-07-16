@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { getRunnerDescriptor, type NormalizedRunnerDescriptor } from './runner-descriptors.js';
+import { readJsonFile } from './pickle-utils.js';
 
 export interface TmuxCallOptions {
   timeoutMs?: number;
@@ -57,14 +58,6 @@ export function runTmux(args: string[], options: TmuxCallOptions = {}): string {
   return result.stdout.trim();
 }
 
-function readJson<T = unknown>(filePath: string): T | null {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
-  } catch {
-    return null;
-  }
-}
-
 interface RunnerStartedState {
   active?: boolean;
   tmux_session_name?: string;
@@ -101,7 +94,7 @@ export async function waitForTmuxRunnerStart(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    if (runnerStarted(readJson<RunnerStartedState>(statePath), sessionName)) {
+    if (runnerStarted(readJsonFile<RunnerStartedState>(statePath), sessionName)) {
       return;
     }
     if (fs.existsSync(runnerLogPath)) {
