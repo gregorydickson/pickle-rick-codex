@@ -51,6 +51,57 @@ function hasResolvableHead(cwd: string): boolean {
   return runGit(['rev-parse', '--verify', 'HEAD'], cwd, { allowFailure: true }) !== '';
 }
 
+export function countCommitsSince(cwd: string, baselineSha: string): number {
+  if (!baselineSha) return 0;
+  const raw = runGit(['rev-list', '--count', `${baselineSha}..HEAD`], cwd, { allowFailure: true });
+  const count = Number.parseInt(raw, 10);
+  return Number.isFinite(count) ? count : 0;
+}
+
+export function isIndexClean(cwd: string): boolean {
+  try {
+    runGit(['diff', '--cached', '--quiet'], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readCommitTrailer(cwd: string, sha: string, key: string): string | null {
+  if (!sha || !key) return null;
+  const value = runGit(['log', '-1', `--format=%(trailers:key=${key},valueonly)`, sha], cwd, {
+    allowFailure: true,
+  });
+  return value.length > 0 ? value : null;
+}
+
+export function amendCommitTrailer(cwd: string, sha: string, trailer: string): string | null {
+  if (!sha || !trailer) return null;
+  const message = runGit(['log', '-1', '--format=%B', sha], cwd, { allowFailure: true, trim: false });
+  if (!message.trim()) return null;
+  try {
+    runGit(
+      [
+        '-c',
+        'user.name=Pickle Rick',
+        '-c',
+        'user.email=pickle-rick@local.invalid',
+        'commit',
+        '--amend',
+        '--no-gpg-sign',
+        '-m',
+        message,
+        '-m',
+        trailer,
+      ],
+      cwd,
+    );
+    return getHeadSha(cwd) || null;
+  } catch {
+    return null;
+  }
+}
+
 export function getWorkingTreeStatus(cwd: string): string {
   return runGit(['status', '--porcelain'], cwd, { allowFailure: true }) || '';
 }

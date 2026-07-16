@@ -67,6 +67,25 @@ test('VAL-STAMP-004: upsert replaces an existing completion_commit in place', ()
   assert.equal(readFrontmatterField(ticketPath, 'completion_commit'), FULL_SHA);
 });
 
+test('VAL-STAMP-004b: upsert replaces a pre-existing EMPTY key line in place (no duplicate)', () => {
+  const original = '---\nid: "ticket-a"\ntitle: "Alpha"\nstatus: "Todo"\ncompletion_commit:\norder: 2\n---\n# Alpha body\n';
+  const ticketPath = writeTicket(original);
+
+  upsertFrontmatterField(ticketPath, 'completion_commit', FULL_SHA);
+
+  const content = fs.readFileSync(ticketPath, 'utf8');
+  const occurrences = content.match(/^completion_commit:/gm) || [];
+  assert.equal(occurrences.length, 1, 'exactly one completion_commit line — the empty line was replaced in place');
+  assert.equal(readFrontmatterField(ticketPath, 'completion_commit'), FULL_SHA);
+
+  const after = parseFrontmatter(content);
+  assert.equal(after.id, 'ticket-a');
+  assert.equal(after.title, 'Alpha');
+  assert.equal(after.status, 'Todo');
+  assert.equal(after.order, '2');
+  assert.ok(content.endsWith('# Alpha body\n'), 'body preserved');
+});
+
 test('VAL-STAMP-005: normalizeCompletionCommitField accepts short and full shas unchanged', () => {
   assert.equal(normalizeCompletionCommitField(SHORT_SHA), SHORT_SHA);
   assert.equal(normalizeCompletionCommitField(FULL_SHA), FULL_SHA);

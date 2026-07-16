@@ -179,7 +179,7 @@ function upsertFrontmatterFieldInContent(content: string, field: string, value: 
   if (!frontmatter) return null;
   const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const line = `${field}: ${JSON.stringify(value)}`;
-  const fieldRegex = new RegExp(`^${escaped}:\\s*(.+)$`, 'm');
+  const fieldRegex = new RegExp(`^${escaped}:[^\\S\\r\\n]*(.*)$`, 'm');
   if (fieldRegex.test(frontmatter.body)) {
     const nextBody = frontmatter.body.replace(fieldRegex, line);
     return content.slice(0, frontmatter.start) + `---\n${nextBody}\n---\n` + content.slice(frontmatter.end);

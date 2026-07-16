@@ -8,14 +8,18 @@ import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '..
 import { loadConfig } from '../services/config.js';
 import { recordIteration } from '../services/circuit-breaker.js';
 import {
+  amendCommitTrailer,
   commitExists,
   commitTrackedChanges,
+  countCommitsSince,
   getHeadSha,
   hasTrackedWorkingTreeChanges,
   getWorkingTreeFingerprint,
   isGitRepo,
+  isIndexClean,
   isWorkingTreeDirty,
   listUntrackedFiles,
+  readCommitTrailer,
   resetGitIndex,
   stageTrackedChangesAndNewPaths,
 } from '../services/git-utils.js';
@@ -172,27 +176,47 @@ function ticketCommitMessage(ticketId: string, ticket: Ticket | null | undefined
   return `${subject}\n\n${ticketTrailer(ticketId)}`;
 }
 
+const TICKET_TRAILER_KEY = 'Pickle-Ticket';
+
 interface ResolveCompletionCommitInput {
   workingDir: string;
   baselineHeadSha: string;
   autoCommitSha: string | null;
+  ticketId: string;
 }
 
 export function resolveCompletionCommitSha({
   workingDir,
   baselineHeadSha,
   autoCommitSha,
+  ticketId,
 }: ResolveCompletionCommitInput): string | null {
   if (!isGitRepo(workingDir)) return null;
-  let candidate = autoCommitSha && autoCommitSha.length > 0 ? autoCommitSha : null;
-  if (!candidate) {
-    const head = getHeadSha(workingDir);
-    if (!head || head === baselineHeadSha) return null;
-    candidate = head;
+
+  // Auto-commit path: spawn-morty owns the commit, whose message already carries the trailer.
+  if (autoCommitSha && autoCommitSha.length > 0) {
+    if (autoCommitSha === baselineHeadSha) return null;
+    return commitExists(workingDir, autoCommitSha) ? autoCommitSha : null;
   }
-  if (candidate === baselineHeadSha) return null;
-  if (!commitExists(workingDir, candidate)) return null;
-  return candidate;
+
+  // Worker self-commit path.
+  const head = getHeadSha(workingDir);
+  if (!head || head === baselineHeadSha) return null;
+  if (!commitExists(workingDir, head)) return null;
+
+  // Self-commit already carries the matching trailer: trust it, no new/amended commit.
+  if (readCommitTrailer(workingDir, head, TICKET_TRAILER_KEY) === ticketId) {
+    return head;
+  }
+
+  // Reconcile a missing/mismatched trailer by amending the tip — only when the window is a
+  // single commit, the candidate is still HEAD (race guard), and the index is clean. Otherwise
+  // preserve the verified work and stamp the resolvable candidate unchanged.
+  if (countCommitsSince(workingDir, baselineHeadSha) !== 1) return head;
+  if (getHeadSha(workingDir) !== head) return head;
+  if (!isIndexClean(workingDir)) return head;
+
+  return amendCommitTrailer(workingDir, head, `${TICKET_TRAILER_KEY}: ${ticketId}`) ?? head;
 }
 
 function stampCompletionCommit(sessionDir: string, ticketId: string, sha: string): void {
@@ -610,6 +634,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       workingDir,
       baselineHeadSha,
       autoCommitSha,
+      ticketId: normalizedTicketId,
     });
     const applied = getWorkingTreeFingerprint(workingDir) !== baselineFingerprint;
     const finalized = finalizeSuccess(applied);
