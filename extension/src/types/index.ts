@@ -558,3 +558,32 @@ export interface TransitionPipelineStateResult {
   pipelineState: PipelineState;
   pipeline: PipelineContract;
 }
+
+// ---------------------------------------------------------------------------
+// Promise Tokens
+// ---------------------------------------------------------------------------
+
+export { PROMISE_TOKENS, type PromiseToken } from '../services/promise-tokens.js';
+
+export const PromiseTokens = {
+  EPIC_COMPLETED: 'EPIC_COMPLETED',
+  TASK_COMPLETED: 'TASK_COMPLETED',
+  WORKER_DONE: 'I AM DONE',
+  PRD_COMPLETE: 'PRD_COMPLETE',
+  TICKET_SELECTED: 'TICKET_SELECTED',
+  ANALYSIS_DONE: 'ANALYSIS_DONE',
+  EXISTENCE_IS_PAIN: 'EXISTENCE_IS_PAIN',
+  THE_CITADEL_APPROVES: 'THE_CITADEL_APPROVES',
+} as const;
+
+/** Returns true if `text` contains `<promise>TOKEN</promise>`, tolerating whitespace inside tags. */
+export function hasToken(text: string, token: string): boolean {
+  if (!text || !token) return false;
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`<promise>\\s*${escaped}\\s*</promise>`).test(text);
+}
+
+/** Wraps `token` in promise XML tags. */
+export function wrapToken(token: string): string {
+  return `<promise>${token}</promise>`;
+}
