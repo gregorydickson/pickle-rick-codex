@@ -11,11 +11,13 @@ import { StateManager, type PersistedState } from '../services/state-manager.js'
 import {
   areTicketDependenciesSatisfied,
   listTickets,
+  normalizeTicketId,
   summarizeTickets,
   unresolvedTicketDependencies,
   updateTicketStatus,
 } from '../services/tickets.js';
 import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
+import { scrubTicketWorkerMessages } from '../services/worker-output.js';
 import { runTicket } from './spawn-morty.js';
 
 interface RunSequentialOptions {
@@ -130,6 +132,7 @@ export async function runSequential(sessionDir: string, options: RunSequentialOp
           ...options,
           runnerMode,
         });
+        scrubTicketWorkerMessages(sessionDir, normalizeTicketId(ticket.id, ticket.id));
         ticket.status = 'Done';
         appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
         break;

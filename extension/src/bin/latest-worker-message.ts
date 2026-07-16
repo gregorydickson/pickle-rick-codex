@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { readScrubbedWorkerMessage } from '../services/worker-output.js';
 
 interface MessageFileCandidate {
   filePath: string;
@@ -38,7 +39,7 @@ function main(argv: string[]): void {
 
   console.log(latest);
   console.log('');
-  const lines = fs.readFileSync(latest, 'utf8').split('\n');
+  const lines = readScrubbedWorkerMessage(latest).split('\n');
   console.log(lines.slice(-80).join('\n'));
 }
 

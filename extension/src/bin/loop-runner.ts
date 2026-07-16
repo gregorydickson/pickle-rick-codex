@@ -22,6 +22,7 @@ import { appendHistory, getRunStartEpoch } from '../services/session.js';
 import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../services/pipeline-phase-setup.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { readJsonFile } from '../services/pickle-utils.js';
+import { readScrubbedWorkerMessage, scrubWorkerOutput } from '../services/worker-output.js';
 import type {
   Config,
   CodexSpawnResult,
@@ -59,19 +60,18 @@ function summaryPaths(sessionDir: string, mode: string): SummaryPaths {
 }
 
 function readLastMessageArtifact(outputLastMessagePath: string): string {
-  if (!outputLastMessagePath || !fs.existsSync(outputLastMessagePath)) {
-    return '';
-  }
-  return fs.readFileSync(outputLastMessagePath, 'utf8');
+  return readScrubbedWorkerMessage(outputLastMessagePath);
 }
 
 function loopSuccessCheck(outputLastMessagePath: string): SuccessCheck {
   const tokens = ['LOOP_COMPLETE', 'TASK_COMPLETED', 'CONTINUE'];
   return ({ stdout, lastMessage }) => {
     const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
+    const scrubbedStdout = scrubWorkerOutput(stdout || '');
+    const scrubbedLastMessage = scrubWorkerOutput(lastMessage || '');
     return tokens.some((token) =>
-      hasPromiseToken(lastMessage, token)
-      || hasPromiseToken(stdout, token)
+      hasPromiseToken(scrubbedLastMessage, token)
+      || hasPromiseToken(scrubbedStdout, token)
       || hasPromiseToken(persistedMessage, token),
     );
   };
@@ -79,8 +79,8 @@ function loopSuccessCheck(outputLastMessagePath: string): SuccessCheck {
 
 function loopShouldExit(outputLastMessagePath: string, result: CodexSpawnResult): boolean {
   const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
-  return hasPromiseToken(result?.lastMessage, 'LOOP_COMPLETE')
-    || hasPromiseToken(result?.stdout, 'LOOP_COMPLETE')
+  return hasPromiseToken(scrubWorkerOutput(result?.lastMessage || ''), 'LOOP_COMPLETE')
+    || hasPromiseToken(scrubWorkerOutput(result?.stdout || ''), 'LOOP_COMPLETE')
     || hasPromiseToken(persistedMessage, 'LOOP_COMPLETE');
 }
 
@@ -353,7 +353,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
       }
       assertCodexSucceeded(result, `${loopConfig.mode} iteration failed`);
 
-      const lastMessage = result.lastMessage || '';
+      const lastMessage = scrubWorkerOutput(result.lastMessage || '');
       appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} finished`);
 
       autoCommitAnatomyParkIteration(
