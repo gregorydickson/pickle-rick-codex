@@ -8,6 +8,7 @@ import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from '..
 import { loadConfig } from '../services/config.js';
 import { recordIteration } from '../services/circuit-breaker.js';
 import {
+  commitExists,
   commitTrackedChanges,
   getHeadSha,
   hasTrackedWorkingTreeChanges,
@@ -22,7 +23,8 @@ import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
+import { getTicketById, normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
+import { normalizeCompletionCommitField, upsertFrontmatterField } from '../services/pickle-utils.js';
 import {
   assertTicketVerificationReady,
   isPreflightError,
@@ -161,8 +163,44 @@ function normalizeCommitSubject(value: unknown, fallback: string): string {
   return normalized || fallback;
 }
 
+function ticketTrailer(ticketId: string): string {
+  return `Pickle-Ticket: ${ticketId}`;
+}
+
 function ticketCommitMessage(ticketId: string, ticket: Ticket | null | undefined): string {
-  return `pickle: ${ticketId} - ${normalizeCommitSubject(ticket?.title, 'completed ticket')}`;
+  const subject = `pickle: ${ticketId} - ${normalizeCommitSubject(ticket?.title, 'completed ticket')}`;
+  return `${subject}\n\n${ticketTrailer(ticketId)}`;
+}
+
+interface ResolveCompletionCommitInput {
+  workingDir: string;
+  baselineHeadSha: string;
+  autoCommitSha: string | null;
+}
+
+export function resolveCompletionCommitSha({
+  workingDir,
+  baselineHeadSha,
+  autoCommitSha,
+}: ResolveCompletionCommitInput): string | null {
+  if (!isGitRepo(workingDir)) return null;
+  let candidate = autoCommitSha && autoCommitSha.length > 0 ? autoCommitSha : null;
+  if (!candidate) {
+    const head = getHeadSha(workingDir);
+    if (!head || head === baselineHeadSha) return null;
+    candidate = head;
+  }
+  if (candidate === baselineHeadSha) return null;
+  if (!commitExists(workingDir, candidate)) return null;
+  return candidate;
+}
+
+function stampCompletionCommit(sessionDir: string, ticketId: string, sha: string): void {
+  const normalized = normalizeCompletionCommitField(sha);
+  if (!normalized) return;
+  const ticket = getTicketById(sessionDir, ticketId);
+  if (!ticket) return;
+  upsertFrontmatterField(ticket.filePath, 'completion_commit', normalized);
 }
 
 interface AutoCommitDetachedTicketChangesInput {
@@ -187,15 +225,15 @@ function autoCommitDetachedTicketChanges({
   ticketId,
   ticket,
   config,
-}: AutoCommitDetachedTicketChangesInput): void {
+}: AutoCommitDetachedTicketChangesInput): string | null {
   if (!tmuxMode || !baselineTrackedClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
-    return;
+    return null;
   }
 
   const currentUntrackedFiles = listUntrackedFiles(workingDir);
   const newUntrackedFiles = currentUntrackedFiles.filter((filePath) => !baselineUntrackedFiles.includes(filePath));
   if (!hasTrackedWorkingTreeChanges(workingDir) && newUntrackedFiles.length === 0) {
-    return;
+    return null;
   }
 
   appendRunnerLog(sessionDir, runnerMode, `no clean commit boundary detected for ${ticketId}; auto-committing ticket changes`);
@@ -211,6 +249,7 @@ function autoCommitDetachedTicketChanges({
       ticket: ticketId,
       commit_hash: head,
     }, { enabled: config.defaults.activity_logging });
+    return head || null;
   } catch (error) {
     resetGitIndex(workingDir);
     appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-commit failed: ${safeErrorMessage(error)}`);
@@ -409,6 +448,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   let baselineFingerprint: string;
   let baselineTrackedClean: boolean;
   let baselineUntrackedFiles: string[];
+  let baselineHeadSha: string;
   const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
 
   function finalizeSuccess(applied: boolean): RunTicketResult {
@@ -446,6 +486,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
     baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
     baselineUntrackedFiles = isGitRepo(workingDir) ? listUntrackedFiles(workingDir) : [];
+    baselineHeadSha = isGitRepo(workingDir) ? getHeadSha(workingDir) : '';
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -553,7 +594,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       }
     }
 
-    autoCommitDetachedTicketChanges({
+    const autoCommitSha = autoCommitDetachedTicketChanges({
       sessionDir,
       runnerMode,
       workingDir,
@@ -565,10 +606,17 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       config,
     });
 
-    if (getWorkingTreeFingerprint(workingDir) === baselineFingerprint) {
-      return finalizeSuccess(false);
+    const completionSha = resolveCompletionCommitSha({
+      workingDir,
+      baselineHeadSha,
+      autoCommitSha,
+    });
+    const applied = getWorkingTreeFingerprint(workingDir) !== baselineFingerprint;
+    const finalized = finalizeSuccess(applied);
+    if (completionSha) {
+      stampCompletionCommit(sessionDir, normalizedTicketId, completionSha);
     }
-    return finalizeSuccess(true);
+    return finalized;
   } catch (error) {
     if (error instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {

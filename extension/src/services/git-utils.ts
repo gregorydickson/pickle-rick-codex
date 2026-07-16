@@ -37,6 +37,16 @@ export function getHeadSha(cwd: string): string {
   return runGit(['rev-parse', 'HEAD'], cwd, { allowFailure: true }) || '';
 }
 
+export function commitExists(cwd: string, sha: string): boolean {
+  if (!sha) return false;
+  try {
+    runGit(['cat-file', '-e', `${String(sha)}^{commit}`], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function hasResolvableHead(cwd: string): boolean {
   return runGit(['rev-parse', '--verify', 'HEAD'], cwd, { allowFailure: true }) !== '';
 }
