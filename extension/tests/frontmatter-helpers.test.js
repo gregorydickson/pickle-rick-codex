@@ -86,6 +86,19 @@ test('VAL-STAMP-004b: upsert replaces a pre-existing EMPTY key line in place (no
   assert.ok(content.endsWith('# Alpha body\n'), 'body preserved');
 });
 
+test('VAL-STAMP-002b: reading an EMPTY key line returns null, not the next frontmatter line', () => {
+  const emptyThenSha = writeTicket(
+    `---\nid: "ticket-a"\nstatus: "Todo"\ncompletion_commit:\nstart_commit: ${FULL_SHA}\n---\n# Body\n`,
+  );
+  assert.equal(readFrontmatterField(emptyThenSha, 'completion_commit'), null);
+  assert.equal(readFrontmatterField(emptyThenSha, 'start_commit'), FULL_SHA);
+
+  const emptyWithTrailingSpaces = writeTicket(
+    `---\nid: "ticket-a"\ncompletion_commit:   \nstart_commit: ${SHORT_SHA}\n---\n# Body\n`,
+  );
+  assert.equal(readFrontmatterField(emptyWithTrailingSpaces, 'completion_commit'), null);
+});
+
 test('VAL-STAMP-005: normalizeCompletionCommitField accepts short and full shas unchanged', () => {
   assert.equal(normalizeCompletionCommitField(SHORT_SHA), SHORT_SHA);
   assert.equal(normalizeCompletionCommitField(FULL_SHA), FULL_SHA);

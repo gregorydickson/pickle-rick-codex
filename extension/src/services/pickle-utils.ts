@@ -168,7 +168,7 @@ function readFrontmatterFieldFromContent(content: string, field: string): string
   const frontmatter = extractFrontmatter(content);
   if (!frontmatter) return null;
   const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = frontmatter.body.match(new RegExp(`^${escaped}:\\s*(.+)$`, 'm'));
+  const match = frontmatter.body.match(new RegExp(`^${escaped}:[^\\S\\r\\n]*(.*)$`, 'm'));
   if (!match) return null;
   const raw = match[1].trim().replace(/^["']|["']$/g, '');
   return raw.length > 0 ? raw : null;
