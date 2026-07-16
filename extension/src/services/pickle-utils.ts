@@ -164,6 +164,53 @@ export function updateFrontmatter(content: string, updates: Record<string, unkno
   return `---\n${rewritten.join('\n')}\n---\n${content.slice(frontmatter.end)}`;
 }
 
+function readFrontmatterFieldFromContent(content: string, field: string): string | null {
+  const frontmatter = extractFrontmatter(content);
+  if (!frontmatter) return null;
+  const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = frontmatter.body.match(new RegExp(`^${escaped}:\\s*(.+)$`, 'm'));
+  if (!match) return null;
+  const raw = match[1].trim().replace(/^["']|["']$/g, '');
+  return raw.length > 0 ? raw : null;
+}
+
+function upsertFrontmatterFieldInContent(content: string, field: string, value: string): string | null {
+  const frontmatter = extractFrontmatter(content);
+  if (!frontmatter) return null;
+  const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const line = `${field}: ${JSON.stringify(value)}`;
+  const fieldRegex = new RegExp(`^${escaped}:\\s*(.+)$`, 'm');
+  if (fieldRegex.test(frontmatter.body)) {
+    const nextBody = frontmatter.body.replace(fieldRegex, line);
+    return content.slice(0, frontmatter.start) + `---\n${nextBody}\n---\n` + content.slice(frontmatter.end);
+  }
+  const closingFence = content.lastIndexOf('\n---', frontmatter.end - 1);
+  if (closingFence === -1) return null;
+  const insertPoint = closingFence + 1;
+  return content.slice(0, insertPoint) + `${line}\n` + content.slice(insertPoint);
+}
+
+export function readFrontmatterField(ticketFilePath: string, field: string): string | null {
+  const content = readTextFile(ticketFilePath);
+  if (content === null) return null;
+  return readFrontmatterFieldFromContent(content, field);
+}
+
+export function upsertFrontmatterField(ticketFilePath: string, field: string, value: string): void {
+  const content = readTextFile(ticketFilePath);
+  if (content === null) return;
+  const next = upsertFrontmatterFieldInContent(content, field, value);
+  if (next === null) return;
+  atomicWriteFile(ticketFilePath, next);
+}
+
+export function normalizeCompletionCommitField(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const stripped = raw.trim().replace(/^["']+|["']+$/g, '').trim();
+  if (!stripped) return null;
+  return /^[0-9a-f]{7,40}$/i.test(stripped) ? stripped : null;
+}
+
 export function readTextFile(filePath: string, fallback: string | null = null): string | null {
   try {
     return fs.readFileSync(filePath, 'utf8');
