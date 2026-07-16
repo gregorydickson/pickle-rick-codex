@@ -9,9 +9,9 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "smoke": "node ./bin/status.js --help >/dev/null",
+    "smoke": "node ./extension/bin/status.js --help >/dev/null",
     "install:local": "bash install.sh",
-    "validate:codex": "node ./bin/validate-codex.js"
+    "validate:codex": "node ./extension/bin/validate-codex.js"
   },
   "license": "MIT"
 }
