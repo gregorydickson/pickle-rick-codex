@@ -7,6 +7,7 @@ import {
   ensureDir,
   safeErrorMessage,
 } from './pickle-utils.js';
+import { readRecoverableJsonObject } from './recoverable-json.js';
 
 export const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 export const LOCK_RETRY_BACKOFF_BASE_MS = 50;
@@ -181,22 +182,15 @@ export class StateManager {
   }
 
   read(statePath: string): PersistedState {
-    if (!fs.existsSync(statePath)) {
-      throw new StateError('MISSING', `State file not found: ${statePath}`);
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    } catch (error) {
-      throw new StateError('CORRUPT', `Unreadable state file: ${safeErrorMessage(error)}`);
-    }
-
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const recovered = readRecoverableJsonObject(statePath);
+    if (recovered === null) {
+      if (!fs.existsSync(statePath)) {
+        throw new StateError('MISSING', `State file not found: ${statePath}`);
+      }
       throw new StateError('CORRUPT', `State file must contain a JSON object: ${statePath}`);
     }
 
-    const state = parsed as PersistedState;
+    const state = recovered as PersistedState;
     let schemaVersion = state.schema_version;
     if (schemaVersion === undefined) {
       schemaVersion = this.options.schemaVersion;

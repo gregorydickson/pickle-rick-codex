@@ -6,6 +6,7 @@ import {
   getSessionsRoot,
   readJsonFile,
 } from './pickle-utils.js';
+import { readRecoverableJsonObject } from './recoverable-json.js';
 
 /**
  * A session-map entry value: maps a cwd string to the session directory path.
@@ -204,7 +205,12 @@ export async function pruneSessionMap(maxAgeDays: number = 7): Promise<void> {
     for (const [cwd, sessionDir] of Object.entries(sessionMap)) {
       const statePath = path.join(sessionDir, 'state.json');
       try {
-        const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as SessionMapEntryState;
+        const state = readRecoverableJsonObject(statePath) as SessionMapEntryState | null;
+        if (!state) {
+          delete sessionMap[cwd];
+          changed = true;
+          continue;
+        }
         if (state.active === true) continue;
         const startedAt = state.started_at ?? '';
         const startedMs = Number.isFinite(new Date(startedAt).getTime())
@@ -236,8 +242,8 @@ export function findLastSessionForCwd(cwd: string): string | null {
       const sessionDir = path.join(getSessionsRoot(), entry.name);
       const statePath = path.join(sessionDir, 'state.json');
       try {
-        const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as SessionMapEntryState;
-        if (!sessionStateMatchesCwd(state, cwd)) continue;
+        const state = readRecoverableJsonObject(statePath) as SessionMapEntryState | null;
+        if (!state || !sessionStateMatchesCwd(state, cwd)) continue;
         const startedAt = state.started_at ?? '';
         const startedMs = Number.isFinite(new Date(startedAt).getTime())
           ? new Date(startedAt).getTime()

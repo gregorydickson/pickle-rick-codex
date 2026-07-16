@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ParsedTicket } from '../types/index.js';
+import { readRecoverableJsonObject } from './recoverable-json.js';
 
 export { STATE_SCHEMA_VERSION } from '../types/index.js';
 
@@ -62,11 +63,8 @@ export function atomicWriteJson<T>(filePath: string, value: T, options: AtomicWr
 }
 
 export function readJsonFile<T = unknown>(filePath: string, fallback: T | null = null): T | null {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
-  } catch {
-    return fallback;
-  }
+  const recovered = readRecoverableJsonObject(filePath);
+  return recovered === null ? fallback : (recovered as unknown as T);
 }
 
 export function backupFile(filePath: string, suffix: string = 'bak'): string {
