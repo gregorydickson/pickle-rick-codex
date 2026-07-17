@@ -169,6 +169,9 @@ test('VAL-STAMP-015: a no-diff / no-commit run does not fabricate a completion_c
   const head = runGit(projectDir, ['rev-parse', 'HEAD']);
   assert.equal(head, baseline, 'HEAD did not advance past baseline');
 
+  // A no-diff / no-commit run produced no completion-commit candidate, so there is no
+  // phantom-stamp risk: the ticket still completes but the oracle never fabricates or
+  // baseline-stamps a completion_commit.
   const ticket = parseTicketFile(ticketFilePath(sessionDir));
   assert.equal(ticket.status, 'Done');
 

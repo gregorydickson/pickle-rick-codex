@@ -27,8 +27,12 @@ import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { getTicketById, normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
-import { normalizeCompletionCommitField, upsertFrontmatterField } from '../services/pickle-utils.js';
+import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
+import {
+  evaluateCompletionEvidence,
+  type CompletionDecision,
+  type CompletionDecisionCtx,
+} from '../services/ticket-completion-evidence.js';
 import {
   assertTicketVerificationReady,
   isPreflightError,
@@ -219,12 +223,29 @@ export function resolveCompletionCommitSha({
   return amendCommitTrailer(workingDir, head, `${TICKET_TRAILER_KEY}: ${ticketId}`) ?? head;
 }
 
-function stampCompletionCommit(sessionDir: string, ticketId: string, sha: string): void {
-  const normalized = normalizeCompletionCommitField(sha);
-  if (!normalized) return;
-  const ticket = getTicketById(sessionDir, ticketId);
-  if (!ticket) return;
-  upsertFrontmatterField(ticket.filePath, 'completion_commit', normalized);
+interface BuildCompletionCtxInput {
+  sessionDir: string;
+  ticketId: string;
+  workingDir: string;
+}
+
+/**
+ * The single completion decision seam. Codex has no worker gate and no session
+ * baseline concept, so `decision:'attribution'` (never 'done-flip', which would
+ * always refuse worker_gate_unavailable) with `startCommit/pinnedSha` explicitly
+ * null. Routing through the oracle folds the pointer write into its promote-once
+ * persistEvidence, so `completion_commit` lands in the manifest AND the file
+ * (R-WDTF) — guaranteed, not order-dependent.
+ */
+function buildCompletionCtx({ sessionDir, ticketId, workingDir }: BuildCompletionCtxInput): CompletionDecisionCtx {
+  return {
+    sessionDir,
+    ticketId,
+    workingDir,
+    startCommit: null,
+    pinnedSha: null,
+    decision: 'attribution',
+  };
 }
 
 interface AutoCommitDetachedTicketChangesInput {
@@ -500,6 +521,17 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       : { status: 'done', applied: false, reason: 'No diff generated.' };
   }
 
+  function finalizeRefusal(applied: boolean, decision: CompletionDecision & { ok: false }): RunTicketResult {
+    // The oracle found no attributable completion evidence: do NOT flip Done and do
+    // NOT stamp a completion_commit. Surface the refusal reason for the caller/logs.
+    appendRunnerLog(
+      sessionDir,
+      runnerMode,
+      `ticket ${normalizedTicketId} completion refused by oracle: ${decision.reason}`,
+    );
+    return { status: 'incomplete', applied, reason: decision.reason };
+  }
+
   try {
     verificationReady = assertTicketVerificationReady({
       ticket: normalizedTicket,
@@ -630,18 +662,39 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       config,
     });
 
-    const completionSha = resolveCompletionCommitSha({
+    // Reconcile the completion commit's Pickle-Ticket trailer (amends an untrailed
+    // single-commit window in place) so the oracle's git-log scan can attribute the
+    // worker's own work. The resolved sha is not stamped directly — the oracle owns
+    // the pointer write via its promote-once persistEvidence (R-WDTF).
+    resolveCompletionCommitSha({
       workingDir,
       baselineHeadSha,
       autoCommitSha,
       ticketId: normalizedTicketId,
     });
     const applied = getWorkingTreeFingerprint(workingDir) !== baselineFingerprint;
-    const finalized = finalizeSuccess(applied);
-    if (completionSha) {
-      stampCompletionCommit(sessionDir, normalizedTicketId, completionSha);
+    const decision = evaluateCompletionEvidence(buildCompletionCtx({
+      sessionDir,
+      ticketId: normalizedTicketId,
+      workingDir,
+    }));
+    if (decision.ok) {
+      // The oracle accepted attributable evidence and, via its promote-once
+      // persistEvidence, has already stamped completion_commit into the manifest and
+      // the file (R-WDTF). Flip Done — the pointer survives the re-materialization.
+      return finalizeSuccess(applied);
     }
-    return finalized;
+    // The oracle refused. Withhold Done ONLY when a completion-commit candidate actually
+    // exists — HEAD advanced past the session baseline, so there is a baseline/foreign/
+    // phantom commit that must not be stamped or claimed as completion. A run that
+    // produced no new commit has nothing to attribute and no phantom-stamp risk, so it
+    // completes with a null completion_commit exactly as before.
+    const committedCandidateExists =
+      isGitRepo(workingDir) && baselineHeadSha.length > 0 && getHeadSha(workingDir) !== baselineHeadSha;
+    if (committedCandidateExists) {
+      return finalizeRefusal(applied, decision);
+    }
+    return finalizeSuccess(applied);
   } catch (error) {
     if (error instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
