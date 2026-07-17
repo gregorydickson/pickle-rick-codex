@@ -529,6 +529,15 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       runnerMode,
       `ticket ${normalizedTicketId} completion refused by oracle: ${decision.reason}`,
     );
+    // Park the ticket with its verdict so an `on-failure=abort` run does not leave it
+    // stuck at the start-of-try `In Progress` write (which resume treats as runnable
+    // and summaries misreport). Mirrors the preflight-Todo path in the catch block.
+    updateTicketStatus(sessionDir, normalizedTicketId, {
+      status: 'Todo',
+      failed_at: new Date().toISOString(),
+      failure_reason: `completion refused by oracle: ${decision.reason}`,
+      failure_kind: 'completion_refused',
+    });
     return { status: 'incomplete', applied, reason: decision.reason };
   }
 
@@ -684,17 +693,20 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       // the file (R-WDTF). Flip Done — the pointer survives the re-materialization.
       return finalizeSuccess(applied);
     }
-    // The oracle refused. Withhold Done ONLY when a completion-commit candidate actually
-    // exists — HEAD advanced past the session baseline, so there is a baseline/foreign/
-    // phantom commit that must not be stamped or claimed as completion. A run that
-    // produced no new commit has nothing to attribute and no phantom-stamp risk, so it
-    // completes with a null completion_commit exactly as before.
-    const committedCandidateExists =
-      isGitRepo(workingDir) && baselineHeadSha.length > 0 && getHeadSha(workingDir) !== baselineHeadSha;
-    if (committedCandidateExists) {
-      return finalizeRefusal(applied, decision);
+    // The oracle refused. Gate on the refusal REASON, not HEAD-advancement: a positively
+    // bad or dead pointer (foreign/baseline/unreachable) must never be claimed as
+    // completion, even on a run that produced no new commit — HEAD-advancement would let a
+    // pre-existing surviving stamp flip Done and defeat the R-OMA/baseline guards.
+    if (decision.reason === 'no_evidence') {
+      // Nothing positively bad to attribute. Codex's completion model is verification-pass
+      // -> Done; a passing run with no phantom/foreign stamp completes with a null
+      // completion_commit exactly as before.
+      return finalizeSuccess(applied);
     }
-    return finalizeSuccess(applied);
+    // foreign_attribution | baseline_sha | unreachable_explicit_unattributable (and the
+    // codex-unreachable worker-gate reasons): a positively-bad or dead pointer that must
+    // never be claimed as completion. Refuse regardless of whether this run advanced HEAD.
+    return finalizeRefusal(applied, decision);
   } catch (error) {
     if (error instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {

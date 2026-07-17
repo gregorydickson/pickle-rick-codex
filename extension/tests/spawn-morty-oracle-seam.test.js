@@ -97,6 +97,48 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
 process.exit(0);
 `;
 
+// Fake codex that self-commits TWO commits in `implement` with NEUTRAL messages that
+// name no ticket id — a multi-commit window (so resolveCompletionCommitSha does NOT
+// amend a Pickle-Ticket trailer) with nothing attributable → oracle returns `no_evidence`.
+const NEUTRAL_TWO_COMMIT_FAKE_CODEX = `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+if (args[0] !== 'exec') { console.error('unexpected codex invocation'); process.exit(1); }
+const prompt = fs.readFileSync(0, 'utf8');
+let outputLastMessagePath = '';
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') { outputLastMessagePath = args[index + 1] || ''; index += 1; }
+}
+const match = prompt.match(/You are executing the "([^"]+)" phase/);
+const phase = match ? match[1] : '';
+if (phase === 'implement') {
+  const cwd = process.cwd();
+  fs.writeFileSync(path.join(cwd, 'feature.txt'), 'base\\nstep-one\\n');
+  execFileSync('git', ['add', 'feature.txt'], { cwd });
+  execFileSync('git', ['-c', 'user.name=Worker', '-c', 'user.email=worker@local.invalid', 'commit', '-m', 'chore: adjust feature step one'], { cwd });
+  fs.writeFileSync(path.join(cwd, 'feature.txt'), 'base\\nstep-one\\nstep-two\\n');
+  execFileSync('git', ['add', 'feature.txt'], { cwd });
+  execFileSync('git', ['-c', 'user.name=Worker', '-c', 'user.email=worker@local.invalid', 'commit', '-m', 'chore: adjust feature step two'], { cwd });
+}
+const lastMessage = phase ? '<promise>' + phase.toUpperCase() + '_COMPLETE</promise>' : '<promise>OK</promise>';
+if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, lastMessage);
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`;
+
+// Seeds a reachable foreign commit whose message names sibling ticket r2 (never r1),
+// then returns its sha. Used to pre-stamp a surviving, positively-foreign completion_commit.
+function seedForeignCommit(projectDir) {
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\nsibling-work\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'deliver r2 milestone']);
+  return runGit(projectDir, ['rev-parse', 'HEAD']);
+}
+
 test('VAL-ORACLE-029: spawn-morty flips Done only when the oracle accepts (happy path)', () => {
   const projectDir = baseRepo();
   const baseline = runGit(projectDir, ['rev-parse', 'HEAD']);
@@ -124,7 +166,14 @@ test('VAL-ORACLE-029: spawn-morty flips Done only when the oracle accepts (happy
   assert.ok(commitResolves(projectDir, completion), 'stamped sha resolves via git cat-file -e');
 });
 
-test('VAL-ORACLE-030: spawn-morty does NOT flip Done when the oracle refuses a foreign/unattributable commit', () => {
+test('VAL-ORACLE-030: a HEAD-advancing run with NO explicit stamp and no attributable window completes Done with a null completion_commit (never stamps the foreign/baseline sha)', () => {
+  // Corrected semantics (O-1): this window carries NO explicit completion_commit, so
+  // the oracle's R-OMA foreign guard never engages — the "deliver r2 milestone" tip is
+  // simply unattributable, and the oracle returns `no_evidence`. A verification-pass run
+  // with no phantom/foreign STAMP must complete as Done with a null pointer rather than
+  // be wedged incomplete. The foreign/baseline protection lives in the STAMP: no foreign
+  // or baseline sha is ever written into completion_commit (asserted below). The genuine
+  // explicit-foreign-stamp refusal path is covered by VAL-ORACLE-035.
   const projectDir = baseRepo();
   const baseline = runGit(projectDir, ['rev-parse', 'HEAD']);
   const fakeBin = makeTempRoot('pickle-oracle-foreign-bin-');
@@ -135,13 +184,15 @@ test('VAL-ORACLE-030: spawn-morty does NOT flip Done when the oracle refuses a f
     { ...R1_TICKET, id: 'R2', title: 'Sibling ticket' },
   ]);
 
-  runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+  const stdout = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+  const result = JSON.parse(stdout.trim());
 
   const head = runGit(projectDir, ['rev-parse', 'HEAD']);
   assert.notEqual(head, baseline, 'the worker did commit — the tip exists');
 
+  assert.equal(result.status, 'done', 'a HEAD-advancing no_evidence run is not wedged (O-1)');
   const ticket = parseTicketFile(ticketFilePath(sessionDir));
-  assert.notEqual(ticket.status, 'Done', 'ticket is NOT flipped to Done on refused evidence');
+  assert.equal(ticket.status, 'Done', 'no_evidence + verified pass completes as Done');
 
   const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
   assert.equal(completion, null, 'no completion_commit stamped for the foreign/unattributable tip');
@@ -164,4 +215,89 @@ test('VAL-ORACLE-031: a no-diff / no-commit run never fabricates or baseline-sta
 
   const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
   assert.equal(completion, null, 'no completion_commit fabricated on a no-diff run');
+});
+
+test('VAL-ORACLE-035 (F1): a surviving foreign completion_commit is refused even when the run makes NO new commit', () => {
+  // The no-new-commit hole: a PRE-EXISTING explicit completion_commit points at a
+  // reachable-but-foreign sibling commit; the worker is a no-op so HEAD == baseline.
+  // The old HEAD-advancement gate would fall through to finalizeSuccess and flip Done
+  // with the foreign pointer intact. Reason-based gating refuses regardless of HEAD.
+  const projectDir = baseRepo();
+  const foreignSha = seedForeignCommit(projectDir);
+  const fakeBin = makeTempRoot('pickle-oracle-f1-bin-');
+  createFakeCodex(fakeBin); // no mutate env → the worker produces NO new commit
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: makeTempRoot() });
+  const sessionDir = setupSession(projectDir, env, 'oracle no-new-commit foreign stamp', [
+    { ...R1_TICKET, completion_commit: foreignSha },
+    { ...R1_TICKET, id: 'R2', title: 'Sibling ticket' },
+  ]);
+
+  const stdout = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+  const result = JSON.parse(stdout.trim());
+
+  const head = runGit(projectDir, ['rev-parse', 'HEAD']);
+  assert.equal(head, foreignSha, 'the worker produced NO new commit (HEAD == baseline)');
+
+  assert.equal(result.status, 'incomplete', 'a surviving foreign stamp is refused, not accepted');
+  assert.equal(result.reason, 'foreign_attribution', 'the refusal reason is the R-OMA foreign guard');
+
+  const ticket = parseTicketFile(ticketFilePath(sessionDir));
+  assert.notEqual(ticket.status, 'Done', 'a foreign completion_commit must NOT flip Done on a no-new-commit run');
+});
+
+test('VAL-ORACLE-036 (F2): a real oracle refusal parks the ticket at Todo with a completion_refused verdict (never left In Progress)', () => {
+  // Status hygiene: before this fix finalizeRefusal returned {status:'incomplete'}
+  // WITHOUT writing the ticket status, leaving it at the start-of-try 'In Progress'
+  // write. Under on-failure=abort the ticket then silently re-runs on resume. The
+  // refusal must land a parkable Todo + failure_reason/failure_kind on disk.
+  const projectDir = baseRepo();
+  const foreignSha = seedForeignCommit(projectDir);
+  const fakeBin = makeTempRoot('pickle-oracle-f2-bin-');
+  createFakeCodex(fakeBin); // no mutate env → real (non-mocked) oracle refusal path
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: makeTempRoot() });
+  const sessionDir = setupSession(projectDir, env, 'oracle refusal status hygiene', [
+    { ...R1_TICKET, completion_commit: foreignSha },
+    { ...R1_TICKET, id: 'R2', title: 'Sibling ticket' },
+  ]);
+
+  runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+
+  const ticketPath = ticketFilePath(sessionDir);
+  const ticket = parseTicketFile(ticketPath);
+  assert.notEqual(ticket.status, 'In Progress', 'a refused ticket is NOT left In Progress');
+  assert.equal(ticket.status, 'Todo', 'a refused ticket is parked at Todo');
+  assert.equal(
+    readFrontmatterField(ticketPath, 'failure_kind'),
+    'completion_refused',
+    'the refusal verdict is recorded as failure_kind',
+  );
+  const failureReason = readFrontmatterField(ticketPath, 'failure_reason');
+  assert.ok(failureReason, 'a non-null failure_reason is recorded');
+  assert.match(String(failureReason), /completion refused by oracle: foreign_attribution/, 'the reason carries the oracle verdict');
+});
+
+test('VAL-ORACLE-037 (O-1): a HEAD-advancing verified run with genuinely no evidence completes Done, not wedged incomplete', () => {
+  // The false-refusal wedge: HEAD advanced with real verified work but the oracle can
+  // attribute nothing (multi-commit window so no trailer amend, commit messages do not
+  // name the ticket, no declared files) → `no_evidence`. This must complete as Done with
+  // a null completion_commit, NOT be wedged as incomplete.
+  const projectDir = baseRepo();
+  const baseline = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const fakeBin = makeTempRoot('pickle-oracle-o1-bin-');
+  writeExecutable(path.join(fakeBin, 'codex'), NEUTRAL_TWO_COMMIT_FAKE_CODEX);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: makeTempRoot() });
+  const sessionDir = setupSession(projectDir, env, 'oracle no-evidence no-wedge', [R1_TICKET]);
+
+  const stdout = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+  const result = JSON.parse(stdout.trim());
+
+  const head = runGit(projectDir, ['rev-parse', 'HEAD']);
+  assert.notEqual(head, baseline, 'HEAD advanced with real verified work');
+
+  assert.equal(result.status, 'done', 'no_evidence with real verified work is not wedged incomplete');
+  const ticket = parseTicketFile(ticketFilePath(sessionDir));
+  assert.equal(ticket.status, 'Done', 'the ticket completes as Done');
+
+  const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
+  assert.equal(completion, null, 'no completion_commit is stamped when evidence is genuinely absent');
 });
