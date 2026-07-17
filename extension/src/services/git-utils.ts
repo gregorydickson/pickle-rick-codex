@@ -117,6 +117,45 @@ export function isWorkingTreeDirty(cwd: string): boolean {
   return getWorkingTreeStatus(cwd) !== '';
 }
 
+function normalizeExcludePrefixes(excludePrefixes?: string[]): string[] {
+  if (!excludePrefixes || excludePrefixes.length === 0) return [];
+  return excludePrefixes
+    .map((prefix) => prefix.replace(/^\.?\/+/, '').replace(/\/+$/, ''))
+    .filter((prefix) => prefix.length > 0);
+}
+
+function statusArgs(excludePrefixes?: string[]): string[] {
+  const args = ['status', '--porcelain', '-z'];
+  const cleanedPrefixes = normalizeExcludePrefixes(excludePrefixes);
+  if (cleanedPrefixes.length > 0) {
+    args.push('--', '.');
+    for (const cleaned of cleanedPrefixes) {
+      args.push(`:!${cleaned}`, `:!${cleaned}/**`);
+    }
+  }
+  return args;
+}
+
+export function listWorkingTreeDirtyPaths(cwd: string, excludePrefixes?: string[]): string[] {
+  const output = runGit(statusArgs(excludePrefixes), cwd, { trim: false, timeout: 30_000 });
+  if (!output) return [];
+
+  const tokens = output.split('\0').filter((token) => token.length > 0);
+  const paths: string[] = [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.length < 4) continue;
+    paths.push(token.slice(3));
+    const status = token.slice(0, 2);
+    if (status[0] === 'R' || status[0] === 'C' || status[1] === 'R' || status[1] === 'C') {
+      index += 1;
+    }
+  }
+
+  return [...new Set(paths)].sort((left, right) => left.localeCompare(right));
+}
+
 export function hasTrackedWorkingTreeChanges(cwd: string): boolean {
   return porcelainStatusLines(getWorkingTreeStatus(cwd)).some((line) => !line.startsWith('?? '));
 }
