@@ -27,6 +27,10 @@ interface RunSequentialOptions {
   [key: string]: unknown;
 }
 
+interface RunSequentialDeps {
+  runTicket?: typeof runTicket;
+}
+
 function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
   const descriptor = getRunnerDescriptor(mode);
   const filePath = path.join(sessionDir, descriptor.runnerLog);
@@ -59,7 +63,12 @@ function shouldStop(state: PersistedState): string | null {
   return null;
 }
 
-export async function runSequential(sessionDir: string, options: RunSequentialOptions = {}): Promise<string> {
+export async function runSequential(
+  sessionDir: string,
+  options: RunSequentialOptions = {},
+  deps: RunSequentialDeps = {},
+): Promise<string> {
+  const runTicketFn = deps.runTicket ?? runTicket;
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const failureMode = options.onFailure || 'abort';
@@ -128,13 +137,40 @@ export async function runSequential(sessionDir: string, options: RunSequentialOp
       attempts += 1;
       try {
         appendRunnerLog(sessionDir, runnerMode, `starting ticket ${ticket.id} attempt ${attempts}/${maxAttempts}`);
-        await runTicket(sessionDir, ticket.id, {
+        const result = await runTicketFn(sessionDir, ticket.id, {
           ...options,
           runnerMode,
         });
-        scrubTicketWorkerMessages(sessionDir, normalizeTicketId(ticket.id, ticket.id));
-        ticket.status = 'Done';
-        appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
+        if (result.status === 'done') {
+          scrubTicketWorkerMessages(sessionDir, normalizeTicketId(ticket.id, ticket.id));
+          ticket.status = 'Done';
+          appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
+          break;
+        }
+        // The oracle refused this ticket's completion (non-throwing): the ticket is NOT
+        // Done. Route it through the same failure-mode handling as a genuine failure so a
+        // ticket is only ever marked Done when the oracle accepted it.
+        appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} not completed: oracle refusal ${result.reason ?? result.status}`);
+        if (attempts < maxAttempts) {
+          const retryStopReason = shouldStop(manager.read(statePath));
+          if (retryStopReason === 'max_time' || retryStopReason === 'max_iterations') {
+            failedTicketId = ticket.id;
+            exitReason = 'error';
+            appendRunnerLog(sessionDir, runnerMode, `not retrying ${ticket.id}: ${retryStopReason} would mask the current failure`);
+            appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
+            break;
+          }
+          continue;
+        }
+        if (failureMode === 'skip') {
+          ticket.status = 'Skipped';
+          updateTicketStatus(sessionDir, ticket.id, { status: 'Skipped', skipped_at: new Date().toISOString() });
+          appendRunnerLog(sessionDir, runnerMode, `skipping ticket ${ticket.id}`);
+          break;
+        }
+        failedTicketId = ticket.id;
+        exitReason = 'error';
+        appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       } catch (error) {
         const cancelled = manager.read(statePath).active === false;
