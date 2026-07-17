@@ -273,14 +273,15 @@ function enumerateSiblingTicketIds(sessionDir: string, selfTicketId: string | nu
  */
 function isForeignAttributedExplicitSha(
   sha: string,
-  ctx: Pick<EvidenceCtx, 'workingDir' | 'sessionDir' | 'ticketId' | 'ownAttributionTokens'>,
+  ctx: Pick<EvidenceCtx, 'sessionDir' | 'ticketId' | 'ownAttributionTokens'>,
   selfId: string | null,
   selfRCode: string | null,
+  attributionDir: string,
 ): boolean {
   if (!ctx.sessionDir) return false;
   const siblingIds = enumerateSiblingTicketIds(ctx.sessionDir, selfId);
   if (siblingIds.length === 0) return false;
-  const message = commitMessage(ctx.workingDir, sha).toLowerCase();
+  const message = commitMessage(attributionDir, sha).toLowerCase();
   if (!message) return false;
   const ownTokens = [
     ...(selfId ? [selfId.toLowerCase()] : []),
@@ -462,9 +463,13 @@ export function readEvidence(ctx: EvidenceCtx): EvidenceResult {
     if (reachable) {
       const selfId = readFrontmatterField(tPath, 'id') ?? ctx.ticketId ?? null;
       const selfRCode = readFrontmatterField(tPath, 'r_code');
+      // R-OMA: the foreign-attribution message read MUST use the repo where reachability
+      // was actually resolved; when probeExplicitSha found the commit through fallbackDir,
+      // ctx.workingDir cannot run git and would yield an empty (=accept) message.
+      const attributionDir = reachable.usedFallback && ctx.fallbackDir ? ctx.fallbackDir : ctx.workingDir;
       // R-OMA: reject a reachable explicit SHA ONLY when positively attributed to a
       // DIFFERENT ticket. Default = accept (explicit-SHA-wins).
-      if (isForeignAttributedExplicitSha(explicit, ctx, selfId, selfRCode)) {
+      if (isForeignAttributedExplicitSha(explicit, ctx, selfId, selfRCode, attributionDir)) {
         process.stderr.write(
           `[ticket-completion-evidence] explicit sha ${explicit} rejected — positively attributed to a different ticket (R-OMA foreign-attribution)\n`,
         );

@@ -163,6 +163,41 @@ test('VAL-ORACLE-012: scan requires WORD-BOUNDARY id match (substring near-miss 
   assert.deepEqual(result, { kind: 'absent', absentReason: 'no_evidence' });
 });
 
+// --- R-OMA foreign attribution over the fallbackDir reachability path ----
+
+test('VAL-ORACLE-032: fallbackDir-reachable explicit SHA foreign-attributed → hard-absent foreign_attribution (attribution reads the fallback repo)', () => {
+  const { dir } = initRepo();
+  const foreignSha = commit(dir, 'fix(r2): sibling milestone work');
+  const nonRepo = makeTempRoot('oracle-nonrepo-');
+  const sessionDir = mkSession();
+  writeTicket(sessionDir, 'R2', {});
+  const ticketPath = writeTicket(sessionDir, 'R1', { completion_commit: foreignSha });
+  const result = readEvidence({ sessionDir, ticketId: 'R1', ticketPath, workingDir: nonRepo, fallbackDir: dir });
+  assert.deepEqual(result, { kind: 'absent', absentReason: 'foreign_attribution' });
+});
+
+test('VAL-ORACLE-033: fallbackDir-reachable OWN-attributed explicit SHA → committed via explicit usedFallback', () => {
+  const { dir } = initRepo();
+  const ownSha = commit(dir, 'implement r1 core behavior');
+  const nonRepo = makeTempRoot('oracle-nonrepo-');
+  const sessionDir = mkSession();
+  writeTicket(sessionDir, 'R2', {});
+  const ticketPath = writeTicket(sessionDir, 'R1', { completion_commit: ownSha });
+  const result = readEvidence({ sessionDir, ticketId: 'R1', ticketPath, workingDir: nonRepo, fallbackDir: dir });
+  assert.deepEqual(result, { kind: 'committed', sha: ownSha, via: 'explicit', usedFallback: true });
+});
+
+test('VAL-ORACLE-034: fallbackDir-reachable UNATTRIBUTED explicit SHA → committed via explicit usedFallback', () => {
+  const { dir } = initRepo();
+  const sha = commit(dir, 'generic untagged build work');
+  const nonRepo = makeTempRoot('oracle-nonrepo-');
+  const sessionDir = mkSession();
+  writeTicket(sessionDir, 'R2', {});
+  const ticketPath = writeTicket(sessionDir, 'R1', { completion_commit: sha });
+  const result = readEvidence({ sessionDir, ticketId: 'R1', ticketPath, workingDir: nonRepo, fallbackDir: dir });
+  assert.deepEqual(result, { kind: 'committed', sha, via: 'explicit', usedFallback: true });
+});
+
 // --- evaluateCompletionEvidence predicate --------------------------------
 
 function attributionCtx(extra) {
