@@ -266,6 +266,14 @@ Runtime state is persisted under `~/.codex/pickle-rick/`, including:
 
 The design is deliberately file-backed so runs can resume and be inspected outside the model loop.
 
+## Reliability Primitives (Internal)
+
+The TypeScript extension under `extension/src/services/` carries a set of standalone git/tmux safety seams ported from the Phase 0/1 safety-seams work. These are internal primitives shipped with tests but not yet wired into any consumer path:
+
+- `git-utils.listWorkingTreeDirtyPaths(cwd, excludePrefixes?)` — parses `git status --porcelain -z` into a de-duped, sorted list of dirty working-tree paths (skipping rename/copy source tokens), with optional exclude-prefix pathspecs
+- `dirty-tree-salvage.ts` — `stashUnattributableRemainder` snapshots the whole dirty tree into a dangling commit under `refs/pickle/salvage/<session>` via a throwaway `GIT_INDEX_FILE` without mutating the real index or worktree, `salvageDirtyTree` anchors foreign dirt and returns only owned paths, and `stageOwnedPaths` stages per-path rather than whole-tree
+- `tmux.ts` — `sessionHashOf` and `isForeignTmuxSession(sessionName, sessionDir)` provide a fail-closed ownership guard via trailing-hash comparison with no filesystem or data-root access
+
 ## Install Layout
 
 Global install:
