@@ -14,6 +14,28 @@ export function shellQuote(value: unknown): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+/** Trailing `-`-delimited segment: the session hash both names are keyed by. */
+export function sessionHashOf(name: string): string {
+  return name.slice(name.lastIndexOf('-') + 1);
+}
+
+/**
+ * We may only drive the tmux session that hosts THIS session's monitor window.
+ * `#S` answers "which tmux session is this PROCESS in" — the right answer only
+ * when the runner was launched inside the session it manages. A runner that
+ * inherits `$TMUX` from somewhere else would otherwise send-keys its pane
+ * commands into a stranger's live pane.
+ *
+ * Launchers name the tmux session `<prefix>-<session-hash>` for the session dir
+ * they manage, so the two hashes agree exactly when the window is ours. Fail
+ * CLOSED: a name we cannot tie to our own session dir is not ours to drive.
+ * Ownership is derived from the pair alone — never resolved against the data
+ * root — so it holds for a runner whose data root lacks the ambient session.
+ */
+export function isForeignTmuxSession(sessionName: string, sessionDir: string): boolean {
+  return sessionHashOf(sessionName) !== sessionHashOf(path.basename(sessionDir));
+}
+
 export function getRuntimeRoot(): string {
   return path.resolve(new URL('..', import.meta.url).pathname);
 }
