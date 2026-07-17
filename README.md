@@ -54,7 +54,7 @@ That install does three things:
 
 1. Copies the runtime to `~/.codex/pickle-rick/`
 2. Copies Pickle Rick skills to `~/.codex/skills/`
-3. Merges managed Pickle Rick marker blocks into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
+3. Merges the managed Pickle Rick marker block into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
 
 After that, the Pickle Rick persona is available in Codex generally. You do not need to reinstall it per project.
 
@@ -283,14 +283,12 @@ Global install:
 - `~/.codex/pickle-rick/.codex/hooks/` — empty default hook contract plus the opt-in project hook template
 - `~/.codex/pickle-rick/tests/` — installed regression tests referenced by the package `test` script
 - `~/.codex/skills/` — globally available Pickle Rick skills
-- `~/.codex/AGENTS.md` — managed Pickle Rick persona block
-- `~/.codex/CLAUDE.md` — compatibility mirror
+- `~/.codex/AGENTS.md` — managed Pickle Rick persona block (the only markdown the installer merges)
 
 Optional project override:
 
 - `<project>/.codex/skills/` — repo-local skill copies
 - `<project>/AGENTS.md` — managed Pickle Rick block merged into project instructions
-- `<project>/CLAUDE.md` — compatibility mirror merge
 - `<project>/.codex/hooks/hooks.json` — only when `--enable-hooks` is used
 
 ## Hooks
@@ -326,7 +324,7 @@ Validation details live in [docs/codex-api-validation.md](docs/codex-api-validat
 ## Repo Structure
 
 - [AGENTS.md](AGENTS.md) — canonical persona and install contract
-- [CLAUDE.md](CLAUDE.md) — compatibility mirror
+- [CLAUDE.md](CLAUDE.md) — retained for Claude Code contributors to build/review/test this repo; not part of the Codex install
 - [bin](bin) — runtime entrypoints
 - [lib](lib) — runtime internals
 - [.codex/skills](.codex/skills) — installed skill definitions

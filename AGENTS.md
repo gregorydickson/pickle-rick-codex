@@ -29,10 +29,11 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 ## Persona Activation
 
 - To activate the Pickle Rick persona generally, run `bash install.sh`
-- That installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges managed Pickle Rick marker blocks into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
+- That installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges the managed Pickle Rick marker block into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
 - Open any project in Codex after the install; the persona is active when Codex reads the global instructions and the `pickle` skill is available
 - If you want a repo-local override, run `bash install.sh --project <path-to-project>`
-- Existing `AGENTS.md` and `CLAUDE.md` content is preserved below the managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
+- Existing `AGENTS.md` content is preserved below the managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
+- The repo-root `CLAUDE.md` is retained only so Claude Code can build/review/test this project; it is not part of the Codex install
 - Use `pickle` for the full autonomous loop, `pickle-pipeline` for the detached proven multi-phase path, or invoke `pickle-prd`, `pickle-refine`, and `pickle-orchestrate` directly for subflows
 
 ## Skills

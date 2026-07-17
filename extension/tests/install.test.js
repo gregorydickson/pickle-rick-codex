@@ -22,6 +22,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   fs.writeFileSync(path.join(codexHome, 'skills', 'existing-skill', 'SKILL.md'), '---\nname: existing-skill\n---\n');
   fs.writeFileSync(path.join(codexHome, 'AGENTS.md'), '# Existing Global Instructions\n');
   fs.writeFileSync(path.join(codexHome, 'CLAUDE.md'), '# Existing Global Claude Instructions\n');
+  const preexistingGlobalClaude = fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8');
   const output = runBash(['install.sh'], {
     cwd: projectRoot,
     env: { PICKLE_DATA_ROOT: installRoot, CODEX_HOME: codexHome, PICKLE_INSTALL_SKIP_BUILD: '1' },
@@ -46,7 +47,6 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(installRoot, 'tests', 'install.test.js')));
   assert.ok(fs.existsSync(path.join(installRoot, 'tests', 'helpers.js')));
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));
-  assert.ok(fs.existsSync(path.join(codexHome, 'CLAUDE.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-pipeline', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(codexHome, 'skills', 'pickle-refine', 'SKILL.md')));
@@ -66,11 +66,11 @@ test('install.sh copies the runtime and installs the global persona and skills',
   const installedReadme = fs.readFileSync(path.join(installRoot, 'README.md'), 'utf8');
   assert.match(globalAgents, /PICKLE_RICK_AGENTS_BEGIN/);
   assert.match(globalAgents, /# Existing Global Instructions/);
-  assert.match(globalClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
+  assert.doesNotMatch(globalClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
+  assert.equal(globalClaude, preexistingGlobalClaude);
+  assert.equal(fs.existsSync(path.join(installRoot, 'CLAUDE.md')), false);
   assert.match(globalAgents, new RegExp(escapeRegex(installRoot)));
-  assert.match(globalClaude, new RegExp(escapeRegex(installRoot)));
   assert.doesNotMatch(globalAgents, /~\/\.codex\/pickle-rick/);
-  assert.doesNotMatch(globalClaude, /~\/\.codex\/pickle-rick/);
   assert.match(installedReadme, new RegExp(escapeRegex(installRoot)));
   assert.doesNotMatch(installedReadme, /~\/\.codex\/pickle-rick/);
   assert.ok(fs.existsSync(path.join(codexHome, 'pickle-rick-backups')));
@@ -105,13 +105,10 @@ test('install.sh writes managed marker blocks on first install and remains idemp
   });
 
   const firstAgents = fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8');
-  const firstClaude = fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8');
   assert.match(firstAgents, /PICKLE_RICK_AGENTS_BEGIN/);
-  assert.match(firstClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
   assert.equal(countMatches(firstAgents, /PICKLE_RICK_AGENTS_BEGIN/g), 1);
   assert.equal(countMatches(firstAgents, /PICKLE_RICK_AGENTS_END/g), 1);
-  assert.equal(countMatches(firstClaude, /PICKLE_RICK_CLAUDE_BEGIN/g), 1);
-  assert.equal(countMatches(firstClaude, /PICKLE_RICK_CLAUDE_END/g), 1);
+  assert.equal(fs.existsSync(path.join(codexHome, 'CLAUDE.md')), false);
 
   runBash(['install.sh'], {
     cwd: projectRoot,
@@ -119,7 +116,7 @@ test('install.sh writes managed marker blocks on first install and remains idemp
   });
 
   assert.equal(fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8'), firstAgents);
-  assert.equal(fs.readFileSync(path.join(codexHome, 'CLAUDE.md'), 'utf8'), firstClaude);
+  assert.equal(fs.existsSync(path.join(codexHome, 'CLAUDE.md')), false);
 });
 
 test('install.sh --project preserves existing project codex state while adding repo-local overrides', () => {
@@ -130,6 +127,7 @@ test('install.sh --project preserves existing project codex state while adding r
   fs.writeFileSync(path.join(projectDir, '.codex', 'skills', 'existing-skill', 'SKILL.md'), '---\nname: existing-skill\n---\n');
   fs.writeFileSync(path.join(projectDir, 'AGENTS.md'), '# Existing Instructions\n');
   fs.writeFileSync(path.join(projectDir, 'CLAUDE.md'), '# Existing Claude Instructions\n');
+  const preexistingProjectClaude = fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8');
 
   const output = runBash(['install.sh', '--project', projectDir], {
     cwd: projectRoot,
@@ -157,11 +155,10 @@ test('install.sh --project preserves existing project codex state while adding r
   const projectClaude = fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8');
   assert.match(projectAgents, /PICKLE_RICK_AGENTS_BEGIN/);
   assert.match(projectAgents, /# Existing Instructions/);
-  assert.match(projectClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
+  assert.doesNotMatch(projectClaude, /PICKLE_RICK_CLAUDE_BEGIN/);
+  assert.equal(projectClaude, preexistingProjectClaude);
   assert.match(projectAgents, new RegExp(escapeRegex(installRoot)));
-  assert.match(projectClaude, new RegExp(escapeRegex(installRoot)));
   assert.doesNotMatch(projectAgents, /~\/\.codex\/pickle-rick/);
-  assert.doesNotMatch(projectClaude, /~\/\.codex\/pickle-rick/);
   assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'pickle-rick-backups')));
 });
 

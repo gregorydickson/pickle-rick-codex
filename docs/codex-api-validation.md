@@ -12,9 +12,9 @@ Validated locally on `2026-04-16` against `codex-cli 0.121.0`.
 
 ## Installation Facts
 
-- `bash install.sh` installs the runtime into the local Codex root at `~/.codex/pickle-rick/`, installs Pickle Rick skills into `~/.codex/skills/`, and merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` and `~/.codex/CLAUDE.md`
+- `bash install.sh` installs the runtime into the local Codex root at `~/.codex/pickle-rick/`, installs Pickle Rick skills into `~/.codex/skills/`, and merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
 - `bash install.sh --project <path-to-project>` is optional and adds repo-local Pickle Rick persona files plus Pickle Rick skill directories to the target project
-- Existing `AGENTS.md` and `CLAUDE.md` content is preserved under a managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
+- Existing `AGENTS.md` content is preserved under a managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
 - The Pickle Rick persona is active generally once Codex reads the global `~/.codex/AGENTS.md` and the `pickle` skill is available
 - The install flow stays local-only; no marketplace publishing is required for the validated path
 - A clean `codex exec` probe in a temp directory returned `Pickle Rick` when asked for the active persona after global install

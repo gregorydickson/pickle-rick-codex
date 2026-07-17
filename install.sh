@@ -313,7 +313,6 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   rm -rf "$target_root/bin" "$target_root/lib" "$target_root/docs" "$target_root/.codex-plugin"
   copy_item README.md
   copy_item AGENTS.md
-  copy_item CLAUDE.md
   copy_item package.json
   copy_item prd.md
   copy_item install.sh
@@ -341,12 +340,10 @@ fi
 
 install_skill_tree "$codex_home/skills" "$target_root"
 merge_managed_markdown "$target_root/AGENTS.md" "$codex_home/AGENTS.md" "agents" "$codex_home/pickle-rick-backups"
-merge_managed_markdown "$target_root/CLAUDE.md" "$codex_home/CLAUDE.md" "claude" "$codex_home/pickle-rick-backups"
 
 if [[ -n "$project_dir" && "$project_is_source" -eq 0 ]]; then
   install_skill_tree "$project_dir/.codex/skills" "$target_root"
   merge_managed_markdown "$target_root/AGENTS.md" "$project_dir/AGENTS.md" "agents" "$project_dir/.codex/pickle-rick-backups"
-  merge_managed_markdown "$target_root/CLAUDE.md" "$project_dir/CLAUDE.md" "claude" "$project_dir/.codex/pickle-rick-backups"
   if [[ "$enable_hooks" -eq 1 ]]; then
     install_project_hooks "$project_dir/.codex/hooks" "$target_root" "$repo_root/.codex/hooks/hooks.template.json"
   fi
