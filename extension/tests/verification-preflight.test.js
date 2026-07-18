@@ -31,6 +31,14 @@ function cleanWorkerProject(prefix = 'pickle-rick-clean-worker-') {
   return projectDir;
 }
 
+function commitWorkerFixture(projectDir) {
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  runGit(projectDir, ['add', '.']);
+  runGit(projectDir, ['commit', '-m', 'fixture']);
+}
+
 function writePreflightManifest(sessionDir, verificationEnv, verification = ['node -e "process.exit(0)"']) {
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -210,6 +218,7 @@ test('spawn-morty uses deterministic verification env when configured', () => {
             DATABASE_URL: { from_env: 'GOOD_DATABASE_URL' },
           },
         },
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -573,6 +582,7 @@ test('spawn-morty executes object-wrapped verification commands after shared nor
             },
           ],
         },
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -614,6 +624,7 @@ test('spawn-morty executes array-of-object verification commands after shared no
           { command: buildVerificationWriteCommand(proofPath, 'verified\n') },
           { command: buildVerificationReadCommand(proofPath, 'verified\n') },
         ],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -652,6 +663,7 @@ test('spawn-morty preserves quoted && inside string-form verification commands',
         description: 'String verification should only split on shell-level && operators.',
         acceptance_criteria: ['Quoted logical operators inside a single verification command are preserved.'],
         verification: `node -e ${JSON.stringify(`const fs = require('node:fs'); const ok = true && true; if (!ok) process.exit(1); fs.writeFileSync(${JSON.stringify(proofPath)}, 'verified\\n');`)}`,
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -692,8 +704,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
-const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
-const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+const markerRoot = ${JSON.stringify(dataRoot)};
+const broadMarker = path.join(markerRoot, 'broad-suite-ran.txt');
+const targetedMarker = path.join(markerRoot, 'targeted-suite-ran.txt');
 if (args[0] === 'test') {
   fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
   console.error('broad test wrapper invoked');
@@ -713,6 +726,7 @@ console.error('unexpected pnpm invocation: ' + args.join(' '));
 process.exit(1);
 `, { mode: 0o755 });
   fs.chmodSync(path.join(fakeBin, 'pnpm'), 0o755);
+  commitWorkerFixture(projectDir);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted vitest verification'], {
     env,
@@ -726,6 +740,7 @@ process.exit(1);
         description: 'Scoped verification should rewrite into a targeted vitest run.',
         acceptance_criteria: ['Scoped vitest verification runs only the targeted file.'],
         verification: ['pnpm test -- tests/targeted.test.ts'],
+        allowed_paths: ['tests/targeted.test.ts', 'targeted-suite-ran.txt'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -754,10 +769,10 @@ process.exit(1);
 
   assert.equal(result.status, 'done');
   assert.equal(ticket.status, 'Done');
-  assert.ok(fs.existsSync(path.join(projectDir, 'targeted-suite-ran.txt')));
-  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.ok(fs.existsSync(path.join(dataRoot, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(dataRoot, 'broad-suite-ran.txt')));
   assert.match(
-    fs.readFileSync(path.join(projectDir, 'targeted-suite-ran.txt'), 'utf8'),
+    fs.readFileSync(path.join(dataRoot, 'targeted-suite-ran.txt'), 'utf8'),
     /exec vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
   );
   assert.match(prompt, /'pnpm' 'exec' 'vitest' 'run' '--config' 'vitest\.config\.mjs' 'tests\/targeted\.test\.ts'/);
@@ -788,8 +803,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
-const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
-const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+const markerRoot = ${JSON.stringify(dataRoot)};
+const broadMarker = path.join(markerRoot, 'broad-suite-ran.txt');
+const targetedMarker = path.join(markerRoot, 'targeted-suite-ran.txt');
 if (args[0] === 'test') {
   fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
   console.error('broad test wrapper invoked');
@@ -810,6 +826,7 @@ console.error('unexpected npm invocation: ' + args.join(' '));
 process.exit(1);
 `, { mode: 0o755 });
   fs.chmodSync(path.join(fakeBin, 'npm'), 0o755);
+  commitWorkerFixture(projectDir);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted npm prefix vitest verification'], {
     env,
@@ -823,6 +840,7 @@ process.exit(1);
         description: 'Scoped verification should rewrite npm --prefix into a targeted vitest run.',
         acceptance_criteria: ['Scoped npm --prefix vitest verification runs only the targeted file.'],
         verification: ['npm --prefix packages/app test -- tests/targeted.test.ts'],
+        allowed_paths: ['packages/app/tests/targeted.test.ts', 'packages/app/targeted-suite-ran.txt'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -836,10 +854,10 @@ process.exit(1);
 
   const result = JSON.parse(output);
   assert.equal(result.status, 'done');
-  assert.ok(fs.existsSync(path.join(packageDir, 'targeted-suite-ran.txt')));
-  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.ok(fs.existsSync(path.join(dataRoot, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(dataRoot, 'broad-suite-ran.txt')));
   assert.match(
-    fs.readFileSync(path.join(packageDir, 'targeted-suite-ran.txt'), 'utf8'),
+    fs.readFileSync(path.join(dataRoot, 'targeted-suite-ran.txt'), 'utf8'),
     /exec -- vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
   );
 });
@@ -869,8 +887,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
-const broadMarker = path.join(process.cwd(), 'broad-suite-ran.txt');
-const targetedMarker = path.join(process.cwd(), 'targeted-suite-ran.txt');
+const markerRoot = ${JSON.stringify(dataRoot)};
+const broadMarker = path.join(markerRoot, 'broad-suite-ran.txt');
+const targetedMarker = path.join(markerRoot, 'targeted-suite-ran.txt');
 if (args[0] === '--filter' && args[2] === 'test') {
   fs.writeFileSync(broadMarker, args.join(' ') + '\\n');
   console.error('broad filtered test wrapper invoked');
@@ -890,6 +909,7 @@ console.error('unexpected pnpm invocation: ' + args.join(' '));
 process.exit(1);
 `, { mode: 0o755 });
   fs.chmodSync(path.join(fakeBin, 'pnpm'), 0o755);
+  commitWorkerFixture(projectDir);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'targeted pnpm filter vitest verification'], {
     env,
@@ -903,6 +923,7 @@ process.exit(1);
         description: 'Scoped verification should rewrite pnpm --filter into a targeted vitest run.',
         acceptance_criteria: ['Scoped pnpm --filter vitest verification runs only the targeted file.'],
         verification: ['pnpm --filter @loanlight/app test -- tests/targeted.test.ts'],
+        allowed_paths: ['packages/app/tests/targeted.test.ts', 'packages/app/targeted-suite-ran.txt'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -916,10 +937,10 @@ process.exit(1);
 
   const result = JSON.parse(output);
   assert.equal(result.status, 'done');
-  assert.ok(fs.existsSync(path.join(packageDir, 'targeted-suite-ran.txt')));
-  assert.ok(!fs.existsSync(path.join(projectDir, 'broad-suite-ran.txt')));
+  assert.ok(fs.existsSync(path.join(dataRoot, 'targeted-suite-ran.txt')));
+  assert.ok(!fs.existsSync(path.join(dataRoot, 'broad-suite-ran.txt')));
   assert.match(
-    fs.readFileSync(path.join(packageDir, 'targeted-suite-ran.txt'), 'utf8'),
+    fs.readFileSync(path.join(dataRoot, 'targeted-suite-ran.txt'), 'utf8'),
     /exec vitest run --config vitest\.config\.mjs tests\/targeted\.test\.ts/,
   );
 });
@@ -963,6 +984,7 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
         description: 'Phase runs should stop promptly once the promise token is written.',
         acceptance_criteria: ['The ticket completes without waiting for each lingering fake codex process to self-exit.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1011,6 +1033,7 @@ test('spawn-morty distinguishes normal verification command failure from preflig
             NODE_ENV: 'test',
           },
         },
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1052,6 +1075,7 @@ test('baseline red', () => {
 import test from 'node:test';
 test('ticket pass', () => {});
 `);
+  commitWorkerFixture(projectDir);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'subtract known reds'], {
     env,
@@ -1073,6 +1097,7 @@ test('ticket pass', () => {});
         description: 'Broad node --test runs should ignore matching baseline reds.',
         acceptance_criteria: ['Known unrelated reds do not block the ticket.'],
         verification: ['node --test'],
+        allowed_paths: ['tests/ticket-pass.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -2147,6 +2172,7 @@ test('spawn-morty ignores vars assigned inside verification commands', () => {
         description: 'Verification assigns its own shell variable before using it.',
         acceptance_criteria: ['Shell-local assignments do not trigger missing-env preflight failures.'],
         verification: ['export SIBLING_REPO_ROOT=. ; test -d "$SIBLING_REPO_ROOT"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },

@@ -11,7 +11,7 @@ import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 import { updateSessionMap } from '../services/session-map.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor } from './helpers.js';
+import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
 function runGit(repoDir, args) {
@@ -28,6 +28,41 @@ function initGitRepo(repoDir) {
   runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
 }
 
+function createCountingLifecycleCodex(binDir, countPath) {
+  writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const counterPath = ${JSON.stringify(countPath)};
+const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
+fs.writeFileSync(counterPath, String(current));
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+const prompt = fs.readFileSync(0, 'utf8');
+const phase = prompt.match(/You are executing the "([^"]+)" phase/)?.[1] || '';
+${fakeLifecycleArtifactWriterSource()}
+if (phase) writeFakeLifecycleArtifact(prompt, phase);
+
+let outputLastMessagePath = '';
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  }
+}
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, phase ? '<promise>' + phase.toUpperCase() + '_COMPLETE</promise>' : '<promise>OK</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+process.exit(0);
+`);
+}
+
 function createPipelineSession({
   env,
   projectDir,
@@ -35,6 +70,7 @@ function createPipelineSession({
   phases = ['pickle', 'anatomy-park'],
   anatomy = {},
   szechuan = {},
+  scope = ['pipeline-output.txt'],
 } = {}) {
   const realProjectDir = fs.realpathSync(projectDir);
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', task], {
@@ -67,6 +103,7 @@ function createPipelineSession({
     },
     bootstrap_source: 'task',
     task,
+    scope,
     anatomy,
     szechuan,
   });
@@ -1397,41 +1434,18 @@ test('pickle-tmux rolls back tmux launch state on launch failure', () => {
 
 test('mux-runner refreshes the run timer instead of inheriting stale session start time', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-runner-timer-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'README.md'), '# Runner timer fixture\n');
+  runGit(projectDir, ['add', 'README.md']);
+  runGit(projectDir, ['commit', '-m', 'fixture']);
   const countPath = path.join(dataRoot, 'codex-count.txt');
-  writeExecutable(
-    path.join(fakeBin, 'codex'),
-    `#!/usr/bin/env node
-import fs from 'node:fs';
-
-const args = process.argv.slice(2);
-const counterPath = ${JSON.stringify(countPath)};
-const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
-fs.writeFileSync(counterPath, String(current));
-
-if (args[0] === '--version') {
-  console.log('codex 9.9.9-test');
-  process.exit(0);
-}
-
-let outputLastMessagePath = '';
-for (let index = 0; index < args.length; index += 1) {
-  if (args[index] === '--output-last-message') {
-    outputLastMessagePath = args[index + 1] || '';
-    index += 1;
-  }
-}
-if (outputLastMessagePath) {
-  fs.writeFileSync(outputLastMessagePath, '<promise>OK</promise>');
-}
-console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
-process.exit(0);
-`,
-  );
+  createCountingLifecycleCodex(fakeBin, countPath);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'runner timer task'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -1442,6 +1456,7 @@ process.exit(0);
         description: 'Verify the timer refreshes on detached runner start.',
         acceptance_criteria: ['Runner can execute one ticket.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1461,7 +1476,7 @@ process.exit(0);
 
   runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   });
 
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
@@ -1469,7 +1484,7 @@ process.exit(0);
   assert.equal(state.step, 'complete');
   assert.equal(state.start_time_epoch, 1);
   assert.ok(Number(state.run_start_time_epoch) > 1);
-  assert.equal(fs.readFileSync(countPath, 'utf8'), '5');
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '8');
 
   const output = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], {
     env,
@@ -1616,7 +1631,12 @@ test('mux-runner refuses pre-existing untracked files before worker execution', 
 
 test('mux-runner preserves ticket failure when max_time would block a retry', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-runner-failure-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'README.md'), '# Runner failure fixture\n');
+  runGit(projectDir, ['add', 'README.md']);
+  runGit(projectDir, ['commit', '-m', 'fixture']);
   const countPath = path.join(dataRoot, 'codex-fail-count.txt');
   writeExecutable(
     path.join(fakeBin, 'codex'),
@@ -1641,7 +1661,7 @@ process.exit(1);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'runner failure task'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -1652,6 +1672,7 @@ process.exit(1);
         description: 'Verify max_time does not hide a real failure.',
         acceptance_criteria: ['Runner should preserve the original failure.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1671,7 +1692,7 @@ process.exit(1);
   try {
     runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
       env,
-      cwd: repoRoot,
+      cwd: projectDir,
     });
   } catch {
     // The child process may surface the terminal error directly; session state is the real assertion target.
@@ -1697,42 +1718,18 @@ process.exit(1);
 
 test('mux-runner does not retry verification-contract failures and leaves the ticket blocked', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-runner-contract-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'README.md'), '# Runner contract fixture\n');
+  runGit(projectDir, ['add', 'README.md']);
+  runGit(projectDir, ['commit', '-m', 'fixture']);
   const countPath = path.join(dataRoot, 'codex-contract-count.txt');
-  writeExecutable(
-    path.join(fakeBin, 'codex'),
-    `#!/usr/bin/env node
-import fs from 'node:fs';
-
-const args = process.argv.slice(2);
-const counterPath = ${JSON.stringify(countPath)};
-const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
-fs.writeFileSync(counterPath, String(current));
-
-if (args[0] === '--version') {
-  console.log('codex 9.9.9-test');
-  process.exit(0);
-}
-
-let outputLastMessagePath = '';
-for (let index = 0; index < args.length; index += 1) {
-  if (args[index] === '--output-last-message') {
-    outputLastMessagePath = args[index + 1] || '';
-    index += 1;
-  }
-}
-
-if (outputLastMessagePath) {
-  fs.writeFileSync(outputLastMessagePath, '<promise>SIMPLIFY_COMPLETE</promise>');
-}
-console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
-process.exit(0);
-`,
-  );
+  createCountingLifecycleCodex(fakeBin, countPath);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'verification contract retry task'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -1744,6 +1741,7 @@ process.exit(0);
         acceptance_criteria: ['Verification contract failures block without replaying the whole ticket.'],
         verification: ['test -f research/proof.txt'],
         output_artifacts: ['research/proof.txt'],
+        allowed_paths: ['research/proof.txt'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -1753,7 +1751,7 @@ process.exit(0);
   try {
     runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
       env,
-      cwd: repoRoot,
+      cwd: projectDir,
     });
   } catch {
     // Exit code is part of the assertion.
@@ -1773,7 +1771,7 @@ process.exit(0);
   assert.match(log, /verification contract blocked/);
   assert.match(log, /without retry/);
   assert.doesNotMatch(log, /attempt 2\/2/);
-  assert.equal(fs.readFileSync(countPath, 'utf8'), '5');
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '8');
 });
 
 test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLETE', () => {
@@ -2225,8 +2223,8 @@ test('pickle-pipeline advances from pickle to anatomy-park in one tmux session',
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   initGitRepo(projectDir);
-  fs.writeFileSync(path.join(projectDir, 'baseline.txt'), 'baseline\n');
-  runGit(projectDir, ['add', 'baseline.txt']);
+  fs.writeFileSync(path.join(projectDir, 'pipeline-output.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'pipeline-output.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
@@ -2318,16 +2316,16 @@ test('pickle-pipeline advances through all configured phases in one tmux session
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   initGitRepo(projectDir);
-  fs.writeFileSync(path.join(projectDir, 'pipeline.txt'), 'baseline\n');
+  fs.writeFileSync(path.join(projectDir, 'pipeline-output.txt'), 'baseline\n');
   fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
     scripts: { test: 'node -e "process.exit(0)"' },
   }));
-  runGit(projectDir, ['add', 'pipeline.txt', 'package.json']);
+  runGit(projectDir, ['add', 'pipeline-output.txt', 'package.json']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     FAKE_LOOP_COMPLETE_AFTER: '1',
-    FAKE_LOOP_MUTATE_FILE: 'pipeline.txt',
+    FAKE_LOOP_MUTATE_FILE: 'pipeline-output.txt',
     FAKE_LOOP_APPEND_TEXT: 'phase mutation\n',
   });
 
@@ -2386,7 +2384,7 @@ test('pickle-pipeline advances through all configured phases in one tmux session
   assert.match(pipelineLog, /pipeline-runner started/);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), true);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
-  assert.equal(fs.readFileSync(path.join(projectDir, 'pipeline.txt'), 'utf8'), 'baseline\nphase mutation\nphase mutation\n');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'pipeline-output.txt'), 'utf8'), 'baseline\nphase mutation\nphase mutation\n');
   const anatomyHistoryIndex = state.history.findIndex((entry) => entry.step === 'anatomy-park');
   const szechuanHistoryIndex = state.history.findIndex((entry) => entry.step === 'szechuan-sauce');
   const citadelHistoryIndex = state.history.findIndex((entry) => entry.step === 'citadel');
@@ -2720,7 +2718,7 @@ test('pickle-pipeline resume rejects immutable contract mutation', () => {
       env,
       cwd: projectDir,
     }),
-    /Cannot change pipeline skip flags on resume/,
+    /Cannot change pipeline skip flags or scope on resume/,
   );
 
   const pipeline = readJsonFile(path.join(sessionDir, 'pipeline.json'));
@@ -2733,8 +2731,8 @@ test('pickle-pipeline resumes the first incomplete phase', () => {
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   initGitRepo(projectDir);
-  fs.writeFileSync(path.join(projectDir, 'baseline.txt'), 'baseline\n');
-  runGit(projectDir, ['add', 'baseline.txt']);
+  fs.writeFileSync(path.join(projectDir, 'pipeline-output.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'pipeline-output.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
@@ -2925,7 +2923,8 @@ test('pickle-pipeline refuses to commit pre-existing tracked changes during anat
   createFakeCodex(fakeBin);
   initGitRepo(projectDir);
   fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 1;\n');
-  runGit(projectDir, ['add', 'index.js']);
+  fs.writeFileSync(path.join(projectDir, 'pipeline-output.txt'), 'pipeline baseline\n');
+  runGit(projectDir, ['add', 'index.js', 'pipeline-output.txt']);
   runGit(projectDir, ['commit', '-m', 'base']);
   fs.writeFileSync(path.join(projectDir, 'index.js'), 'export const value = 2;\n');
 
@@ -2952,25 +2951,24 @@ test('pickle-pipeline refuses to commit pre-existing tracked changes during anat
       env,
       cwd: projectDir,
     }),
-    /anatomy-park requires a clean tracked working tree/,
   );
 
   const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
   const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
-  const loopLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const pipelineLog = fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8');
 
   assert.equal(afterHead, beforeHead);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), 'M index.js');
   assert.equal(commitSubject, 'base');
-  assert.match(loopLog, /refusing anatomy-park start with 1 pre-existing tracked change/);
+  assert.match(pipelineLog, /pre-existing-dirt/);
 });
 
 test('pickle-pipeline records cancel against anatomy and does not advance', async () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   initGitRepo(projectDir);
-  fs.writeFileSync(path.join(projectDir, 'baseline.txt'), 'baseline\n');
-  runGit(projectDir, ['add', 'baseline.txt']);
+  fs.writeFileSync(path.join(projectDir, 'pipeline-output.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'pipeline-output.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
@@ -3007,7 +3005,7 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
     if (child.exitCode !== null) throw new Error(`pipeline exited before anatomy: ${pipelineError}\n${fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8')}`);
     const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'), null);
     return pipelineState?.phase_statuses?.['anatomy-park'] === 'running';
-  }, { message: 'pipeline did not enter anatomy-park' });
+  }, { timeoutMs: 15_000, message: 'pipeline did not enter anatomy-park' });
 
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
     env,
@@ -3017,7 +3015,7 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
   await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code) => {
-      if (code === 0) {
+      if (code === 0 || code === 1) {
         resolve();
         return;
       }
@@ -3040,8 +3038,8 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
   const failingDataRoot = makeTempRoot();
   const failingProjectDir = makeTempRoot('pickle-rick-project-');
   initGitRepo(failingProjectDir);
-  fs.writeFileSync(path.join(failingProjectDir, 'baseline.txt'), 'baseline\n');
-  runGit(failingProjectDir, ['add', 'baseline.txt']);
+  fs.writeFileSync(path.join(failingProjectDir, 'pipeline-output.txt'), 'baseline\n');
+  runGit(failingProjectDir, ['add', 'pipeline-output.txt']);
   runGit(failingProjectDir, ['commit', '-m', 'baseline']);
   const failingFakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(failingFakeBin);
@@ -3305,7 +3303,7 @@ test('loop-runner auto-commits anatomy-park fix iterations when the worker leave
   assert.equal(fs.readFileSync(path.join(projectDir, 'index.js'), 'utf8'), 'export const value = 1;\nexport const healed = true;\n');
   assert.match(commitSubject, /^anatomy-park: .* - Fake correctness finding #1, trap door$/);
   assert.match(runnerLog, /anatomy-park auto-committed:/);
-  assert.match(runnerLog, /iteration 1 progress: .*head_sha/);
+  assert.match(runnerLog, /iteration 1 progress: .*head_tree_sha/);
 });
 
 test('loop-runner auto-commits anatomy-park iterations that add a new regression file', () => {

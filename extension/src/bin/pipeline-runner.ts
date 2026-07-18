@@ -55,6 +55,10 @@ function isBlockingExitReason(exitReason: string): boolean {
     || String(exitReason).startsWith('preflight-');
 }
 
+export function pipelineExitFailed(exitReason: string): boolean {
+  return exitReason !== 'success';
+}
+
 function readSessionExitReason(sessionDir: string): string {
   return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
 }
@@ -183,12 +187,7 @@ async function main(argv: string[]): Promise<void> {
     throw new Error('Usage: node bin/pipeline-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
   const exitReason = await runPipeline(sessionDir, { onFailure: parseFailureMode(argv) });
-  if (
-    exitReason === 'error'
-    || exitReason === 'no_tickets'
-    || exitReason === 'invalid_session'
-    || isBlockingExitReason(exitReason)
-  ) {
+  if (pipelineExitFailed(exitReason)) {
     process.exitCode = 1;
   }
 }

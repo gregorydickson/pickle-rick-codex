@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
+import { pipelineExitFailed } from '../bin/pipeline-runner.js';
 import {
   createFakeCodex,
   createFakeTmux,
@@ -30,6 +31,13 @@ function initGitRepo(repoDir) {
   execFileSync('git', ['add', 'baseline.txt'], { cwd: repoDir });
   execFileSync('git', ['commit', '-qm', 'baseline'], { cwd: repoDir });
 }
+
+test('pipeline-runner CLI treats every non-success terminal reason as failure', () => {
+  assert.equal(pipelineExitFailed('success'), false);
+  for (const reason of ['citadel-blocked', 'circuit_open', 'cancelled', 'no_tickets', 'future-failure']) {
+    assert.equal(pipelineExitFailed(reason), true, reason);
+  }
+});
 
 test('pickle-pipeline bootstraps from task and launches detached tmux', () => {
   const dataRoot = makeTempRoot();

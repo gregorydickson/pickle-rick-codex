@@ -325,19 +325,19 @@ The installed runtime ships `.codex/hooks/hooks.json` as an empty fail-open cont
 
 ## Validated Behavior
 
-The distribution checks below were rerun on July 18, 2026; `validate:codex` recorded the locally installed CLI as `codex-cli 0.144.5`. Hook delivery remains unvalidated, but the installed sequential pipeline now has authenticated disposable-repository evidence:
+The distribution checks below were rerun on July 18, 2026; `validate:codex` recorded the locally installed CLI as `codex-cli 0.144.5`. Hook delivery remains unvalidated. The current hardened build has controlled fake-Codex coverage, but does not yet have replacement authenticated full-pipeline evidence:
 
 - `bash install.sh` installs the runtime, persona, and skills globally
 - `~/.codex/pickle-rick/install.sh --project <path>` works from the installed runtime because the canonical root skill tree is shipped with it; `--enable-hooks` is intentionally rejected
 - a clean `codex exec` probe in a temp directory returned `Pickle Rick`
 - the PRD and refinement flows can detect success artifacts and exit promptly even if the child Codex process lingers
 - `pickle-pipeline` launches one detached tmux session, records immutable pipeline metadata, advances through configured cleanup phases, and runs the mandatory Citadel release gate last, with `pipeline-runner.log` in the monitor pane
-- authenticated installed-runtime dogfood completed PRD refinement, one scoped worker ticket, an attributable clean commit, 8/8 target tests, and final Citadel approval in session `2026-07-18-1c18e785`
+- historical session `2026-07-18-1c18e785` predates the current lifecycle, scope, recovery, and Citadel hardening and is not release evidence for this build
 - `status.js` renders pipeline metadata for pipeline sessions without changing legacy non-pipeline status output
 - `pickle-tmux --prd ./prd.md` bootstraps, refines, and launches detached tmux instead of requiring a task-string workaround
 - zero-ticket detached runs fail closed with `last_exit_reason = "no_tickets"` instead of marking the session complete
 - detached tmux launchers for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park` are covered by local tests with a fake `tmux` binary
-- source and isolated installed-runtime suites pass: 238/238 fast tests and 176/176 integration tests
+- source and isolated installed-runtime release gates must pass before an authenticated dogfood run is recorded
 
 Validation details live in [docs/codex-api-validation.md](docs/codex-api-validation.md).
 

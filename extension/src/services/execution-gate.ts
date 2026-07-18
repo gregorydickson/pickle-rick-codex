@@ -164,16 +164,35 @@ export function assertQualityBaselineFresh(value: unknown, workingDir: string): 
     throw new QualityBaselineError('quality-baseline-missing', 'no persisted repository quality baseline exists');
   }
   const baseline = value as Partial<QualityBaseline>;
+  const commandsValid = Array.isArray(baseline.commands)
+    && baseline.commands.length > 0
+    && baseline.commands.every((result) => result
+      && typeof result === 'object'
+      && typeof result.command === 'string'
+      && result.command.trim().length > 0
+      && typeof result.ok === 'boolean'
+      && (result.exitCode === null || typeof result.exitCode === 'number')
+      && typeof result.signature === 'string'
+      && typeof result.output === 'string');
   if (
     typeof baseline.head_sha !== 'string'
     || typeof baseline.captured_at !== 'string'
     || !Number.isFinite(Date.parse(baseline.captured_at))
-    || !Array.isArray(baseline.commands)
+    || !commandsValid
     || !baseline.command_contract
     || typeof baseline.command_contract !== 'object'
     || Array.isArray(baseline.command_contract)
   ) {
-    throw new QualityBaselineError('quality-baseline-missing', 'persisted repository quality baseline is incomplete');
+    throw new QualityBaselineError('quality-baseline-missing', 'persisted repository quality baseline is incomplete or has no executable commands');
+  }
+  const baselineCommandNames = [...new Set(baseline.commands!.map((result) => result.command))].sort();
+  const contractCommandNames = Object.keys(baseline.command_contract!).sort();
+  if (
+    baselineCommandNames.length !== baseline.commands!.length
+    || JSON.stringify(baselineCommandNames) !== JSON.stringify(contractCommandNames)
+    || contractCommandNames.some((command) => typeof baseline.command_contract![command] !== 'string')
+  ) {
+    throw new QualityBaselineError('quality-baseline-missing', 'persisted quality results do not exactly match the executable command contract');
   }
   const currentHead = runGit(workingDir, ['rev-parse', 'HEAD']);
   if (baseline.head_sha !== currentHead) {
@@ -313,7 +332,7 @@ export async function runQualityCommand(
   });
 }
 
-/** A single failed attempt is treated as flaky; only diagnostics repeated by the bounded retry persist. */
+/** A failed attempt is flaky only when the bounded retry succeeds. Two failures always fail closed. */
 async function runQualityCommandStabilized(
   command: string,
   workingDir: string,
@@ -325,12 +344,13 @@ async function runQualityCommandStabilized(
   const retry = await runQualityCommand(command, workingDir, timeoutMs, options);
   if (retry.ok) return retry;
   const retryIdentities = new Set(resultFailureSet(retry, workingDir));
-  const persistent = resultFailureSet(first, workingDir).filter((identity) => retryIdentities.has(identity));
-  if (persistent.length === 0) {
-    return { ...retry, ok: true, failure_set: [], signature: outputSignature('', workingDir) };
-  }
+  const shared = resultFailureSet(first, workingDir).filter((identity) => retryIdentities.has(identity));
+  const persistent = shared.length > 0
+    ? shared
+    : [...new Set([first, retry].map((result) => `failed-attempt:${result.exitCode ?? 'none'}:${result.signature}`))].sort();
   return {
     ...retry,
+    ok: false,
     failure_set: persistent,
     signature: crypto.createHash('sha256').update(JSON.stringify(persistent)).digest('hex'),
   };

@@ -103,6 +103,21 @@ process.exit(1);
   assert.equal((await evaluateWorkerQualityGate(root, persistentBaseline, 5_000)).verdict, 'red');
 });
 
+test('quality gate never treats two silent failed attempts as a passing flake', async () => {
+  const root = tempRepo();
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+    scripts: { typecheck: 'node check.cjs' },
+  }));
+  const checkPath = path.join(root, 'check.cjs');
+  fs.writeFileSync(checkPath, 'process.exit(0);\n');
+  const cleanBaseline = await captureQualityBaseline(root, 5_000);
+  fs.writeFileSync(checkPath, 'process.exit(1);\n');
+  const verdict = await evaluateWorkerQualityGate(root, cleanBaseline, 5_000);
+  assert.equal(verdict.verdict, 'red');
+  assert.equal(verdict.failures[0]?.ok, false);
+  assert.ok((verdict.failures[0]?.failure_set || []).length > 0);
+});
+
 test('quality baseline freshness reports typed missing, stale HEAD, stale contract, and write failures', async () => {
   const root = tempRepo();
   const packagePath = path.join(root, 'package.json');
