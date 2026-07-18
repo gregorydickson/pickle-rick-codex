@@ -5,7 +5,13 @@ import { recoverableHardReset } from './recoverable-git.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 
 export type MetricDirection = 'higher' | 'lower';
+export type MetricTargetRelation = 'gt' | 'gte' | 'lt' | 'lte';
 export type MetricClassification = 'baseline' | 'improved' | 'held' | 'regressed';
+
+export interface MetricTargetContract {
+  target: number | null;
+  target_relation: MetricTargetRelation | null;
+}
 
 export interface MetricMeasurement {
   command: string;
@@ -23,10 +29,12 @@ export interface MetricHistoryEntry extends MetricMeasurement {
 }
 
 export interface MetricConvergenceState {
-  schema_version: 1;
+  schema_version: 2;
   command: string;
   direction: MetricDirection;
   tolerance: number;
+  target: number | null;
+  target_relation: MetricTargetRelation | null;
   baseline: MetricMeasurement;
   best: MetricMeasurement;
   latest: MetricMeasurement;
@@ -88,6 +96,63 @@ export function normalizeMetricTolerance(value: unknown): number {
     throw new Error(`Metric tolerance must be a non-negative finite number; received ${JSON.stringify(value)}.`);
   }
   return tolerance;
+}
+
+export function normalizeMetricTargetContract(
+  directionValue: unknown,
+  targetValue: unknown,
+  relationValue: unknown,
+): MetricTargetContract {
+  const direction = normalizeMetricDirection(directionValue);
+  const targetMissing = targetValue === null || targetValue === undefined || targetValue === '';
+  const relationMissing = relationValue === null || relationValue === undefined || relationValue === '';
+  if (targetMissing && relationMissing) {
+    return { target: null, target_relation: null };
+  }
+  if (targetMissing) {
+    throw new Error('Metric target relation requires a numeric target.');
+  }
+  if (relationMissing) {
+    throw new Error('Metric target requires --target-relation (gt, gte, lt, or lte).');
+  }
+
+  const target = Number(targetValue);
+  if (!Number.isFinite(target)) {
+    throw new Error(`Metric target must be a finite number; received ${JSON.stringify(targetValue)}.`);
+  }
+  if (!['gt', 'gte', 'lt', 'lte'].includes(String(relationValue))) {
+    throw new Error(`Metric target relation must be gt, gte, lt, or lte; received ${JSON.stringify(relationValue)}.`);
+  }
+  const targetRelation = relationValue as MetricTargetRelation;
+  const directionMatches = direction === 'higher'
+    ? targetRelation === 'gt' || targetRelation === 'gte'
+    : targetRelation === 'lt' || targetRelation === 'lte';
+  if (!directionMatches) {
+    throw new Error(`Metric target relation ${targetRelation} is incompatible with direction ${direction}.`);
+  }
+  return { target, target_relation: targetRelation };
+}
+
+export function isMetricTargetSatisfied(
+  score: number,
+  target: number,
+  relation: MetricTargetRelation,
+): boolean {
+  if (!Number.isFinite(score) || !Number.isFinite(target)) {
+    throw new Error('Metric target evaluation requires finite scores.');
+  }
+  switch (relation) {
+    case 'gt': return score > target;
+    case 'gte': return score >= target;
+    case 'lt': return score < target;
+    case 'lte': return score <= target;
+    default: throw new Error(`Unsupported metric target relation: ${String(relation)}.`);
+  }
+}
+
+export function metricStateTargetSatisfied(state: MetricConvergenceState): boolean {
+  if (state.target === null || state.target_relation === null) return false;
+  return isMetricTargetSatisfied(state.best.score, state.target, state.target_relation);
 }
 
 export function measureMetric(command: string, options: MeasureMetricOptions): MetricMeasurement {
@@ -209,12 +274,16 @@ export function createMetricConvergenceState(
   baseline: MetricMeasurement,
   direction: MetricDirection,
   tolerance: number,
+  targetValue: unknown = null,
+  relationValue: unknown = null,
 ): MetricConvergenceState {
+  const targetContract = normalizeMetricTargetContract(direction, targetValue, relationValue);
   return {
-    schema_version: 1,
+    schema_version: 2,
     command: baseline.command,
     direction,
     tolerance,
+    ...targetContract,
     baseline,
     best: baseline,
     latest: baseline,
@@ -235,12 +304,24 @@ function assertStateShape(value: unknown): MetricConvergenceState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Invalid microverse metric state: expected an object.');
   }
-  const state = value as MetricConvergenceState;
-  if (state.schema_version !== 1 || typeof state.command !== 'string') {
+  const raw = value as Omit<MetricConvergenceState, 'schema_version' | 'target' | 'target_relation'> & {
+    schema_version: 1 | 2;
+    target?: unknown;
+    target_relation?: unknown;
+  };
+  if ((raw.schema_version !== 1 && raw.schema_version !== 2) || typeof raw.command !== 'string') {
     throw new Error('Invalid microverse metric state: unsupported schema or command.');
   }
-  normalizeMetricDirection(state.direction);
-  normalizeMetricTolerance(state.tolerance);
+  const direction = normalizeMetricDirection(raw.direction);
+  normalizeMetricTolerance(raw.tolerance);
+  const targetContract = raw.schema_version === 1
+    ? { target: null, target_relation: null } as MetricTargetContract
+    : normalizeMetricTargetContract(direction, raw.target, raw.target_relation);
+  const state = {
+    ...raw,
+    schema_version: 2,
+    ...targetContract,
+  } as MetricConvergenceState;
   if (!Number.isFinite(state.baseline?.score) || !Number.isFinite(state.best?.score) || !Number.isFinite(state.latest?.score)) {
     throw new Error('Invalid microverse metric state: baseline, best, and latest scores must be finite.');
   }

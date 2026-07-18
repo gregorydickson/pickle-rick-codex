@@ -14,13 +14,14 @@ import { recordCodexManagerRelaunch } from './manager-relaunch-integrity.js';
 
 interface LoopConfig {
   mode: string;
-  target?: string;
+  target?: string | number;
   [key: string]: unknown;
 }
 
 interface ExistingLoopConfig {
   mode?: string;
-  target?: string;
+  target?: string | number;
+  target_relation?: string;
   [key: string]: unknown;
 }
 
@@ -91,7 +92,18 @@ function assertResumeTargetUnchanged(
   loopConfig: LoopConfig,
   existingConfig: ExistingLoopConfig | null | undefined,
 ): void {
-  if (!sessionDir || !loopConfig || typeof loopConfig.target !== 'string' || !loopConfig.target) {
+  if (!sessionDir || !loopConfig || loopConfig.target === undefined || loopConfig.target === null || loopConfig.target === '') {
+    return;
+  }
+
+  if (typeof loopConfig.target === 'number') {
+    const sameTarget = typeof existingConfig?.target === 'number' && existingConfig.target === loopConfig.target;
+    const sameRelation = existingConfig?.target_relation === loopConfig.target_relation;
+    if (!sameTarget || !sameRelation) {
+      throw new Error(
+        `Cannot change numeric target when resuming ${existingConfig?.mode || loopConfig.mode || 'detached loop'}: ${sessionDir} is pinned to ${String(existingConfig?.target_relation || '?')} ${String(existingConfig?.target ?? '?')}.`,
+      );
+    }
     return;
   }
 

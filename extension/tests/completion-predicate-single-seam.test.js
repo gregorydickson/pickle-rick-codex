@@ -80,7 +80,6 @@ test('PIN 1: zero readEvidence(<arg>) callsites outside ticket-completion-eviden
       `evaluateCompletionEvidence (B-1SEAM single-seam regression): ${violations.join(', ')}`,
   );
 });
-
 test('PIN 2: evaluateCompletionEvidence( callsites are exactly {spawn-morty.ts: 1}', () => {
   const spawnMortyCount = (spawnMortyCode.match(/evaluateCompletionEvidence\(/g) || []).length;
   assert.equal(
@@ -151,5 +150,24 @@ test('FAIL-INJECTION: the readEvidence callsite regex catches real calls and spa
   assert.ok(
     !READ_EVIDENCE_CALLSITE_RE.test("reason: `... readEvidence().kind === 'absent' ...`"),
     'zero-arg prose mention must NOT count as a callsite',
+  );
+});
+
+test('PIN 5: detached-loop completion uses only persisted final-message evidence', () => {
+  const loopRunner = nonCommentText(
+    fs.readFileSync(path.join(srcRoot, 'bin', 'loop-runner.ts'), 'utf8'),
+  );
+
+  assert.ok(
+    /function authoritativeLoopCompletionToken\(outputLastMessagePath: string\)/.test(loopRunner),
+    'loop-runner must centralize authoritative final-message token parsing.',
+  );
+  assert.ok(
+    /return \(\) => authoritativeLoopCompletionToken\(outputLastMessagePath\) !== null/.test(loopRunner),
+    'early-success monitoring must consult only authoritative final-message evidence.',
+  );
+  assert.ok(
+    !/hasPromiseToken/.test(loopRunner),
+    'loop-runner must not scan stdout, streamed assistant content, or result.lastMessage for promise tokens.',
   );
 });

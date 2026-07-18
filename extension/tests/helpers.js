@@ -139,7 +139,12 @@ for (let index = 1; index < args.length; index += 1) {
   }
 }
 
-const sessionDir = addDirs.at(-1) || process.cwd();
+const sessionDir = prompt.match(/Session control dir \\(read-only\\): ([^\\n]+)/)?.[1]?.trim()
+  || addDirs.at(-1)
+  || process.cwd();
+const workerArtifactDir = prompt.match(/Worker artifact dir: ([^\\n]+)/)?.[1]?.trim()
+  || addDirs.at(-1)
+  || sessionDir;
 const prdPath = path.join(sessionDir, 'prd.md');
 const refinedPath = path.join(sessionDir, 'prd_refined.md');
 const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
@@ -216,6 +221,20 @@ if (prompt.includes('You are the Citadel release reviewer')) {
   fs.writeFileSync(path.join(sessionDir, 'loop-iteration-' + current + '.txt'), prompt);
   const loopModeMatch = prompt.match(/Loop mode: ([^\\n]+)/);
   const loopMode = loopModeMatch ? loopModeMatch[1].trim() : 'loop';
+  const experimentMatch = prompt.match(/Current experiment ID: (exp-\\d+)/);
+  const experimentArtifactPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)?.[1]?.trim();
+  if (loopMode === 'microverse' && experimentMatch) {
+    fs.writeFileSync(experimentArtifactPath || path.join(workerArtifactDir, 'microverse-experiment.json'), JSON.stringify({
+      experiment_id: experimentMatch[1],
+      hypothesis: 'Fake measured hypothesis ' + current,
+      hypothesis_family: 'fake/metric',
+      differentiator: 'iteration ' + current,
+      rationale: 'Exercise the measured Microverse runtime contract.',
+      target_paths: process.env.FAKE_LOOP_MUTATE_FILE ? [process.env.FAKE_LOOP_MUTATE_FILE] : [],
+      insight: 'Fake worker completed measured iteration ' + current,
+      verification: ['fake metric verification'],
+    }, null, 2));
+  }
   const loopMutateFile = process.env.FAKE_LOOP_MUTATE_FILE || '';
   if (loopMutateFile) {
     const targetPath = path.resolve(process.cwd(), loopMutateFile);
@@ -237,9 +256,9 @@ if (prompt.includes('You are the Citadel release reviewer')) {
       trap_doors: ['guard drift'],
       next_action: summaryVariant === 'changing' ? 'continue' : 'new evidence required',
     };
-    fs.writeFileSync(path.join(sessionDir, loopMode + '-summary.json'), JSON.stringify(summary, null, 2));
+    fs.writeFileSync(path.join(workerArtifactDir, loopMode + '-summary.json'), JSON.stringify(summary, null, 2));
     fs.writeFileSync(
-      path.join(sessionDir, loopMode + '-summary.md'),
+      path.join(workerArtifactDir, loopMode + '-summary.md'),
       [
         '# Summary',
         '',

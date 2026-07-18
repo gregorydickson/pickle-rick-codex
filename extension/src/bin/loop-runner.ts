@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from '../services/codex.js';
+import { runCodexExecMonitored, assertCodexSucceeded } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
 import { canExecute, loadCircuitState, recordIteration } from '../services/circuit-breaker.js';
 import { logActivity } from '../services/activity-logger.js';
@@ -24,7 +24,9 @@ import {
   createMetricConvergenceState,
   measureMetric,
   normalizeMetricDirection,
+  normalizeMetricTargetContract,
   normalizeMetricTolerance,
+  metricStateTargetSatisfied,
   readMetricConvergenceState,
   recordMetricIteration,
   writeMetricConvergenceState,
@@ -32,6 +34,27 @@ import {
   type MetricConvergenceState,
   type MetricIterationCheckpoint,
 } from '../services/metric-convergence.js';
+import {
+  abandonPlannedExperiment,
+  assertExperimentStrategy,
+  compactExperimentMemory,
+  completeExperiment,
+  planExperiment,
+  readExperimentLedger,
+  reconcileRunningExperiments,
+  recordWorkerAttemptFailure,
+  researchConvergenceState,
+  startExperiment,
+  updateExperimentPlan,
+  type ExperimentClassification,
+  type MicroverseExperimentRecord,
+} from '../services/experiment-ledger.js';
+import { archiveMicroverseExperiment } from '../services/microverse-experiment-archive.js';
+import {
+  captureProtectedPathManifest,
+  changedProtectedPaths,
+  type ProtectedPathManifest,
+} from '../services/microverse-protection.js';
 import { recoverableHardReset } from '../services/recoverable-git.js';
 import { enforceLoopMutationScope } from '../services/pipeline-scope.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
@@ -39,12 +62,11 @@ import { buildLoopPrompt, type LoopPromptConfig, type LoopPromptState } from '..
 import { appendHistory, getRunStartEpoch } from '../services/session.js';
 import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../services/pipeline-phase-setup.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { readJsonFile } from '../services/pickle-utils.js';
-import { readScrubbedWorkerMessage, scrubWorkerOutput } from '../services/worker-output.js';
+import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
+import { scrubWorkerOutput } from '../services/worker-output.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import type {
   Config,
-  CodexSpawnResult,
   ProgressSnapshot,
   SuccessCheck,
 } from '../types/index.js';
@@ -56,6 +78,22 @@ interface SummaryPaths {
   markdown: string;
   stopJson: string;
   stopMarkdown: string;
+}
+
+interface ControlFileSnapshot {
+  filePath: string;
+  existed: boolean;
+  content: Buffer | null;
+}
+
+interface MicroverseAttemptTransaction {
+  schema_version: 1;
+  experiment_id: string;
+  iteration: number;
+  attempt: number;
+  checkpoint: MetricIterationCheckpoint;
+  metric_state_before: MetricConvergenceState;
+  created_at: string;
 }
 
 function appendRunnerLog(sessionDir: string, message: string): void {
@@ -78,29 +116,124 @@ function summaryPaths(sessionDir: string, mode: string): SummaryPaths {
   };
 }
 
-function readLastMessageArtifact(outputLastMessagePath: string): string {
-  return readScrubbedWorkerMessage(outputLastMessagePath);
-}
-
-function loopSuccessCheck(outputLastMessagePath: string): SuccessCheck {
-  const tokens = ['LOOP_COMPLETE', 'TASK_COMPLETED', 'CONTINUE'];
-  return ({ stdout, lastMessage }) => {
-    const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
-    const scrubbedStdout = scrubWorkerOutput(stdout || '');
-    const scrubbedLastMessage = scrubWorkerOutput(lastMessage || '');
-    return tokens.some((token) =>
-      hasPromiseToken(scrubbedLastMessage, token)
-      || hasPromiseToken(scrubbedStdout, token)
-      || hasPromiseToken(persistedMessage, token),
-    );
+function workerSummaryPaths(workerArtifactDir: string, mode: string): Pick<SummaryPaths, 'json' | 'markdown'> {
+  return {
+    json: path.join(workerArtifactDir, `${mode}-summary.json`),
+    markdown: path.join(workerArtifactDir, `${mode}-summary.md`),
   };
 }
 
-function loopShouldExit(outputLastMessagePath: string, result: CodexSpawnResult): boolean {
+function createWorkerArtifactDir(sessionDir: string, mode: string, iteration: number, attempt: number): string {
+  const root = path.join(sessionDir, 'worker-artifacts');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  fs.chmodSync(root, 0o700);
+  const artifactDir = fs.mkdtempSync(path.join(root, `${mode}-${iteration}-attempt-${attempt}-`));
+  fs.chmodSync(artifactDir, 0o700);
+  return artifactDir;
+}
+
+function createOutputLastMessagePath(sessionDir: string, mode: string, iteration: number, attempt: number): string {
+  const root = path.join(sessionDir, 'control', 'last-messages');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  fs.chmodSync(root, 0o700);
+  return path.join(root, `${mode}.${iteration}.attempt-${attempt}.txt`);
+}
+
+function assertControlPlaneOutsideWorkerCwd(sessionDir: string, workingDir: string): void {
+  const canonicalWorkingDir = fs.realpathSync.native(path.resolve(workingDir));
+  const canonicalSessionDir = fs.realpathSync.native(path.resolve(sessionDir));
+  const relative = path.relative(canonicalWorkingDir, canonicalSessionDir);
+  if (relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) {
+    throw new Error('Pickle session control directory must be outside the worker working directory.');
+  }
+}
+
+function captureControlFiles(sessionDir: string): ControlFileSnapshot[] {
+  return ['loop_config.json', 'microverse-metrics.json', 'microverse-experiments.json', 'microverse-attempt.json'].map((name) => {
+    const filePath = path.join(sessionDir, name);
+    const existed = fs.existsSync(filePath);
+    return { filePath, existed, content: existed ? fs.readFileSync(filePath) : null };
+  });
+}
+
+function restoreTamperedControlFiles(snapshots: ControlFileSnapshot[]): string[] {
+  const tampered: string[] = [];
+  for (const snapshot of snapshots) {
+    const currentExists = fs.existsSync(snapshot.filePath);
+    const current = currentExists ? fs.readFileSync(snapshot.filePath) : null;
+    const changed = snapshot.existed !== currentExists
+      || (snapshot.content !== null && current !== null && !snapshot.content.equals(current));
+    if (!changed) continue;
+    tampered.push(path.basename(snapshot.filePath));
+    if (snapshot.existed && snapshot.content) {
+      fs.writeFileSync(snapshot.filePath, snapshot.content, { mode: 0o600 });
+    } else {
+      fs.rmSync(snapshot.filePath, { force: true });
+    }
+  }
+  return tampered;
+}
+
+function promoteWorkerSummaryArtifacts(workerArtifactDir: string, sessionDir: string, mode: string): void {
+  if (!['anatomy-park', 'szechuan-sauce'].includes(mode)) return;
+  const source = workerSummaryPaths(workerArtifactDir, mode);
+  const destination = summaryPaths(sessionDir, mode);
+  for (const [sourcePath, destinationPath] of [
+    [source.json, destination.json],
+    [source.markdown, destination.markdown],
+  ]) {
+    if (!fs.existsSync(sourcePath)) continue;
+    const stat = fs.lstatSync(sourcePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_048_576) {
+      throw new Error(`Invalid worker summary artifact: ${sourcePath}`);
+    }
+    fs.writeFileSync(destinationPath, fs.readFileSync(sourcePath), { mode: 0o600 });
+  }
+}
+
+function readLastMessageArtifact(outputLastMessagePath: string): string {
+  return outputLastMessagePath && fs.existsSync(outputLastMessagePath)
+    ? fs.readFileSync(outputLastMessagePath, 'utf8')
+    : '';
+}
+
+type LoopCompletionToken = 'LOOP_COMPLETE' | 'TASK_COMPLETED' | 'CONTINUE';
+
+function authoritativeLoopCompletionToken(outputLastMessagePath: string): LoopCompletionToken | null {
   const persistedMessage = readLastMessageArtifact(outputLastMessagePath);
-  return hasPromiseToken(scrubWorkerOutput(result?.lastMessage || ''), 'LOOP_COMPLETE')
-    || hasPromiseToken(scrubWorkerOutput(result?.stdout || ''), 'LOOP_COMPLETE')
-    || hasPromiseToken(persistedMessage, 'LOOP_COMPLETE');
+  const matches = [...persistedMessage.matchAll(/<promise>\s*(LOOP_COMPLETE|TASK_COMPLETED|CONTINUE)\s*<\/promise>/g)];
+  if (matches.length !== 1) return null;
+  return matches[0][1] as LoopCompletionToken;
+}
+
+function loopSuccessCheck(outputLastMessagePath: string): SuccessCheck {
+  return () => authoritativeLoopCompletionToken(outputLastMessagePath) !== null;
+}
+
+function writeWorkerDiagnostics(
+  sessionDir: string,
+  mode: string,
+  iteration: number,
+  attempt: number,
+  outputMessagePath: string,
+  result: Awaited<ReturnType<typeof runCodexExecMonitored>>,
+  completionToken: LoopCompletionToken | null,
+): void {
+  const scrubbedStderr = scrubWorkerOutput(result.stderr || '');
+  const diagnostics = {
+    exit_code: result.exitCode,
+    timed_out: result.timedOut,
+    cancelled: result.cancelled,
+    terminated_after_success: result.terminatedAfterSuccess,
+    last_message_present: readLastMessageArtifact(outputMessagePath).length > 0,
+    completion_token: completionToken,
+    stderr_tail: scrubbedStderr.slice(-4_096),
+  };
+  fs.writeFileSync(
+    path.join(sessionDir, `${mode}.${iteration}.attempt-${attempt}.worker-diagnostics.json`),
+    JSON.stringify(diagnostics, null, 2),
+    { mode: 0o600 },
+  );
 }
 
 function normalizeLoopMessage(message: unknown): string {
@@ -179,6 +312,98 @@ function metricTimeoutMs(loopConfig: LoopConfig): number {
   return seconds * 1000;
 }
 
+interface WorkerExperimentArtifact {
+  experiment_id: string;
+  hypothesis: string;
+  hypothesis_family?: string | null;
+  differentiator?: string | null;
+  rationale: string;
+  target_paths?: string[];
+  insight?: string | null;
+  verification?: string[];
+}
+
+function workerExperimentArtifactPath(workerArtifactDir: string): string {
+  return path.join(workerArtifactDir, 'microverse-experiment.json');
+}
+
+function readWorkerExperimentArtifact(workerArtifactDir: string, experimentId: string): WorkerExperimentArtifact {
+  const artifactPath = workerExperimentArtifactPath(workerArtifactDir);
+  const artifact = readJsonFile<WorkerExperimentArtifact>(artifactPath, null);
+  if (!artifact || artifact.experiment_id !== experimentId
+      || typeof artifact.hypothesis !== 'string' || !artifact.hypothesis.trim()
+      || typeof artifact.rationale !== 'string' || !artifact.rationale.trim()
+      || (artifact.target_paths != null && (!Array.isArray(artifact.target_paths) || artifact.target_paths.some((entry) => typeof entry !== 'string' || !entry.trim())))
+      || (artifact.verification != null && (!Array.isArray(artifact.verification) || artifact.verification.some((entry) => typeof entry !== 'string' || !entry.trim())))) {
+    throw new Error(`Measured Microverse iteration requires a valid ${artifactPath} for ${experimentId}.`);
+  }
+  return artifact;
+}
+
+function adoptOrValidateWorkerExperimentPlan(
+  sessionDir: string,
+  experimentId: string,
+  artifact: WorkerExperimentArtifact,
+): void {
+  const ledger = readExperimentLedger(sessionDir);
+  const record = ledger?.experiments.find((entry) => entry.id === experimentId) || null;
+  if (!ledger || !record) throw new Error('Microverse experiment ledger disappeared during plan validation.');
+  assertExperimentStrategy(ledger, {
+    hypothesisFamily: artifact.hypothesis_family,
+    targetPaths: artifact.target_paths,
+  });
+  if (record.hypothesis.startsWith('Runtime placeholder for Microverse iteration ')) {
+    updateExperimentPlan(sessionDir, experimentId, {
+      hypothesis: artifact.hypothesis,
+      hypothesisFamily: artifact.hypothesis_family,
+      differentiator: artifact.differentiator,
+      rationale: artifact.rationale,
+      targetPaths: artifact.target_paths,
+    });
+    return;
+  }
+  const clean = (value: string | null | undefined): string | null => value == null ? null : value.trim();
+  const paths = (values: string[] | undefined): string[] => [...new Set((values || []).map((entry) => entry.trim()))].sort();
+  const samePlan = record.hypothesis === artifact.hypothesis.trim()
+    && record.hypothesis_family === clean(artifact.hypothesis_family)
+    && record.differentiator === clean(artifact.differentiator)
+    && record.rationale === artifact.rationale.trim()
+    && JSON.stringify(record.target_paths) === JSON.stringify(paths(artifact.target_paths));
+  if (!samePlan) {
+    throw new Error(`Retry for ${experimentId} must preserve its frozen hypothesis, family, rationale, differentiator, and target paths.`);
+  }
+}
+
+function planMicroverseExperiment(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  iteration: number,
+  baselineScore: number,
+): MicroverseExperimentRecord {
+  const ledger = readExperimentLedger(sessionDir);
+  const pending = ledger?.experiments.find((entry) => entry.status === 'planned') || null;
+  if (pending) return startExperiment(sessionDir, pending.id);
+  const parent = ledger?.experiments.filter((entry) => entry.status === 'accepted').at(-1) || null;
+  const record = planExperiment(sessionDir, {
+    parentId: parent?.id || null,
+    hypothesis: `Runtime placeholder for Microverse iteration ${iteration}`,
+    differentiator: `iteration ${iteration}`,
+    rationale: String(loopConfig.task || 'Measured metric improvement'),
+    targetPaths: [],
+    baselineScore,
+  });
+  return startExperiment(sessionDir, record.id);
+}
+
+function microversePromptContext(sessionDir: string): { memory: string; convergence: string } {
+  const ledger = readExperimentLedger(sessionDir);
+  if (!ledger) return { memory: '{}', convergence: 'none' };
+  return {
+    memory: JSON.stringify(compactExperimentMemory(ledger)),
+    convergence: researchConvergenceState(ledger).level,
+  };
+}
+
 function revertMetricIterationSafely(
   sessionDir: string,
   workingDir: string,
@@ -196,15 +421,118 @@ function revertMetricIterationSafely(
   });
 }
 
+function microverseAttemptPath(sessionDir: string): string {
+  return path.join(sessionDir, 'microverse-attempt.json');
+}
+
+function writeMicroverseAttemptTransaction(
+  sessionDir: string,
+  experiment: MicroverseExperimentRecord,
+  iteration: number,
+  checkpoint: MetricIterationCheckpoint,
+  metricState: MetricConvergenceState,
+): void {
+  atomicWriteJson(microverseAttemptPath(sessionDir), {
+    schema_version: 1,
+    experiment_id: experiment.id,
+    iteration,
+    attempt: experiment.attempt,
+    checkpoint,
+    metric_state_before: metricState,
+    created_at: new Date().toISOString(),
+  } satisfies MicroverseAttemptTransaction);
+}
+
+function clearMicroverseAttemptTransaction(sessionDir: string): void {
+  fs.rmSync(microverseAttemptPath(sessionDir), { force: true });
+}
+
+function microverseAttemptHasTerminalOutcome(sessionDir: string): boolean {
+  const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+  if (!transaction) return false;
+  const experiment = readExperimentLedger(sessionDir)?.experiments.find((entry) => entry.id === transaction.experiment_id);
+  return experiment?.status === 'accepted' || experiment?.status === 'rejected';
+}
+
+function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: string): string[] {
+  const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+  if (!transaction) return [];
+  if (transaction.schema_version !== 1 || !/^exp-\d{4,}$/.test(transaction.experiment_id)
+      || !Number.isInteger(transaction.iteration) || !Number.isInteger(transaction.attempt)
+      || !transaction.checkpoint || !transaction.metric_state_before) {
+    throw new Error('Invalid durable Microverse attempt transaction.');
+  }
+  const ledger = readExperimentLedger(sessionDir);
+  const experiment = ledger?.experiments.find((entry) => entry.id === transaction.experiment_id) || null;
+  if (experiment && ['accepted', 'rejected', 'invalid'].includes(experiment.status)) {
+    if (experiment.status === 'accepted' || experiment.status === 'rejected') {
+      const manager = new StateManager();
+      manager.update(path.join(sessionDir, 'state.json'), (current) => {
+        current.iteration = Math.max(Number(current.iteration || 0), transaction.iteration);
+        current.loop_stall_count = ledger?.experiment_stall_count || 0;
+        current.worker_failure_count = ledger?.worker_failure_count || 0;
+        return current;
+      });
+    }
+    const metric = readMetricConvergenceState(sessionDir);
+    if (metric) writeMetricSummary(sessionDir, metric);
+    clearMicroverseAttemptTransaction(sessionDir);
+    return [];
+  }
+  revertMetricIterationSafely(sessionDir, workingDir, transaction.checkpoint);
+  writeMetricConvergenceState(sessionDir, transaction.metric_state_before);
+  const reconciled = reconcileRunningExperiments(sessionDir, {
+    mode: 'resume',
+    insight: 'Interrupted attempt restored from its durable repository and metric checkpoint.',
+  });
+  writeMetricSummary(sessionDir, transaction.metric_state_before);
+  clearMicroverseAttemptTransaction(sessionDir);
+  return reconciled.reconciled_ids;
+}
+
+function finalizeMicroverseAttemptOnExit(sessionDir: string, exitReason: string): string[] {
+  const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+  const ledger = readExperimentLedger(sessionDir);
+  const experiment = transaction
+    ? ledger?.experiments.find((entry) => entry.id === transaction.experiment_id) || null
+    : null;
+  if (transaction && experiment && (experiment.status === 'accepted' || experiment.status === 'rejected')) {
+    const manager = new StateManager();
+    manager.update(path.join(sessionDir, 'state.json'), (current) => {
+      current.iteration = Math.max(Number(current.iteration || 0), transaction.iteration);
+      current.loop_stall_count = ledger?.experiment_stall_count || 0;
+      current.worker_failure_count = ledger?.worker_failure_count || 0;
+      return current;
+    });
+    const metric = readMetricConvergenceState(sessionDir);
+    if (metric) writeMetricSummary(sessionDir, metric);
+    clearMicroverseAttemptTransaction(sessionDir);
+    return [];
+  }
+  if (transaction?.metric_state_before) {
+    writeMetricConvergenceState(sessionDir, transaction.metric_state_before);
+  }
+  const reconciled = reconcileRunningExperiments(sessionDir, {
+    mode: 'cancel',
+    insight: `Worker attempt abandoned when loop stopped with ${exitReason}.`,
+  });
+  const metric = readMetricConvergenceState(sessionDir);
+  if (metric) writeMetricSummary(sessionDir, metric);
+  clearMicroverseAttemptTransaction(sessionDir);
+  return reconciled.reconciled_ids;
+}
+
 function ensureMetricBaseline(sessionDir: string, loopConfig: LoopConfig, workingDir: string): MetricConvergenceState | null {
   if (!isMeasuredMicroverse(loopConfig)) return null;
   const command = String(loopConfig.metric).trim();
   const direction = normalizeMetricDirection(loopConfig.direction ?? 'higher');
   const tolerance = normalizeMetricTolerance(loopConfig.tolerance ?? 0);
+  const target = normalizeMetricTargetContract(direction, loopConfig.target, loopConfig.target_relation);
   const existing = readMetricConvergenceState(sessionDir);
   if (existing) {
-    if (existing.command !== command || existing.direction !== direction || existing.tolerance !== tolerance) {
-      throw new Error('Cannot change the metric command, direction, or tolerance while resuming a Microverse session.');
+    if (existing.command !== command || existing.direction !== direction || existing.tolerance !== tolerance
+        || existing.target !== target.target || existing.target_relation !== target.target_relation) {
+      throw new Error('Cannot change the metric command, direction, tolerance, or target while resuming a Microverse session.');
     }
     captureMetricIterationCheckpoint(workingDir);
     return existing;
@@ -217,13 +545,15 @@ function ensureMetricBaseline(sessionDir: string, loopConfig: LoopConfig, workin
     revertMetricIterationSafely(sessionDir, workingDir, checkpoint);
     throw error;
   }
-  const state = createMetricConvergenceState(baseline, direction, tolerance);
+  const state = createMetricConvergenceState(baseline, direction, tolerance, target.target, target.target_relation);
   writeMetricConvergenceState(sessionDir, state);
   appendRunnerLog(sessionDir, `microverse baseline measured: ${baseline.score}`);
   return state;
 }
 
 function writeMetricSummary(sessionDir: string, state: MetricConvergenceState): void {
+  const ledger = readExperimentLedger(sessionDir);
+  const convergence = ledger ? researchConvergenceState(ledger) : null;
   const summary = {
     objective: 'measured metric convergence',
     baseline: state.baseline.score,
@@ -231,7 +561,13 @@ function writeMetricSummary(sessionDir: string, state: MetricConvergenceState): 
     best_result: state.best.score,
     direction: state.direction,
     tolerance: state.tolerance,
+    target: state.target,
+    target_relation: state.target_relation,
+    target_satisfied: metricStateTargetSatisfied(state),
     stall_count: state.stall_count,
+    experiment_stall_count: ledger?.experiment_stall_count || 0,
+    worker_failure_count: ledger?.worker_failure_count || 0,
+    convergence_level: convergence?.level || 'none',
     failed_approaches: state.failed_approaches,
     verification: [`${state.command} => ${state.latest.score}`],
     next_action: state.stall_count > 0 ? 'Try a materially different approach.' : 'Continue toward convergence or stop when the target is met.',
@@ -245,7 +581,11 @@ function writeMetricSummary(sessionDir: string, state: MetricConvergenceState): 
     `- Baseline: ${state.baseline.score}`,
     `- Best: ${state.best.score}`,
     `- Latest: ${state.latest.score}`,
-    `- Stall count: ${state.stall_count}`,
+    `- Target: ${state.target === null ? 'not configured' : `${state.target_relation} ${state.target}`}`,
+    `- Target satisfied: ${metricStateTargetSatisfied(state)}`,
+    `- Experiment stall count: ${ledger?.experiment_stall_count || 0}`,
+    `- Worker failure count: ${ledger?.worker_failure_count || 0}`,
+    `- Convergence: ${convergence?.level || 'none'}`,
     '',
   ].join('\n'));
 }
@@ -256,16 +596,26 @@ function processMetricIteration(
   workingDir: string,
   checkpoint: MetricIterationCheckpoint,
   iteration: number,
-): { classification: Exclude<MetricClassification, 'baseline'>; state: MetricConvergenceState } {
+  experimentId: string,
+): { classification: Exclude<MetricClassification, 'baseline'>; state: MetricConvergenceState; changedPaths: string[]; diffArtifact: string | null } {
   const currentState = readMetricConvergenceState(sessionDir);
   if (!currentState) throw new Error('Microverse metric state disappeared during an iteration.');
+  const attemptedHead = getHeadSha(workingDir) || checkpoint.head;
+  const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
+  const repositoryChanged = attemptedHead !== checkpoint.head || dirtyPaths.length > 0;
+  const evidence = repositoryChanged
+    ? archiveMicroverseExperiment({
+      workingDir,
+      sessionDir,
+      experimentId,
+      baseRef: checkpoint.head,
+      excludeUntrackedPaths: checkpoint.untracked,
+    })
+    : null;
   const measurement = measureMetric(currentState.command, {
     cwd: workingDir,
     timeoutMs: metricTimeoutMs(loopConfig),
   });
-  const attemptedHead = getHeadSha(workingDir) || checkpoint.head;
-  const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
-  const repositoryChanged = attemptedHead !== checkpoint.head || dirtyPaths.length > 0;
   const natural = recordMetricIteration(currentState, measurement, {
     iteration,
     headBefore: checkpoint.head,
@@ -298,7 +648,11 @@ function processMetricIteration(
   writeMetricConvergenceState(sessionDir, recorded.state);
   writeMetricSummary(sessionDir, recorded.state);
   appendRunnerLog(sessionDir, `microverse metric ${classification}: ${currentState.best.score} -> ${measurement.score} (${recorded.state.stall_count} stalled)`);
-  return recorded;
+  return {
+    ...recorded,
+    changedPaths: evidence?.changedPaths ?? [],
+    diffArtifact: evidence?.artifact ?? null,
+  };
 }
 
 function ensureAdvancedLoopCleanTrackedPreflight(sessionDir: string, loopConfig: LoopConfig, workingDir: string): void {
@@ -479,7 +833,20 @@ export async function runLoop(sessionDir: string): Promise<void> {
   const initialState = manager.read(statePath);
 
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
+  assertControlPlaneOutsideWorkerCwd(sessionDir, initialState.working_dir as string);
+  if (isMeasuredMicroverse(loopConfig)) {
+    const recovered = recoverInterruptedMicroverseAttempt(sessionDir, initialState.working_dir as string);
+    if (recovered.length > 0) {
+      appendRunnerLog(sessionDir, `microverse restored interrupted attempt checkpoint: ${recovered.join(', ')}`);
+    }
+  }
   ensureAdvancedLoopCleanTrackedPreflight(sessionDir, loopConfig, initialState.working_dir as string);
+  if (isMeasuredMicroverse(loopConfig)) {
+    const reconciled = reconcileRunningExperiments(sessionDir, { mode: 'resume' });
+    if (reconciled.reconciled_ids.length > 0) {
+      appendRunnerLog(sessionDir, `microverse reconciled interrupted experiments: ${reconciled.reconciled_ids.join(', ')}`);
+    }
+  }
   ensureMetricBaseline(sessionDir, loopConfig, initialState.working_dir as string);
   enterLoopRunnerPhase(manager, statePath, loopConfig.mode);
 
@@ -491,6 +858,20 @@ export async function runLoop(sessionDir: string): Promise<void> {
       const state = manager.read(statePath);
       if (state.active === false) {
         exitReason = (state.last_exit_reason as string | null) || 'cancelled';
+        break;
+      }
+      const currentMetricState = isMeasuredMicroverse(loopConfig)
+        ? readMetricConvergenceState(sessionDir)
+        : null;
+      if (currentMetricState && metricStateTargetSatisfied(currentMetricState)) {
+        exitReason = 'success';
+        appendRunnerLog(sessionDir, `microverse runtime target satisfied at ${currentMetricState.best.score}`);
+        break;
+      }
+      const currentLedger = currentMetricState ? readExperimentLedger(sessionDir) : null;
+      if (currentLedger && researchConvergenceState(currentLedger).level === 'stalled') {
+        exitReason = 'stalled';
+        appendRunnerLog(sessionDir, 'microverse research convergence already stalled before starting another experiment');
         break;
       }
       if (Number.isInteger(state.max_iterations) && (state.max_iterations as number) > 0 && (state.iteration as number) >= (state.max_iterations as number)) {
@@ -523,30 +904,57 @@ export async function runLoop(sessionDir: string): Promise<void> {
       pendingMetricIteration = metricCheckpoint
         ? { cwd: state.working_dir as string, checkpoint: metricCheckpoint }
         : null;
+      const iteration = (state.iteration as number) + 1;
+      const experiment = metricCheckpoint && currentMetricState
+        ? planMicroverseExperiment(sessionDir, loopConfig, iteration, currentMetricState.best.score)
+        : null;
+      if (experiment && metricCheckpoint && currentMetricState) {
+        writeMicroverseAttemptTransaction(sessionDir, experiment, iteration, metricCheckpoint, currentMetricState);
+      }
+      const protectedManifest: ProtectedPathManifest | null = metricCheckpoint
+        ? captureProtectedPathManifest(state.working_dir as string, loopConfig.protected_paths)
+        : null;
+      const promptContext = experiment ? microversePromptContext(sessionDir) : null;
       const beforeUntrackedFiles = isGitRepo(state.working_dir as string)
         ? listUntrackedFiles(state.working_dir as string)
         : [];
       manager.update(statePath, (current) => {
-        current.iteration = (current.iteration as number) + 1;
+        if (!metricCheckpoint) current.iteration = (current.iteration as number) + 1;
         current.step = loopConfig.mode;
         appendHistory(current, loopConfig.mode, current.current_ticket || undefined);
         return current;
       });
 
-      const outputLastMessagePath = path.join(sessionDir, `${loopConfig.mode}.${(state.iteration as number) + 1}.last-message.txt`);
+      const attempt = experiment?.attempt ?? 1;
+      const workerArtifactDir = createWorkerArtifactDir(sessionDir, loopConfig.mode, iteration, attempt);
+      const workerSummaries = workerSummaryPaths(workerArtifactDir, loopConfig.mode);
+      const experimentArtifactPath = experiment
+        ? workerExperimentArtifactPath(workerArtifactDir)
+        : null;
+      const controlSnapshots = captureControlFiles(sessionDir);
+      const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attempt);
+      fs.rmSync(outputLastMessagePath, { force: true });
       const result = await runCodexExecMonitored({
         cwd: state.working_dir as string,
         prompt: buildLoopPrompt({
           mode: loopConfig.mode,
           sessionDir,
+          workerArtifactDir,
           workingDir: state.working_dir as string,
           state: manager.read(statePath) as unknown as LoopPromptState,
-          loopConfig: loopConfig as unknown as LoopPromptConfig,
+          loopConfig: {
+            ...loopConfig,
+            experiment_id: experiment?.id,
+            experiment_artifact_path: experimentArtifactPath || undefined,
+            experiment_memory: promptContext?.memory,
+            convergence_level: promptContext?.convergence,
+          } as unknown as LoopPromptConfig,
         }),
         timeoutMs: getWorkerTimeoutMs(state, config),
         outputLastMessagePath,
-        progressArtifactPaths: Object.values(summaryPaths(sessionDir, loopConfig.mode)),
-        addDirs: [sessionDir],
+        progressArtifactPaths: Object.values(workerSummaries),
+        addDirs: [workerArtifactDir],
+        inheritConfiguredAddDirs: false,
         successCheck: loopSuccessCheck(outputLastMessagePath),
         successSignalGraceMs: 150,
         successPollMs: 50,
@@ -570,14 +978,88 @@ export async function runLoop(sessionDir: string): Promise<void> {
         current.active_child_controller_pid = null;
         return current;
       });
+      const tamperedControlFiles = restoreTamperedControlFiles(controlSnapshots);
       if (result.cancelled || manager.read(statePath).active === false) {
         exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
         break;
       }
+      const completionToken = authoritativeLoopCompletionToken(outputLastMessagePath);
+      writeWorkerDiagnostics(
+        sessionDir,
+        loopConfig.mode,
+        iteration,
+        attempt,
+        outputLastMessagePath,
+        result,
+        completionToken,
+      );
+      let workerFailure: Extract<ExperimentClassification, 'worker_incomplete' | 'worker_error' | 'worker_timeout' | 'protected_path_tamper'> | null = result.timedOut
+        ? 'worker_timeout'
+        : result.exitCode !== 0
+          ? 'worker_error'
+          : completionToken
+            ? null
+            : 'worker_incomplete';
+      let workerFailureDetail = workerFailure
+        ? `${loopConfig.mode} worker ended as ${workerFailure} (exit ${result.exitCode})`
+        : '';
+      if (tamperedControlFiles.length > 0) {
+        workerFailure = 'protected_path_tamper';
+        workerFailureDetail = `Runtime control files changed and were restored: ${tamperedControlFiles.join(', ')}`;
+      }
+      let experimentArtifact: WorkerExperimentArtifact | null = null;
+      if (!workerFailure && experiment) {
+        try {
+          experimentArtifact = readWorkerExperimentArtifact(workerArtifactDir, experiment.id);
+          adoptOrValidateWorkerExperimentPlan(sessionDir, experiment.id, experimentArtifact);
+        } catch (error) {
+          workerFailure = 'worker_incomplete';
+          workerFailureDetail = safeErrorMessage(error);
+        }
+      }
+      if (tamperedControlFiles.length > 0 && !metricCheckpoint) {
+        throw new Error(workerFailureDetail);
+      }
+      if (protectedManifest) {
+        const protectedChanges = changedProtectedPaths(state.working_dir as string, protectedManifest);
+        if (protectedChanges.length > 0) {
+          workerFailure = 'protected_path_tamper';
+          workerFailureDetail = `Protected evaluation paths changed: ${protectedChanges.join(', ')}`;
+        }
+      }
+      if (workerFailure && metricCheckpoint && experiment) {
+        revertMetricIterationSafely(sessionDir, state.working_dir as string, metricCheckpoint);
+        pendingMetricIteration = null;
+        recordWorkerAttemptFailure(sessionDir, experiment.id, {
+          classification: workerFailure,
+          insight: workerFailureDetail,
+        });
+        const failures = readExperimentLedger(sessionDir)?.worker_failure_count || 0;
+        manager.update(statePath, (current) => {
+          current.worker_failure_count = failures;
+          current.last_loop_message = workerFailureDetail;
+          return current;
+        });
+        appendRunnerLog(sessionDir, `microverse ${workerFailure}: ${workerFailureDetail} (${failures} consecutive worker failures)`);
+        if (failures >= Number(loopConfig.worker_failure_limit || 3)) {
+          abandonPlannedExperiment(sessionDir, experiment.id, {
+            classification: workerFailure,
+            insight: `${workerFailureDetail}; worker failure limit reached.`,
+          });
+          clearMicroverseAttemptTransaction(sessionDir);
+          exitReason = 'worker_failure_limit';
+          break;
+        }
+        clearMicroverseAttemptTransaction(sessionDir);
+        continue;
+      }
       assertCodexSucceeded(result, `${loopConfig.mode} iteration failed`);
+      if (!completionToken) throw new Error(`${loopConfig.mode} iteration exited without exactly one authoritative completion token in --output-last-message`);
 
-      const lastMessage = scrubWorkerOutput(result.lastMessage || '');
-      appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} finished`);
+      const lastMessage = readLastMessageArtifact(outputLastMessagePath);
+      appendRunnerLog(sessionDir, `iteration ${iteration} finished`);
+
+      promoteWorkerSummaryArtifacts(workerArtifactDir, sessionDir, loopConfig.mode);
 
       enforceAdvancedLoopScope(
         sessionDir,
@@ -592,7 +1074,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
         loopConfig,
         state.working_dir as string,
         beforeSnapshot,
-        (state.iteration as number) + 1,
+        iteration,
         beforeUntrackedFiles,
       );
 
@@ -602,10 +1084,28 @@ export async function runLoop(sessionDir: string): Promise<void> {
           loopConfig,
           state.working_dir as string,
           metricCheckpoint,
-          (state.iteration as number) + 1,
+          iteration,
+          experiment!.id,
         )
         : null;
-      pendingMetricIteration = null;
+
+      if (metricResult && experiment) {
+        completeExperiment(sessionDir, experiment.id, {
+          status: metricResult.classification === 'improved' ? 'accepted' : 'rejected',
+          classification: metricResult.classification,
+          resultScore: metricResult.state.latest.score,
+          changedPaths: metricResult.changedPaths,
+          diffArtifact: metricResult.diffArtifact,
+          insight: experimentArtifact?.insight || null,
+          verification: experimentArtifact?.verification || [],
+        });
+        if (process.env.PICKLE_TEST_MODE === '1' && process.env.PICKLE_TEST_MICROVERSE_THROW_AFTER_COMPLETION === '1') {
+          throw new Error('Injected post-completion Microverse failure.');
+        }
+        pendingMetricIteration = null;
+        writeMetricSummary(sessionDir, metricResult.state);
+      }
+      if (!metricResult) pendingMetricIteration = null;
 
       const afterSnapshot = captureProgressSnapshot({
         sessionDir,
@@ -619,14 +1119,18 @@ export async function runLoop(sessionDir: string): Promise<void> {
         diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot'),
       );
       const latest = manager.update(statePath, (current) => {
-        current.loop_stall_count = metricResult
-          ? metricResult.state.stall_count
+        const ledger = metricResult ? readExperimentLedger(sessionDir) : null;
+        if (metricResult) current.iteration = (current.iteration as number) + 1;
+        current.loop_stall_count = ledger
+          ? ledger.experiment_stall_count
           : progressReasons.length ? 0 : Number(current.loop_stall_count || 0) + 1;
+        current.worker_failure_count = ledger?.worker_failure_count || 0;
         current.last_loop_message = lastMessage.trim();
         return current;
       });
+      if (metricResult) clearMicroverseAttemptTransaction(sessionDir);
       if (progressReasons.length) {
-        appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} progress: ${progressReasons.join(',')}`);
+        appendRunnerLog(sessionDir, `iteration ${iteration} progress: ${progressReasons.join(',')}`);
       }
 
       if (config.defaults.circuit_breaker.enabled) {
@@ -638,16 +1142,26 @@ export async function runLoop(sessionDir: string): Promise<void> {
         });
         if (!canExecute(circuitState)) {
           exitReason = 'circuit_open';
-          appendRunnerLog(sessionDir, `circuit breaker opened after iteration ${(state.iteration as number) + 1}`);
+          appendRunnerLog(sessionDir, `circuit breaker opened after iteration ${iteration}`);
           break;
         }
       }
 
-      if (loopShouldExit(outputLastMessagePath, result) && (!metricResult || metricResult.classification === 'improved')) {
+      if (metricResult && metricStateTargetSatisfied(metricResult.state)) {
+        exitReason = 'success';
+        appendRunnerLog(sessionDir, `microverse runtime target satisfied at ${metricResult.state.best.score}`);
+        break;
+      }
+      if (completionToken === 'LOOP_COMPLETE' && (!metricResult
+          || (metricResult.classification === 'improved' && metricResult.state.target === null))) {
         exitReason = 'success';
         break;
       }
-      if ((latest.loop_stall_count as number) >= Number(loopConfig.stall_limit || 5)) {
+      const convergence = metricResult ? readExperimentLedger(sessionDir) : null;
+      const scientificallyStalled = convergence
+        ? researchConvergenceState(convergence).level === 'stalled'
+        : (latest.loop_stall_count as number) >= Number(loopConfig.stall_limit || 8);
+      if (scientificallyStalled) {
         exitReason = 'stalled';
         break;
       }
@@ -660,7 +1174,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
       thrownError = error;
     }
   } finally {
-    if (pendingMetricIteration) {
+    if (pendingMetricIteration && !microverseAttemptHasTerminalOutcome(sessionDir)) {
       try {
         revertMetricIterationSafely(sessionDir, pendingMetricIteration.cwd, pendingMetricIteration.checkpoint);
         appendRunnerLog(sessionDir, `microverse iteration rolled back after ${exitReason}`);
@@ -672,6 +1186,19 @@ export async function runLoop(sessionDir: string): Promise<void> {
             `Microverse iteration failed and rollback did not complete: ${safeErrorMessage(rollbackError)}`,
           )
           : rollbackError;
+        exitReason = 'error';
+      }
+    }
+    if (isMeasuredMicroverse(loopConfig)) {
+      try {
+        const reconciledIds = finalizeMicroverseAttemptOnExit(sessionDir, exitReason);
+        if (reconciledIds.length > 0) {
+          appendRunnerLog(sessionDir, `microverse abandoned interrupted experiments: ${reconciledIds.join(', ')}`);
+        }
+      } catch (reconcileError) {
+        thrownError = thrownError
+          ? new AggregateError([thrownError, reconcileError], 'Microverse failed while reconciling interrupted experiments.')
+          : reconcileError;
         exitReason = 'error';
       }
     }

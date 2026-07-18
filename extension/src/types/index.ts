@@ -419,6 +419,7 @@ export interface CodexExecOptions {
   model?: string;
   skipGitRepoCheck?: boolean;
   addDirs?: string[];
+  inheritConfiguredAddDirs?: boolean;
   json?: boolean;
 }
 

@@ -221,7 +221,7 @@ Detached advanced loops currently present in the repo:
   <img src="images/microverse.png" alt="Pickle Rick Microverse" width="100%" />
 </p>
 
-`pickle-microverse` is the metric-convergence loop. Command metrics must print exactly one finite number. The runtime captures a baseline, measures each iteration, accepts only improvements, reverts held/regressed work, records failed approaches, and stops at the stall limit. It launches as a detached tmux loop with fresh Codex context per iteration.
+`pickle-microverse` is the evidence-driven metric-convergence loop. Command metrics must print exactly one finite number. The runtime owns numeric target evaluation, requires authoritative final-message and experiment evidence, accepts only improvements, archives and reverts held/regressed work, separates worker failures from scientific stalls, and escalates convergence at 3/5/8 valid stalls. Optional protected paths keep workers from changing evaluation inputs.
 
 ### Recoverable destructive operations
 
@@ -244,7 +244,7 @@ node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js "<task>"
 node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume
 node ~/.codex/pickle-rick/extension/bin/pickle-tmux.js --prd ./prd.md
 node ~/.codex/pickle-rick/extension/bin/pickle-tmux.js --resume
-node ~/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"
+node ~/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<cmd>" --direction higher --target 90 --target-relation gt --protected-path "evaluation/**" --task "<task>"
 node ~/.codex/pickle-rick/extension/bin/szechuan-sauce.js <target>
 node ~/.codex/pickle-rick/extension/bin/anatomy-park.js <target>
 node ~/.codex/pickle-rick/extension/bin/setup.js "<task>"

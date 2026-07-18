@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { launchDetachedLoop } from '../services/detached-launch.js';
+import { normalizeMetricTargetContract } from '../services/metric-convergence.js';
 
 type DetachedLoopConfig = Parameters<typeof launchDetachedLoop>[0]['loopConfig'];
 
@@ -12,6 +13,14 @@ interface MicroverseArgs {
   taskSpecified: boolean;
   direction: string;
   directionSpecified: boolean;
+  target: number | null;
+  targetSpecified: boolean;
+  targetRelation: string | null;
+  targetRelationSpecified: boolean;
+  protectedPaths: string[];
+  protectedPathsSpecified: boolean;
+  workerFailureLimit: number;
+  workerFailureLimitSpecified: boolean;
   tolerance: number;
   toleranceSpecified: boolean;
   metricTimeoutSeconds: number;
@@ -31,11 +40,19 @@ function parseArgs(argv: string[]): MicroverseArgs {
   let taskSpecified = false;
   let direction = 'higher';
   let directionSpecified = false;
+  let target: number | null = null;
+  let targetSpecified = false;
+  let targetRelation: string | null = null;
+  let targetRelationSpecified = false;
+  const protectedPaths: string[] = [];
+  let protectedPathsSpecified = false;
+  let workerFailureLimit = 3;
+  let workerFailureLimitSpecified = false;
   let tolerance = 0;
   let toleranceSpecified = false;
   let metricTimeoutSeconds = 120;
   let metricTimeoutSpecified = false;
-  let stallLimit = 5;
+  let stallLimit = 8;
   let stallLimitSpecified = false;
   let maxIterations: number | null = null;
   let resume: string | null = null;
@@ -58,6 +75,22 @@ function parseArgs(argv: string[]): MicroverseArgs {
       direction = argv[i + 1] || 'higher';
       directionSpecified = true;
       i += 1;
+    } else if (arg === '--target') {
+      target = Number(argv[i + 1] ?? '');
+      targetSpecified = true;
+      i += 1;
+    } else if (arg === '--target-relation') {
+      targetRelation = argv[i + 1] || '';
+      targetRelationSpecified = true;
+      i += 1;
+    } else if (arg === '--protected-path') {
+      protectedPaths.push(argv[i + 1] || '');
+      protectedPathsSpecified = true;
+      i += 1;
+    } else if (arg === '--worker-failure-limit') {
+      workerFailureLimit = Number(argv[i + 1] || '0');
+      workerFailureLimitSpecified = true;
+      i += 1;
     } else if (arg === '--tolerance') {
       tolerance = Number(argv[i + 1] || '0');
       toleranceSpecified = true;
@@ -67,7 +100,7 @@ function parseArgs(argv: string[]): MicroverseArgs {
       metricTimeoutSpecified = true;
       i += 1;
     } else if (arg === '--stall-limit') {
-      stallLimit = Number(argv[i + 1] || '5');
+      stallLimit = Number(argv[i + 1] || '8');
       stallLimitSpecified = true;
       i += 1;
     } else if (arg === '--max-iterations') {
@@ -95,11 +128,21 @@ function parseArgs(argv: string[]): MicroverseArgs {
   if (direction !== 'higher' && direction !== 'lower') {
     throw new Error('--direction must be higher or lower');
   }
+  const targetContract = normalizeMetricTargetContract(direction, target, targetRelation);
+  if (!resume && targetContract.target !== null && !metric) {
+    throw new Error('--target requires --metric; free-form --goal sessions do not produce a runtime score.');
+  }
   if (!Number.isFinite(tolerance) || tolerance < 0) {
     throw new Error('--tolerance must be a non-negative finite number');
   }
   if (!Number.isFinite(metricTimeoutSeconds) || metricTimeoutSeconds <= 0) {
     throw new Error('--metric-timeout must be a positive number of seconds');
+  }
+  if (protectedPaths.some((entry) => !entry.trim())) {
+    throw new Error('--protected-path requires a non-empty repository-relative path or glob');
+  }
+  if (!Number.isInteger(workerFailureLimit) || workerFailureLimit <= 0) {
+    throw new Error('--worker-failure-limit must be a positive integer');
   }
 
   return {
@@ -111,6 +154,14 @@ function parseArgs(argv: string[]): MicroverseArgs {
     taskSpecified,
     direction,
     directionSpecified,
+    target: targetContract.target,
+    targetSpecified,
+    targetRelation: targetContract.target_relation,
+    targetRelationSpecified,
+    protectedPaths,
+    protectedPathsSpecified,
+    workerFailureLimit,
+    workerFailureLimitSpecified,
     tolerance,
     toleranceSpecified,
     metricTimeoutSeconds,
@@ -149,6 +200,18 @@ async function main(argv: string[]): Promise<void> {
   }
   if (!parsed.resume || parsed.directionSpecified) {
     loopConfig.direction = parsed.direction;
+  }
+  if (parsed.targetSpecified && parsed.target !== null) {
+    loopConfig.target = parsed.target;
+  }
+  if (parsed.targetRelationSpecified) {
+    loopConfig.target_relation = parsed.targetRelation;
+  }
+  if (!parsed.resume || parsed.protectedPathsSpecified) {
+    loopConfig.protected_paths = parsed.protectedPaths;
+  }
+  if (!parsed.resume || parsed.workerFailureLimitSpecified) {
+    loopConfig.worker_failure_limit = parsed.workerFailureLimit;
   }
   if (!parsed.resume || parsed.toleranceSpecified) {
     loopConfig.tolerance = parsed.tolerance;

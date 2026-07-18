@@ -7,7 +7,10 @@ import {
   captureMetricIterationCheckpoint,
   classifyMetric,
   createMetricConvergenceState,
+  isMetricTargetSatisfied,
   measureMetric,
+  metricStateTargetSatisfied,
+  normalizeMetricTargetContract,
   readMetricConvergenceState,
   recordMetricIteration,
   revertMetricIteration,
@@ -46,6 +49,55 @@ test('classifyMetric respects direction and tolerance', () => {
   assert.equal(classifyMetric(9, 10, 'higher', 0), 'regressed');
   assert.equal(classifyMetric(9, 10, 'lower', 0), 'improved');
   assert.equal(classifyMetric(10.05, 10, 'higher', 0.1), 'held');
+});
+
+test('metric targets validate direction and evaluate exact relation semantics', () => {
+  assert.deepEqual(normalizeMetricTargetContract('higher', '90', 'gt'), {
+    target: 90,
+    target_relation: 'gt',
+  });
+  assert.deepEqual(normalizeMetricTargetContract('lower', 10, 'lte'), {
+    target: 10,
+    target_relation: 'lte',
+  });
+  assert.throws(() => normalizeMetricTargetContract('higher', 90, 'lt'), /incompatible with direction higher/);
+  assert.throws(() => normalizeMetricTargetContract('lower', 10, 'gte'), /incompatible with direction lower/);
+  assert.throws(() => normalizeMetricTargetContract('higher', Infinity, 'gt'), /finite number/);
+  assert.throws(() => normalizeMetricTargetContract('higher', 90, null), /requires --target-relation/);
+  assert.throws(() => normalizeMetricTargetContract('higher', null, 'gt'), /requires a numeric target/);
+
+  assert.equal(isMetricTargetSatisfied(90, 90, 'gt'), false);
+  assert.equal(isMetricTargetSatisfied(90.01, 90, 'gt'), true);
+  assert.equal(isMetricTargetSatisfied(90, 90, 'gte'), true);
+  assert.equal(isMetricTargetSatisfied(10, 10, 'lt'), false);
+  assert.equal(isMetricTargetSatisfied(9.99, 10, 'lt'), true);
+  assert.equal(isMetricTargetSatisfied(10, 10, 'lte'), true);
+});
+
+test('metric state owns its target and migrates targetless schema 1 sessions', () => {
+  const targeted = createMetricConvergenceState(measurement(89), 'higher', 0, 90, 'gt');
+  assert.equal(targeted.schema_version, 2);
+  assert.equal(targeted.target, 90);
+  assert.equal(targeted.target_relation, 'gt');
+  assert.equal(metricStateTargetSatisfied(targeted), false);
+  const accepted = recordMetricIteration(targeted, measurement(91), {
+    iteration: 1,
+    headBefore: 'aaaaaaa',
+    headAfter: 'bbbbbbb',
+  }).state;
+  assert.equal(metricStateTargetSatisfied(accepted), true);
+
+  const sessionDir = makeTempRoot('pickle-metric-v1-migration-');
+  const legacy = { ...createMetricConvergenceState(measurement(10), 'higher', 0) };
+  legacy.schema_version = 1;
+  delete legacy.target;
+  delete legacy.target_relation;
+  fs.writeFileSync(path.join(sessionDir, 'microverse-metrics.json'), `${JSON.stringify(legacy)}\n`);
+  const migrated = readMetricConvergenceState(sessionDir);
+  assert.equal(migrated.schema_version, 2);
+  assert.equal(migrated.target, null);
+  assert.equal(migrated.target_relation, null);
+  assert.equal(metricStateTargetSatisfied(migrated), false);
 });
 
 test('metric state accepts improvements, records failed approaches, and round-trips atomically', () => {

@@ -344,7 +344,10 @@ function buildCodexExecInvocation(options: CodexExecOptions): { command: string;
     args.push('--json');
   }
 
-  const addDirs = [...(config.runtime.add_dirs || []), ...(options.addDirs || [])];
+  const configuredAddDirs = options.inheritConfiguredAddDirs === false
+    ? []
+    : (config.runtime.add_dirs || []);
+  const addDirs = [...configuredAddDirs, ...(options.addDirs || [])];
   assertAddDirsUnderTmpdirIfTestMode(addDirs);
   for (const dir of addDirs) {
     args.push('--add-dir', dir);

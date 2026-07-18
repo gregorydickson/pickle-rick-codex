@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { describeVerificationContract, normalizeVerificationCommands } from './verification-env.js';
 import { serializeApprovedWorkerContext, type WorkerLifecycleArtifact, type WorkerLifecyclePhase } from './worker-lifecycle.js';
 import type { Ticket, VerificationContract } from '../types/index.js';
@@ -187,7 +188,12 @@ export interface LoopPromptConfig {
   goal?: string;
   direction?: string;
   stall_limit?: number;
-  target?: string;
+  target?: string | number;
+  target_relation?: string;
+  experiment_id?: string;
+  experiment_artifact_path?: string;
+  experiment_memory?: string;
+  convergence_level?: string;
   allowed_paths?: string[];
   focus?: string;
   domain?: string;
@@ -197,6 +203,7 @@ export interface LoopPromptConfig {
 export interface LoopPromptInput {
   mode: string;
   sessionDir: string;
+  workerArtifactDir?: string;
   workingDir: string;
   state: LoopPromptState;
   loopConfig: LoopPromptConfig;
@@ -205,23 +212,26 @@ export interface LoopPromptInput {
 export function buildLoopPrompt({
   mode,
   sessionDir,
+  workerArtifactDir,
   workingDir,
   state,
   loopConfig,
 }: LoopPromptInput): string {
+  const artifactDir = workerArtifactDir || sessionDir;
   const iteration = Number.isInteger(state.iteration) ? state.iteration : 0;
   const maxIterations = Number.isInteger(state.max_iterations) && (state.max_iterations ?? 0) > 0
     ? state.max_iterations
     : 'unlimited';
   const common = [
     `Loop mode: ${mode}`,
-    `Session dir: ${sessionDir}`,
+    `Session control dir (read-only): ${sessionDir}`,
+    `Worker artifact dir: ${artifactDir}`,
     `Working directory: ${workingDir}`,
     `Original task: ${state.original_prompt}`,
     `Iteration: ${iteration} / ${maxIterations}`,
     'You are running in a detached Pickle Rick tmux loop with fresh Codex context for this iteration.',
     'Make one coherent iteration of progress, grounded in the current repository state.',
-    'Write short notes or artifacts to the session directory if useful, but keep the main work in the repository.',
+    'Runtime control files are read-only. Write worker handoff artifacts only to the worker artifact directory, and keep the main work in the repository.',
     'If the loop should continue after this iteration, return <promise>CONTINUE</promise>.',
     'If the objective is complete or converged, return <promise>LOOP_COMPLETE</promise>.',
     'Stop immediately after writing any summary artifacts and the promise token.',
@@ -234,11 +244,15 @@ export function buildLoopPrompt({
       `Objective: ${loopConfig.task}`,
       loopConfig.metric ? `Metric command: ${loopConfig.metric}` : `Goal: ${loopConfig.goal}`,
       `Direction: ${loopConfig.direction || 'higher'}`,
-      `Stall limit: ${loopConfig.stall_limit || 5}`,
-      loopConfig.metric ? `The runtime—not the worker—measures this command before and after the iteration. It will retain only a real improvement and revert held/regressed work. Read ${sessionDir}/microverse-metrics.json before choosing an approach, and do not repeat entries in failed_approaches.` : '',
-      `Write/update ${sessionDir}/microverse-summary.json with keys: objective, baseline, latest_result, best_result, change_applied, verification, next_action.`,
-      `Write/update ${sessionDir}/microverse-summary.md as the human-readable version of the same summary.`,
-      'Process: make one targeted change, measure or reason about impact, avoid repeating failed approaches, and converge deliberately.',
+      loopConfig.target != null ? `Runtime target: best score ${loopConfig.target_relation || 'gte'} ${loopConfig.target}. The runtime alone decides whether this target is satisfied.` : '',
+      `Stall limit: ${loopConfig.stall_limit || 8}`,
+      loopConfig.metric ? `The runtime—not the worker—measures this command before and after the iteration. It will retain only a real improvement and revert held/regressed work. Read ${sessionDir}/microverse-metrics.json and ${sessionDir}/microverse-experiments.json before choosing an approach.` : '',
+      loopConfig.experiment_id ? `Current experiment ID: ${loopConfig.experiment_id}` : '',
+      loopConfig.experiment_id ? `Before modifying the repository, write ${loopConfig.experiment_artifact_path || path.join(artifactDir, 'microverse-experiment.json')} with keys: experiment_id (exactly ${loopConfig.experiment_id}), hypothesis, hypothesis_family, differentiator, rationale, target_paths. Before returning the promise token, add insight and verification. This is the only measured-experiment handoff artifact.` : '',
+      loopConfig.experiment_memory ? `Compact experiment memory:\n${loopConfig.experiment_memory}` : '',
+      loopConfig.convergence_level && loopConfig.convergence_level !== 'none' ? `Research convergence intervention: ${loopConfig.convergence_level}. Select a materially different hypothesis family; do not repeat an exhausted sibling approach.` : '',
+      'Do not write metric state, the experiment ledger, loop configuration, or runtime summaries; the runtime owns them.',
+      'Process: state one falsifiable hypothesis, make one targeted change, verify it, record the learned insight, and converge deliberately.',
     ].join('\n\n');
   }
 
@@ -250,8 +264,8 @@ export function buildLoopPrompt({
       loopConfig.focus ? `Focus: ${loopConfig.focus}` : 'Focus: none',
       loopConfig.domain ? `Domain principles: ${loopConfig.domain}` : 'Domain principles: none',
       allowedPaths.length > 0 ? `Immutable mutation scope: ${JSON.stringify(allowedPaths)}` : '',
-      `Write/update ${sessionDir}/szechuan-sauce-summary.json with keys: issue_family, files_touched, cleanup_applied, verification, next_action.`,
-      `Write/update ${sessionDir}/szechuan-sauce-summary.md as the human-readable version of the same summary.`,
+      `Write/update ${artifactDir}/szechuan-sauce-summary.json with keys: issue_family, files_touched, cleanup_applied, verification, next_action.`,
+      `Write/update ${artifactDir}/szechuan-sauce-summary.md as the human-readable version of the same summary.`,
       loopConfig.dry_run ? 'Dry run: catalog violations only, do not edit files.' : 'Fix exactly one highest-value code quality issue this iteration.',
       'Phase 0 contract discovery: identify repository contracts, tests, public interfaces, and local conventions that constrain the cleanup before selecting a finding.',
       'Severity rubric: P0 data loss/security/correctness catastrophe; P1 production correctness or scope/diff-hygiene breach; P2 material maintainability defect with concrete evidence; P3 localized low-risk simplification; P4 optional polish.',
@@ -270,8 +284,8 @@ export function buildLoopPrompt({
       ...common,
       `Target: ${loopConfig.target}`,
       allowedPaths.length > 0 ? `Immutable mutation scope: ${JSON.stringify(allowedPaths)}` : '',
-      `Write/update ${sessionDir}/anatomy-park-summary.json with keys: finding_family, highest_severity_finding, data_flow_path, fix_applied, verification, trap_doors, next_action.`,
-      `Write/update ${sessionDir}/anatomy-park-summary.md as the human-readable version of the same summary.`,
+      `Write/update ${artifactDir}/anatomy-park-summary.json with keys: finding_family, highest_severity_finding, data_flow_path, fix_applied, verification, trap_doors, next_action.`,
+      `Write/update ${artifactDir}/anatomy-park-summary.md as the human-readable version of the same summary.`,
       loopConfig.dry_run ? 'Dry run: review and catalog findings only, do not edit or commit files.' : 'Fix at most one high-severity correctness issue this iteration.',
       'Trace data flow through the subsystem, identify where meaning changes incorrectly, and prefer correctness bugs over style complaints.',
       'Do not re-discover the same finding family across adjacent iterations unless you are adding concrete new evidence, a fix, or a stronger regression test.',
