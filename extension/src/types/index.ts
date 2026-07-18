@@ -135,6 +135,9 @@ export interface Ticket {
   // the index signature below still admits any other ad-hoc field.
   output_artifacts?: string[];
   proof_corpus?: string[];
+  allowed_paths?: string[];
+  allowedPaths?: string[];
+  files?: string[];
   freeze_contract?: FreezeContract | null;
   frontmatter?: Record<string, string>;
   [key: string]: unknown;
@@ -185,7 +188,7 @@ export interface RefinementManifest {
 
 export type PipelineBootstrapSource = 'task' | 'prd';
 
-export type PipelinePhase = 'pickle' | 'anatomy-park' | 'szechuan-sauce';
+export type PipelinePhase = 'pickle' | 'citadel' | 'anatomy-park' | 'szechuan-sauce';
 
 export interface PipelineSkipFlags {
   anatomy: boolean;
@@ -196,12 +199,15 @@ export interface PipelineContract {
   schema_version: number;
   working_dir: string;
   target: string;
+  /** Immutable operator-requested scope. Empty means derive from completed tickets. */
+  scope: string[];
   phases: PipelinePhase[];
   skip_flags: PipelineSkipFlags;
   bootstrap_source: PipelineBootstrapSource;
   task: string | null;
   bootstrap_prd: string | null;
   pickle: Record<string, unknown>;
+  citadel: Record<string, unknown>;
   anatomy: Record<string, unknown>;
   szechuan: Record<string, unknown>;
 }
@@ -305,7 +311,11 @@ export interface VerificationContract {
 }
 
 export interface PreflightDiagnostic {
-  kind: 'preflight-missing-env' | 'preflight-invalid-env';
+  kind:
+    | 'preflight-missing-env'
+    | 'preflight-invalid-env'
+    | 'preflight-missing-executable'
+    | 'preflight-unsafe-glob';
   name: string;
   message: string;
 }
@@ -358,12 +368,18 @@ export interface CodexSpawnResult {
   usage: CodexUsage;
   terminatedAfterSuccess: boolean;
   cancelled: boolean;
+  outputFormat: 'stream-json' | 'codex-block' | 'plain-text';
+  assistantContent: string;
+  toolCalls: import('../services/classifier-utils.js').CodexToolCallObservation[];
 }
 
 export interface SuccessCheckContext {
   stdout: string;
   stderr: string;
   lastMessage: string;
+  outputFormat: 'stream-json' | 'codex-block' | 'plain-text';
+  assistantContent: string;
+  toolCalls: import('../services/classifier-utils.js').CodexToolCallObservation[];
 }
 
 export type SuccessCheck = (ctx: SuccessCheckContext) => boolean;
@@ -377,6 +393,7 @@ export interface RunSpawnedCommandOptions {
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   outputLastMessagePath?: string;
+  progressArtifactPaths?: string[];
   successCheck?: SuccessCheck;
   successSignalGraceMs?: number;
   successPollMs?: number;
@@ -392,6 +409,7 @@ export interface CodexExecOptions {
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   outputLastMessagePath?: string;
+  progressArtifactPaths?: string[];
   cleanupPaths?: string[];
   onSpawn?: (child: import('node:child_process').ChildProcess) => void;
   cancelCheck?: CancelCheck;
@@ -460,6 +478,7 @@ export type ProgressMode = 'anatomy-park' | 'microverse' | 'szechuan-sauce' | st
 
 export interface ProgressSnapshot {
   head_sha: string;
+  head_tree_sha: string;
   worktree_fingerprint: string;
   step: string | null;
   current_ticket: string | null;
@@ -507,6 +526,7 @@ export interface PipelineStateOptions {
 
 export interface BeginPipelinePhaseOptions extends PipelineStateOptions {
   startedAt?: string;
+  runnerPid?: number;
 }
 
 export interface FinishPipelinePhaseOptions extends PipelineStateOptions {

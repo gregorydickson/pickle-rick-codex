@@ -36,6 +36,12 @@ export function isForeignTmuxSession(sessionName: string, sessionDir: string): b
   return sessionHashOf(sessionName) !== sessionHashOf(path.basename(sessionDir));
 }
 
+export function assertOwnedTmuxSession(sessionName: string, sessionDir: string): void {
+  if (isForeignTmuxSession(sessionName, sessionDir)) {
+    throw new Error(`Refusing to mutate foreign tmux session ${sessionName}`);
+  }
+}
+
 export function getRuntimeRoot(): string {
   return path.resolve(new URL('..', import.meta.url).pathname);
 }
@@ -61,9 +67,26 @@ export function tmuxSessionExists(sessionName: string, options: TmuxCallOptions 
   return result.status === 0;
 }
 
-export function clearTmuxSession(sessionName: string, options: TmuxCallOptions = {}): boolean {
-  if (!tmuxSessionExists(sessionName, options)) return false;
+export function killTmuxSession(sessionName: string, sessionDir: string, options: TmuxCallOptions = {}): void {
+  assertOwnedTmuxSession(sessionName, sessionDir);
   runTmux(['kill-session', '-t', sessionName], options);
+}
+
+export function respawnOwnedTmuxPane(
+  sessionName: string,
+  sessionDir: string,
+  paneTarget: string,
+  command: string,
+  options: TmuxCallOptions = {},
+): void {
+  assertOwnedTmuxSession(sessionName, sessionDir);
+  runTmux(['respawn-pane', '-k', '-t', paneTarget, command], options);
+}
+
+export function clearTmuxSession(sessionName: string, sessionDir: string, options: TmuxCallOptions = {}): boolean {
+  assertOwnedTmuxSession(sessionName, sessionDir);
+  if (!tmuxSessionExists(sessionName, options)) return false;
+  killTmuxSession(sessionName, sessionDir, options);
   return true;
 }
 

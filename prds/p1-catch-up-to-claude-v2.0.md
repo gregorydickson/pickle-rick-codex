@@ -1,15 +1,18 @@
 # PRD: Catch Up pickle-rick-codex to pickle-rick-claude v2.0
 
-**Priority:** P1 · **Status:** Ready to plan · **Source:** Full audit of pickle-rick-claude (v2.0.0-beta.46+) vs pickle-rick-codex (v0.2.16-beta.1)
+**Priority:** P1 · **Status:** In progress; inventory snapshot partially superseded · **Source:** July 15 audit of pickle-rick-claude (v2.0.0-beta.46+) vs pickle-rick-codex (then v0.2.16-beta.1)
 **Captured:** 2026-07-15 · **Blocks:** All future codex work until parity is achieved
+
+> **Status note (2026-07-18):** This is a frozen historical gap inventory, not current-state evidence. The port is now TypeScript-based, deploys a compiled `extension/`, has enforced fast/integration tiers plus a CI release gate, includes recoverable JSON and completion-evidence services, runs measured Microverse iterations, and has a compact final Citadel gate. That Citadel is intentionally not the Claude port's 26-analyzer subsystem. Re-run each gap check against the current tree before treating a row as open. `prds/MASTER_PLAN.md` is the live ledger.
 
 ## Summary
 
 The codex port is 3 weeks and ~46 beta releases behind the claude version. The claude version has evolved
 from a shared baseline into a hardened multi-backend convergence + review platform with ~70 shipped
 reliability fixes, 35 commands, 19 agents, a TypeScript extension architecture, and a full release gate.
-The codex port is a minimum-viable pipeline runner with 14 skills, plain JS, no agents, no citadel, no
-convergence runtime, and only 1 shipped fix (LOA-1568).
+At capture time, the codex port was a minimum-viable pipeline runner with 14 skills, plain JS, no agents,
+no Citadel, no convergence runtime, and only 1 shipped fix (LOA-1568). Those facts are retained below as
+the July 15 comparison baseline and must not be quoted as the current implementation state.
 
 This PRD catalogs every gap and proposes a phased migration to bring codex to parity, including the
 architectural migration from plain JS to TypeScript (matching claude's extension model).
@@ -22,7 +25,7 @@ last 3 weeks is still present in codex. The codex port cannot dogfood itself rel
 oracle, worker spawn, and gate correctness fixes are ported. The missing review phases (citadel,
 council-of-ricks, death-crystal) mean codex cannot run the full pipeline that claude runs.
 
-## Current State
+## Historical State At Capture (Superseded)
 
 | Metric | Codex (v0.2.16-beta.1) | Claude (v2.0.0-beta.46+) |
 |--------|------------------------|--------------------------|
@@ -289,7 +292,7 @@ Spec Conformance → Code Review → Simplify). The two review gates are absent 
 
 **Also:** Backfill partial commands (pickle-pipeline citadel stage, pickle-refine-prd depth, pickle-tmux flags, pickle-microverse flags, pickle-prd paused mode).
 
-**Exit criteria:** All 6 commands invocable with `codex exec`, citadel runs as pipeline stage, pickle-pipeline runs full 4-phase (build → citadel → anatomy → szechuan).
+**Exit criteria:** All 6 commands invocable with `codex exec`, citadel runs as the final pipeline stage, and pickle-pipeline runs full 4-phase (build → anatomy → szechuan → citadel).
 
 ### Phase 3: Agent System (19 agents)
 
@@ -350,7 +353,7 @@ Spec Conformance → Code Review → Simplify). The two review gates are absent 
 - **AC-7.** Tmux ownership guard prevents foreign-pane keystroke injection.
 - **AC-8.** Promise token scrubbing is applied to all worker output.
 - **AC-9.** Citadel runs as a pipeline stage in `pickle-pipeline`.
-- **AC-10.** `pickle-pipeline` runs a real multi-ticket bundle end-to-end (build → citadel → anatomy → szechuan) hands-off with zero interventions.
+- **AC-10.** `pickle-pipeline` runs a real multi-ticket bundle end-to-end (build → anatomy → szechuan → citadel) hands-off with zero interventions.
 - **AC-11.** All top 10 reliability fixes are ported with regression tests.
 - **AC-12.** Version bumped to v2.1.0 with matching git tag.
 

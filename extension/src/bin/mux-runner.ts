@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
+import { canExecute, loadCircuitState } from '../services/circuit-breaker.js';
 import { getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
@@ -18,6 +19,7 @@ import {
 } from '../services/tickets.js';
 import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
 import { scrubTicketWorkerMessages } from '../services/worker-output.js';
+import { decideTicketRecovery } from '../services/recovery-controller.js';
 import { runTicket } from './spawn-morty.js';
 
 interface RunSequentialOptions {
@@ -133,6 +135,12 @@ export async function runSequential(
         appendRunnerLog(sessionDir, runnerMode, `stopping during ticket ${ticket.id}: ${stopReason}`);
         break;
       }
+      if (config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
+        failedTicketId = ticket.id;
+        exitReason = 'circuit_open';
+        appendRunnerLog(sessionDir, runnerMode, `refusing ticket ${ticket.id}: circuit breaker is OPEN`);
+        break;
+      }
 
       attempts += 1;
       try {
@@ -151,25 +159,26 @@ export async function runSequential(
         // Done. Route it through the same failure-mode handling as a genuine failure so a
         // ticket is only ever marked Done when the oracle accepted it.
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} not completed: oracle refusal ${result.reason ?? result.status}`);
-        if (attempts < maxAttempts) {
-          const retryStopReason = shouldStop(manager.read(statePath));
-          if (retryStopReason === 'max_time' || retryStopReason === 'max_iterations') {
-            failedTicketId = ticket.id;
-            exitReason = 'error';
-            appendRunnerLog(sessionDir, runnerMode, `not retrying ${ticket.id}: ${retryStopReason} would mask the current failure`);
-            appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
-            break;
-          }
+        const recovery = decideTicketRecovery({
+          failureKind: 'oracle_refusal',
+          failureMode,
+          attempt: attempts,
+          maxAttempts,
+          stopReason: shouldStop(manager.read(statePath)),
+          circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
+        });
+        if (recovery.action === 'retry') {
           continue;
         }
-        if (failureMode === 'skip') {
+        if (recovery.action === 'skip') {
           ticket.status = 'Skipped';
           updateTicketStatus(sessionDir, ticket.id, { status: 'Skipped', skipped_at: new Date().toISOString() });
           appendRunnerLog(sessionDir, runnerMode, `skipping ticket ${ticket.id}`);
           break;
         }
         failedTicketId = ticket.id;
-        exitReason = 'error';
+        exitReason = recovery.exitReason || 'error';
+        appendRunnerLog(sessionDir, runnerMode, `recovery stopped for ${ticket.id}: ${recovery.reason}`);
         appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       } catch (error) {
@@ -193,25 +202,26 @@ export async function runSequential(
           break;
         }
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
-        if (attempts < maxAttempts) {
-          const retryStopReason = shouldStop(manager.read(statePath));
-          if (retryStopReason === 'max_time' || retryStopReason === 'max_iterations') {
-            failedTicketId = ticket.id;
-            exitReason = 'error';
-            appendRunnerLog(sessionDir, runnerMode, `not retrying ${ticket.id}: ${retryStopReason} would mask the current failure`);
-            appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
-            break;
-          }
+        const recovery = decideTicketRecovery({
+          failureKind: 'worker_failure',
+          failureMode,
+          attempt: attempts,
+          maxAttempts,
+          stopReason: shouldStop(manager.read(statePath)),
+          circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
+        });
+        if (recovery.action === 'retry') {
           continue;
         }
-        if (failureMode === 'skip') {
+        if (recovery.action === 'skip') {
           ticket.status = 'Skipped';
           updateTicketStatus(sessionDir, ticket.id, { status: 'Skipped', skipped_at: new Date().toISOString() });
           appendRunnerLog(sessionDir, runnerMode, `skipping ticket ${ticket.id}`);
           break;
         }
         failedTicketId = ticket.id;
-        exitReason = 'error';
+        exitReason = recovery.exitReason || 'error';
+        appendRunnerLog(sessionDir, runnerMode, `recovery stopped for ${ticket.id}: ${recovery.reason}`);
         appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       }
@@ -251,6 +261,7 @@ async function main(argv: string[]): Promise<void> {
     || exitReason === 'no_tickets'
     || exitReason === 'invalid_session'
     || exitReason === 'verification-contract-failed'
+    || exitReason === 'circuit_open'
     || String(exitReason).startsWith('preflight-')
   ) {
     process.exitCode = 1;

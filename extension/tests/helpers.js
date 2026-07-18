@@ -70,8 +70,35 @@ export function writeExecutable(filePath, content) {
 export function prependPath(binDir, env = {}) {
   return {
     ...env,
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_QUALITY_COMMANDS: '["node -e \\\"process.exit(0)\\\""]',
     PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
   };
+}
+
+// Source injected into bespoke fake-Codex executables so every worker test honors
+// the same persisted lifecycle-artifact contract as the shared fake.
+export function fakeLifecycleArtifactWriterSource() {
+  return String.raw`
+function writeFakeLifecycleArtifact(prompt, phase) {
+  const line = prompt.split('\n').find((candidate) => candidate.startsWith('Lifecycle artifact path: '));
+  const artifactPath = line ? line.slice('Lifecycle artifact path: '.length).trim() : '';
+  if (!artifactPath) return;
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  const ticketId = path.basename(path.dirname(artifactPath));
+  const criteriaLine = prompt.split('\n').find((candidate) => candidate.startsWith('Required acceptance criteria JSON: '));
+  const criteria = criteriaLine ? JSON.parse(criteriaLine.slice('Required acceptance criteria JSON: '.length)) : [];
+  const base = { schema_version: 1, phase, ticket_id: ticketId, summary: 'approved ' + phase };
+  const artifact = phase === 'research' ? { ...base, evidence: ['research evidence'] }
+    : phase === 'research_review' || phase === 'plan_review' ? { ...base, verdict: 'approved', evidence: ['review evidence'] }
+    : phase === 'plan' ? { ...base, steps: ['implement the ticket'] }
+    : phase === 'implement' ? { ...base, files_changed: [], verification: ['fake verification'] }
+    : phase === 'review' ? { ...base, verdict: 'approved', implementation_reviewed: true, evidence: ['implementation reviewed'] }
+    : phase === 'simplify' ? { ...base, verification: ['fake verification'] }
+    : { ...base, verdict: 'all_pass', implementation_reviewed: true, acceptance_criteria: criteria.map((criterion) => ({ criterion, status: 'pass', evidence: 'fake evidence' })) };
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
+}
+`;
 }
 
 export function createFakeCodex(binDir) {
@@ -86,6 +113,11 @@ const prompt = fs.readFileSync(0, 'utf8');
 
 if (args[0] === '--version') {
   console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+if (args[0] === 'exec' && args[1] === '--help') {
+  console.log('Usage: codex exec [--cd DIR] [--json] [--add-dir DIR] [--output-last-message FILE]');
   process.exit(0);
 }
 
@@ -123,7 +155,61 @@ function extractTicketPhase() {
   return match ? match[1] : '';
 }
 
-if (prompt.includes('Loop mode:')) {
+function writeLifecycleArtifact(phase) {
+  const artifactPath = extractPathAfter('Lifecycle artifact path: ');
+  const missingPhase = process.env.FAKE_LIFECYCLE_MISSING_PHASE || '';
+  if (!artifactPath || phase === missingPhase) return;
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  const ticketId = path.basename(path.dirname(artifactPath));
+  const criteriaLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Required acceptance criteria JSON: '));
+  const criteria = criteriaLine ? JSON.parse(criteriaLine.slice('Required acceptance criteria JSON: '.length)) : [];
+  const base = { schema_version: 1, phase, ticket_id: ticketId, summary: 'approved ' + phase + ' marker' };
+  const artifact = phase === 'research'
+    ? { ...base, evidence: ['approved research marker'] }
+    : phase === 'research_review' || phase === 'plan_review'
+      ? { ...base, verdict: 'approved', evidence: ['approved ' + phase + ' evidence'] }
+      : phase === 'plan'
+        ? { ...base, steps: ['approved plan marker'] }
+        : phase === 'implement'
+          ? { ...base, files_changed: process.env.FAKE_CODEX_MUTATE_FILE ? [process.env.FAKE_CODEX_MUTATE_FILE] : [], verification: ['fake implementation verification'] }
+          : phase === 'review'
+            ? { ...base, verdict: 'approved', implementation_reviewed: true, evidence: ['reviewed implementation diff'] }
+            : phase === 'simplify'
+              ? { ...base, verification: ['fake simplification verification'] }
+              : { ...base, verdict: 'all_pass', implementation_reviewed: true, acceptance_criteria: criteria.map((criterion) => ({ criterion, status: 'pass', evidence: 'fake conformance evidence' })) };
+  if (phase === (process.env.FAKE_LIFECYCLE_INVALID_PHASE || '')) artifact.summary = '';
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
+  const promptLog = process.env.FAKE_LIFECYCLE_PROMPT_LOG || '';
+  if (promptLog) {
+    fs.mkdirSync(promptLog, { recursive: true });
+    fs.writeFileSync(path.join(promptLog, phase + '.prompt.txt'), prompt);
+  }
+}
+
+if (prompt.includes('You are the Citadel release reviewer')) {
+  const reportPath = extractPathAfter('Citadel report path: ');
+  const criteriaLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Required acceptance criteria '));
+  const expectedCriteria = criteriaLine ? JSON.parse(criteriaLine.slice(criteriaLine.indexOf(': ') + 2)) : [];
+  if (!reportPath) {
+    console.error('missing Citadel report path');
+    process.exit(1);
+  }
+  fs.writeFileSync(reportPath, JSON.stringify({
+    schema_version: 1,
+    verdict: process.env.FAKE_CITADEL_VERDICT || 'approve',
+    reviewed_range: 'fake..HEAD',
+    acceptance_criteria_checked: process.env.FAKE_CITADEL_INCOMPLETE_COVERAGE === '1'
+      ? expectedCriteria.slice(0, Math.max(0, expectedCriteria.length - 1))
+      : expectedCriteria,
+    findings: process.env.FAKE_CITADEL_VERDICT === 'block'
+      ? [{ severity: 'high', title: 'Fake blocker', evidence: 'fake evidence', file: 'fake.js', line: 1, recommendation: 'fix it' }]
+      : [],
+    generated_at: '2026-07-18T00:00:00.000Z',
+  }, null, 2));
+  lastMessage = process.env.FAKE_CITADEL_NO_PROMISE === '1'
+    ? JSON.stringify({ reviewed: true })
+    : '<promise>THE_CITADEL_APPROVES</promise>';
+} else if (prompt.includes('Loop mode:')) {
   const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
   const current = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0') + 1;
   fs.writeFileSync(counterPath, String(current));
@@ -218,6 +304,7 @@ if (prompt.includes('Loop mode:')) {
             'The refined ticket carries at least one ticket-specific verification command.',
           ],
           verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
           priority: 'P1',
           status: 'Todo',
         },
@@ -225,7 +312,7 @@ if (prompt.includes('Loop mode:')) {
     }, null, 2),
   );
   lastMessage = '<promise>REFINEMENT_COMPLETE</promise>';
-} else if (!fs.existsSync(prdPath)) {
+} else if (!fs.existsSync(prdPath) && !prompt.includes('You are executing the "')) {
   fs.writeFileSync(
     prdPath,
     '# PRD\\n\\n## Summary\\nFake codex produced a draft.\\n\\n## Verification\\n- \`npm test\`\\n',
@@ -233,6 +320,7 @@ if (prompt.includes('Loop mode:')) {
   lastMessage = '<promise>PRD_COMPLETE</promise>';
 } else if (prompt.includes('You are executing the "')) {
   const phase = extractTicketPhase();
+  writeLifecycleArtifact(phase);
   const mutatePhase = process.env.FAKE_CODEX_MUTATE_PHASE || 'implement';
   const mutateFile = process.env.FAKE_CODEX_MUTATE_FILE || '';
   if (mutateFile && phase === mutatePhase) {
@@ -263,6 +351,7 @@ if (prompt.includes('Loop mode:')) {
             'The refined ticket carries at least one ticket-specific verification command.',
           ],
           verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
           priority: 'P1',
           status: 'Todo',
         },
@@ -340,7 +429,7 @@ function simulateRunnerStart(mode) {
   if (fs.existsSync(statePath)) {
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     state.active = true;
-    state.tmux_runner_pid = 4242;
+    state.tmux_runner_pid = Number(process.env.FAKE_TMUX_RUNNER_PID || 4242);
     state.last_exit_reason = null;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   }

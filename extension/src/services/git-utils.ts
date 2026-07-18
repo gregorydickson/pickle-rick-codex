@@ -37,6 +37,15 @@ export function getHeadSha(cwd: string): string {
   return runGit(['rev-parse', 'HEAD'], cwd, { allowFailure: true }) || '';
 }
 
+export function isPathTracked(cwd: string, relativePath: string): boolean {
+  try {
+    runGit(['ls-files', '--error-unmatch', '--', relativePath], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function commitExists(cwd: string, sha: string): boolean {
   if (!sha) return false;
   try {
@@ -149,6 +158,8 @@ export function listWorkingTreeDirtyPaths(cwd: string, excludePrefixes?: string[
     paths.push(token.slice(3));
     const status = token.slice(0, 2);
     if (status[0] === 'R' || status[0] === 'C' || status[1] === 'R' || status[1] === 'C') {
+      const sourcePath = tokens[index + 1];
+      if (sourcePath) paths.push(sourcePath);
       index += 1;
     }
   }
@@ -216,6 +227,13 @@ export function commitTrackedChanges(cwd: string, message: string, options: Comm
 
 export function resetGitIndex(cwd: string): void {
   runGit(['reset'], cwd, { allowFailure: true });
+}
+
+export function resetHeadPreservingWorktree(cwd: string, sha: string): void {
+  if (!sha || !commitExists(cwd, sha)) {
+    throw new Error('Cannot restore worker HEAD: invalid baseline commit.');
+  }
+  runGit(['reset', '--mixed', sha], cwd);
 }
 
 function appendFilesystemEntryFingerprint(hash: crypto.Hash, rootDir: string, relativePath: string = ''): void {

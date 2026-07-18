@@ -10,7 +10,7 @@ import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { writePipelineContract } from '../services/pipeline.js';
 import { buildVerificationCommandScope, buildVerificationFailureSet, ensurePipelineState, writeVerificationBaselines } from '../services/pipeline-state.js';
 import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../services/verification-env.js';
-import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
+import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeExecutable, writeJson, fakeLifecycleArtifactWriterSource } from './helpers.js';
 
 function runGit(repoDir, args) {
   return execFileSync('git', args, {
@@ -18,6 +18,17 @@ function runGit(repoDir, args) {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+}
+
+function cleanWorkerProject(prefix = 'pickle-rick-clean-worker-') {
+  const projectDir = makeTempRoot(prefix);
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'README.md'), '# Clean worker fixture\n');
+  runGit(projectDir, ['add', 'README.md']);
+  runGit(projectDir, ['commit', '-m', 'fixture']);
+  return projectDir;
 }
 
 function writePreflightManifest(sessionDir, verificationEnv, verification = ['node -e "process.exit(0)"']) {
@@ -32,6 +43,7 @@ function writePreflightManifest(sessionDir, verificationEnv, verification = ['no
         verification_env: verificationEnv,
         priority: 'P1',
         status: 'Todo',
+        allowed_paths: ['README.md'],
       },
     ],
   });
@@ -168,6 +180,7 @@ test('pickle-tmux blocks malformed DATABASE_URL before detached launch', () => {
 
 test('spawn-morty uses deterministic verification env when configured', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-deterministic-env-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -178,7 +191,7 @@ test('spawn-morty uses deterministic verification env when configured', () => {
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'deterministic verification env'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -205,7 +218,7 @@ test('spawn-morty uses deterministic verification env when configured', () => {
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   const result = JSON.parse(output);
@@ -218,7 +231,7 @@ test('spawn-morty uses deterministic verification env when configured', () => {
   assert.equal(ticket.status, 'Done');
 });
 
-test('spawn-morty works directly in the current branch working tree', () => {
+test('spawn-morty refuses pre-existing dirt before starting a worker', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   const projectDir = makeTempRoot('pickle-rick-working-branch-');
@@ -255,26 +268,281 @@ test('spawn-morty works directly in the current branch working tree', () => {
         ],
         priority: 'P1',
         status: 'Todo',
+        allowed_paths: ['feature.txt'],
       },
     ],
   });
 
-  const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
+      env,
+      cwd: projectDir,
+    }),
+    /pre-existing-dirt/,
+  );
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\nuser-change\n');
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'ownership_preflight');
+});
+
+test('spawn-morty fails closed when quality baseline commands mutate the repository', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-quality-baseline-mutation-');
+  createFakeCodex(fakeBin);
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  const baseHead = runGit(projectDir, ['rev-parse', 'HEAD']).trim();
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  env.PICKLE_TEST_QUALITY_COMMANDS = JSON.stringify([
+    `node -e ${JSON.stringify("require('node:fs').appendFileSync('feature.txt', 'baseline-mutation\\n')")}`,
+  ]);
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'mutating quality baseline'], {
     env,
     cwd: projectDir,
   }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1',
+      title: 'Mutating baseline',
+      description: 'Baseline commands must be read-only.',
+      acceptance_criteria: ['No worker starts after a mutating baseline command.'],
+      verification: ['node -e "process.exit(0)"'],
+      allowed_paths: ['feature.txt'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
 
-  const result = JSON.parse(output);
+  await assert.rejects(runTicketWithEnv(sessionDir, 'r1', env), /quality-baseline-mutation/);
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
-  assert.equal(result.status, 'done');
-  assert.equal(result.applied, true);
-  assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\nuser-change\nagent-change\n');
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'quality_gate');
   assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
-  assert.equal(ticket.status, 'Done');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\n');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']).trim(), '');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'r1.research.last-message.txt')), false);
+});
+
+test('spawn-morty blocks a red worker quality gate before auto-commit', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-quality-red-');
+  const marker = path.join(dataRoot, 'quality-baseline-complete');
+  createFakeCodex(fakeBin);
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  const baseHead = runGit(projectDir, ['rev-parse', 'HEAD']).trim();
+  const qualityCommand = `node -e ${JSON.stringify([
+    "const fs = require('node:fs')",
+    `const marker = ${JSON.stringify(marker)}`,
+    "if (fs.existsSync(marker)) process.exit(9)",
+    "fs.writeFileSync(marker, 'done')",
+  ].join('; '))}`;
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+  env.PICKLE_TEST_QUALITY_COMMANDS = JSON.stringify([qualityCommand]);
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'red quality gate'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, { ...readJsonFile(statePath), tmux_mode: true });
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1',
+      title: 'Red gate',
+      description: 'Failing quality checks must not create a commit.',
+      acceptance_criteria: ['HEAD remains at the ticket baseline.'],
+      verification: ['node -e "process.exit(0)"'],
+      allowed_paths: ['feature.txt'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+
+  await assert.rejects(runTicketWithEnv(sessionDir, 'r1', env), /worker-quality-gate-red/);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'quality_gate');
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
+  assert.equal(runGit(projectDir, ['rev-list', '--count', 'HEAD']).trim(), '1');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']).trim(), '');
+});
+
+test('spawn-morty anchors and rolls back an out-of-scope worker self-commit', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-scope-self-commit-');
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+  const baseHead = runGit(projectDir, ['rev-parse', 'HEAD']).trim();
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+${fakeLifecycleArtifactWriterSource()}
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const phase = prompt.match(/executing the "([^"]+)" phase/)?.[1] || 'research';
+writeFakeLifecycleArtifact(prompt, phase);
+if (phase === 'implement') {
+  fs.writeFileSync('foreign.txt', 'out of scope\\n');
+  execFileSync('git', ['add', 'foreign.txt']);
+  execFileSync('git', ['-c', 'user.name=Bad Worker', '-c', 'user.email=bad@example.test', 'commit', '-m', 'out of scope']);
+}
+const message = '<promise>' + phase.toUpperCase() + '_COMPLETE</promise>';
+const outputIndex = args.indexOf('--output-last-message');
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], message);
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+console.log(message);
+`);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'scope self-commit'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1',
+      title: 'Scoped self-commit',
+      description: 'Only the declared feature path may change.',
+      acceptance_criteria: ['Reject foreign.txt.'],
+      verification: ['node -e "process.exit(0)"'],
+      allowed_paths: ['feature.txt'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+
+  await assert.rejects(runTicketWithEnv(sessionDir, 'r1', env), /scope-violation:.*foreign\.txt/);
+  const recoveryRef = `refs/pickle/rejected/${path.basename(sessionDir)}/r1`;
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']).trim(), baseHead);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']).trim(), '');
+  assert.equal(runGit(projectDir, ['show', `${recoveryRef}:foreign.txt`]), 'out of scope\n');
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'scope_violation');
+});
+
+test('spawn-morty rejects out-of-scope mutations created by the post-worker quality gate', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-quality-scope-');
+  const gateMarker = path.join(dataRoot, 'quality-baseline-ran');
+  createFakeCodex(fakeBin);
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+
+  const qualityCommand = `node -e ${JSON.stringify([
+    "const fs = require('node:fs')",
+    `const marker = ${JSON.stringify(gateMarker)}`,
+    "if (fs.existsSync(marker)) fs.writeFileSync('foreign.txt', 'quality mutation\\n')",
+    "else fs.writeFileSync(marker, 'baseline captured\\n')",
+  ].join('; '))}`;
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+  env.PICKLE_TEST_QUALITY_COMMANDS = JSON.stringify([qualityCommand]);
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'quality scope fence'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1',
+      title: 'Quality scope fence',
+      description: 'Quality checks must not mutate files outside ticket ownership.',
+      acceptance_criteria: ['Only feature.txt may change.'],
+      verification: ['node -e "process.exit(0)"'],
+      allowed_paths: ['feature.txt'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+
+  await assert.rejects(
+    runTicketWithEnv(sessionDir, 'r1', env),
+    /scope-violation:.*foreign\.txt/,
+  );
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket.status, 'Blocked');
+  assert.equal(ticket.frontmatter.failure_kind, 'scope_violation');
+  assert.equal(runGit(projectDir, ['rev-list', '--count', 'HEAD']).trim(), '1');
+  assert.equal(runGit(projectDir, ['diff', '--cached', '--name-only']).trim(), '');
+});
+
+test('spawn-morty rejects pre-existing untracked files before quality checks or worker execution', async () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const projectDir = makeTempRoot('pickle-rick-quality-index-');
+  createFakeCodex(fakeBin);
+  runGit(projectDir, ['init']);
+  runGit(projectDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(projectDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(projectDir, 'feature.txt'), 'base\n');
+  fs.writeFileSync(path.join(projectDir, 'scratch.txt'), 'pre-existing untracked\n');
+  runGit(projectDir, ['add', 'feature.txt']);
+  runGit(projectDir, ['commit', '-m', 'base']);
+
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'agent-change\n',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'quality index fence'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1',
+      title: 'Quality index fence',
+      description: 'Ownership requires a clean starting tree.',
+      acceptance_criteria: ['The worker refuses pre-existing untracked data.'],
+      verification: ['node -e "process.exit(0)"'],
+      allowed_paths: ['feature.txt'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+
+  await assert.rejects(runTicketWithEnv(sessionDir, 'r1', env), /pre-existing-dirt/);
+  assert.equal(runGit(projectDir, ['rev-list', '--count', 'HEAD']).trim(), '1');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']).trim(), '?? scratch.txt');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'feature.txt'), 'utf8'), 'base\n');
 });
 
 test('spawn-morty executes object-wrapped verification commands after shared normalization', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-object-verification-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -283,7 +551,7 @@ test('spawn-morty executes object-wrapped verification commands after shared nor
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'object wrapped verification execution'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   const proofPath = path.join(sessionDir, 'verification-proof.txt');
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -313,7 +581,7 @@ test('spawn-morty executes object-wrapped verification commands after shared nor
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   const result = JSON.parse(output);
@@ -323,6 +591,7 @@ test('spawn-morty executes object-wrapped verification commands after shared nor
 
 test('spawn-morty executes array-of-object verification commands after shared normalization', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-array-verification-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -331,7 +600,7 @@ test('spawn-morty executes array-of-object verification commands after shared no
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'array object verification execution'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   const proofPath = path.join(sessionDir, 'verification-proof.txt');
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -353,7 +622,7 @@ test('spawn-morty executes array-of-object verification commands after shared no
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   const result = JSON.parse(output);
@@ -363,6 +632,7 @@ test('spawn-morty executes array-of-object verification commands after shared no
 
 test('spawn-morty preserves quoted && inside string-form verification commands', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-quoted-verification-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -371,7 +641,7 @@ test('spawn-morty preserves quoted && inside string-form verification commands',
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'quoted verification command'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   const proofPath = path.join(sessionDir, 'verification-proof.txt');
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -390,7 +660,7 @@ test('spawn-morty preserves quoted && inside string-form verification commands',
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   const result = JSON.parse(output);
@@ -673,6 +943,7 @@ test('normalizeVerificationCommands leaves unknown runners unchanged', () => {
 
 test('spawn-morty stops phases promptly after writing phase promise tokens', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-phase-promise-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -682,7 +953,7 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'phase promise stop'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -701,17 +972,21 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
   const started = Date.now();
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   const elapsed = Date.now() - started;
 
-  assert.ok(elapsed < 7000, `spawn-morty took too long after phase success: ${elapsed}ms`);
+  // Five fake phases would take at least 15s if the promise-token early-stop
+  // contract regressed. Leave enough headroom for this integration suite's
+  // parallel process load while still proving each lingering child is stopped.
+  assert.ok(elapsed < 12000, `spawn-morty took too long after phase success: ${elapsed}ms`);
   const result = JSON.parse(output);
   assert.equal(result.status, 'done');
 });
 
 test('spawn-morty distinguishes normal verification command failure from preflight failures', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-verification-failure-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -720,7 +995,7 @@ test('spawn-morty distinguishes normal verification command failure from preflig
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'verification failure'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -745,7 +1020,7 @@ test('spawn-morty distinguishes normal verification command failure from preflig
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
       env,
-      cwd: repoRoot,
+      cwd: projectDir,
     }),
     /verification-command-failed:/,
   );
@@ -1575,6 +1850,7 @@ test('spawn-morty preserves pnpm --filter scoped baseline subtraction for packag
 
 test('spawn-morty classifies verification contract execution failures separately from generic command failures', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-contract-failure-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -1583,7 +1859,7 @@ test('spawn-morty classifies verification contract execution failures separately
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'verification contract failure'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -1603,7 +1879,7 @@ test('spawn-morty classifies verification contract execution failures separately
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
       env,
-      cwd: repoRoot,
+      cwd: projectDir,
     }),
     /verification-contract-failed:/,
   );
@@ -1616,6 +1892,7 @@ test('spawn-morty classifies verification contract execution failures separately
 
 test('spawn-morty blocks timed-out verification commands instead of treating signal exits as passing verification', async () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-timed-verification-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   writeJson(path.join(dataRoot, 'config.json'), {
@@ -1629,7 +1906,7 @@ test('spawn-morty blocks timed-out verification commands instead of treating sig
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'timed verification command'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -1851,6 +2128,7 @@ test('spawn-morty infers sibling roots from repo wrapper verification commands',
 
 test('spawn-morty ignores vars assigned inside verification commands', () => {
   const dataRoot = makeTempRoot();
+  const projectDir = cleanWorkerProject('pickle-local-assignment-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
@@ -1859,7 +2137,7 @@ test('spawn-morty ignores vars assigned inside verification commands', () => {
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'local assignment verification env'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -1877,7 +2155,7 @@ test('spawn-morty ignores vars assigned inside verification commands', () => {
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
-    cwd: repoRoot,
+    cwd: projectDir,
   }).trim();
 
   const result = JSON.parse(output);

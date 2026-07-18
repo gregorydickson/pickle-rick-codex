@@ -12,6 +12,10 @@ interface MicroverseArgs {
   taskSpecified: boolean;
   direction: string;
   directionSpecified: boolean;
+  tolerance: number;
+  toleranceSpecified: boolean;
+  metricTimeoutSeconds: number;
+  metricTimeoutSpecified: boolean;
   stallLimit: number;
   stallLimitSpecified: boolean;
   maxIterations: number | null;
@@ -27,6 +31,10 @@ function parseArgs(argv: string[]): MicroverseArgs {
   let taskSpecified = false;
   let direction = 'higher';
   let directionSpecified = false;
+  let tolerance = 0;
+  let toleranceSpecified = false;
+  let metricTimeoutSeconds = 120;
+  let metricTimeoutSpecified = false;
   let stallLimit = 5;
   let stallLimitSpecified = false;
   let maxIterations: number | null = null;
@@ -49,6 +57,14 @@ function parseArgs(argv: string[]): MicroverseArgs {
     } else if (arg === '--direction') {
       direction = argv[i + 1] || 'higher';
       directionSpecified = true;
+      i += 1;
+    } else if (arg === '--tolerance') {
+      tolerance = Number(argv[i + 1] || '0');
+      toleranceSpecified = true;
+      i += 1;
+    } else if (arg === '--metric-timeout') {
+      metricTimeoutSeconds = Number(argv[i + 1] || '120');
+      metricTimeoutSpecified = true;
       i += 1;
     } else if (arg === '--stall-limit') {
       stallLimit = Number(argv[i + 1] || '5');
@@ -76,6 +92,15 @@ function parseArgs(argv: string[]): MicroverseArgs {
       throw new Error('--task is required unless resuming');
     }
   }
+  if (direction !== 'higher' && direction !== 'lower') {
+    throw new Error('--direction must be higher or lower');
+  }
+  if (!Number.isFinite(tolerance) || tolerance < 0) {
+    throw new Error('--tolerance must be a non-negative finite number');
+  }
+  if (!Number.isFinite(metricTimeoutSeconds) || metricTimeoutSeconds <= 0) {
+    throw new Error('--metric-timeout must be a positive number of seconds');
+  }
 
   return {
     metric,
@@ -86,6 +111,10 @@ function parseArgs(argv: string[]): MicroverseArgs {
     taskSpecified,
     direction,
     directionSpecified,
+    tolerance,
+    toleranceSpecified,
+    metricTimeoutSeconds,
+    metricTimeoutSpecified,
     stallLimit,
     stallLimitSpecified,
     maxIterations,
@@ -120,6 +149,12 @@ async function main(argv: string[]): Promise<void> {
   }
   if (!parsed.resume || parsed.directionSpecified) {
     loopConfig.direction = parsed.direction;
+  }
+  if (!parsed.resume || parsed.toleranceSpecified) {
+    loopConfig.tolerance = parsed.tolerance;
+  }
+  if (!parsed.resume || parsed.metricTimeoutSpecified) {
+    loopConfig.metric_timeout_seconds = parsed.metricTimeoutSeconds;
   }
   if (!parsed.resume || parsed.stallLimitSpecified) {
     loopConfig.stall_limit = parsed.stallLimit;

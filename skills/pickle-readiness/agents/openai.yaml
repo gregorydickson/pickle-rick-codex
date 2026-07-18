@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pickle Readiness"
+  short_description: "Check whether a Pickle Rick session is safe to run"
+  default_prompt: "Use $pickle-readiness to check whether this Pickle Rick session is safe to run."

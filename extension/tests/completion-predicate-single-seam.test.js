@@ -120,19 +120,18 @@ test('PIN 3: ticket-completion-evidence importer files are exactly {spawn-morty.
   );
 });
 
-test('PIN 4: spawn-morty completion tail routes Done through the predicate (attribution, .ok-gated)', () => {
+test('PIN 4: spawn-morty completion tail routes Done through the predicate (done-flip, .ok-gated)', () => {
   assert.ok(
     /evaluateCompletionEvidence\(/.test(spawnMortyCode),
     'spawn-morty.ts no longer calls evaluateCompletionEvidence — the completion decision bypassed the predicate.',
   );
   assert.ok(
-    /decision:\s*'attribution'/.test(spawnMortyCode),
-    "spawn-morty's completion ctx must use decision:'attribution' (codex has no worker gate; " +
-      "'done-flip' would always refuse worker_gate_unavailable).",
+    /decision:\s*'done-flip'/.test(spawnMortyCode),
+    "spawn-morty's completion ctx must use decision:'done-flip' so the portable worker gate is fail-closed.",
   );
   assert.ok(
-    !/decision:\s*'done-flip'/.test(spawnMortyCode),
-    "spawn-morty must NOT select decision:'done-flip' (no worker gate → always worker_gate_unavailable).",
+    /workerGateVerdict:/.test(spawnMortyCode),
+    "spawn-morty must inject the worker gate resolver into the single completion oracle.",
   );
   assert.ok(
     /\.ok\b[\s\S]{0,160}finalizeSuccess\(/.test(spawnMortyCode),

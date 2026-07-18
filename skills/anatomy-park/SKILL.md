@@ -13,6 +13,8 @@ Launch the detached tmux runner:
 
 `node $HOME/.codex/pickle-rick/extension/bin/anatomy-park.js <target>`
 
+When launched by `pickle-pipeline`, mutations are fenced to the pipeline's immutable resolved scope. Any out-of-scope commit or dirty edit is archived through the recovery seam, rolled back, and blocks the phase.
+
 Optional flags:
 
 - `--dry-run`

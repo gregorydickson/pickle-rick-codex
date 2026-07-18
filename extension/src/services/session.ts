@@ -9,6 +9,7 @@ import {
   getSessionsRoot,
   nowIso,
 } from './pickle-utils.js';
+import { getHeadSha, isGitRepo } from './git-utils.js';
 import { cancelPipelineSession, isPipelineSession } from './pipeline-state.js';
 import {
   findLastSessionForCwd,
@@ -20,6 +21,8 @@ import {
 import { StateManager } from './state-manager.js';
 import type { PersistedState } from './state-manager.js';
 import type { Config } from '../types/index.js';
+import { tmuxSessionExists } from './tmux.js';
+import { reapOwnedOrphanProcessGroup } from './orphan-reaper.js';
 
 export interface SessionResult {
   sessionDir: string;
@@ -89,6 +92,11 @@ export function createInitialState({
     pipeline_task: null,
     pipeline_phases: null,
     pipeline_skip_flags: null,
+    start_commit: isGitRepo(cwd) ? getHeadSha(cwd) : null,
+    pinned_sha: isGitRepo(cwd) ? getHeadSha(cwd) : null,
+    quality_baseline: null,
+    manager_relaunch_count: 0,
+    manager_relaunch_history: [],
     ...overrides,
   };
   if (state.active === false) {
@@ -210,10 +218,107 @@ export function getSessionMapCwds(state: PersistedState): string[] {
   return values;
 }
 
+function isProcessAlive(pid: unknown): boolean {
+  const normalized = Number(pid);
+  if (!Number.isInteger(normalized) || normalized <= 0) return false;
+  try {
+    process.kill(normalized, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function reconcileSessionLiveness(
+  sessionDir: string,
+  stateManager: StateManager = new StateManager(),
+  nowMs: number = Date.now(),
+): { state: PersistedState; stale: boolean } {
+  const statePath = getStatePath(sessionDir);
+  const state = stateManager.read(statePath);
+  if (state.active !== true) return { state, stale: false };
+
+  const tmuxName = typeof state.tmux_session_name === 'string' ? state.tmux_session_name : '';
+  const runnerMissing = state.tmux_mode === true && (
+    !isProcessAlive(state.tmux_runner_pid)
+    || (tmuxName !== '' && !tmuxSessionExists(tmuxName))
+  );
+  const maxMinutes = Number(state.max_time_minutes || 0);
+  const startedMs = getRunStartEpoch(state) * 1000;
+  const expired = maxMinutes > 0 && startedMs > 0 && nowMs - startedMs >= maxMinutes * 60_000;
+  if (!runnerMissing && !expired) return { state, stale: false };
+
+  const reason = runnerMissing ? 'runner_lost' : 'max_time';
+  let orphanChildPid = isProcessAlive(state.active_child_pid) ? Number(state.active_child_pid) : null;
+  const orphanRecovery = orphanChildPid
+    ? reapOwnedOrphanProcessGroup(sessionDir, orphanChildPid)
+    : null;
+  if (orphanRecovery?.status === 'reaped' || orphanRecovery?.status === 'not-running') {
+    orphanChildPid = null;
+  }
+  const reconciled = stateManager.update(statePath, (current) => {
+    if (current.active !== true) return current;
+    current.active = false;
+    current.tmux_runner_pid = null;
+    current.worker_pid = null;
+    current.active_child_pid = orphanChildPid;
+    current.orphan_child_pid = orphanChildPid;
+    current.orphan_recovery = orphanRecovery;
+    if (!orphanChildPid) {
+      current.active_child_kind = null;
+      current.active_child_command = null;
+    }
+    current.last_exit_reason = orphanChildPid ? `${reason}_orphaned_child` : reason;
+    current.step = current.step === 'complete' ? current.step : (orphanChildPid ? 'blocked' : 'paused');
+    if (orphanChildPid) {
+      current.recovery_required = true;
+      current.recovery_reason = `runner disappeared while child pid ${orphanChildPid} remained unsafe to reap: ${orphanRecovery?.reason || 'ownership unknown'}`;
+    } else {
+      current.recovery_required = false;
+      current.recovery_reason = null;
+    }
+    appendHistory(current, String(current.last_exit_reason), current.current_ticket || undefined);
+    return current;
+  });
+  // A live orphan must remain mapped and discoverable. Returning stale=false keeps
+  // resolveSessionForCwd from pruning the only recovery handle; cancel/status can
+  // then surface the blocked session instead of silently abandoning a mutator.
+  return { state: reconciled, stale: orphanChildPid === null };
+}
+
+export function reconcileAllSessionLiveness(): Array<{ sessionDir: string; reason: string; state: PersistedState }> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(getSessionsRoot(), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const reconciled: Array<{ sessionDir: string; reason: string; state: PersistedState }> = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const sessionDir = path.join(getSessionsRoot(), entry.name);
+    if (!fs.existsSync(getStatePath(sessionDir))) continue;
+    try {
+      const result = reconcileSessionLiveness(sessionDir);
+      if (result.stale) {
+        reconciled.push({ sessionDir, reason: String(result.state.last_exit_reason || 'inactive'), state: result.state });
+      }
+    } catch {
+      // A corrupt session must not prevent reconciliation of the remaining sessions.
+    }
+  }
+  return reconciled;
+}
+
 export async function resolveSessionForCwd(cwd: string, options: ResolveSessionForCwdOptions = {}): Promise<string | null> {
   const normalizedCwd = normalizeSessionCwd(cwd);
   const direct = getSessionForCwd(normalizedCwd);
-  if (direct) return direct;
+  if (direct) {
+    const reconciled = reconcileSessionLiveness(direct);
+    if (!reconciled.stale || options.last) return direct;
+    await removeSessionMapEntry(normalizedCwd, direct);
+  }
   if (options.last) {
     const sessionDir = findLastSessionForCwd(normalizedCwd);
     if (sessionDir) {
@@ -224,7 +329,11 @@ export async function resolveSessionForCwd(cwd: string, options: ResolveSessionF
   return null;
 }
 
-export async function deactivateSession(sessionDir: string, reason: string = 'cancelled'): Promise<PersistedState> {
+export async function deactivateSession(
+  sessionDir: string,
+  reason: string = 'cancelled',
+  options: { preserveMapping?: boolean } = {},
+): Promise<PersistedState> {
   const state = isPipelineSession(sessionDir)
     ? cancelPipelineSession(sessionDir, { exitReason: reason }).state
     : new StateManager().update(
@@ -237,8 +346,10 @@ export async function deactivateSession(sessionDir: string, reason: string = 'ca
         return current;
       },
     );
-  for (const cwd of getSessionMapCwds(state)) {
-    await removeSessionMapEntry(cwd, sessionDir);
+  if (!options.preserveMapping) {
+    for (const cwd of getSessionMapCwds(state)) {
+      await removeSessionMapEntry(cwd, sessionDir);
+    }
   }
   return state;
 }

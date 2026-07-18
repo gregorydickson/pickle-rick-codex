@@ -17,15 +17,15 @@ If you want the short version: this repo gives Codex a real Pickle Rick persona,
 ## What This Port Actually Does
 
 - Installs a global Pickle Rick persona into Codex
-- Installs Pickle Rick skills into `~/.codex/skills`
+- Installs Pickle Rick skills into Codex's supported user location at `~/.agents/skills`
 - Drafts PRDs with machine-checkable acceptance criteria
 - Refines PRDs into ticket manifests and per-ticket markdown files
 - Executes tickets sequentially in the current branch working tree
 - Supports detached tmux orchestration with a runner window and live monitor
-- Supports a detached `pickle-pipeline` path that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce` in one tmux session
+- Supports a detached `pickle-pipeline` path that runs `pickle`, optional `anatomy-park` and `szechuan-sauce`, then a mandatory final fail-closed `citadel` gate in one tmux session
 - Supports detached context-clearing loops for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park`
 - Tracks runtime state, session mappings, metrics, and circuit-breaker state
-- Supports safe cancel and retry flows without destructive rollback
+- Supports safe cancel and retry flows; rejected mutations are archived to Git recovery refs before the clean checkpoint is restored
 
 ## What It Does Not Promise
 
@@ -39,6 +39,9 @@ If you want the short version: this repo gives Codex a real Pickle Rick persona,
 ### Requirements
 
 - Node.js `>=20`
+- npm (bundled with Node.js)
+- `rsync` for runtime deployment
+- `tmux` for detached and pipeline modes
 - `codex` installed and authenticated
 - Git available in the target repo
 
@@ -53,7 +56,7 @@ bash install.sh
 That install does three things:
 
 1. Copies the runtime to `~/.codex/pickle-rick/`
-2. Copies Pickle Rick skills to `~/.codex/skills/`
+2. Copies Pickle Rick skills to `~/.agents/skills/`
 3. Merges the managed Pickle Rick marker block into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
 
 After that, the Pickle Rick persona is available in Codex generally. You do not need to reinstall it per project.
@@ -66,13 +69,19 @@ Only use project bootstrap if you explicitly want repo-local Pickle Rick instruc
 bash install.sh --project /path/to/project
 ```
 
-That keeps the global install, and also adds managed Pickle Rick files to the target repo without deleting unrelated project-local Codex configuration. The installed runtime carries the source `.codex/skills` and `.codex/hooks` trees it needs, so the documented `~/.codex/pickle-rick/install.sh --project ...` path works after the first global install too.
+That keeps the global install, and also adds managed Pickle Rick files to the target repo without deleting unrelated project-local Codex configuration. The installed runtime carries the canonical root `skills/` tree it needs, so the documented `~/.codex/pickle-rick/install.sh --project ...` path works after the first global install too.
 
-Optional hooks remain opt-in:
+Hook installation currently fails closed:
 
 ```bash
 bash install.sh --project /path/to/project --enable-hooks
 ```
+
+That command exits without changing the runtime or project. The former hook template has not passed authenticated validation for Codex's current event names, payloads, decisions, and trust behavior, so the installer will not present it as usable configuration.
+
+### Plugin Packaging
+
+The repository is a validator-clean Codex plugin source: `.codex-plugin/plugin.json` points to the canonical root `skills/` directory. The local `bash install.sh` path remains the guaranteed compatibility install; it does not silently edit a marketplace or claim that the plugin is installed through `codex plugin add`.
 
 ## How To Build Things With It
 
@@ -112,9 +121,10 @@ This is where broad intent gets narrowed into atomic work that can be run in ord
 The orchestrator runs tickets in manifest order. For each ticket it:
 
 1. works directly in the current branch working tree
-2. runs the ticket through the worker loop
-3. verifies outputs
-4. advances state or stops on policy
+2. runs a causal eight-phase lifecycle: `research`, `research_review`, `plan`, `plan_review`, `implement`, `review`, `simplify`, `conformance`
+3. persists and validates a ticket-scoped JSON artifact after every phase, reading approved research and plan artifacts into implementation
+4. verifies outputs and exact acceptance-criteria conformance
+5. advances state or stops on policy
 
 The point is not “maximum chaos.” The point is controlled sequential autonomy. Each ticket works on the branch as it exists now, carries forward prior ticket changes naturally, and still records explicit session artifacts and verification results.
 
@@ -127,7 +137,7 @@ Use the pickle-tmux skill with --prd ./prd.md so the runtime refines the PRD, la
 If the work should move through the full proven multi-phase path, use the dedicated detached pipeline entrypoint instead:
 
 ```text
-Use the pickle-pipeline skill with "ship the feature" so the runtime launches one tmux session, runs pickle first, then advances through anatomy-park and szechuan-sauce when those phases are enabled.
+Use the pickle-pipeline skill with "ship the feature" so the runtime launches one tmux session, runs pickle, advances through anatomy-park and szechuan-sauce when enabled, then blocks final completion on Citadel release findings.
 ```
 
 ### Step 4: Inspect, Retry, Or Cancel
@@ -137,7 +147,7 @@ Pickle Rick is not a black box. The runtime exposes state and recovery tools:
 - `pickle-status` for the current session snapshot
 - `pickle-metrics` for usage and activity reporting
 - `pickle-retry` to safely re-run a ticket
-- `pickle-cancel` to stop the active session without destructive rollback
+- `pickle-cancel` to stop the active session; any rejected in-flight mutation is retained through recovery refs before checkpoint restoration
 
 ### Step 5: Optional Polish Loops
 
@@ -179,7 +189,7 @@ You describe a feature
 The current Codex install exposes these primary skills:
 
 - `pickle` — end-to-end autonomous loop
-- `pickle-pipeline` — detached multi-phase pipeline across `pickle`, `anatomy-park`, and `szechuan-sauce`
+- `pickle-pipeline` — detached multi-phase pipeline across `pickle`, optional `anatomy-park` and `szechuan-sauce`, and mandatory final `citadel`
 - `pickle-tmux` — bootstrap from a PRD or resume a prepared session in detached tmux
 - `pickle-prd` — draft a PRD
 - `pickle-refine` — run three analyst passes, synthesize the result, and decompose the PRD into tickets
@@ -188,6 +198,8 @@ The current Codex install exposes these primary skills:
 - `pickle-metrics` — session, token, commit, and LOC reporting
 - `pickle-cancel` — cancel the active session safely
 - `pickle-retry` — retry a failed or current ticket safely
+
+The Codex Citadel is deliberately compact: declared typecheck/lint/test scripts plus one adversarial read-only acceptance-criteria review. It is a fail-closed final gate, not a claim of parity with the Claude edition's larger analyzer suite.
 
 Detached advanced loops currently present in the repo:
 
@@ -209,7 +221,13 @@ Detached advanced loops currently present in the repo:
   <img src="images/microverse.png" alt="Pickle Rick Microverse" width="100%" />
 </p>
 
-`pickle-microverse` is the metric-convergence loop. Use it when you can define a measurable objective and want iterative improve-or-revert behavior rather than one-shot implementation. It now launches as a detached tmux loop with fresh Codex context per iteration.
+`pickle-microverse` is the metric-convergence loop. Command metrics must print exactly one finite number. The runtime captures a baseline, measures each iteration, accepts only improvements, reverts held/regressed work, records failed approaches, and stops at the stall limit. It launches as a detached tmux loop with fresh Codex context per iteration.
+
+### Recoverable destructive operations
+
+Worker rejection, Citadel read-only enforcement, and Microverse held/regressed iterations share one destructive Git seam. Before `git reset --hard` or removal of iteration-created untracked files, the runtime anchors committed work and snapshots dirty/untracked evidence under `refs/pickle/recovery/*`, `refs/pickle/salvage/*`, or the subsystem-specific rejected/recovery ref. If the archive cannot be created, the reset aborts and the attempted working tree is left in place.
+
+Recovery archival is capped at 50 MiB by default. Set `PICKLE_DESTRUCTIVE_ARCHIVE_MAX_BYTES` to a positive byte count when a repository needs a different limit. Exceeding the cap fails closed: the session does not report success and the runtime does not perform the destructive restore. Inspect the error, preserve or commit the attempted tree, or raise the cap deliberately before retrying.
 
 <p align="center">
   <img src="images/szechwan-sauce.jpeg" alt="Szechuan Sauce code quality loop" width="600" />
@@ -222,27 +240,27 @@ Detached advanced loops currently present in the repo:
 If you want the guaranteed path without relying on skill invocation, use the runtime directly:
 
 ```bash
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js "<task>"
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js --resume
-node ~/.codex/pickle-rick/bin/pickle-tmux.js --prd ./prd.md
-node ~/.codex/pickle-rick/bin/pickle-tmux.js --resume
-node ~/.codex/pickle-rick/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"
-node ~/.codex/pickle-rick/bin/szechuan-sauce.js <target>
-node ~/.codex/pickle-rick/bin/anatomy-park.js <target>
-node ~/.codex/pickle-rick/bin/setup.js "<task>"
-node ~/.codex/pickle-rick/bin/draft-prd.js <session-dir> "<task>"
-node ~/.codex/pickle-rick/bin/spawn-refinement-team.js <session-dir>
-node ~/.codex/pickle-rick/bin/mux-runner.js <session-dir> --on-failure=retry-once
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js "<task>"
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume
+node ~/.codex/pickle-rick/extension/bin/pickle-tmux.js --prd ./prd.md
+node ~/.codex/pickle-rick/extension/bin/pickle-tmux.js --resume
+node ~/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"
+node ~/.codex/pickle-rick/extension/bin/szechuan-sauce.js <target>
+node ~/.codex/pickle-rick/extension/bin/anatomy-park.js <target>
+node ~/.codex/pickle-rick/extension/bin/setup.js "<task>"
+node ~/.codex/pickle-rick/extension/bin/draft-prd.js <session-dir> "<task>"
+node ~/.codex/pickle-rick/extension/bin/spawn-refinement-team.js <session-dir>
+node ~/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry-once
 ```
 
 Support commands:
 
 ```bash
 tmux attach -t pickle-<session-id>
-node ~/.codex/pickle-rick/bin/status.js
-node ~/.codex/pickle-rick/bin/metrics.js --weekly
-node ~/.codex/pickle-rick/bin/cancel.js
-node ~/.codex/pickle-rick/bin/retry-ticket.js --ticket <ticket-id>
+node ~/.codex/pickle-rick/extension/bin/status.js
+node ~/.codex/pickle-rick/extension/bin/metrics.js --weekly
+node ~/.codex/pickle-rick/extension/bin/cancel.js
+node ~/.codex/pickle-rick/extension/bin/retry-ticket.js --ticket <ticket-id>
 ```
 
 For pipeline sessions, `status.js` prints the active pipeline phase, per-phase status summary, bootstrap source, and target path while preserving the existing non-pipeline status output.
@@ -268,7 +286,7 @@ The design is deliberately file-backed so runs can resume and be inspected outsi
 
 ## Reliability Primitives (Internal)
 
-The TypeScript extension under `extension/src/services/` carries a set of standalone git/tmux safety seams ported from the Phase 0/1 safety-seams work. These are internal primitives shipped with tests but not yet wired into any consumer path:
+The TypeScript extension under `extension/src/services/` carries git/tmux safety seams ported from the Phase 0/1 safety-seams work. They are wired into worker commits, advanced-loop commits, and detached tmux lifecycle paths:
 
 - `git-utils.listWorkingTreeDirtyPaths(cwd, excludePrefixes?)` — parses `git status --porcelain -z` into a de-duped, sorted list of dirty working-tree paths (skipping rename/copy source tokens), with optional exclude-prefix pathspecs
 - `dirty-tree-salvage.ts` — `stashUnattributableRemainder` snapshots the whole dirty tree into a dangling commit under `refs/pickle/salvage/<session>` via a throwaway `GIT_INDEX_FILE` without mutating the real index or worktree, `salvageDirtyTree` anchors foreign dirt and returns only owned paths, and `stageOwnedPaths` stages per-path rather than whole-tree
@@ -279,17 +297,18 @@ The TypeScript extension under `extension/src/services/` carries a set of standa
 Global install:
 
 - `~/.codex/pickle-rick/` — runtime, scripts, docs
-- `~/.codex/pickle-rick/.codex/skills/` — bundled source skill definitions used by the installed `install.sh --project ...` path
-- `~/.codex/pickle-rick/.codex/hooks/` — empty default hook contract plus the opt-in project hook template
-- `~/.codex/pickle-rick/tests/` — installed regression tests referenced by the package `test` script
-- `~/.codex/skills/` — globally available Pickle Rick skills
+- `~/.codex/pickle-rick/skills/` — canonical plugin skill definitions used by the installed `install.sh --project ...` path
+- `~/.codex/pickle-rick/.codex/skills` — compatibility symlink to the canonical root `skills/`
+- `~/.codex/pickle-rick/.codex/hooks/` — empty default hook contract plus inactive, unvalidated reference material
+- `~/.codex/pickle-rick/extension/tests/` — installed regression tests beside the compiled modules they import
+- `~/.agents/skills/` — globally available Pickle Rick skills
 - `~/.codex/AGENTS.md` — managed Pickle Rick persona block (the only markdown the installer merges)
 
 Optional project override:
 
-- `<project>/.codex/skills/` — repo-local skill copies
+- `<project>/.agents/skills/` — repo-local skill copies
 - `<project>/AGENTS.md` — managed Pickle Rick block merged into project instructions
-- `<project>/.codex/hooks/hooks.json` — only when `--enable-hooks` is used
+- project hooks are never written; `--enable-hooks` is rejected before installation mutates state
 
 ## Hooks
 
@@ -297,27 +316,28 @@ Hooks are not part of the guaranteed path.
 
 The repo ships local handlers for:
 
-- `SessionStart -> bin/session-start.js`
-- `Stop -> bin/stop-hook.js`
-- `PreToolUse -> bin/config-protection.js`
-- `PostToolUse -> bin/log-commit.js`
+- `SessionStart -> extension/bin/session-start.js`
+- `Stop -> extension/bin/stop-hook.js`
+- `PreToolUse -> extension/bin/config-protection.js`
+- `PostToolUse -> extension/bin/log-commit.js`
 
-The installed runtime ships `.codex/hooks/hooks.json` as an empty fail-open contract and `.codex/hooks/hooks.template.json` as the opt-in project template rendered by `bash install.sh --project <path> --enable-hooks`. The default install still does not enable project hooks automatically. Use hooks only when you explicitly want them and the installed Codex build has been validated to fire the events you care about.
+The installed runtime ships `.codex/hooks/hooks.json` as an empty fail-open contract and retains `.codex/hooks/hooks.template.json` only as historical reference. `bash install.sh --project <path> --enable-hooks` fails before changing installation or project state. Re-enable hook installation only after authenticated tests prove the installed Codex build's event names, input payloads, output decisions, trust prompts, and failure behavior.
 
 ## Validated Behavior
 
-Validated locally on April 19, 2026 against `codex-cli 0.120.0`:
+The distribution checks below were rerun on July 18, 2026; `validate:codex` recorded the locally installed CLI as `codex-cli 0.144.5`. Hook delivery remains unvalidated, but the installed sequential pipeline now has authenticated disposable-repository evidence:
 
 - `bash install.sh` installs the runtime, persona, and skills globally
-- `~/.codex/pickle-rick/install.sh --project <path> [--enable-hooks]` works from the installed runtime because the source `.codex` tree is shipped with it
+- `~/.codex/pickle-rick/install.sh --project <path>` works from the installed runtime because the canonical root skill tree is shipped with it; `--enable-hooks` is intentionally rejected
 - a clean `codex exec` probe in a temp directory returned `Pickle Rick`
 - the PRD and refinement flows can detect success artifacts and exit promptly even if the child Codex process lingers
-- `pickle-pipeline` launches one detached tmux session, records immutable pipeline metadata, and advances through the configured phases with `pipeline-runner.log` in the monitor pane
+- `pickle-pipeline` launches one detached tmux session, records immutable pipeline metadata, advances through configured cleanup phases, and runs the mandatory Citadel release gate last, with `pipeline-runner.log` in the monitor pane
+- authenticated installed-runtime dogfood completed PRD refinement, one scoped worker ticket, an attributable clean commit, 8/8 target tests, and final Citadel approval in session `2026-07-18-1c18e785`
 - `status.js` renders pipeline metadata for pipeline sessions without changing legacy non-pipeline status output
 - `pickle-tmux --prd ./prd.md` bootstraps, refines, and launches detached tmux instead of requiring a task-string workaround
 - zero-ticket detached runs fail closed with `last_exit_reason = "no_tickets"` instead of marking the session complete
 - detached tmux launchers for `pickle-tmux`, `pickle-microverse`, `szechuan-sauce`, and `anatomy-park` are covered by local tests with a fake `tmux` binary
-- the runtime test suite passes on the checked-in code
+- source and isolated installed-runtime suites pass: 238/238 fast tests and 176/176 integration tests
 
 Validation details live in [docs/codex-api-validation.md](docs/codex-api-validation.md).
 
@@ -325,10 +345,10 @@ Validation details live in [docs/codex-api-validation.md](docs/codex-api-validat
 
 - [AGENTS.md](AGENTS.md) — canonical persona and install contract
 - [CLAUDE.md](CLAUDE.md) — retained for Claude Code contributors to build/review/test this repo; not part of the Codex install
-- [bin](bin) — runtime entrypoints
-- [lib](lib) — runtime internals
-- [.codex/skills](.codex/skills) — installed skill definitions
-- [tests](tests) — regression coverage
+- [extension/src/bin](extension/src/bin) — TypeScript runtime entrypoints
+- [extension/src/services](extension/src/services) — TypeScript runtime internals
+- [skills](skills) — canonical plugin skill definitions (`.codex/skills` is a compatibility symlink)
+- [extension/tests](extension/tests) — regression coverage against compiled runtime artifacts
 - [images](images) — README assets
 - [docs/codex-api-validation.md](docs/codex-api-validation.md) — local validation notes
 
@@ -336,10 +356,11 @@ Validation details live in [docs/codex-api-validation.md](docs/codex-api-validat
 
 ```bash
 npm test
-node ./bin/validate-codex.js
+npm run release:gate
+node ./extension/bin/validate-codex.js
 bash install.sh
 ```
 
-The installed runtime now includes the `tests/` directory referenced by `package.json`, so `npm test` is truthful both in the repo and after install.
+The installed runtime keeps tests under `extension/tests` and source-level invariant fixtures under `extension/src`; its conditional pretest skips compilation because development dependencies are intentionally not deployed, then tests the exact compiled files that were installed.
 
 If you change install behavior, persona wiring, or runtime completion detection, update the tests and the validation doc in the same change.

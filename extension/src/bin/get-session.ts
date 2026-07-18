@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { listSessions } from '../services/session-map.js';
-import { resolveSessionForCwd } from '../services/session.js';
+import { listSessions, removeSessionMapEntry } from '../services/session-map.js';
+import { getSessionMapCwds, loadSessionState, reconcileAllSessionLiveness, resolveSessionForCwd } from '../services/session.js';
 
 async function main(argv: string[]): Promise<void> {
   if (argv.includes('--help')) {
@@ -25,6 +25,22 @@ async function main(argv: string[]): Promise<void> {
   }
 
   if (list) {
+    const stale = reconcileAllSessionLiveness();
+    for (const session of stale) {
+      for (const mappedCwd of getSessionMapCwds(session.state)) {
+        await removeSessionMapEntry(mappedCwd, session.sessionDir);
+      }
+    }
+    for (const mapped of listSessions()) {
+      try {
+        const state = loadSessionState(mapped.sessionDir);
+        if (state.active !== true && state.recovery_required !== true) {
+          await removeSessionMapEntry(mapped.cwd, mapped.sessionDir);
+        }
+      } catch {
+        await removeSessionMapEntry(mapped.cwd, mapped.sessionDir);
+      }
+    }
     console.log(JSON.stringify(listSessions(), null, 2));
     return;
   }

@@ -23,7 +23,8 @@ import {
 import { ensurePipelineState } from '../services/pipeline-state.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { recordCodexManagerRelaunch } from '../services/manager-relaunch-integrity.js';
 import { isPreflightError, type PreflightError } from '../services/verification-env.js';
 import type { TicketSummary } from '../services/tickets.js';
 import type { PipelineContract } from '../types/index.js';
@@ -39,6 +40,8 @@ interface PicklePipelineArgs {
   skipAnatomySpecified: boolean;
   skipSzechuan: boolean;
   skipSzechuanSpecified: boolean;
+  scope: string[];
+  scopeSpecified: boolean;
 }
 
 function parseFailureMode(argv: string[]): string {
@@ -63,6 +66,8 @@ function parseArgs(argv: string[]): PicklePipelineArgs {
     skipAnatomySpecified: false,
     skipSzechuan: false,
     skipSzechuanSpecified: false,
+    scope: [],
+    scopeSpecified: false,
   };
   const taskParts: string[] = [];
 
@@ -96,6 +101,14 @@ function parseArgs(argv: string[]): PicklePipelineArgs {
     } else if (arg === '--skip-szechuan') {
       parsed.skipSzechuan = true;
       parsed.skipSzechuanSpecified = true;
+    } else if (arg === '--scope') {
+      const scopePath = argv[index + 1] || '';
+      if (!scopePath || scopePath.startsWith('--')) {
+        throw new Error('--scope requires a repository-relative path. Repeat --scope for multiple paths.');
+      }
+      parsed.scope.push(scopePath);
+      parsed.scopeSpecified = true;
+      index += 1;
     } else if (arg === '--help' || arg.startsWith('--on-failure=')) {
       continue;
     } else if (arg === '--max-iterations') {
@@ -129,9 +142,9 @@ function parseArgs(argv: string[]): PicklePipelineArgs {
 function usage(): string {
   return [
     'Usage:',
-    '  node bin/pickle-pipeline.js "task string" [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
-    '  node bin/pickle-pipeline.js --task "task string" [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
-    '  node bin/pickle-pipeline.js --prd path/to/prd.md [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
+    '  node bin/pickle-pipeline.js "task string" [--scope PATH ...] [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
+    '  node bin/pickle-pipeline.js --task "task string" [--scope PATH ...] [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
+    '  node bin/pickle-pipeline.js --prd path/to/prd.md [--scope PATH ...] [--skip-anatomy] [--skip-szechuan] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
     '  node bin/pickle-pipeline.js --resume [SESSION_DIR] [--resume-ready-only] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
   ].join('\n');
 }
@@ -144,6 +157,7 @@ function buildPipelinePhases(parsed: PicklePipelineArgs): string[] {
   if (!parsed.skipSzechuan) {
     phases.push('szechuan-sauce');
   }
+  phases.push('citadel');
   return phases;
 }
 
@@ -152,6 +166,7 @@ function createPipelineLaunchContract(state: PersistedState, parsed: PicklePipel
   return createPipelineContract({
     working_dir: state.working_dir,
     target: state.working_dir,
+    scope: parsed.scope,
     phases,
     skip_flags: {
       anatomy: parsed.skipAnatomy,
@@ -164,8 +179,8 @@ function createPipelineLaunchContract(state: PersistedState, parsed: PicklePipel
 }
 
 function assertResumeSkipFlagsUnchanged(parsed: PicklePipelineArgs): void {
-  if (parsed.skipAnatomySpecified || parsed.skipSzechuanSpecified) {
-    throw new Error('Cannot change pipeline skip flags on resume.');
+  if (parsed.skipAnatomySpecified || parsed.skipSzechuanSpecified || parsed.scopeSpecified) {
+    throw new Error('Cannot change pipeline skip flags or scope on resume.');
   }
 }
 
@@ -258,6 +273,9 @@ async function main(argv: string[]): Promise<void> {
     }
 
     assertBootstrapSessionNotRunning(sessionDir);
+    if (parsed.resume) {
+      recordCodexManagerRelaunch(sessionDir, 'pickle-pipeline');
+    }
     previousSessionDir = getSessionForCwd(state.working_dir as string);
     await updateSessionMap(state.working_dir as string, sessionDir);
 
@@ -273,6 +291,7 @@ async function main(argv: string[]): Promise<void> {
       current.max_iterations = 0;
       current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;
+      current.preserve_tmux_monitor = process.env.PICKLE_PRESERVE_TMUX_MONITOR === '1';
       current.last_exit_reason = null;
       current.active_child_pid = null;
       current.active_child_kind = null;
@@ -283,7 +302,7 @@ async function main(argv: string[]): Promise<void> {
     });
 
     try {
-      clearTmuxSession(sessionName);
+      clearTmuxSession(sessionName, sessionDir);
       runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
@@ -296,6 +315,12 @@ async function main(argv: string[]): Promise<void> {
         ';',
         'status=$?',
         ';',
+        'node',
+        shellQuote(path.join(runtimeRoot, 'bin', 'terminal-tmux-cleanup.js')),
+        shellQuote(sessionDir),
+        '||',
+        'true',
+        ';',
         'echo',
         shellQuote(''),
         ';',
@@ -307,7 +332,7 @@ async function main(argv: string[]): Promise<void> {
       ].join(' ');
 
       runTmux(['set-option', '-w', '-t', `${sessionName}:0`, 'remain-on-exit', 'on']);
-      runTmux(['respawn-pane', '-k', '-t', `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`]);
+      respawnOwnedTmuxPane(sessionName, sessionDir, `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`);
       const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, runnerDescriptor.monitorMode], {
         encoding: 'utf8',
         timeout: 30_000,
@@ -320,7 +345,7 @@ async function main(argv: string[]): Promise<void> {
     } catch (error) {
       if (launchStarted) {
         try {
-          runTmux(['kill-session', '-t', sessionName]);
+          killTmuxSession(sessionName, sessionDir);
         } catch {
           // Best-effort cleanup for partially created tmux sessions.
         }

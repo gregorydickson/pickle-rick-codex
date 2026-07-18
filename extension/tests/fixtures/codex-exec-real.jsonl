@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019c-test"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"node ./bin/setup.js --resume /tmp/session","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"node ./bin/setup.js --resume /tmp/session","aggregated_output":"ready\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Runtime validated.\n<promise>WORKER_DONE</promise>"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":18}}

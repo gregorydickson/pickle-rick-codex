@@ -1,6 +1,7 @@
 // @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
@@ -21,6 +22,15 @@ function sessionDirFromOutput(output) {
   return path.dirname(statePath);
 }
 
+function initGitRepo(repoDir) {
+  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['config', 'user.name', 'Pickle Rick Tests'], { cwd: repoDir });
+  execFileSync('git', ['config', 'user.email', 'pickle-rick-tests@example.com'], { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'baseline.txt'), 'baseline\n');
+  execFileSync('git', ['add', 'baseline.txt'], { cwd: repoDir });
+  execFileSync('git', ['commit', '-qm', 'baseline'], { cwd: repoDir });
+}
+
 test('pickle-pipeline bootstraps from task and launches detached tmux', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
@@ -33,7 +43,7 @@ test('pickle-pipeline bootstraps from task and launches detached tmux', () => {
     FAKE_TMUX_LOG: tmuxLog,
   });
 
-  const output = runNode([path.join(repoRoot, 'bin/pickle-pipeline.js'), 'bootstrap the pickle phase'], {
+  const output = runNode([path.join(repoRoot, 'bin/pickle-pipeline.js'), '--scope', 'README.md', 'bootstrap the pickle phase'], {
     env,
     cwd: projectDir,
   }).trim();
@@ -47,7 +57,8 @@ test('pickle-pipeline bootstraps from task and launches detached tmux', () => {
 
   assert.equal(pipeline.bootstrap_source, 'task');
   assert.equal(pipeline.task, 'bootstrap the pickle phase');
-  assert.deepEqual(pipeline.phases, ['pickle', 'anatomy-park', 'szechuan-sauce']);
+  assert.deepEqual(pipeline.scope, ['README.md']);
+  assert.deepEqual(pipeline.phases, ['pickle', 'anatomy-park', 'szechuan-sauce', 'citadel']);
   assert.deepEqual(pipeline.skip_flags, {
     anatomy: false,
     szechuan: false,
@@ -63,6 +74,7 @@ test('pipeline-runner executes the configured phases to completion', () => {
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
   createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
   });
@@ -82,6 +94,7 @@ test('pipeline-runner executes the configured phases to completion', () => {
         verification: ['node -e "process.exit(0)"'],
         priority: 'P1',
         status: 'Todo',
+        allowed_paths: ['baseline.txt'],
       },
     ],
   });
@@ -89,9 +102,9 @@ test('pipeline-runner executes the configured phases to completion', () => {
     schema_version: 1,
     working_dir: fs.realpathSync(projectDir),
     target: fs.realpathSync(projectDir),
-    phases: ['pickle', 'szechuan-sauce'],
+    phases: ['pickle', 'anatomy-park', 'szechuan-sauce'],
     skip_flags: {
-      anatomy: true,
+      anatomy: false,
       szechuan: false,
     },
     bootstrap_source: 'task',
@@ -115,7 +128,9 @@ test('pipeline-runner executes the configured phases to completion', () => {
   assert.equal(state.pipeline_phase_index, null);
   assert.equal(pipelineState.current_phase, null);
   assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses['anatomy-park'], 'done');
   assert.equal(pipelineState.phase_statuses['szechuan-sauce'], 'done');
+  assert.equal(pipelineState.phase_statuses.citadel, 'done');
   assert.match(runnerLog, /pipeline-runner started/);
   assert.match(runnerLog, /pipeline-runner finished: success/);
 });
@@ -180,6 +195,7 @@ fs.writeFileSync(
         verification: ['npm test'],
         priority: 'P1',
         status: 'Todo',
+        allowed_paths: ['README.md'],
         required_env: ['GITHUB_PACKAGES_TOKEN'],
       },
     ],
@@ -265,6 +281,7 @@ test('pipeline-runner treats verification-contract failures as blocked and exits
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
   createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
   });
@@ -283,6 +300,7 @@ test('pipeline-runner treats verification-contract failures as blocked and exits
         acceptance_criteria: ['Pipeline mode preserves blocked ticket context for contract failures.'],
         verification: ['test -f research/proof.txt'],
         output_artifacts: ['research/proof.txt'],
+        allowed_paths: ['research/proof.txt'],
         priority: 'P1',
         status: 'Todo',
       },

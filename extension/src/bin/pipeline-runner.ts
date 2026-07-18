@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPipelineContract, resolveNextPipelinePhase } from '../services/pipeline.js';
+import { PipelineScopeError, resolvePipelineScope } from '../services/pipeline-scope.js';
 import { beginPipelinePhase, cancelPipelineSession, ensurePipelineState, finishPipelinePhase } from '../services/pipeline-state.js';
 import {
   preparePipelineAnatomyParkPhase,
@@ -11,8 +12,11 @@ import {
 } from '../services/pipeline-phase-setup.js';
 import { readJsonFile } from '../services/pickle-utils.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
+import { StateManager } from '../services/state-manager.js';
+import { finalizeTerminalState } from '../services/state-terminal.js';
 import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
+import { runCitadel } from '../services/citadel.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
 
 type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSession>[2];
@@ -46,7 +50,9 @@ function phaseFailureMessage(phase: string, exitReason: string): string | null {
 }
 
 function isBlockingExitReason(exitReason: string): boolean {
-  return exitReason === 'verification-contract-failed' || String(exitReason).startsWith('preflight-');
+  return exitReason === 'verification-contract-failed'
+    || exitReason === 'scope-violation'
+    || String(exitReason).startsWith('preflight-');
 }
 
 function readSessionExitReason(sessionDir: string): string {
@@ -54,7 +60,7 @@ function readSessionExitReason(sessionDir: string): string {
 }
 
 async function runPipelinePhase(sessionDir: string, phase: PipelinePhase, executePhase: () => Promise<string>): Promise<string> {
-  beginPipelinePhase(sessionDir, phase);
+  beginPipelinePhase(sessionDir, phase, { runnerPid: process.pid });
   try {
     const exitReason = await executePhase();
     if (exitReason === 'cancelled') {
@@ -70,8 +76,12 @@ async function runPipelinePhase(sessionDir: string, phase: PipelinePhase, execut
     }
     return exitReason;
   } catch (error) {
+    const recordedExitReason = readSessionExitReason(sessionDir);
+    const phaseExitReason = error instanceof PipelineScopeError
+      ? 'scope-violation'
+      : isBlockingExitReason(recordedExitReason) ? recordedExitReason : 'error';
     finishPipelinePhase(sessionDir, phase, {
-      exitReason: 'error',
+      exitReason: phaseExitReason,
       lastError: error instanceof Error ? error.message : String(error),
     });
     throw error;
@@ -85,20 +95,22 @@ async function runPipelineLoopPhase(
   preparePhase: PreparePipelineLoopPhase,
 ): Promise<string> {
   return await runPipelinePhase(sessionDir, phase, async () => {
-    await preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase);
+    const scope = resolvePipelineScope(sessionDir, pipeline);
+    appendRunnerLog(sessionDir, `${phase} immutable scope (${scope.source}): ${scope.paths.join(', ')}`);
+    await preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase, scope.paths);
     await runLoop(sessionDir);
     return readSessionExitReason(sessionDir);
   });
 }
 
 export async function runPipeline(sessionDir: string, options: RunPipelineOptions = {}): Promise<string> {
-  const pipeline = readPipelineContract(sessionDir);
-  let pipelineState = ensurePipelineState(sessionDir, pipeline);
-  let nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
-  let exitReason = 'success';
-
+  let exitReason = 'error';
   appendRunnerLog(sessionDir, getRunnerDescriptor('pipeline').runnerStartMarker);
   try {
+    const pipeline = readPipelineContract(sessionDir);
+    let pipelineState = ensurePipelineState(sessionDir, pipeline);
+    let nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
+    exitReason = 'success';
     while (nextPhase) {
       if (nextPhase === 'pickle') {
         exitReason = await runPipelinePhase(
@@ -108,6 +120,12 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
             ...options,
             runnerMode: 'pipeline',
           }),
+        );
+      } else if (nextPhase === 'citadel') {
+        exitReason = await runPipelinePhase(
+          sessionDir,
+          'citadel',
+          async () => await runCitadel(sessionDir),
         );
       } else if (nextPhase === 'anatomy-park') {
         exitReason = await runPipelineLoopPhase(
@@ -140,7 +158,19 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
 
     return 'success';
   } catch (error) {
-    exitReason = 'error';
+    const recordedExitReason = readSessionExitReason(sessionDir);
+    exitReason = error instanceof PipelineScopeError
+      ? 'scope-violation'
+      : isBlockingExitReason(recordedExitReason) ? recordedExitReason : 'error';
+    try {
+      finalizeTerminalState(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+    } catch (finalizeError) {
+      throw new AggregateError(
+        [error, finalizeError],
+        'Pipeline failed and terminal state finalization did not complete.',
+        { cause: finalizeError },
+      );
+    }
     throw error;
   } finally {
     appendRunnerLog(sessionDir, `pipeline-runner finished: ${exitReason}`);

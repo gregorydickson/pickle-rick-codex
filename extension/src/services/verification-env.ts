@@ -247,6 +247,119 @@ function tokenizeShellWords(command: string): string[] {
   return tokens;
 }
 
+function splitShellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = '';
+  let quote: string | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    const next = command[index + 1];
+    if (quote) {
+      current += char;
+      if (char === quote) quote = null;
+      else if (char === '\\' && quote === '"' && index + 1 < command.length) current += command[++index];
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === '\\' && index + 1 < command.length) {
+      current += char + command[++index];
+      continue;
+    }
+    if (char === ';' || char === '\n' || char === '|' || (char === '&' && next === '&')) {
+      if (current.trim()) segments.push(current.trim());
+      current = '';
+      if ((char === '|' && next === '|') || (char === '&' && next === '&')) index += 1;
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments;
+}
+
+function hasUnquotedGlob(command: string): boolean {
+  let quote: string | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (char === '\\' && quote === '"') index += 1;
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (char === '*' || char === '?' || (char === '[' && !/\s/.test(command[index + 1] || ''))) return true;
+  }
+  return false;
+}
+
+const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'printf', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
+
+function commandExecutable(segment: string): string | null {
+  const tokens = tokenizeShellWords(segment);
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+  while (['command', 'env', 'exec'].includes(tokens[index])) {
+    index += 1;
+    while (index < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index]) || tokens[index].startsWith('-'))) index += 1;
+  }
+  return tokens[index] || null;
+}
+
+function executableExists(executable: string, cwd: string, env: Record<string, string | undefined>): boolean {
+  if (SHELL_BUILTINS.has(executable) || executable.includes('$') || executable.includes('`')) return true;
+  const candidates = executable.includes('/')
+    ? [path.resolve(cwd, executable)]
+    : String(env.PATH || '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, executable));
+  return candidates.some((candidate) => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
+function verificationCommandDiagnostics(
+  ticket: TicketVerificationInput | null | undefined,
+  cwd: string,
+  env: Record<string, string | undefined>,
+): PreflightDiagnostic[] {
+  const diagnostics: PreflightDiagnostic[] = [];
+  for (const command of ticketVerificationCommands(ticket)) {
+    if (hasUnquotedGlob(command)) {
+      diagnostics.push({
+        kind: 'preflight-unsafe-glob',
+        name: command,
+        message: `verification command contains an unquoted glob; quote it or enumerate the intended paths: ${command}`,
+      });
+      continue;
+    }
+    for (const segment of splitShellSegments(command)) {
+      const executable = commandExecutable(segment);
+      if (!executable || executableExists(executable, cwd, env)) continue;
+      diagnostics.push({
+        kind: 'preflight-missing-executable',
+        name: executable,
+        message: `${executable} is not executable or could not be found on PATH for verification command: ${command}`,
+      });
+      break;
+    }
+  }
+  return diagnostics;
+}
+
 function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -705,26 +818,20 @@ export function resolveVerificationEnv({
   ticket,
   config,
   ambientEnv = process.env,
+  cwd = process.cwd(),
 }: {
   ticket: TicketVerificationInput | null | undefined;
   config: ConfigVerificationInput | null | undefined;
   ambientEnv?: NodeJS.ProcessEnv;
+  cwd?: string;
 }): VerificationEnvResult {
   const contract = resolveTicketVerificationContract({ ticket, config });
 
-  if (!contract) {
-    return {
-      contract: null,
-      env: ambientEnv,
-      diagnostics: [],
-    };
-  }
-
-  const env: Record<string, string | undefined> = contract.mode === 'replace'
+  const env: Record<string, string | undefined> = contract?.mode === 'replace'
     ? pickReplaceBaseEnv(ambientEnv)
     : { ...ambientEnv };
 
-  for (const [key, spec] of Object.entries(contract.vars)) {
+  for (const [key, spec] of Object.entries(contract?.vars || {})) {
     if (spec.type === 'env') {
       env[key] = ambientEnv[spec.fromEnv];
     } else {
@@ -732,9 +839,10 @@ export function resolveVerificationEnv({
     }
   }
 
-  const diagnostics = contract.required
+  const diagnostics = (contract?.required || [])
     .map((entry) => validateRequirement(entry.name, entry.format, env[entry.name]))
     .filter((d): d is PreflightDiagnostic => d !== null);
+  diagnostics.push(...verificationCommandDiagnostics(ticket, cwd, env));
 
   return { contract, env, diagnostics };
 }
@@ -743,12 +851,14 @@ export function assertTicketVerificationReady({
   ticket,
   config,
   ambientEnv = process.env,
+  cwd = process.cwd(),
 }: {
   ticket: TicketVerificationInput | null | undefined;
   config: ConfigVerificationInput | null | undefined;
   ambientEnv?: NodeJS.ProcessEnv;
+  cwd?: string;
 }): VerificationEnvResult {
-  const resolved = resolveVerificationEnv({ ticket, config, ambientEnv });
+  const resolved = resolveVerificationEnv({ ticket, config, ambientEnv, cwd });
   const first = resolved.diagnostics[0];
   if (first) {
     throw new PreflightError({

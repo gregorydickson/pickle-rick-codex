@@ -7,6 +7,7 @@ Port the Claude-era `/pickle-pipeline` workflow into `pickle-rick-codex` as a fi
 The Codex port already has the constituent loops:
 
 - build and ticket execution via `pickle` / `pickle-tmux`
+- fail-closed release review via `citadel`
 - correctness review via `anatomy-park`
 - code-quality cleanup via `szechuan-sauce`
 
@@ -38,7 +39,7 @@ This creates three problems:
 ## Goals
 
 1. Add a first-class `pickle-pipeline` skill and CLI to the Codex port.
-2. Run `pickle -> anatomy-park -> szechuan-sauce` sequentially in one tmux session.
+2. Run `pickle -> anatomy-park -> szechuan-sauce -> citadel` sequentially in one tmux session, with Citadel mandatory and final.
 3. Support starting from either a task string or an existing `prd.md`.
 4. Support resume at the first incomplete phase.
 5. Preserve the current detached-launch safety guarantees:
@@ -72,9 +73,10 @@ This creates three problems:
 1. User runs `pickle-pipeline "add retry logic to loan webhooks"`.
 2. Runtime creates a session and detached tmux session.
 3. Build phase creates/refines the PRD and executes tickets.
-4. On success, the same tmux runner advances to Anatomy Park.
-5. On success, the same tmux runner advances to Szechuan Sauce.
-6. User reattaches later and sees the whole run under one session.
+4. On success, the same runner executes the mandatory deterministic and adversarial Citadel release gate.
+5. On success, the same tmux runner advances to Anatomy Park.
+6. On success, the same tmux runner advances to Szechuan Sauce.
+7. User reattaches later and sees the whole run under one session.
 
 Success:
 
@@ -128,10 +130,10 @@ Add `.codex/skills/pickle-pipeline/SKILL.md` with a detached full-lifecycle cont
 Add `bin/pickle-pipeline.js` with this supported surface:
 
 ```bash
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js "task"
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js --prd ./prd.md
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js --resume
-node ~/.codex/pickle-rick/bin/pickle-pipeline.js --resume <session-dir>
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js "task"
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js --prd ./prd.md
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume
+node ~/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume <session-dir>
 ```
 
 Supported flags:
@@ -195,7 +197,7 @@ Add a stable per-session pipeline contract:
 ```json
 {
   "schema_version": 1,
-  "phases": ["pickle", "anatomy-park", "szechuan-sauce"],
+  "phases": ["pickle", "anatomy-park", "szechuan-sauce", "citadel"],
   "target": "/abs/path",
   "task": "optional task string",
   "bootstrap_prd": "/abs/path/to/original/prd.md",

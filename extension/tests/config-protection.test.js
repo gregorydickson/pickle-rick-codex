@@ -176,8 +176,8 @@ test('loadConfig falls back to safe defaults when nested config shapes are malfo
     half_open_after: 2,
     same_error_threshold: 5,
   });
-  assert.equal(config.hooks.enabled, true);
-  assert.deepEqual(config.hooks.validated_events, ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse']);
+  assert.equal(config.hooks.enabled, false);
+  assert.deepEqual(config.hooks.validated_events, []);
 });
 
 test('ensureConfigFile migrates untouched legacy managed max-time defaults to eight hours', () => {
@@ -216,4 +216,22 @@ test('ensureConfigFile migrates untouched legacy managed max-time defaults to ei
 
   assert.equal(config.defaults.max_time_minutes, 480);
   assert.equal(loadConfig(configPath).defaults.max_time_minutes, 480);
+  assert.equal(config.hooks.enabled, false);
+  assert.deepEqual(config.hooks.validated_events, []);
+});
+
+test('ensureConfigFile preserves an intentional hook opt-in on a customized config', () => {
+  const dataRoot = makeTempRoot();
+  const configPath = path.join(dataRoot, 'config.json');
+  writeJson(configPath, {
+    defaults: { max_time_minutes: 60 },
+    hooks: {
+      enabled: true,
+      validated_events: ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse'],
+    },
+  });
+
+  const config = ensureConfigFile(configPath);
+  assert.equal(config.hooks.enabled, true);
+  assert.deepEqual(config.hooks.validated_events, ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse']);
 });

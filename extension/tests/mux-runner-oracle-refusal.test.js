@@ -132,3 +132,25 @@ test('mux-runner retries an oracle-refused ticket once then aborts under on-fail
   assert.doesNotMatch(log, /completed ticket r1/);
   assert.notEqual(ticket.status, 'Done');
 });
+
+test('mux-runner refuses ticket execution while the circuit is OPEN', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('open circuit task');
+  writeJson(path.join(sessionDir, 'circuit_breaker.json'), {
+    state: 'OPEN',
+    reason: 'stalled',
+  });
+  let calls = 0;
+
+  const finalReason = await withDataRoot(dataRoot, () =>
+    runSequential(sessionDir, { onFailure: 'retry-once', runnerMode: 'pickle' }, {
+      runTicket: async () => {
+        calls += 1;
+        return { status: 'done', applied: true };
+      },
+    }),
+  );
+
+  assert.equal(calls, 0);
+  assert.equal(finalReason, 'circuit_open');
+  assert.match(readRunnerLog(sessionDir), /refusing ticket r1: circuit breaker is OPEN/);
+});

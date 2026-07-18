@@ -11,7 +11,7 @@ Iterative metric optimization loop: measure -> compare -> accept/revert -> repea
 
 Launch the detached tmux runner:
 
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<cmd>" --task "<task>"`
+`node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --metric "<command-that-prints-one-number>" --direction higher --tolerance 0 --task "<task>"`
 
 Or use a qualitative goal:
 
@@ -20,6 +20,8 @@ Or use a qualitative goal:
 Resume:
 
 `node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --resume`
+
+Command metrics are measured by the runtime before the first iteration and after every iteration. The command must exit successfully and print exactly one finite number. Improved iterations are retained; held or regressed iterations are reverted. Use `--metric-timeout <seconds>` to bound each measurement.
 
 ## Process
 

@@ -9,6 +9,7 @@ import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import {
   assertPipelineResumeCompatible,
   createPipelineContract,
+  normalizePipelinePhases,
   resolveNextPipelinePhase,
   validatePipelineContract,
   writePipelineContract,
@@ -52,11 +53,12 @@ test('validatePipelineContract normalizes aliases and resolveNextPipelinePhase r
     task: 'ship the pipeline',
   });
 
-  assert.deepEqual(contract.phases, ['pickle', 'anatomy-park', 'szechuan-sauce']);
+  assert.deepEqual(contract.phases, ['pickle', 'anatomy-park', 'szechuan-sauce', 'citadel']);
   assert.deepEqual(contract.skip_flags, {
     anatomy: false,
     szechuan: false,
   });
+  assert.deepEqual(contract.scope, []);
   assert.equal(
     resolveNextPipelinePhase(contract, {
       phase_statuses: {
@@ -67,6 +69,17 @@ test('validatePipelineContract normalizes aliases and resolveNextPipelinePhase r
     }),
     'anatomy-park',
   );
+});
+
+test('normalizePipelinePhases canonicalizes arbitrary Citadel placement to exactly one final gate', () => {
+  assert.deepEqual(normalizePipelinePhases(['citadel', 'pickle', 'review', 'anatomy', 'citadel']), [
+    'pickle',
+    'anatomy-park',
+    'citadel',
+  ]);
+  assert.deepEqual(normalizePipelinePhases(['pickle']), ['pickle', 'citadel']);
+  assert.deepEqual(normalizePipelinePhases(['citadel']), ['citadel']);
+  assert.throws(() => normalizePipelinePhases(['pickle', 'build']), /Duplicate pipeline phase "pickle"/);
 });
 
 test('assertPipelineResumeCompatible rejects immutable launch drift on resume', () => {
@@ -161,14 +174,14 @@ test('ensurePipelineState mirrors immutable pipeline launch fields into state.js
   assert.equal(mirroredState.pipeline_bootstrap_source, 'prd');
   assert.equal(mirroredState.pipeline_bootstrap_prd, '/tmp/original-prd.md');
   assert.equal(mirroredState.pipeline_task, null);
-  assert.deepEqual(mirroredState.pipeline_phases, ['pickle', 'anatomy-park', 'szechuan-sauce']);
+  assert.deepEqual(mirroredState.pipeline_phases, ['pickle', 'anatomy-park', 'szechuan-sauce', 'citadel']);
   assert.deepEqual(mirroredState.pipeline_skip_flags, {
     anatomy: false,
     szechuan: false,
   });
   assert.equal(mirroredState.pipeline_phase, 'pickle');
   assert.equal(mirroredState.pipeline_phase_index, 0);
-  assert.equal(mirroredState.pipeline_total_phases, 3);
+  assert.equal(mirroredState.pipeline_total_phases, 4);
 });
 
 test('cancelPipelineSession updates pipeline-state.json and mirrors the interrupted phase into state.json atomically', () => {
@@ -198,12 +211,12 @@ test('cancelPipelineSession updates pipeline-state.json and mirrors the interrup
   assert.equal(result.state.pipeline_mode, true);
   assert.equal(result.state.pipeline_phase, 'anatomy-park');
   assert.equal(result.state.pipeline_phase_index, 1);
-  assert.equal(result.state.pipeline_total_phases, 3);
+  assert.equal(result.state.pipeline_total_phases, 4);
   assert.equal(result.state.pipeline_working_dir, '/tmp/pipeline-working-dir');
   assert.equal(result.state.pipeline_target, '/tmp/pipeline-working-dir');
   assert.equal(result.state.pipeline_bootstrap_source, 'task');
   assert.equal(result.state.pipeline_task, 'ship the pipeline');
-  assert.deepEqual(result.state.pipeline_phases, ['pickle', 'anatomy-park', 'szechuan-sauce']);
+  assert.deepEqual(result.state.pipeline_phases, ['pickle', 'anatomy-park', 'szechuan-sauce', 'citadel']);
   assert.deepEqual(result.state.pipeline_skip_flags, {
     anatomy: false,
     szechuan: false,
@@ -234,6 +247,11 @@ test('finishPipelinePhase keeps verification-contract failures blocked on the cu
   writeJson(statePath, {
     ...readJsonFile(statePath),
     current_ticket: 'ticket-007',
+    tmux_runner_pid: 111,
+    worker_pid: 222,
+    active_child_pid: 333,
+    active_child_kind: 'codex',
+    active_child_command: 'codex exec',
   });
 
   const result = finishPipelinePhase(sessionDir, 'pickle', {
@@ -243,6 +261,10 @@ test('finishPipelinePhase keeps verification-contract failures blocked on the cu
 
   const pipelineState = readPipelineState(sessionDir);
   assert.equal(result.state.last_exit_reason, 'verification-contract-failed');
+  assert.equal(result.state.active, false);
+  assert.equal(result.state.tmux_runner_pid, null);
+  assert.equal(result.state.worker_pid, null);
+  assert.equal(result.state.active_child_pid, null);
   assert.equal(result.state.step, 'blocked');
   assert.equal(result.state.current_ticket, 'ticket-007');
   assert.equal(result.state.pipeline_phase, 'pickle');
@@ -471,7 +493,7 @@ test('finishPipelinePhase with omitted exitReason derives consistent success sta
   assert.equal(result.state.step, 'anatomy-park');
 });
 
-test('finishPipelinePhase with omitted exitReason completes the pipeline on the last phase', () => {
+test('finishPipelinePhase with omitted exitReason completes the pipeline only after final Citadel', () => {
   const sessionDir = makeTempRoot();
   const workingDir = '/tmp/pipeline-working-dir';
   writeSessionState(sessionDir, workingDir);
@@ -488,11 +510,21 @@ test('finishPipelinePhase with omitted exitReason completes the pipeline on the 
   });
 
   const result = finishPipelinePhase(sessionDir, 'pickle');
+  assert.equal(result.state.step, 'citadel');
+  const citadelStart = beginPipelinePhase(sessionDir, 'citadel', {
+    startedAt: '2026-04-19T00:11:00.000Z',
+    runnerPid: 12345,
+  });
+  assert.equal(citadelStart.state.active, true);
+  assert.equal(citadelStart.state.last_exit_reason, null);
+  assert.equal(citadelStart.state.tmux_runner_pid, 12345);
+  const finalResult = finishPipelinePhase(sessionDir, 'citadel');
   const pipelineState = readPipelineState(sessionDir);
 
   assert.equal(pipelineState.phase_statuses.pickle, 'done');
+  assert.equal(pipelineState.phase_statuses.citadel, 'done');
   assert.equal(pipelineState.last_exit_reason, 'success');
   assert.equal(pipelineState.current_phase, null);
   assert.ok(pipelineState.completed_at);
-  assert.equal(result.state.step, 'complete');
+  assert.equal(finalResult.state.step, 'complete');
 });

@@ -1,0 +1,58 @@
+name: CI and installed-runtime gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Install locked development dependencies
+        run: npm ci --prefix extension --no-audit --no-fund
+      - name: Install the plugin validator dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
+      - name: Validate source plugin ingestion contract
+        run: python3 .github/scripts/validate_plugin.py .
+      - name: Source release gate
+        run: npm run release:gate
+      - name: Install packaged runtime into an isolated Codex home
+        env:
+          CODEX_HOME: ${{ runner.temp }}/pickle-codex-home
+          AGENTS_HOME: ${{ runner.temp }}/pickle-agents-home
+          PICKLE_DATA_ROOT: ${{ runner.temp }}/pickle-runtime
+        run: bash install.sh
+      - name: Test the installed package layout
+        env:
+          CODEX_HOME: ${{ runner.temp }}/pickle-codex-home
+          AGENTS_HOME: ${{ runner.temp }}/pickle-agents-home
+          PICKLE_DATA_ROOT: ${{ runner.temp }}/pickle-runtime
+          PICKLE_INSTALL_SKIP_BUILD: "1"
+        run: npm --prefix "$PICKLE_DATA_ROOT" test
+      - name: Smoke installed entrypoints and plugin assets
+        env:
+          AGENTS_HOME: ${{ runner.temp }}/pickle-agents-home
+          PICKLE_DATA_ROOT: ${{ runner.temp }}/pickle-runtime
+        run: |
+          test -f "$PICKLE_DATA_ROOT/extension/bin/setup.js"
+          test -f "$PICKLE_DATA_ROOT/extension/tests/helpers.js"
+          test -f "$PICKLE_DATA_ROOT/skills/pickle-pipeline/SKILL.md"
+          test -L "$PICKLE_DATA_ROOT/.codex/skills"
+          test -f "$PICKLE_DATA_ROOT/.pickle-rick-runtime"
+          test -f "$AGENTS_HOME/skills/pickle-pipeline/SKILL.md"
+          python3 .github/scripts/validate_plugin.py "$PICKLE_DATA_ROOT"

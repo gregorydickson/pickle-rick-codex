@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readFrontmatterField, parseTicketFile } from '../services/pickle-utils.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable } from './helpers.js';
+import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable, fakeLifecycleArtifactWriterSource } from './helpers.js';
 
 function runGit(dir, args) {
   return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -51,6 +51,7 @@ function setupSession(projectDir, env, task, ticketOverrides = {}) {
         verification: ['node -e "process.exit(0)"'],
         priority: 'P1',
         status: 'Todo',
+        allowed_paths: ['feature.txt'],
         ...ticketOverrides,
       },
     ],
@@ -110,6 +111,7 @@ test('VAL-STAMP-013: a worker self-commit carrying the Pickle-Ticket trailer is 
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+${fakeLifecycleArtifactWriterSource()}
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
@@ -121,6 +123,7 @@ for (let index = 1; index < args.length; index += 1) {
 }
 const match = prompt.match(/You are executing the "([^"]+)" phase/);
 const phase = match ? match[1] : '';
+writeFakeLifecycleArtifact(prompt, phase);
 if (phase === 'implement') {
   const cwd = process.cwd();
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'base\\nworker-change\\n');

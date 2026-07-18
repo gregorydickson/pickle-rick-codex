@@ -15,10 +15,12 @@ import type {
 export { STATE_SCHEMA_VERSION } from '../types/index.js';
 
 export const PIPELINE_SCHEMA_VERSION = STATE_SCHEMA_VERSION;
-export const PIPELINE_PHASES: readonly PipelinePhase[] = Object.freeze(['pickle', 'anatomy-park', 'szechuan-sauce']);
+export const PIPELINE_PHASES: readonly PipelinePhase[] = Object.freeze(['pickle', 'anatomy-park', 'szechuan-sauce', 'citadel']);
 export const PIPELINE_PHASE_ALIAS_MAP: Readonly<Record<string, PipelinePhase>> = Object.freeze({
   pickle: 'pickle',
   build: 'pickle',
+  citadel: 'citadel',
+  review: 'citadel',
   anatomy: 'anatomy-park',
   'anatomy-park': 'anatomy-park',
   szechuan: 'szechuan-sauce',
@@ -27,6 +29,7 @@ export const PIPELINE_PHASE_ALIAS_MAP: Readonly<Record<string, PipelinePhase>> =
 
 const RESUME_IMMUTABLE_FIELDS: ReadonlyArray<readonly [keyof PipelineContract, string]> = Object.freeze([
   ['target', 'target'],
+  ['scope', 'scope'],
   ['working_dir', 'working directory'],
   ['bootstrap_source', 'bootstrap source'],
   ['bootstrap_prd', 'bootstrap PRD path'],
@@ -43,6 +46,7 @@ const RESUME_IMMUTABLE_FIELDS: ReadonlyArray<readonly [keyof PipelineContract, s
 interface PipelineContractInput {
   working_dir?: unknown;
   target?: unknown;
+  scope?: unknown;
   phases?: unknown;
   skip_flags?: unknown;
   bootstrap_source?: unknown;
@@ -50,6 +54,7 @@ interface PipelineContractInput {
   bootstrap_prd?: unknown;
   schema_version?: unknown;
   pickle?: unknown;
+  citadel?: unknown;
   anatomy?: unknown;
   szechuan?: unknown;
   [key: string]: unknown;
@@ -62,6 +67,7 @@ interface PipelineContractInput {
 export interface PipelineStateMirror {
   pipeline_working_dir: string;
   pipeline_target: string;
+  pipeline_scope: string[];
   pipeline_bootstrap_source: PipelineBootstrapSource;
   pipeline_bootstrap_prd: string | null;
   pipeline_task: string | null;
@@ -94,6 +100,26 @@ function compareJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+export function normalizePipelineScope(value: unknown): string[] {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw new PipelineContractError('Pipeline scope must be an array of repository-relative paths.', 'PIPELINE_SCOPE_INVALID');
+  }
+  const normalized = new Set<string>();
+  for (const entry of value) {
+    const raw = String(entry ?? '').trim().replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!raw || raw === '.' || path.posix.isAbsolute(raw)) {
+      throw new PipelineContractError(`Invalid pipeline scope path ${JSON.stringify(entry)}. Repository root and absolute paths are forbidden.`, 'PIPELINE_SCOPE_INVALID');
+    }
+    const clean = path.posix.normalize(raw);
+    if (clean === '..' || clean.startsWith('../')) {
+      throw new PipelineContractError(`Pipeline scope escapes the repository: ${JSON.stringify(entry)}.`, 'PIPELINE_SCOPE_INVALID');
+    }
+    normalized.add(clean);
+  }
+  return [...normalized].sort();
+}
+
 export function normalizePipelinePhase(value: unknown): PipelinePhase {
   const normalized = String(value ?? '').trim().toLowerCase();
   const phase = PIPELINE_PHASE_ALIAS_MAP[normalized];
@@ -114,12 +140,15 @@ export function normalizePipelinePhases(values: unknown): PipelinePhase[] {
   const phases: PipelinePhase[] = [];
   for (const value of values) {
     const phase = normalizePipelinePhase(value);
+    if (phase === 'citadel') {
+      continue;
+    }
     if (phases.includes(phase)) {
       throw new PipelineContractError(`Duplicate pipeline phase "${phase}" is not allowed.`, 'PIPELINE_PHASES_INVALID');
     }
     phases.push(phase);
   }
-  return phases;
+  return [...phases, 'citadel'];
 }
 
 function normalizeBootstrapSource(value: unknown): PipelineBootstrapSource {
@@ -220,10 +249,12 @@ export function createPipelineContract(contract: unknown): PipelineContract {
       : PIPELINE_SCHEMA_VERSION,
     working_dir: path.resolve(input.working_dir as string),
     target: path.resolve(input.target as string),
+    scope: normalizePipelineScope(input.scope),
     phases,
     skip_flags: skipFlags,
     ...bootstrap,
     pickle: isPlainObject(input.pickle) ? { ...input.pickle } : {},
+    citadel: isPlainObject(input.citadel) ? { ...input.citadel } : {},
     anatomy: isPlainObject(input.anatomy) ? { ...input.anatomy } : {},
     szechuan: isPlainObject(input.szechuan) ? { ...input.szechuan } : {},
   };
@@ -263,6 +294,7 @@ export function buildPipelineStateMirror(contract: unknown): PipelineStateMirror
   return {
     pipeline_working_dir: normalized.working_dir,
     pipeline_target: normalized.target,
+    pipeline_scope: [...normalized.scope],
     pipeline_bootstrap_source: normalized.bootstrap_source,
     pipeline_bootstrap_prd: normalized.bootstrap_prd,
     pipeline_task: normalized.task,

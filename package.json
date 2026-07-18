@@ -8,10 +8,13 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "npm --prefix extension test",
+    "test:installed": "npm --prefix extension run test:runtime",
+    "release:gate": "npm --prefix extension run typecheck && npm --prefix extension run lint && npm test",
     "smoke": "node ./extension/bin/status.js --help >/dev/null",
     "install:local": "bash install.sh",
-    "validate:codex": "node ./extension/bin/validate-codex.js"
+    "validate:codex": "node ./extension/bin/validate-codex.js",
+    "check:readiness": "node ./extension/bin/check-readiness.js"
   },
   "license": "MIT"
 }

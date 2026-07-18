@@ -1,7 +1,15 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
+import {
+  collectCodexToolCalls,
+  detectOutputFormat,
+  extractAssistantContent,
+  extractCodexUsage,
+} from './classifier-utils.js';
 import type {
   CodexExecOptions,
   CodexSpawnResult,
@@ -10,39 +18,53 @@ import type {
   SuccessCheckContext,
 } from '../types/index.js';
 
-export function hasPromiseToken(text: unknown, token: unknown): boolean {
-  return new RegExp(`<promise>\\s*${String(token).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*<\\/promise>`).test(String(text || ''));
+export class AddDirOutsideSandboxError extends Error {
+  readonly addDir: string;
+  readonly sandboxRoot: string;
+
+  constructor(addDir: string, sandboxRoot: string) {
+    super(`Codex --add-dir is outside the test sandbox: ${addDir} (sandbox: ${sandboxRoot})`);
+    this.name = 'AddDirOutsideSandboxError';
+    this.addDir = addDir;
+    this.sandboxRoot = sandboxRoot;
+  }
 }
 
-function extractUsageFromJson(stdout: unknown): CodexUsage {
-  const usage: CodexUsage = {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-  };
-
-  for (const line of String(stdout || '').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as {
-        usage?: Record<string, unknown>;
-        response?: { usage?: Record<string, unknown> };
-        result?: { usage?: Record<string, unknown> };
-      };
-      const candidate = parsed.usage || parsed.response?.usage || parsed.result?.usage || null;
-      if (!candidate || typeof candidate !== 'object') continue;
-      usage.input_tokens += Number(candidate.input_tokens || 0);
-      usage.output_tokens += Number(candidate.output_tokens || 0);
-      usage.cache_creation_input_tokens += Number(candidate.cache_creation_input_tokens || 0);
-      usage.cache_read_input_tokens += Number(candidate.cache_read_input_tokens || 0);
-    } catch {
-      // Ignore non-JSON or unknown events.
-    }
+function canonicalPath(candidate: string): string {
+  const resolved = path.resolve(candidate);
+  let existing = resolved;
+  const suffix: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return resolved;
+    suffix.unshift(path.basename(existing));
+    existing = parent;
   }
+  try {
+    return path.join(fs.realpathSync.native(existing), ...suffix);
+  } catch {
+    return resolved;
+  }
+}
 
-  return usage;
+/** Test harnesses must never grant Codex write access outside the OS temp sandbox. */
+export function assertAddDirsUnderTmpdirIfTestMode(
+  addDirs: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  tmpRoot: string = os.tmpdir(),
+): void {
+  if (env.PICKLE_TEST_MODE !== '1') return;
+  const sandboxRoot = canonicalPath(tmpRoot);
+  for (const addDir of addDirs) {
+    const candidate = canonicalPath(addDir);
+    const relative = path.relative(sandboxRoot, candidate);
+    if (relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) continue;
+    throw new AddDirOutsideSandboxError(addDir, sandboxRoot);
+  }
+}
+
+export function hasPromiseToken(text: unknown, token: unknown): boolean {
+  return new RegExp(`<promise>\\s*${String(token).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*<\\/promise>`).test(String(text || ''));
 }
 
 function removeStaleOutputs(paths: string[] = []): void {
@@ -89,6 +111,7 @@ async function runSpawnedCommand({
   timeoutMs = 900_000,
   env = {},
   outputLastMessagePath = '',
+  progressArtifactPaths = [],
   successCheck,
   successSignalGraceMs = 750,
   successPollMs = 250,
@@ -110,6 +133,8 @@ async function runSpawnedCommand({
     let cancelTimer: NodeJS.Timeout | null = null;
     let forcedAfterSuccess = false;
     let forcedByCancel = false;
+    let forcedByTimeout = false;
+    let progressSignature = '';
 
     const child = spawn(command, args, {
       cwd,
@@ -141,6 +166,19 @@ async function runSpawnedCommand({
 
     const currentStdout = (): string => Buffer.concat(stdoutChunks).toString('utf8');
     const currentStderr = (): string => Buffer.concat(stderrChunks).toString('utf8');
+    const observedArtifactPaths = [...new Set([outputLastMessagePath, ...progressArtifactPaths].filter(Boolean))];
+    const currentProgressSignature = (): string => JSON.stringify({
+      stdout: stdoutChunks.reduce((total, chunk) => total + chunk.length, 0),
+      stderr: stderrChunks.reduce((total, chunk) => total + chunk.length, 0),
+      artifacts: observedArtifactPaths.map((filePath) => {
+        try {
+          const stat = fs.statSync(filePath);
+          return [filePath, stat.size, stat.mtimeMs];
+        } catch {
+          return [filePath, -1, -1];
+        }
+      }),
+    });
 
     const scheduleTermination = (
       signal: NodeJS.Signals,
@@ -156,12 +194,33 @@ async function runSpawnedCommand({
       }, delayMs).unref?.();
     };
 
+    const armSuccessTermination = (): void => {
+      if (successGraceTimer) clearTimeout(successGraceTimer);
+      successGraceTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          forcedAfterSuccess = true;
+          scheduleTermination('SIGTERM', 'SIGKILL');
+        }
+      }, successSignalGraceMs);
+    };
+
+    const observeProgress = (): void => {
+      const signature = currentProgressSignature();
+      if (signature === progressSignature) return;
+      progressSignature = signature;
+      if (successObserved) armSuccessTermination();
+    };
+
     const checkForSuccess = (): void => {
+      observeProgress();
       if (successObserved || typeof successCheck !== 'function') return;
       const ctx: SuccessCheckContext = {
         stdout: currentStdout(),
         stderr: currentStderr(),
         lastMessage: readLastMessage(outputLastMessagePath),
+        outputFormat: detectOutputFormat(currentStdout()),
+        assistantContent: extractAssistantContent(currentStdout()),
+        toolCalls: collectCodexToolCalls(currentStdout()),
       };
       try {
         if (!successCheck(ctx)) {
@@ -172,16 +231,13 @@ async function runSpawnedCommand({
       }
 
       successObserved = true;
-      successGraceTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          forcedAfterSuccess = true;
-          scheduleTermination('SIGTERM', 'SIGKILL');
-        }
-      }, successSignalGraceMs);
+      progressSignature = currentProgressSignature();
+      armSuccessTermination();
     };
 
     timeoutTimer = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
+        forcedByTimeout = true;
         scheduleTermination('SIGTERM', 'SIGKILL');
       }
     }, timeoutMs);
@@ -218,24 +274,42 @@ async function runSpawnedCommand({
     });
 
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
-      const stdout = currentStdout();
-      const stderr = currentStderr();
-      const message = readLastMessage(outputLastMessagePath);
-      const timedOut = signal === 'SIGTERM' || signal === 'SIGKILL';
-      finalize({
-        exitCode: forcedByCancel
-          ? 130
-          : successObserved
-            ? 0
-            : (code ?? (signal ? 1 : 0)),
-        stdout,
-        stderr,
-        timedOut: successObserved || forcedByCancel ? false : timedOut,
-        lastMessage: message,
-        usage: extractUsageFromJson(stdout),
-        terminatedAfterSuccess: forcedAfterSuccess,
-        cancelled: forcedByCancel,
-      });
+      cleanup();
+      const flushStarted = Date.now();
+      let stableSignature = currentProgressSignature();
+      const flushQuietMs = Math.max(50, Math.min(successSignalGraceMs, 250));
+      const finalizeAfterFlush = (): void => {
+        const nextSignature = currentProgressSignature();
+        if (nextSignature !== stableSignature && Date.now() - flushStarted < 1_000) {
+          stableSignature = nextSignature;
+          setTimeout(finalizeAfterFlush, flushQuietMs);
+          return;
+        }
+        const stdout = currentStdout();
+        const stderr = currentStderr();
+        const message = readLastMessage(outputLastMessagePath);
+        const outputFormat = detectOutputFormat(stdout);
+        finalize({
+          exitCode: forcedByCancel
+            ? 130
+            : forcedByTimeout
+              ? 124
+              : successObserved
+                ? 0
+                : (code ?? (signal ? 1 : 0)),
+          stdout,
+          stderr,
+          timedOut: forcedByTimeout,
+          lastMessage: message,
+          usage: extractCodexUsage(stdout) as CodexUsage,
+          terminatedAfterSuccess: forcedAfterSuccess,
+          cancelled: forcedByCancel,
+          outputFormat,
+          assistantContent: extractAssistantContent(stdout),
+          toolCalls: collectCodexToolCalls(stdout),
+        });
+      };
+      setTimeout(finalizeAfterFlush, flushQuietMs);
     });
   });
 }
@@ -271,6 +345,7 @@ function buildCodexExecInvocation(options: CodexExecOptions): { command: string;
   }
 
   const addDirs = [...(config.runtime.add_dirs || []), ...(options.addDirs || [])];
+  assertAddDirsUnderTmpdirIfTestMode(addDirs);
   for (const dir of addDirs) {
     args.push('--add-dir', dir);
   }
@@ -298,6 +373,7 @@ export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpaw
     timeoutMs: options.timeoutMs,
     env: options.env,
     outputLastMessagePath: options.outputLastMessagePath,
+    progressArtifactPaths: options.progressArtifactPaths,
     cleanupPaths: options.cleanupPaths,
     onSpawn: options.onSpawn,
     cancelCheck: options.cancelCheck,
@@ -314,6 +390,7 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
     timeoutMs: options.timeoutMs,
     env: options.env,
     outputLastMessagePath: options.outputLastMessagePath,
+    progressArtifactPaths: options.progressArtifactPaths,
     successCheck: options.successCheck,
     successSignalGraceMs: options.successSignalGraceMs,
     successPollMs: options.successPollMs,

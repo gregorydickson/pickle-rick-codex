@@ -106,10 +106,9 @@ export function salvageDirtyTree(input: SalvageDirtyTreeInput): SalvageDirtyTree
 /**
  * Stage exactly `paths`, one per-path `git add -- <p>` (never a whole-tree
  * `add -A`/`-u`). Handles new, modified, AND deleted tracked files (`git add`
- * records a deletion). Rename caveat: the porcelain parser
- * (`git-utils.ts:listWorkingTreeDirtyPaths`) surfaces only the NEW path of a
- * rename, so a rename staged from that output commits as a copy (deletion-half
- * left unstaged); callers wanting a true move must feed both rename halves.
+ * records a deletion). The porcelain parser
+ * (`git-utils.ts:listWorkingTreeDirtyPaths`) surfaces both halves of a rename,
+ * so staging its result preserves the move rather than committing a copy.
  */
 export function stageOwnedPaths(workingDir: string, paths: readonly string[]): void {
   for (const p of paths) {

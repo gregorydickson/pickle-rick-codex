@@ -38,7 +38,7 @@ test('listWorkingTreeDirtyPaths returns new, modified, and deleted paths deduped
   assert.deepEqual(result, ['deleted.txt', 'modified.txt', 'new.txt']);
 });
 
-test('listWorkingTreeDirtyPaths surfaces only the NEW path for a rename (skips rename second token)', () => {
+test('listWorkingTreeDirtyPaths surfaces both paths for a rename so owned staging preserves the move', () => {
   const dir = initRepo('pickle-rick-list-dirty-rename-');
   fs.writeFileSync(path.join(dir, 'oldname.txt'), 'stable content for rename detection\n');
   git(dir, ['add', '-A']);
@@ -48,7 +48,7 @@ test('listWorkingTreeDirtyPaths surfaces only the NEW path for a rename (skips r
 
   const result = listWorkingTreeDirtyPaths(dir);
   assert.ok(result.includes('newname.txt'), 'new path is returned');
-  assert.ok(!result.includes('oldname.txt'), 'rename source (second token) is skipped');
+  assert.ok(result.includes('oldname.txt'), 'rename source is returned for deletion staging');
 });
 
 test('listWorkingTreeDirtyPaths filters out paths under excludePrefixes', () => {

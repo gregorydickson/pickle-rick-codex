@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   STATE_SCHEMA_VERSION,
   atomicWriteJson,
@@ -12,6 +13,7 @@ import { readRecoverableJsonObject } from './recoverable-json.js';
 export const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 export const LOCK_RETRY_BACKOFF_BASE_MS = 50;
 export const STALE_LOCK_THRESHOLD_MS = 30_000;
+export const RUNTIME_STATE_SCHEMA_VERSION = 1;
 
 const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 
@@ -77,6 +79,69 @@ export class TransactionError extends StateError {
   }
 }
 
+export class SchemaVersionDeployDriftError extends StateError {
+  readonly runtimeVersion: number;
+  readonly sourceVersion: number | null;
+
+  constructor(runtimeVersion: number, sourceVersion: number | null) {
+    super(
+      'SCHEMA_DEPLOY_DRIFT',
+      `Runtime state schema ${runtimeVersion} does not match source schema ${sourceVersion}; rebuild/reinstall pickle-rick-codex.`,
+    );
+    this.name = 'SchemaVersionDeployDriftError';
+    this.runtimeVersion = runtimeVersion;
+    this.sourceVersion = sourceVersion;
+  }
+}
+
+export class SchemaVersionAheadError extends StateError {
+  readonly statePath: string;
+  readonly writtenValue: number;
+  readonly maxSupported: number;
+
+  constructor(statePath: string, writtenValue: number, maxSupported: number) {
+    super(
+      'SCHEMA_MISMATCH',
+      `State schema ${writtenValue} at ${statePath} is newer than supported ${maxSupported}.`,
+    );
+    this.name = 'SchemaVersionAheadError';
+    this.statePath = statePath;
+    this.writtenValue = writtenValue;
+    this.maxSupported = maxSupported;
+  }
+}
+
+export function assertSchemaVersionDeployParity(
+  runtimeVersion = RUNTIME_STATE_SCHEMA_VERSION,
+  sourceVersion: number | null = readDeployedSchemaVersion(),
+): void {
+  if (runtimeVersion !== sourceVersion || sourceVersion !== STATE_SCHEMA_VERSION) {
+    throw new SchemaVersionDeployDriftError(runtimeVersion, sourceVersion);
+  }
+}
+
+export function readDeployedSchemaVersion(
+  manifestPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'state-schema.json'),
+): number | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    return Number.isInteger(parsed.schema_version) ? Number(parsed.schema_version) : null;
+  } catch {
+    return null;
+  }
+}
+
+function assertSchemaVersionWithinCeiling(
+  statePath: string,
+  state: PersistedState,
+  maxSupported: number,
+): void {
+  const value = Number(state.schema_version);
+  if (Number.isFinite(value) && value > maxSupported) {
+    throw new SchemaVersionAheadError(statePath, value, maxSupported);
+  }
+}
+
 /**
  * Shape of every JSON state blob persisted by StateManager. The index signature
  * keeps the loose runtime behaviour (callers freely read/mutate arbitrary keys)
@@ -111,8 +176,9 @@ export class StateManager {
   options: ResolvedStateManagerOptions;
 
   constructor(options: StateManagerOptions = {}) {
+    assertSchemaVersionDeployParity();
     this.options = {
-      schemaVersion: STATE_SCHEMA_VERSION,
+      schemaVersion: RUNTIME_STATE_SCHEMA_VERSION,
       retryBaseMs: LOCK_RETRY_BACKOFF_BASE_MS,
       acquireTimeoutMs: LOCK_ACQUIRE_TIMEOUT_MS,
       staleLockThresholdMs: STALE_LOCK_THRESHOLD_MS,
@@ -198,10 +264,7 @@ export class StateManager {
     }
 
     if (schemaVersion > this.options.schemaVersion) {
-      throw new StateError(
-        'SCHEMA_MISMATCH',
-        `State schema ${schemaVersion} is newer than supported ${this.options.schemaVersion}`,
-      );
+      throw new SchemaVersionAheadError(statePath, schemaVersion, this.options.schemaVersion);
     }
 
     return state;
@@ -234,6 +297,7 @@ export class StateManager {
         : this.read(statePath);
       const result = mutator(state) ?? state;
       result.schema_version ??= this.options.schemaVersion;
+      assertSchemaVersionWithinCeiling(statePath, result, this.options.schemaVersion);
       atomicWriteJson(statePath, result);
       return result;
     } finally {
@@ -242,8 +306,9 @@ export class StateManager {
   }
 
   forceWrite(statePath: string, state: PersistedState): void {
+    state.schema_version ??= this.options.schemaVersion;
+    assertSchemaVersionWithinCeiling(statePath, state, this.options.schemaVersion);
     try {
-      state.schema_version ??= this.options.schemaVersion;
       atomicWriteJson(statePath, state);
     } catch {
       // Best effort.
@@ -267,6 +332,9 @@ export class StateManager {
       result.forEach((state) => {
         state.schema_version ??= this.options.schemaVersion;
       });
+      result.forEach((state, index) => {
+        assertSchemaVersionWithinCeiling(ordered[index], state, this.options.schemaVersion);
+      });
       for (let index = 0; index < ordered.length; index += 1) {
         atomicWriteJson(ordered[index], result[index]);
       }
@@ -284,6 +352,9 @@ export class StateManager {
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError as Error);
         }
+      }
+      if (error instanceof SchemaVersionAheadError && rollbackErrors.length === 0) {
+        throw error;
       }
       throw new TransactionError(safeErrorMessage(error), rollbackErrors);
     } finally {

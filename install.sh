@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
+agents_home="${AGENTS_HOME:-$HOME/.agents}"
 target_root="${PICKLE_DATA_ROOT:-$codex_home/pickle-rick}"
 project_dir=""
 enable_hooks=0
@@ -10,13 +11,100 @@ project_is_source=0
 runtime_is_installed_source=0
 repo_is_checkout=0
 
+require_command() {
+  local command_name="$1"
+  local install_hint="$2"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "Missing required command: $command_name. $install_hint" >&2
+    exit 1
+  fi
+}
+
+require_command node "Install Node.js 20 or newer."
+require_command npm "Install npm with Node.js 20 or newer."
+require_command rsync "Install rsync before running the installer."
+
+node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+if [[ "$node_major" -lt 20 ]]; then
+  echo "Pickle Rick requires Node.js 20 or newer; found $(node --version)." >&2
+  exit 1
+fi
+
 usage() {
   cat <<'EOF'
 Usage:
   bash install.sh
   bash install.sh --project /path/to/project
-  bash install.sh --project /path/to/project --enable-hooks
+
+The former --enable-hooks option is rejected until the installed Codex hook
+event, payload, decision, and trust contracts have authenticated validation.
 EOF
+}
+
+canonicalize_path() {
+  node - "$1" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+
+let candidate = path.resolve(process.argv[2]);
+const missing = [];
+while (!fs.existsSync(candidate)) {
+  const parent = path.dirname(candidate);
+  if (parent === candidate) break;
+  missing.unshift(path.basename(candidate));
+  candidate = parent;
+}
+const resolved = fs.existsSync(candidate) ? fs.realpathSync(candidate) : candidate;
+process.stdout.write(path.join(resolved, ...missing));
+EOF
+}
+
+is_same_or_ancestor() {
+  local possible_ancestor="$1"
+  local candidate="$2"
+  [[ "$candidate" == "$possible_ancestor" || "$candidate" == "$possible_ancestor/"* ]]
+}
+
+assert_safe_install_roots() {
+  local canonical_home
+  canonical_home="$(canonicalize_path "$HOME")"
+
+  if [[ "$codex_home" == "/" || "$codex_home" == "$canonical_home" ]] \
+    || is_same_or_ancestor "$codex_home" "$canonical_home" \
+    || [[ "$codex_home" == "$repo_root" ]]; then
+    echo "Refusing unsafe CODEX_HOME target: $codex_home" >&2
+    exit 1
+  fi
+
+  if [[ "$agents_home" == "/" || "$agents_home" == "$canonical_home" || "$agents_home" == "$codex_home" ]] \
+    || is_same_or_ancestor "$agents_home" "$canonical_home" \
+    || [[ "$agents_home" == "$repo_root" ]]; then
+    echo "Refusing unsafe AGENTS_HOME target: $agents_home" >&2
+    exit 1
+  fi
+
+  if [[ "$target_root" == "/" || "$target_root" == "$canonical_home" || "$target_root" == "$codex_home" || "$target_root" == "$agents_home" ]] \
+    || is_same_or_ancestor "$target_root" "$canonical_home" \
+    || { [[ "$target_root" == "$repo_root" ]] && [[ -d "$repo_root/.git" ]]; }; then
+    echo "Refusing unsafe PICKLE_DATA_ROOT target: $target_root" >&2
+    exit 1
+  fi
+
+  if [[ -d "$target_root" ]] && [[ -n "$(find "$target_root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    local marker="$target_root/.pickle-rick-runtime"
+    local package_name=""
+    local plugin_name=""
+    if [[ -f "$target_root/package.json" ]]; then
+      package_name="$(node -e 'try { process.stdout.write(String(require(process.argv[1]).name || "")); } catch {}' "$target_root/package.json")"
+    fi
+    if [[ -f "$target_root/.codex-plugin/plugin.json" ]]; then
+      plugin_name="$(node -e 'try { process.stdout.write(String(require(process.argv[1]).name || "")); } catch {}' "$target_root/.codex-plugin/plugin.json")"
+    fi
+    if [[ ! -f "$marker" && "$package_name" != "pickle-rick-codex" && "$plugin_name" != "pickle-rick-codex" ]]; then
+      echo "Refusing to replace non-Pickle-Rick directory: $target_root" >&2
+      exit 1
+    fi
+  fi
 }
 
 backup_path() {
@@ -48,6 +136,12 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function backupCurrent() {
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, `${path.basename(targetFile)}.${Date.now()}.bak`);
+  fs.copyFileSync(targetFile, backupFile);
+}
+
 if (!fs.existsSync(targetFile)) {
   fs.writeFileSync(targetFile, `${block}\n`);
   process.exit(0);
@@ -55,10 +149,18 @@ if (!fs.existsSync(targetFile)) {
 
 const current = fs.readFileSync(targetFile, 'utf8');
 if (current.includes(start) && current.includes(end)) {
-  const updated = current.replace(
+  let updated = current.replace(
     new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`, 'm'),
     block,
   );
+  const managedEnd = updated.indexOf(end) + end.length;
+  const suffix = updated.slice(managedEnd);
+  const trimmedSuffix = suffix.trimStart();
+  if (trimmedSuffix === source || trimmedSuffix.startsWith(`${source}\n`)) {
+    const preserved = trimmedSuffix.slice(source.length).trimStart();
+    updated = `${updated.slice(0, managedEnd)}${preserved ? `\n\n${preserved}` : '\n'}`;
+  }
+  if (updated !== current) backupCurrent();
   fs.writeFileSync(targetFile, updated.endsWith('\n') ? updated : `${updated}\n`);
   process.exit(0);
 }
@@ -68,9 +170,7 @@ if (current.trimEnd() === source) {
   process.exit(0);
 }
 
-fs.mkdirSync(backupDir, { recursive: true });
-const backupFile = path.join(backupDir, `${path.basename(targetFile)}.${Date.now()}.bak`);
-fs.copyFileSync(targetFile, backupFile);
+backupCurrent();
 const merged = `${block}\n\n${current.trimStart()}`;
 fs.writeFileSync(targetFile, merged.endsWith('\n') ? merged : `${merged}\n`);
 EOF
@@ -84,66 +184,10 @@ sync_runtime_source_tree() {
   fi
 
   mkdir -p "$runtime_root/.codex"
-  rm -rf "$runtime_root/.codex/skills" "$runtime_root/.codex/hooks" "$runtime_root/tests"
-  cp -R "$repo_root/.codex/skills" "$runtime_root/.codex/"
+  rm -rf "$runtime_root/skills" "$runtime_root/.codex/skills" "$runtime_root/.codex/hooks" "$runtime_root/tests"
+  cp -R "$repo_root/skills" "$runtime_root/"
+  ln -s ../skills "$runtime_root/.codex/skills"
   cp -R "$repo_root/.codex/hooks" "$runtime_root/.codex/"
-  cp -R "$repo_root/extension/tests" "$runtime_root/tests"
-}
-
-write_pickle_pipeline_skill() {
-  local skills_root="$1"
-  local runtime_root="$2"
-  local skill_dir="$skills_root/pickle-pipeline"
-
-  mkdir -p "$skill_dir"
-  cat > "$skill_dir/SKILL.md" <<'EOF'
----
-name: pickle-pipeline
-description: "Launch the proven detached Pickle Rick pipeline that runs pickle, then optional anatomy-park and szechuan-sauce phases in one tmux session."
-metadata:
-  short-description: "Detached multi-phase pipeline mode"
----
-
-# Pickle Rick Pipeline
-
-Launch from a task string:
-
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js "ship the feature"`
-
-Launch from an existing PRD:
-
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --prd ./prd.md`
-
-Resume the latest pipeline session for the current repo:
-
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume`
-
-Resume a specific pipeline session:
-
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js --resume <session-dir>`
-
-Skip downstream phases explicitly:
-
-`node $HOME/.codex/pickle-rick/extension/bin/pickle-pipeline.js "ship the feature" --skip-anatomy --skip-szechuan`
-
-## Behavior
-
-1. Verifies `tmux` is available before detach
-2. Bootstraps the Pickle Rick session from a task string or PRD
-3. Writes the immutable pipeline contract to `pipeline.json`
-4. Launches one detached tmux session that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce`
-5. Refuses resume-time contract mutation for target, bootstrap source, task/PRD, phases, and skip flags
-6. Rolls back launch state if tmux accepts commands but the pipeline runner never starts
-7. Creates a monitor window whose runner pane tails `pipeline-runner.log`
-8. Prints `tmux attach` instructions
-
-## Use It When
-
-- You want the proven detached path for a task that should flow through multiple Pickle Rick phases
-- You want one tmux session and one monitor across `pickle`, `anatomy-park`, and `szechuan-sauce`
-- You need resumable pipeline state with status output that shows phase metadata
-EOF
-  render_runtime_root_in_tree "$skill_dir" "$runtime_root"
 }
 
 install_skill_tree() {
@@ -152,15 +196,40 @@ install_skill_tree() {
 
   mkdir -p "$skills_root"
   shopt -s nullglob
-  for skill_dir in "$repo_root/.codex/skills"/*; do
+  for skill_dir in "$repo_root/skills"/*; do
     local skill_name
     skill_name="$(basename "$skill_dir")"
     rm -rf "$skills_root/$skill_name"
     cp -R "$skill_dir" "$skills_root/"
   done
   shopt -u nullglob
-  write_pickle_pipeline_skill "$skills_root" "$runtime_root"
   render_runtime_root_in_tree "$skills_root" "$runtime_root"
+}
+
+install_legacy_codex_skill_links() {
+  local canonical_skills_root="$1"
+  local legacy_skills_root="$2"
+  local backup_root="$codex_home/pickle-rick-backups/legacy-skills"
+
+  mkdir -p "$legacy_skills_root"
+  shopt -s nullglob
+  for skill_dir in "$repo_root/skills"/*; do
+    local skill_name
+    local legacy_path
+    local canonical_path
+    skill_name="$(basename "$skill_dir")"
+    legacy_path="$legacy_skills_root/$skill_name"
+    canonical_path="$canonical_skills_root/$skill_name"
+    if [[ -e "$legacy_path" || -L "$legacy_path" ]]; then
+      if [[ -L "$legacy_path" && "$(canonicalize_path "$legacy_path")" == "$(canonicalize_path "$canonical_path")" ]]; then
+        continue
+      fi
+      mkdir -p "$backup_root"
+      mv "$legacy_path" "$backup_root/${skill_name}.$(date +%s).$$.bak"
+    fi
+    ln -s "$canonical_path" "$legacy_path"
+  done
+  shopt -u nullglob
 }
 
 render_runtime_root_in_tree() {
@@ -226,21 +295,6 @@ if (fs.existsSync(rootDir)) {
 EOF
 }
 
-install_project_hooks() {
-  local hooks_dir="$1"
-  local runtime_root="$2"
-  local template_file="$3"
-
-  mkdir -p "$hooks_dir"
-  if [[ -f "$hooks_dir/hooks.json" ]]; then
-    local backup_dir="$hooks_dir/pickle-rick-backups"
-    mkdir -p "$backup_dir"
-    cp "$hooks_dir/hooks.json" "$(backup_path "$hooks_dir/hooks.json" "$backup_dir")"
-  fi
-  cp "$template_file" "$hooks_dir/hooks.json"
-  render_runtime_root_in_tree "$hooks_dir" "$runtime_root"
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project)
@@ -268,6 +322,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+repo_root="$(canonicalize_path "$repo_root")"
+codex_home="$(canonicalize_path "$codex_home")"
+agents_home="$(canonicalize_path "$agents_home")"
+target_root="$(canonicalize_path "$target_root")"
+assert_safe_install_roots
+
+if [[ "$enable_hooks" -eq 1 ]]; then
+  echo "--enable-hooks is unsupported until Codex hook delivery and decision schemas pass authenticated validation." >&2
+  exit 1
+fi
+
 if [[ "$repo_root" == "$target_root" ]]; then
   runtime_is_installed_source=1
 fi
@@ -290,7 +355,7 @@ fi
 # PICKLE_INSTALL_SKIP_BUILD=1 to deploy a pre-built tree without recompiling.
 if [[ "$runtime_is_installed_source" -eq 0 && "${PICKLE_INSTALL_SKIP_BUILD:-0}" != "1" && -d "$repo_root/extension/src" ]]; then
   echo "Building Pickle Rick Codex runtime (extension/)..."
-  ( cd "$repo_root/extension" && npm install --no-fund --no-audit )
+  ( cd "$repo_root/extension" && npm ci --no-fund --no-audit )
   # Force-clean stale compiled twins so a stale tsc cache can never be deployed.
   rm -rf "$repo_root/extension/bin" "$repo_root/extension/services" "$repo_root/extension/types"
   rm -f "$repo_root/extension/.tsbuildinfo"
@@ -301,6 +366,7 @@ fi
 
 mkdir -p "$target_root"
 mkdir -p "$codex_home"
+mkdir -p "$agents_home"
 
 copy_item() {
   local item="$1"
@@ -311,6 +377,7 @@ copy_item() {
 
 if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   rm -rf "$target_root/bin" "$target_root/lib" "$target_root/docs" "$target_root/.codex-plugin"
+  rm -f "$target_root/CLAUDE.md"
   copy_item README.md
   copy_item AGENTS.md
   copy_item package.json
@@ -319,40 +386,39 @@ if [[ "$runtime_is_installed_source" -eq 0 ]]; then
   copy_item .codex-plugin
   copy_item docs
   copy_item images
-  # Deploy the compiled TypeScript runtime. rsync extension/ excluding sources,
-  # tests, dev deps, and tsconfig so only the freshly compiled runtime
-  # (bin/*.js, services/*.js, types/*.js, bin/*.sh, package.json) lands under
+  # Deploy the compiled TypeScript runtime, source-level invariant fixtures, and
+  # tests while excluding development dependencies and build configuration.
+  # Tests stay beside the compiled files they import; source is retained because
+  # several architecture tests inspect it. Conditional pretest skips compilation
+  # when the installed package has no node_modules.
   # $target_root/extension/. --delete-excluded keeps the deployed tree clean and
   # idempotent across reinstalls.
   mkdir -p "$target_root/extension"
   rsync -a --delete --delete-excluded \
     --exclude='node_modules' \
-    --exclude='src' \
-    --exclude='tests' \
     --exclude='tsconfig.json' \
     "$repo_root/extension/" "$target_root/extension/"
 fi
 sync_runtime_source_tree "$target_root"
-write_pickle_pipeline_skill "$target_root/.codex/skills" "$target_root"
+touch "$target_root/.pickle-rick-runtime"
 if [[ "$runtime_is_installed_source" -eq 0 || "$repo_is_checkout" -eq 0 ]]; then
   render_runtime_root_in_tree "$target_root" "$target_root" "sessions,activity"
 fi
 
-install_skill_tree "$codex_home/skills" "$target_root"
+install_skill_tree "$agents_home/skills" "$target_root"
+install_legacy_codex_skill_links "$agents_home/skills" "$codex_home/skills"
 merge_managed_markdown "$target_root/AGENTS.md" "$codex_home/AGENTS.md" "agents" "$codex_home/pickle-rick-backups"
 
 if [[ -n "$project_dir" && "$project_is_source" -eq 0 ]]; then
-  install_skill_tree "$project_dir/.codex/skills" "$target_root"
+  install_skill_tree "$project_dir/.agents/skills" "$target_root"
   merge_managed_markdown "$target_root/AGENTS.md" "$project_dir/AGENTS.md" "agents" "$project_dir/.codex/pickle-rick-backups"
-  if [[ "$enable_hooks" -eq 1 ]]; then
-    install_project_hooks "$project_dir/.codex/hooks" "$target_root" "$repo_root/.codex/hooks/hooks.template.json"
-  fi
 fi
 
 echo "Installed Pickle Rick Codex runtime to:"
 echo "  $target_root"
 echo "Installed Pickle Rick persona and skills into:"
-echo "  $codex_home"
+echo "  persona: $codex_home/AGENTS.md"
+echo "  skills: $agents_home/skills"
 if [[ -n "$project_dir" ]]; then
   if [[ "$project_is_source" -eq 1 ]]; then
     echo "Project bootstrap skipped because the target project is the source repo:"
@@ -362,17 +428,13 @@ if [[ -n "$project_dir" ]]; then
     echo "  Pickle Rick is already installed globally for Codex"
     echo "  the source repo already contains matching local persona files"
   else
-    echo "Copied project-facing .codex assets to:"
+    echo "Copied project-facing Pickle Rick assets to:"
     echo "  $project_dir"
     echo
     echo "Project override activation:"
     echo "  open the project in Codex so it can prefer $project_dir/AGENTS.md"
     echo "  global Pickle Rick install remains available in every workspace"
-    if [[ "$enable_hooks" -eq 1 ]]; then
-      echo "  project-local hooks were installed from a rendered template"
-    else
-      echo "  project-local hooks were left untouched; pass --enable-hooks to install experimental hooks"
-    fi
+    echo "  project-local hooks were left untouched; hook installation is disabled pending authenticated validation"
   fi
 fi
 echo

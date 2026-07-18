@@ -4,7 +4,7 @@ import { createSession, getSessionMapCwds } from './session.js';
 import type { SessionResult } from './session.js';
 import { loadConfig } from './config.js';
 import { findLastSessionForCwd, getSessionForCwd, updateSessionMap } from './session-map.js';
-import { StateManager } from './state-manager.js';
+import { assertSchemaVersionDeployParity, StateManager } from './state-manager.js';
 
 interface ParsedSetupArgs {
   resume: string | null;
@@ -91,6 +91,7 @@ function parseArgs(argv: string[]): ParsedSetupArgs {
 }
 
 export async function setupSession(argv: string[], options: SetupSessionOptions = {}): Promise<SessionResult> {
+  assertSchemaVersionDeployParity();
   const parsed = parseArgs(argv);
   const cwd = fs.realpathSync(options.cwd || process.cwd());
   const shouldUpdateSessionMap = options.updateSessionMap !== false;

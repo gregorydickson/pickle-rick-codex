@@ -25,6 +25,12 @@ export function normalizeErrorSignature(input: unknown): string {
     .slice(0, 200);
 }
 
+/** Explicit discovery diagnostics are information gained, not repeated execution failures. */
+export function isConstraintDiscoverySignature(input: unknown): boolean {
+  const value = String(input || '').trim().toLowerCase();
+  return /^(?:(?:constraint[-_ ]discovery|discovered constraint)\s*:|\[constraint[-_ ]discovery\](?:\s|:))/.test(value);
+}
+
 export function freshCircuitState(): CircuitState {
   return {
     state: 'CLOSED',
@@ -53,6 +59,10 @@ export function saveCircuitState(sessionDir: string, circuitState: CircuitState)
   atomicWriteJson(path.join(sessionDir, 'circuit_breaker.json'), circuitState);
 }
 
+export function canExecute(circuitState: CircuitState): boolean {
+  return circuitState.state !== 'OPEN';
+}
+
 function recordTransition(circuitState: CircuitState, nextState: CircuitStateName, reason: string): void {
   if (circuitState.state === nextState) return;
   const timestamp = new Date().toISOString();
@@ -73,6 +83,19 @@ function recordTransition(circuitState: CircuitState, nextState: CircuitStateNam
   if (nextState === 'CLOSED') {
     circuitState.opened_at = null;
   }
+}
+
+export function resetCircuitBreaker(sessionDir: string, reason = 'manual reset'): CircuitState {
+  const circuitState = loadCircuitState(sessionDir);
+  if (circuitState.state === 'CLOSED') return circuitState;
+
+  circuitState.consecutive_no_progress = 0;
+  circuitState.consecutive_same_error = 0;
+  circuitState.last_error_signature = null;
+  circuitState.last_snapshot = null;
+  recordTransition(circuitState, 'CLOSED', reason);
+  saveCircuitState(sessionDir, circuitState);
+  return circuitState;
 }
 
 export function recordIteration(
@@ -99,12 +122,13 @@ export function recordIteration(
   ).filter((reason) => reason !== 'initial_snapshot');
   const progress = progressReasons.length > 0;
   const errorSignature = options.error ? normalizeErrorSignature(options.error) : null;
+  const constraintDiscovered = isConstraintDiscoverySignature(options.error);
 
-  if (progress) {
+  if (progress || constraintDiscovered) {
     circuitState.consecutive_no_progress = 0;
     circuitState.consecutive_same_error = 0;
     circuitState.last_error_signature = errorSignature;
-    recordTransition(circuitState, 'CLOSED', 'progress detected');
+    recordTransition(circuitState, 'CLOSED', constraintDiscovered ? 'constraint discovered' : 'progress detected');
   } else {
     circuitState.consecutive_no_progress += 1;
     if (errorSignature && errorSignature === circuitState.last_error_signature) {

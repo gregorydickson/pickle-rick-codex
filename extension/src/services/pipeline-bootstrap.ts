@@ -6,6 +6,7 @@ import { setupSession } from './setup-session.js';
 import { appendHistory } from './session.js';
 import { findLastSessionForCwd, getSessionForCwd } from './session-map.js';
 import { StateManager, type PersistedState } from './state-manager.js';
+import { finalizeTerminalStateObject } from './state-terminal.js';
 import {
   buildVerificationCommandScope,
   buildVerificationFailureSet,
@@ -31,6 +32,7 @@ import type {
   VerificationBaselineEntry,
   VerificationBaselines,
 } from '../types/index.js';
+import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 
 interface CreateBootstrapSessionOptions {
   prdPath?: string | null;
@@ -117,6 +119,7 @@ export function assertBootstrapSessionNotRunning(sessionDir: string | null): voi
   if (!sessionDir) {
     return;
   }
+  assertSessionOrphanRecovered(sessionDir);
   const state = readJsonFile<{ tmux_runner_pid?: unknown }>(path.join(sessionDir, 'state.json'), null);
   if (isProcessAlive(Number(state?.tmux_runner_pid))) {
     throw new Error(`Session is already running under tmux runner pid ${state?.tmux_runner_pid}.`);
@@ -222,6 +225,7 @@ function capturePipelineVerificationBaselines(
       // Config is a valid verification input at runtime; ConfigDefaults lacks
       // the index signature ConfigVerificationInput models, so widen via unknown.
       config: config as unknown as ConfigVerificationInput,
+      cwd: workingDir,
     });
     byTicket[ticket.id] ??= { ...(existing.by_ticket?.[ticket.id] || {}) };
     for (const command of verificationCommands) {
@@ -377,6 +381,7 @@ export async function ensureBootstrapSessionReady(
     assertTicketVerificationReady({
       ticket: nextTicket,
       config: loadConfig() as unknown as ConfigVerificationInput,
+      cwd: (manager.read(statePath).working_dir as string | undefined) || process.cwd(),
     });
   }
 
@@ -454,19 +459,13 @@ export function exitMuxRunnerPhase(
 ): string {
   let finalReason = exitReason;
   const state = manager.update(statePath, (current) => {
-    finalReason = current.active === false && current.last_exit_reason
-      ? (current.last_exit_reason as string)
-      : exitReason;
-    current.active = false;
-    current.tmux_runner_pid = null;
-    current.worker_pid = null;
-    current.active_child_pid = null;
-    current.active_child_kind = null;
-    current.active_child_command = null;
+    finalReason = finalizeTerminalStateObject(current, {
+      exitReason,
+      deferExitReason: deferTerminalState,
+    });
     if (deferTerminalState) {
       return current;
     }
-    current.last_exit_reason = finalReason;
     if (finalReason === 'success') {
       current.current_ticket = null;
       current.step = 'complete';

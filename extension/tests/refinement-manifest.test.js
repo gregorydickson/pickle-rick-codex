@@ -379,6 +379,42 @@ test('validateRefinementManifest rejects formatter ownership drift, opaque wrapp
   assert.ok(issues.some((issue) => issue.includes('must declare proof_corpus coverage')));
   assert.ok(issues.some((issue) => issue.includes('verification references artifact "research/external-contract-freeze.md" but no ticket owns it')));
   assert.ok(issues.some((issue) => issue.includes('no authoritative producer exists')));
+  assert.ok(issues.some((issue) => issue.includes('declares no allowed_paths or owned artifacts')));
+});
+
+test('validateRefinementManifest accepts explicit scope and normalizes allowedPaths aliases', () => {
+  const enriched = enrichRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [{
+      id: 'scoped-ticket',
+      title: 'Scoped change',
+      description: 'Change one owned subsystem.',
+      acceptance_criteria: ['Only src/owned changes.'],
+      verification: ['test -f src/owned.ts'],
+      allowedPaths: ['./src/owned.ts'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+  assert.deepEqual(enriched.manifest.tickets[0].allowed_paths, ['src/owned.ts']);
+  assert.equal(validateRefinementManifest(enriched.manifest).some((issue) => issue.includes('allowed_paths')), false);
+});
+
+test('validateRefinementManifest rejects universal repository-root ownership', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [{
+      id: 'unbounded-ticket',
+      title: 'Unbounded change',
+      description: 'Claims the entire repository.',
+      acceptance_criteria: ['Change anything.'],
+      verification: ['npm test'],
+      allowed_paths: ['.'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+  assert.ok(issues.some((issue) => issue.includes('invalid ticket scope path: .')));
 });
 
 test('validateRefinementManifest rejects formatter-sensitive verification before formatter ownership dependency', () => {

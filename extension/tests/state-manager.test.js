@@ -3,7 +3,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { StateManager } from '../services/state-manager.js';
+import {
+  assertSchemaVersionDeployParity,
+  SchemaVersionAheadError,
+  SchemaVersionDeployDriftError,
+  StateManager,
+  readDeployedSchemaVersion,
+} from '../services/state-manager.js';
 import { makeTempRoot } from './helpers.js';
 
 function defaultState(sessionDir) {
@@ -47,6 +53,65 @@ test('StateManager read hydrates missing schema_version without rewriting the fi
 
   assert.equal(state.schema_version, 1);
   assert.equal(fs.readFileSync(statePath, 'utf8'), originalContent);
+});
+
+test('schema deploy parity throws a typed drift error', () => {
+  assert.doesNotThrow(() => assertSchemaVersionDeployParity(1, 1));
+  assert.throws(
+    () => assertSchemaVersionDeployParity(1, 2),
+    (error) => error instanceof SchemaVersionDeployDriftError
+      && error.code === 'SCHEMA_DEPLOY_DRIFT'
+      && error.runtimeVersion === 1
+      && error.sourceVersion === 2,
+  );
+});
+
+test('installed-layout schema manifest exposes stale runtime/source drift', () => {
+  const installedExtension = makeTempRoot('pickle-installed-schema-');
+  const manifestPath = path.join(installedExtension, 'state-schema.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ schema_version: 2 }));
+  const installedSourceVersion = readDeployedSchemaVersion(manifestPath);
+
+  assert.equal(installedSourceVersion, 2);
+  assert.throws(
+    () => assertSchemaVersionDeployParity(1, installedSourceVersion),
+    (error) => error instanceof SchemaVersionDeployDriftError
+      && error.runtimeVersion === 1
+      && error.sourceVersion === 2,
+  );
+});
+
+test('schema deploy parity fails closed when the installed manifest is absent', () => {
+  const missing = readDeployedSchemaVersion(path.join(makeTempRoot('pickle-missing-schema-'), 'state-schema.json'));
+  assert.equal(missing, null);
+  assert.throws(
+    () => assertSchemaVersionDeployParity(1, missing),
+    (error) => error instanceof SchemaVersionDeployDriftError && error.sourceVersion === null,
+  );
+});
+
+test('StateManager rejects ahead schemas on resume and before update writes', () => {
+  const tempRoot = makeTempRoot();
+  const statePath = path.join(tempRoot, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({ ...defaultState(tempRoot), schema_version: 2 }));
+  const manager = new StateManager();
+
+  assert.throws(
+    () => manager.read(statePath),
+    (error) => error instanceof SchemaVersionAheadError
+      && error.statePath === statePath
+      && error.writtenValue === 2,
+  );
+
+  fs.writeFileSync(statePath, JSON.stringify({ ...defaultState(tempRoot), schema_version: 1 }));
+  assert.throws(
+    () => manager.update(statePath, (state) => {
+      state.schema_version = 2;
+      return state;
+    }),
+    (error) => error instanceof SchemaVersionAheadError,
+  );
+  assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).schema_version, 1);
 });
 
 test('StateManager update steals stale lock files', () => {

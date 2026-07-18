@@ -13,6 +13,7 @@ import {
   commitTrackedChanges,
   countCommitsSince,
   getHeadSha,
+  getWorkingTreeStatus,
   hasTrackedWorkingTreeChanges,
   getWorkingTreeFingerprint,
   isGitRepo,
@@ -21,10 +22,33 @@ import {
   listUntrackedFiles,
   readCommitTrailer,
   resetGitIndex,
-  stageTrackedChangesAndNewPaths,
+  stagePaths,
 } from '../services/git-utils.js';
 import { buildTicketPhasePrompt } from '../services/prompts.js';
+import {
+  prepareWorkerLifecycleArtifact,
+  readAndValidateWorkerLifecycleArtifact,
+  workerLifecycleArtifactPath,
+  WORKER_LIFECYCLE_PHASES,
+  type WorkerLifecycleArtifact,
+} from '../services/worker-lifecycle.js';
+import { recoverableHardReset } from '../services/recoverable-git.js';
+import { assertAcPhaseBoundary } from '../services/ac-phase-gate.js';
+import { evaluatePersistedTicketScope, persistTicketScope } from '../services/scope-contract.js';
+import {
+  captureQualityBaseline,
+  captureWorkspaceSnapshot,
+  changedPathsSinceSnapshot,
+  evaluateWorkerQualityGate,
+  assertQualityBaselineFresh,
+  QualityBaselineError,
+  persistFreshQualityBaseline,
+  type QualityBaseline,
+  type WorkerGateVerdict,
+  type WorkspaceSnapshot,
+} from '../services/execution-gate.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
+import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
@@ -227,25 +251,86 @@ interface BuildCompletionCtxInput {
   sessionDir: string;
   ticketId: string;
   workingDir: string;
+  startCommit: string | null;
+  pinnedSha: string | null;
+  workerGate: WorkerGateVerdict;
 }
 
 /**
- * The single completion decision seam. Codex has no worker gate and no session
- * baseline concept, so `decision:'attribution'` (never 'done-flip', which would
- * always refuse worker_gate_unavailable) with `startCommit/pinnedSha` explicitly
- * null. Routing through the oracle folds the pointer write into its promote-once
- * persistEvidence, so `completion_commit` lands in the manifest AND the file
- * (R-WDTF) — guaranteed, not order-dependent.
+ * The single completion decision seam. Ticket verification, the portable worker
+ * quality gate, scope enforcement, and git attribution all converge here. The
+ * oracle owns the durable completion pointer and the only Done-flip decision.
  */
-function buildCompletionCtx({ sessionDir, ticketId, workingDir }: BuildCompletionCtxInput): CompletionDecisionCtx {
+function buildCompletionCtx({
+  sessionDir,
+  ticketId,
+  workingDir,
+  startCommit,
+  pinnedSha,
+  workerGate,
+}: BuildCompletionCtxInput): CompletionDecisionCtx {
   return {
     sessionDir,
     ticketId,
     workingDir,
-    startCommit: null,
-    pinnedSha: null,
-    decision: 'attribution',
+    startCommit,
+    pinnedSha,
+    decision: 'done-flip',
+    workerGateVerdict: () => ({
+      verdict: workerGate.verdict,
+      computedVia: workerGate.computedVia,
+    }),
   };
+}
+
+function repositoryMutationFingerprint(workingDir: string): string {
+  return JSON.stringify({
+    head: isGitRepo(workingDir) ? getHeadSha(workingDir) : null,
+    status: isGitRepo(workingDir) ? getWorkingTreeStatus(workingDir) : null,
+    files: getWorkingTreeFingerprint(workingDir),
+  });
+}
+
+function workerGateFailureKind(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('scope-violation:')) return 'scope_violation';
+  if (message.startsWith('worker-quality-gate-')) return 'quality_gate';
+  if (message.startsWith('quality-baseline-mutation:')) return 'quality_gate';
+  if (message.startsWith('pre-existing-dirt:')) return 'ownership_preflight';
+  return 'command_failed';
+}
+
+interface WorkerMutationBoundary {
+  head: string;
+  fingerprint: string;
+  untracked: string[];
+}
+
+function rejectedWorkerRef(sessionDir: string, ticketId: string): string {
+  const safe = (value: string): string => value.replace(/[^A-Za-z0-9._-]+/g, '-');
+  return `refs/pickle/rejected/${safe(path.basename(sessionDir))}/${safe(ticketId)}`;
+}
+
+function restoreRejectedWorkerMutation(
+  workingDir: string,
+  sessionDir: string,
+  ticketId: string,
+  boundary: WorkerMutationBoundary,
+  runnerMode: string | null,
+): void {
+  if (!isGitRepo(workingDir) || repositoryMutationFingerprint(workingDir) === boundary.fingerprint) return;
+  recoverableHardReset({
+    workingDir,
+    sessionDir,
+    targetHead: boundary.head,
+    operation: `rejected-${ticketId}`,
+    preserveUntracked: boundary.untracked,
+    headRecoveryRef: rejectedWorkerRef(sessionDir, ticketId),
+    log: (message) => appendRunnerLog(sessionDir, runnerMode, message),
+  });
+  if (repositoryMutationFingerprint(workingDir) !== boundary.fingerprint) {
+    throw new Error('worker-rollback-failed: rejected worker changes were anchored, but the original repository boundary was not restored');
+  }
 }
 
 interface AutoCommitDetachedTicketChangesInput {
@@ -258,6 +343,7 @@ interface AutoCommitDetachedTicketChangesInput {
   ticketId: string;
   ticket: Ticket;
   config: Config;
+  changedPaths: string[];
 }
 
 function autoCommitDetachedTicketChanges({
@@ -270,6 +356,7 @@ function autoCommitDetachedTicketChanges({
   ticketId,
   ticket,
   config,
+  changedPaths,
 }: AutoCommitDetachedTicketChangesInput): string | null {
   if (!tmuxMode || !baselineTrackedClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
     return null;
@@ -283,7 +370,10 @@ function autoCommitDetachedTicketChanges({
 
   appendRunnerLog(sessionDir, runnerMode, `no clean commit boundary detected for ${ticketId}; auto-committing ticket changes`);
   try {
-    stageTrackedChangesAndNewPaths(workingDir, newUntrackedFiles);
+    // Stage the already-fenced ticket delta only. Whole-tree staging here would
+    // sweep in a concurrent/user or quality-command mutation after scope review.
+    resetGitIndex(workingDir);
+    stagePaths(workingDir, changedPaths);
     commitTrackedChanges(workingDir, ticketCommitMessage(ticketId, ticket));
     const head = getHeadSha(workingDir);
     appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-committed: ${head}`);
@@ -318,6 +408,13 @@ function isSessionCancelled(manager: StateManager, statePath: string): boolean {
 }
 
 function updateActiveChild(statePath: string, manager: StateManager, fields: Record<string, unknown>): void {
+  if (Object.hasOwn(fields, 'active_child_pid')) {
+    const pid = Number(fields.active_child_pid);
+    fields.active_child_identity = Number.isInteger(pid) && pid > 0
+      ? captureSpawnedProcessIdentity(pid)
+      : null;
+    fields.active_child_controller_pid = Number.isInteger(pid) && pid > 0 ? process.pid : null;
+  }
   manager.update(statePath, (current) => {
     Object.assign(current, fields);
     return current;
@@ -494,7 +591,10 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   let baselineTrackedClean: boolean;
   let baselineUntrackedFiles: string[];
   let baselineHeadSha: string;
-  const phases = ['research', 'plan', 'implement', 'review', 'simplify'];
+  let workspaceBaseline: WorkspaceSnapshot;
+  let qualityBaseline: QualityBaseline;
+  let mutationBoundary: WorkerMutationBoundary | null = null;
+  const lifecycleArtifacts: WorkerLifecycleArtifact[] = [];
 
   function finalizeSuccess(applied: boolean): RunTicketResult {
     updateTicketStatus(sessionDir, normalizedTicketId, {
@@ -547,11 +647,65 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       // Config is a valid verification input at runtime; ConfigDefaults lacks
       // the index signature ConfigVerificationInput models, so widen via unknown.
       config: config as unknown as ConfigVerificationInput,
+      cwd: workingDir,
     });
+    if (isGitRepo(workingDir) && isWorkingTreeDirty(workingDir)) {
+      throw new Error('pre-existing-dirt: worker requires a completely clean working tree; commit, stash, or remove existing tracked and untracked changes first');
+    }
     baselineFingerprint = getWorkingTreeFingerprint(workingDir);
     baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
     baselineUntrackedFiles = isGitRepo(workingDir) ? listUntrackedFiles(workingDir) : [];
     baselineHeadSha = isGitRepo(workingDir) ? getHeadSha(workingDir) : '';
+    if (baselineHeadSha) {
+      mutationBoundary = {
+        head: baselineHeadSha,
+        fingerprint: repositoryMutationFingerprint(workingDir),
+        untracked: baselineUntrackedFiles,
+      };
+    }
+    workspaceBaseline = captureWorkspaceSnapshot(workingDir);
+    persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+    const persistedQualityBaseline = manager.read(statePath).quality_baseline;
+    try {
+      qualityBaseline = assertQualityBaselineFresh(persistedQualityBaseline, workingDir);
+    } catch (error) {
+      if (!(error instanceof QualityBaselineError) || error.kind === 'quality-baseline-write-failed') throw error;
+      appendRunnerLog(sessionDir, runnerMode, `${error.message}; capturing a fresh session repository quality baseline`);
+      const beforeQualityBaseline = repositoryMutationFingerprint(workingDir);
+      qualityBaseline = await captureQualityBaseline(
+        workingDir,
+        config.defaults.worker_timeout_seconds * 1000,
+        {
+          isCancelled: () => isSessionCancelled(manager, statePath),
+          onSpawn: (pid, command) => updateActiveChild(statePath, manager, {
+            active_child_pid: pid,
+            active_child_kind: 'quality-baseline',
+            active_child_command: command,
+          }),
+          onExit: () => updateActiveChild(statePath, manager, {
+            active_child_pid: null,
+            active_child_kind: null,
+            active_child_command: null,
+          }),
+        },
+      );
+      if (isSessionCancelled(manager, statePath)) throw new CancellationError();
+      if (repositoryMutationFingerprint(workingDir) !== beforeQualityBaseline) {
+        throw new Error(
+          'quality-baseline-mutation: repository quality commands modified the working tree, index, or HEAD while capturing the baseline',
+          { cause: error },
+        );
+      }
+      qualityBaseline = persistFreshQualityBaseline(
+        qualityBaseline,
+        workingDir,
+        (value) => manager.update(statePath, (current) => {
+          current.quality_baseline = value;
+          return current;
+        }),
+        () => manager.read(statePath).quality_baseline,
+      );
+    }
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -566,7 +720,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       active_child_command: null,
     });
 
-    for (const phase of phases) {
+    for (const phase of WORKER_LIFECYCLE_PHASES) {
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }
@@ -578,6 +732,10 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         return current;
       });
 
+      const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
+      prepareWorkerLifecycleArtifact(artifactPath);
+      const readOnlyPhase = ['research', 'research_review', 'plan', 'plan_review', 'review', 'conformance'].includes(phase);
+      const phaseRepositoryBoundary = readOnlyPhase ? repositoryMutationFingerprint(workingDir) : null;
       const result = await runCodexExecMonitored({
         cwd: workingDir,
         prompt: buildTicketPhasePrompt({
@@ -588,10 +746,13 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           },
           sessionDir,
           workingDir,
+          artifactPath,
+          priorArtifacts: lifecycleArtifacts,
           tmuxMode,
         }),
         timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
         outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
+        progressArtifactPaths: [artifactPath],
         addDirs: [sessionDir],
         successCheck: phaseSuccessCheck(phase, path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`)),
         successSignalGraceMs: 150,
@@ -614,6 +775,22 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         throw new CancellationError();
       }
       assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
+      const artifact = readAndValidateWorkerLifecycleArtifact(
+        artifactPath,
+        phase,
+        normalizedTicketId,
+        normalizedTicket.acceptance_criteria || [],
+      );
+      assertAcPhaseBoundary(
+        phase,
+        artifact,
+        lifecycleArtifacts,
+        normalizedTicket.acceptance_criteria || [],
+      );
+      if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
+        throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
+      }
+      lifecycleArtifacts.push(artifact);
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
     }
 
@@ -659,6 +836,64 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       }
     }
 
+    const changedPathsBeforeGate = changedPathsSinceSnapshot(workingDir, workspaceBaseline);
+    const scopeVerdict = evaluatePersistedTicketScope(
+      sessionDir,
+      normalizedTicket,
+      normalizedTicketId,
+      workspaceBaseline.headSha,
+      workingDir,
+      changedPathsBeforeGate,
+    );
+    if (!scopeVerdict.ok) {
+      throw new Error(`scope-violation: ${scopeVerdict.reason || scopeVerdict.violations.join(', ')}`);
+    }
+
+    const workerGate = await evaluateWorkerQualityGate(
+      workingDir,
+      qualityBaseline,
+      config.defaults.worker_timeout_seconds * 1000,
+      {
+        isCancelled: () => isSessionCancelled(manager, statePath),
+        onSpawn: (pid, command) => updateActiveChild(statePath, manager, {
+          active_child_pid: pid,
+          active_child_kind: 'quality-gate',
+          active_child_command: command,
+        }),
+        onExit: () => updateActiveChild(statePath, manager, {
+          active_child_pid: null,
+          active_child_kind: null,
+          active_child_command: null,
+        }),
+      },
+    );
+    if (isSessionCancelled(manager, statePath)) throw new CancellationError();
+    if (workerGate.verdict === 'red') {
+      const failures = workerGate.failures.map((failure) => failure.command).join(', ');
+      appendRunnerLog(sessionDir, runnerMode, `ticket ${normalizedTicketId} worker quality gate red: ${failures}`);
+    }
+
+    // Quality commands are arbitrary repository scripts and may mutate the tree.
+    // Recompute the complete ticket delta after they run and fence it again.
+    const postGateChangedPaths = changedPathsSinceSnapshot(workingDir, workspaceBaseline);
+    const postGateScopeVerdict = evaluatePersistedTicketScope(
+      sessionDir,
+      normalizedTicket,
+      normalizedTicketId,
+      workspaceBaseline.headSha,
+      workingDir,
+      postGateChangedPaths,
+    );
+    if (!postGateScopeVerdict.ok) {
+      throw new Error(`scope-violation: ${postGateScopeVerdict.reason || postGateScopeVerdict.violations.join(', ')}`);
+    }
+    if (workerGate.verdict !== 'green') {
+      const detail = workerGate.verdict === 'red'
+        ? workerGate.failures.map((failure) => failure.command).join(', ') || 'unknown quality command'
+        : 'repository declares no portable quality commands';
+      throw new Error(`worker-quality-gate-${workerGate.verdict}: ${detail}`);
+    }
+
     const autoCommitSha = autoCommitDetachedTicketChanges({
       sessionDir,
       runnerMode,
@@ -669,6 +904,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       ticketId: normalizedTicketId,
       ticket: normalizedTicket,
       config,
+      changedPaths: postGateChangedPaths,
     });
 
     // Reconcile the completion commit's Pickle-Ticket trailer (amends an untrailed
@@ -686,6 +922,9 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       sessionDir,
       ticketId: normalizedTicketId,
       workingDir,
+      startCommit: typeof state.start_commit === 'string' ? state.start_commit : null,
+      pinnedSha: typeof state.pinned_sha === 'string' ? state.pinned_sha : null,
+      workerGate,
     }));
     if (decision.ok) {
       // The oracle accepted attributable evidence and, via its promote-once
@@ -697,58 +936,82 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     // bad or dead pointer (foreign/baseline/unreachable) must never be claimed as
     // completion, even on a run that produced no new commit — HEAD-advancement would let a
     // pre-existing surviving stamp flip Done and defeat the R-OMA/baseline guards.
-    if (decision.reason === 'no_evidence') {
-      // Nothing positively bad to attribute. Codex's completion model is verification-pass
-      // -> Done; a passing run with no phantom/foreign stamp completes with a null
-      // completion_commit exactly as before.
-      return finalizeSuccess(applied);
+    if (decision.reason === 'no_evidence' && postGateChangedPaths.length === 0) {
+      // A truly mutation-free audit/no-op is complete without a commit, but only after
+      // ticket verification, scope evaluation, and the oracle's worker-gate rung passed.
+      return finalizeSuccess(false);
     }
-    // foreign_attribution | baseline_sha | unreachable_explicit_unattributable (and the
-    // codex-unreachable worker-gate reasons): a positively-bad or dead pointer that must
-    // never be claimed as completion. Refuse regardless of whether this run advanced HEAD.
-    return finalizeRefusal(applied, decision);
+    // Mutating no-evidence runs, foreign/baseline/dead evidence, and red/unavailable
+    // worker gates all fail closed.
+    if (mutationBoundary) {
+      restoreRejectedWorkerMutation(
+        workingDir,
+        sessionDir,
+        normalizedTicketId,
+        mutationBoundary,
+        runnerMode,
+      );
+    }
+    return finalizeRefusal(false, decision);
   } catch (error) {
-    if (error instanceof CancellationError) {
+    let handledError: unknown = error;
+    if (mutationBoundary) {
+      try {
+        restoreRejectedWorkerMutation(
+          workingDir,
+          sessionDir,
+          normalizedTicketId,
+          mutationBoundary,
+          runnerMode,
+        );
+      } catch (rollbackError) {
+        handledError = new AggregateError(
+          [error, rollbackError],
+          `worker transaction failed and recovery did not restore the original boundary: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    if (handledError instanceof CancellationError) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Todo',
         cancelled_at: new Date().toISOString(),
       });
       throw error;
     }
-    if (isPreflightError(error)) {
+    if (isPreflightError(handledError)) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Todo',
         failed_at: new Date().toISOString(),
-        failure_reason: (error as Error).message,
-        failure_kind: (error as { kind?: unknown }).kind,
+        failure_reason: (handledError as Error).message,
+        failure_kind: (handledError as { kind?: unknown }).kind,
       });
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
-        error: (error as Error).message,
+        error: (handledError as Error).message,
       });
-      throw error;
+      throw handledError;
     }
-    if (isVerificationContractError(error)) {
+    if (isVerificationContractError(handledError)) {
       updateTicketStatus(sessionDir, normalizedTicketId, {
         status: 'Blocked',
         failed_at: new Date().toISOString(),
-        failure_reason: (error as Error).message,
-        failure_kind: (error as { kind?: unknown }).kind,
+        failure_reason: (handledError as Error).message,
+        failure_kind: (handledError as { kind?: unknown }).kind,
       });
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
-        error: (error as Error).message,
+        error: (handledError as Error).message,
       });
-      throw error;
+      throw handledError;
     }
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Blocked',
       failed_at: new Date().toISOString(),
-      failure_reason: error instanceof Error ? error.message : String(error),
-      failure_kind: 'command_failed',
+      failure_reason: handledError instanceof Error ? handledError.message : String(handledError),
+      failure_kind: workerGateFailureKind(handledError),
     });
     recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState, {
-      error: error instanceof Error ? error.message : String(error),
+      error: handledError instanceof Error ? handledError.message : String(handledError),
     });
-    throw error;
+    throw handledError;
   } finally {
     updateActiveChild(statePath, manager, {
       worker_pid: null,

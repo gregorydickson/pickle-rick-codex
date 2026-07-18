@@ -159,7 +159,7 @@ function main(): never {
 
   if (tier && selectedFiles.length === 0) {
     process.stderr.write(`[no files for tier ${tier}]\n`);
-    process.exit(0);
+    process.exit(1);
   }
 
   if (dryRun) {

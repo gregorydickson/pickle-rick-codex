@@ -5,7 +5,14 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderStatus } from '../bin/status.js';
-import { recordIteration, loadCircuitState } from '../services/circuit-breaker.js';
+import {
+  canExecute,
+  freshCircuitState,
+  loadCircuitState,
+  recordIteration,
+  resetCircuitBreaker,
+  saveCircuitState,
+} from '../services/circuit-breaker.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
 import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot } from './helpers.js';
@@ -57,6 +64,103 @@ test('progress snapshot detects tracked file content changes even when the porce
 
   assert.match(runGit(repoDir, ['status', '--porcelain']), /M index\.js/);
   assert.deepEqual(diffProgressSnapshot(before, after), ['worktree_fingerprint']);
+});
+
+test('progress snapshot does not count an empty commit as progress', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+  const before = captureProgressSnapshot({ sessionDir, workingDir: repoDir, mode: null });
+
+  runGit(repoDir, ['commit', '--allow-empty', '-m', 'empty churn']);
+  const after = captureProgressSnapshot({ sessionDir, workingDir: repoDir, mode: null });
+
+  assert.notEqual(before.head_sha, after.head_sha);
+  assert.equal(before.head_tree_sha, after.head_tree_sha);
+  assert.deepEqual(diffProgressSnapshot(before, after), []);
+});
+
+test('progress snapshot counts a genuine committed tree change as progress', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+  const before = captureProgressSnapshot({ sessionDir, workingDir: repoDir, mode: null });
+
+  commitFile(repoDir, 'README.md', '# changed\n', 'real change');
+  const after = captureProgressSnapshot({ sessionDir, workingDir: repoDir, mode: null });
+
+  assert.notEqual(before.head_tree_sha, after.head_tree_sha);
+  assert.deepEqual(diffProgressSnapshot(before, after), ['head_tree_sha', 'worktree_fingerprint']);
+});
+
+test('OPEN circuit refuses execution and explicit reset closes it without erasing history', () => {
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  const circuit = freshCircuitState();
+  circuit.state = 'OPEN';
+  circuit.total_opens = 1;
+  circuit.reason = 'stalled';
+  circuit.opened_at = new Date().toISOString();
+  circuit.history.push({ from: 'CLOSED', to: 'OPEN', timestamp: circuit.opened_at, reason: 'stalled' });
+  saveCircuitState(sessionDir, circuit);
+
+  assert.equal(canExecute(loadCircuitState(sessionDir)), false);
+  const reset = resetCircuitBreaker(sessionDir, 'operator approved');
+  assert.equal(canExecute(reset), true);
+  assert.equal(reset.state, 'CLOSED');
+  assert.equal(reset.total_opens, 1);
+  assert.equal(reset.history.at(-1).reason, 'operator approved');
+});
+
+test('circuit breaker ignores empty commits but closes on a genuine tree change', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+  const state = {
+    working_dir: repoDir,
+    step: 'implement',
+    current_ticket: 'r1',
+    loop_mode: null,
+  };
+  const circuitBreakerConfig = {
+    no_progress_threshold: 1,
+    half_open_after: 1,
+    same_error_threshold: 5,
+  };
+  recordIteration(sessionDir, state, { circuitBreakerConfig });
+
+  runGit(repoDir, ['commit', '--allow-empty', '-m', 'empty churn']);
+  const opened = recordIteration(sessionDir, state, { circuitBreakerConfig });
+  assert.equal(opened.state, 'OPEN');
+
+  commitFile(repoDir, 'README.md', '# real change\n', 'real change');
+  const closed = recordIteration(sessionDir, state, { circuitBreakerConfig });
+  assert.equal(closed.state, 'CLOSED');
+});
+
+test('constraint-discovery diagnostics do not open the circuit without repository churn', () => {
+  const repoDir = makeTempRoot('pickle-rick-progress-repo-');
+  const sessionDir = makeTempRoot('pickle-rick-progress-session-');
+  initRepo(repoDir);
+  commitFile(repoDir, 'README.md', '# baseline\n');
+  const state = { working_dir: repoDir, step: 'implement', current_ticket: 'r1', loop_mode: null };
+  const circuitBreakerConfig = { no_progress_threshold: 1, half_open_after: 1, same_error_threshold: 1 };
+
+  recordIteration(sessionDir, state, { circuitBreakerConfig });
+  const afterDiscovery = recordIteration(sessionDir, state, {
+    circuitBreakerConfig,
+    error: 'constraint-discovery: repository requires generated fixtures before tests',
+  });
+  assert.equal(afterDiscovery.state, 'CLOSED');
+  assert.equal(afterDiscovery.consecutive_no_progress, 0);
+
+  const persistentFailure = recordIteration(sessionDir, state, {
+    circuitBreakerConfig,
+    error: 'test suite failed persistently',
+  });
+  assert.equal(persistentFailure.state, 'OPEN');
 });
 
 test('progress snapshot detects canonical summary artifact changes for anatomy park and microverse', () => {

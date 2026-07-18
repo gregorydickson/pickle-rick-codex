@@ -1,8 +1,21 @@
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getHeadSha, getWorkingTreeFingerprint } from './git-utils.js';
 import type { CaptureProgressSnapshotArgs, ProgressMode, ProgressSnapshot } from '../types/index.js';
+
+function getHeadTreeSha(workingDir: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {
+      cwd: workingDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
 
 function canonicalProgressArtifacts(mode: ProgressMode): string[] {
   switch (mode) {
@@ -97,6 +110,7 @@ export function captureProgressSnapshot({
 }: CaptureProgressSnapshotArgs): ProgressSnapshot {
   return {
     head_sha: getHeadSha(workingDir),
+    head_tree_sha: getHeadTreeSha(workingDir),
     worktree_fingerprint: getWorkingTreeFingerprint(workingDir),
     step: step || null,
     current_ticket: currentTicket || null,
@@ -119,8 +133,11 @@ export function diffProgressSnapshot(
   if ((previous.current_ticket || null) !== (next.current_ticket || null)) {
     reasons.push('current_ticket');
   }
-  if (previous.head_sha !== next.head_sha) {
-    reasons.push('head_sha');
+  // Commit identity is not progress: an empty commit changes HEAD without
+  // changing the project tree. Older snapshots have no tree SHA, so treat the
+  // first post-upgrade observation as a baseline rather than fabricated work.
+  if (previous.head_tree_sha && next.head_tree_sha && previous.head_tree_sha !== next.head_tree_sha) {
+    reasons.push('head_tree_sha');
   }
   if (previous.worktree_fingerprint !== next.worktree_fingerprint) {
     reasons.push('worktree_fingerprint');

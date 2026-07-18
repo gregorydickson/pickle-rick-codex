@@ -726,13 +726,16 @@ export function evaluateCompletionEvidence(ctx: CompletionDecisionCtx): Completi
       if (isAcceptedEvidence(recovered)) via = 'announcement';
     }
   }
+  // The worker verdict governs every Done-flip, including verified no-op tickets
+  // that legitimately have no completion commit. Check it before the evidence
+  // return so absent evidence cannot bypass a red/unavailable quality gate.
+  const earlyRefusal = workerGateRefusal(ctx);
+  if (earlyRefusal) return earlyRefusal;
   if (!isAcceptedEvidence(evidence)) return refuseAbsent(evidence);
   const viaAtAccept: EvidenceVia | 'announcement' = via ?? evidence.via ?? 'scan';
   const reprobed = promoteOnceAndReprobe(ctx, evidence.sha);
   if (reprobed) evidence = reprobed;
   if (!isAcceptedEvidence(evidence)) return refuseAbsent(evidence);
-  const refusal = workerGateRefusal(ctx);
-  if (refusal) return refusal;
   return { ok: true, sha: evidence.sha, via: viaAtAccept, usedFallback: evidence.usedFallback };
 }
 

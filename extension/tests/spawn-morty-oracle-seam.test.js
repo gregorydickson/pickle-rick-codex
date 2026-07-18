@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readFrontmatterField, parseTicketFile } from '../services/pickle-utils.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable } from './helpers.js';
+import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable, fakeLifecycleArtifactWriterSource } from './helpers.js';
 
 function runGit(dir, args) {
   return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -34,6 +34,10 @@ function baseRepo() {
 
 function ticketFilePath(sessionDir) {
   return path.join(sessionDir, 'r1', 'linear_ticket_r1.md');
+}
+
+function rejectedWorkerRef(sessionDir) {
+  return `refs/pickle/rejected/${path.basename(sessionDir)}/r1`;
 }
 
 function setupSession(projectDir, env, task, tickets) {
@@ -63,6 +67,7 @@ const R1_TICKET = {
   verification: ['node -e "process.exit(0)"'],
   priority: 'P1',
   status: 'Todo',
+  allowed_paths: ['feature.txt'],
 };
 
 // Fake codex that self-commits TWO commits in `implement`, the tip attributed to a
@@ -71,6 +76,7 @@ const FOREIGN_FAKE_CODEX = `#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+${fakeLifecycleArtifactWriterSource()}
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
@@ -82,6 +88,7 @@ for (let index = 1; index < args.length; index += 1) {
 }
 const match = prompt.match(/You are executing the "([^"]+)" phase/);
 const phase = match ? match[1] : '';
+writeFakeLifecycleArtifact(prompt, phase);
 if (phase === 'implement') {
   const cwd = process.cwd();
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'base\\nstep-one\\n');
@@ -104,6 +111,7 @@ const NEUTRAL_TWO_COMMIT_FAKE_CODEX = `#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+${fakeLifecycleArtifactWriterSource()}
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
@@ -115,6 +123,7 @@ for (let index = 1; index < args.length; index += 1) {
 }
 const match = prompt.match(/You are executing the "([^"]+)" phase/);
 const phase = match ? match[1] : '';
+writeFakeLifecycleArtifact(prompt, phase);
 if (phase === 'implement') {
   const cwd = process.cwd();
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'base\\nstep-one\\n');
@@ -166,14 +175,7 @@ test('VAL-ORACLE-029: spawn-morty flips Done only when the oracle accepts (happy
   assert.ok(commitResolves(projectDir, completion), 'stamped sha resolves via git cat-file -e');
 });
 
-test('VAL-ORACLE-030: a HEAD-advancing run with NO explicit stamp and no attributable window completes Done with a null completion_commit (never stamps the foreign/baseline sha)', () => {
-  // Corrected semantics (O-1): this window carries NO explicit completion_commit, so
-  // the oracle's R-OMA foreign guard never engages — the "deliver r2 milestone" tip is
-  // simply unattributable, and the oracle returns `no_evidence`. A verification-pass run
-  // with no phantom/foreign STAMP must complete as Done with a null pointer rather than
-  // be wedged incomplete. The foreign/baseline protection lives in the STAMP: no foreign
-  // or baseline sha is ever written into completion_commit (asserted below). The genuine
-  // explicit-foreign-stamp refusal path is covered by VAL-ORACLE-035.
+test('VAL-ORACLE-030: a HEAD-advancing run with no attributable window fails closed', () => {
   const projectDir = baseRepo();
   const baseline = runGit(projectDir, ['rev-parse', 'HEAD']);
   const fakeBin = makeTempRoot('pickle-oracle-foreign-bin-');
@@ -188,15 +190,21 @@ test('VAL-ORACLE-030: a HEAD-advancing run with NO explicit stamp and no attribu
   const result = JSON.parse(stdout.trim());
 
   const head = runGit(projectDir, ['rev-parse', 'HEAD']);
-  assert.notEqual(head, baseline, 'the worker did commit — the tip exists');
+  assert.equal(head, baseline, 'rejected commits are rolled back to the original HEAD');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '', 'the original clean tree is restored');
+  const recoveryRef = rejectedWorkerRef(sessionDir);
+  const rejectedTip = runGit(projectDir, ['rev-parse', recoveryRef]);
+  assert.notEqual(rejectedTip, baseline, 'the attempted commit window remains recoverable');
+  assert.equal(runGit(projectDir, ['show', `${recoveryRef}:feature.txt`]), 'base\nstep-one\nstep-two');
 
-  assert.equal(result.status, 'done', 'a HEAD-advancing no_evidence run is not wedged (O-1)');
+  assert.equal(result.status, 'incomplete', 'a mutating no_evidence run fails closed');
+  assert.equal(result.reason, 'no_evidence');
   const ticket = parseTicketFile(ticketFilePath(sessionDir));
-  assert.equal(ticket.status, 'Done', 'no_evidence + verified pass completes as Done');
+  assert.equal(ticket.status, 'Todo');
 
   const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
   assert.equal(completion, null, 'no completion_commit stamped for the foreign/unattributable tip');
-  assert.notEqual(completion, head, 'the foreign tip sha is never stamped');
+  assert.notEqual(completion, rejectedTip, 'the foreign tip sha is never stamped');
   assert.notEqual(completion, baseline, 'the baseline sha is never stamped');
 });
 
@@ -239,7 +247,7 @@ test('VAL-ORACLE-035 (F1): a surviving foreign completion_commit is refused even
   assert.equal(head, foreignSha, 'the worker produced NO new commit (HEAD == baseline)');
 
   assert.equal(result.status, 'incomplete', 'a surviving foreign stamp is refused, not accepted');
-  assert.equal(result.reason, 'foreign_attribution', 'the refusal reason is the R-OMA foreign guard');
+  assert.equal(result.reason, 'baseline_sha', 'the session-start commit cannot prove ticket work');
 
   const ticket = parseTicketFile(ticketFilePath(sessionDir));
   assert.notEqual(ticket.status, 'Done', 'a foreign completion_commit must NOT flip Done on a no-new-commit run');
@@ -273,14 +281,10 @@ test('VAL-ORACLE-036 (F2): a real oracle refusal parks the ticket at Todo with a
   );
   const failureReason = readFrontmatterField(ticketPath, 'failure_reason');
   assert.ok(failureReason, 'a non-null failure_reason is recorded');
-  assert.match(String(failureReason), /completion refused by oracle: foreign_attribution/, 'the reason carries the oracle verdict');
+  assert.match(String(failureReason), /completion refused by oracle: baseline_sha/, 'the reason carries the oracle verdict');
 });
 
-test('VAL-ORACLE-037 (O-1): a HEAD-advancing verified run with genuinely no evidence completes Done, not wedged incomplete', () => {
-  // The false-refusal wedge: HEAD advanced with real verified work but the oracle can
-  // attribute nothing (multi-commit window so no trailer amend, commit messages do not
-  // name the ticket, no declared files) → `no_evidence`. This must complete as Done with
-  // a null completion_commit, NOT be wedged as incomplete.
+test('VAL-ORACLE-037: a HEAD-advancing verified run with genuinely no evidence fails closed', () => {
   const projectDir = baseRepo();
   const baseline = runGit(projectDir, ['rev-parse', 'HEAD']);
   const fakeBin = makeTempRoot('pickle-oracle-o1-bin-');
@@ -292,11 +296,17 @@ test('VAL-ORACLE-037 (O-1): a HEAD-advancing verified run with genuinely no evid
   const result = JSON.parse(stdout.trim());
 
   const head = runGit(projectDir, ['rev-parse', 'HEAD']);
-  assert.notEqual(head, baseline, 'HEAD advanced with real verified work');
+  assert.equal(head, baseline, 'rejected work is rolled back to the original HEAD');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '', 'the original clean tree is restored');
+  const recoveryRef = rejectedWorkerRef(sessionDir);
+  const rejectedTip = runGit(projectDir, ['rev-parse', recoveryRef]);
+  assert.notEqual(rejectedTip, baseline, 'the verified attempted work remains recoverable');
+  assert.equal(runGit(projectDir, ['show', `${recoveryRef}:feature.txt`]), 'base\nstep-one\nstep-two');
 
-  assert.equal(result.status, 'done', 'no_evidence with real verified work is not wedged incomplete');
+  assert.equal(result.status, 'incomplete', 'unattributable mutating work is refused');
+  assert.equal(result.reason, 'no_evidence');
   const ticket = parseTicketFile(ticketFilePath(sessionDir));
-  assert.equal(ticket.status, 'Done', 'the ticket completes as Done');
+  assert.equal(ticket.status, 'Todo');
 
   const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
   assert.equal(completion, null, 'no completion_commit is stamped when evidence is genuinely absent');

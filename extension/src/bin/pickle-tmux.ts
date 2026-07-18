@@ -16,7 +16,8 @@ import {
 } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { recordCodexManagerRelaunch } from '../services/manager-relaunch-integrity.js';
 import { isPreflightError, type PreflightError } from '../services/verification-env.js';
 import type { TicketSummary } from '../services/tickets.js';
 
@@ -159,6 +160,9 @@ async function main(argv: string[]): Promise<void> {
       throw error;
     }
     assertBootstrapSessionNotRunning(sessionDir);
+    if (parsed.resume) {
+      recordCodexManagerRelaunch(sessionDir, 'pickle-tmux');
+    }
     previousSessionDir = getSessionForCwd(state.working_dir as string);
     await updateSessionMap(state.working_dir as string, sessionDir);
     const sessionName = `pickle-${path.basename(sessionDir)}`.replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -175,6 +179,7 @@ async function main(argv: string[]): Promise<void> {
       current.max_iterations = 0;
       current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;
+      current.preserve_tmux_monitor = process.env.PICKLE_PRESERVE_TMUX_MONITOR === '1';
       current.last_exit_reason = null;
       current.active_child_pid = null;
       current.active_child_kind = null;
@@ -185,7 +190,7 @@ async function main(argv: string[]): Promise<void> {
     });
 
     try {
-      clearTmuxSession(sessionName);
+      clearTmuxSession(sessionName, sessionDir);
       runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
@@ -198,6 +203,12 @@ async function main(argv: string[]): Promise<void> {
         ';',
         'status=$?',
         ';',
+        'node',
+        shellQuote(path.join(runtimeRoot, 'bin', 'terminal-tmux-cleanup.js')),
+        shellQuote(sessionDir),
+        '||',
+        'true',
+        ';',
         'echo',
         shellQuote(''),
         ';',
@@ -209,7 +220,7 @@ async function main(argv: string[]): Promise<void> {
       ].join(' ');
 
       runTmux(['set-option', '-w', '-t', `${sessionName}:0`, 'remain-on-exit', 'on']);
-      runTmux(['respawn-pane', '-k', '-t', `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`]);
+      respawnOwnedTmuxPane(sessionName, sessionDir, `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`);
       const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, runnerDescriptor.monitorMode], {
         encoding: 'utf8',
         timeout: 30_000,
@@ -222,7 +233,7 @@ async function main(argv: string[]): Promise<void> {
     } catch (error) {
       if (launchStarted) {
         try {
-          runTmux(['kill-session', '-t', sessionName]);
+          killTmuxSession(sessionName, sessionDir);
         } catch {
           // Best-effort cleanup for partially created tmux sessions.
         }

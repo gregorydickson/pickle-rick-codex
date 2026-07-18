@@ -2,20 +2,24 @@
   "name": "pickle-rick-codex",
   "description": "Pickle Rick Codex CLI package and persona bootstrap — local install into ~/.codex/pickle-rick/ with bundled source .codex assets, empty default hooks contract, and optional target-project persona activation on the guaranteed `codex exec` path",
   "version": "0.2.17-beta.1",
-  "skills": [
-    "pickle",
-    "pickle-tmux",
-    "pickle-prd",
-    "pickle-refine",
-    "pickle-orchestrate",
-    "pickle-status",
-    "pickle-metrics",
-    "pickle-cancel",
-    "pickle-retry",
-    "pickle-microverse",
-    "szechuan-sauce",
-    "anatomy-park"
-  ],
-  "hooks": ".codex/hooks/hooks.json",
-  "scripts": "bin/"
+  "author": {
+    "name": "Gregory Dickson",
+    "url": "https://github.com/gregorydickson"
+  },
+  "repository": "https://github.com/gregorydickson/pickle-rick-codex",
+  "license": "MIT",
+  "keywords": ["codex", "engineering", "pipeline", "skills"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Pickle Rick Codex",
+    "shortDescription": "Autonomous engineering workflows for Codex",
+    "longDescription": "Draft, refine, execute, inspect, and verify engineering work through the Pickle Rick Codex pipeline.",
+    "developerName": "Gregory Dickson",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Use Pickle Rick to turn this task into a verified implementation.",
+      "Run the Pickle Rick pipeline for this repository."
+    ]
+  }
 }

@@ -19,6 +19,12 @@ test('validate-codex reports the configured codex version and guaranteed path', 
   assert.match(parsed.validation_date, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(parsed.codex_version, 'codex 9.9.9-test');
   assert.equal(parsed.guaranteed_path, 'codex exec --full-auto');
+  assert.deepEqual(parsed.exec_capabilities, {
+    '--cd': true,
+    '--json': true,
+    '--add-dir': true,
+    '--output-last-message': true,
+  });
 });
 
 test('draft-prd writes a PRD and advances the session state', () => {
@@ -484,6 +490,7 @@ async function main() {
             verification: ['npm test'],
             priority: 'P1',
             status: 'Todo',
+            allowed_paths: ['README.md'],
           },
         ],
       }, null, 2),
@@ -657,4 +664,90 @@ setTimeout(() => {
   assert.equal(result.timedOut, false);
   assert.equal(result.terminatedAfterSuccess, false);
   assert.match(result.lastMessage, /IMPLEMENT_COMPLETE/);
+});
+
+test('runCodexExecMonitored drains SIGTERM final output and does not truncate last-message artifacts', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-drain-');
+  const artifactDir = makeTempRoot('pickle-codex-drain-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const artifactPath = path.join(artifactDir, 'phase.json');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex test'); process.exit(0); }
+const output = args[args.indexOf('--output-last-message') + 1];
+fs.writeFileSync(output, '<promise>DONE</promise>');
+fs.writeFileSync(${JSON.stringify(artifactPath)}, '{"stage":"started"');
+process.on('SIGTERM', () => {
+  fs.appendFileSync(output, '\\nFINAL-DRAINED');
+  fs.appendFileSync(${JSON.stringify(artifactPath)}, ',"final":true}');
+  setTimeout(() => process.exit(0), 30);
+});
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'drain',
+    timeoutMs: 2_000,
+    outputLastMessagePath: messagePath,
+    progressArtifactPaths: [artifactPath],
+    successSignalGraceMs: 100,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.terminatedAfterSuccess, true);
+  assert.match(result.lastMessage, /FINAL-DRAINED/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(artifactPath, 'utf8')), { stage: 'started', final: true });
+});
+
+test('artifact progress extends success shutdown grace but never the absolute timeout', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-progress-');
+  const artifactDir = makeTempRoot('pickle-codex-progress-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const artifactPath = path.join(artifactDir, 'progress.txt');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex test'); process.exit(0); }
+const output = args[args.indexOf('--output-last-message') + 1];
+fs.writeFileSync(output, '<promise>DONE</promise>');
+let count = 0;
+const timer = setInterval(() => {
+  fs.appendFileSync(${JSON.stringify(artifactPath)}, String(count++));
+  if (process.env.FINITE_PROGRESS === '1' && count === 5) { clearInterval(timer); process.exit(0); }
+}, 70);
+`, { mode: 0o755 });
+
+  const finite = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'progress',
+    env: { FINITE_PROGRESS: '1' },
+    timeoutMs: 2_000,
+    outputLastMessagePath: messagePath,
+    progressArtifactPaths: [artifactPath],
+    successSignalGraceMs: 100,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+  assert.equal(finite.exitCode, 0);
+  assert.equal(finite.terminatedAfterSuccess, false);
+  assert.equal(fs.readFileSync(artifactPath, 'utf8'), '01234');
+
+  const absolute = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'progress forever',
+    timeoutMs: 350,
+    outputLastMessagePath: messagePath,
+    progressArtifactPaths: [artifactPath],
+    successSignalGraceMs: 100,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+  assert.equal(absolute.exitCode, 124);
+  assert.equal(absolute.timedOut, true);
 });

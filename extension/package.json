@@ -9,8 +9,9 @@
     "prebuild": "bash scripts/copy-shell-assets.sh",
     "build": "tsc",
     "audit:test-tiers": "bash scripts/audit-test-tiers.sh",
-    "pretest": "npm run build && npm run audit:test-tiers",
+    "pretest": "if [ -d src ] && [ -d node_modules ]; then npm run build && npm run audit:test-tiers; fi",
     "test": "npm run test:fast && npm run test:integration",
+    "test:runtime": "npm run test:fast && npm run test:integration",
     "test:fast": "node bin/test-runner.js --tier fast --test-concurrency=8",
     "test:integration": "node bin/test-runner.js --tier integration --test-concurrency=4"
   },

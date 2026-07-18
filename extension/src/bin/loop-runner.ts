@@ -4,18 +4,36 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
+import { canExecute, loadCircuitState, recordIteration } from '../services/circuit-breaker.js';
 import { logActivity } from '../services/activity-logger.js';
 import {
   commitTrackedChanges,
   getHeadSha,
   getWorkingTreeStatus,
   isGitRepo,
+  isPathTracked,
   isWorkingTreeDirty,
+  listWorkingTreeDirtyPaths,
   listUntrackedFiles,
+  resetHeadPreservingWorktree,
   resetGitIndex,
-  stagePaths,
-  stageTrackedChanges,
 } from '../services/git-utils.js';
+import { salvageDirtyTree, stageOwnedPaths } from '../services/dirty-tree-salvage.js';
+import {
+  captureMetricIterationCheckpoint,
+  createMetricConvergenceState,
+  measureMetric,
+  normalizeMetricDirection,
+  normalizeMetricTolerance,
+  readMetricConvergenceState,
+  recordMetricIteration,
+  writeMetricConvergenceState,
+  type MetricClassification,
+  type MetricConvergenceState,
+  type MetricIterationCheckpoint,
+} from '../services/metric-convergence.js';
+import { recoverableHardReset } from '../services/recoverable-git.js';
+import { enforceLoopMutationScope } from '../services/pipeline-scope.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
 import { buildLoopPrompt, type LoopPromptConfig, type LoopPromptState } from '../services/prompts.js';
 import { appendHistory, getRunStartEpoch } from '../services/session.js';
@@ -23,6 +41,7 @@ import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../se
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { readJsonFile } from '../services/pickle-utils.js';
 import { readScrubbedWorkerMessage, scrubWorkerOutput } from '../services/worker-output.js';
+import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import type {
   Config,
   CodexSpawnResult,
@@ -146,37 +165,170 @@ function anatomyParkProgressReasons(workingDir: string, reasons: string[]): stri
   return reasons.filter((reason) => reason !== 'worktree_fingerprint');
 }
 
-function ensureAnatomyParkPreflightCommit(sessionDir: string, loopConfig: LoopConfig, workingDir: string): void {
-  if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
-    return;
+function isMeasuredMicroverse(loopConfig: LoopConfig): boolean {
+  return loopConfig.mode === 'microverse'
+    && typeof loopConfig.metric === 'string'
+    && loopConfig.metric.trim().length > 0;
+}
+
+function metricTimeoutMs(loopConfig: LoopConfig): number {
+  const seconds = Number(loopConfig.metric_timeout_seconds ?? 120);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error('Microverse metric_timeout_seconds must be positive.');
   }
-  if (!isWorkingTreeDirty(workingDir)) {
+  return seconds * 1000;
+}
+
+function revertMetricIterationSafely(
+  sessionDir: string,
+  workingDir: string,
+  checkpoint: MetricIterationCheckpoint,
+): void {
+  const session = path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-');
+  recoverableHardReset({
+    workingDir,
+    sessionDir,
+    targetHead: checkpoint.head,
+    operation: 'microverse-revert',
+    preserveUntracked: checkpoint.untracked,
+    headRecoveryRef: `refs/pickle/microverse-recovery/${session}`,
+    log: (message) => appendRunnerLog(sessionDir, message),
+  });
+}
+
+function ensureMetricBaseline(sessionDir: string, loopConfig: LoopConfig, workingDir: string): MetricConvergenceState | null {
+  if (!isMeasuredMicroverse(loopConfig)) return null;
+  const command = String(loopConfig.metric).trim();
+  const direction = normalizeMetricDirection(loopConfig.direction ?? 'higher');
+  const tolerance = normalizeMetricTolerance(loopConfig.tolerance ?? 0);
+  const existing = readMetricConvergenceState(sessionDir);
+  if (existing) {
+    if (existing.command !== command || existing.direction !== direction || existing.tolerance !== tolerance) {
+      throw new Error('Cannot change the metric command, direction, or tolerance while resuming a Microverse session.');
+    }
+    captureMetricIterationCheckpoint(workingDir);
+    return existing;
+  }
+  const checkpoint = captureMetricIterationCheckpoint(workingDir);
+  let baseline;
+  try {
+    baseline = measureMetric(command, { cwd: workingDir, timeoutMs: metricTimeoutMs(loopConfig) });
+  } catch (error) {
+    revertMetricIterationSafely(sessionDir, workingDir, checkpoint);
+    throw error;
+  }
+  const state = createMetricConvergenceState(baseline, direction, tolerance);
+  writeMetricConvergenceState(sessionDir, state);
+  appendRunnerLog(sessionDir, `microverse baseline measured: ${baseline.score}`);
+  return state;
+}
+
+function writeMetricSummary(sessionDir: string, state: MetricConvergenceState): void {
+  const summary = {
+    objective: 'measured metric convergence',
+    baseline: state.baseline.score,
+    latest_result: state.latest.score,
+    best_result: state.best.score,
+    direction: state.direction,
+    tolerance: state.tolerance,
+    stall_count: state.stall_count,
+    failed_approaches: state.failed_approaches,
+    verification: [`${state.command} => ${state.latest.score}`],
+    next_action: state.stall_count > 0 ? 'Try a materially different approach.' : 'Continue toward convergence or stop when the target is met.',
+  };
+  fs.writeFileSync(summaryPaths(sessionDir, 'microverse').json, JSON.stringify(summary, null, 2));
+  fs.writeFileSync(summaryPaths(sessionDir, 'microverse').markdown, [
+    '# Microverse Metric Summary',
+    '',
+    `- Command: \`${state.command}\``,
+    `- Direction: ${state.direction}`,
+    `- Baseline: ${state.baseline.score}`,
+    `- Best: ${state.best.score}`,
+    `- Latest: ${state.latest.score}`,
+    `- Stall count: ${state.stall_count}`,
+    '',
+  ].join('\n'));
+}
+
+function processMetricIteration(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  workingDir: string,
+  checkpoint: MetricIterationCheckpoint,
+  iteration: number,
+): { classification: Exclude<MetricClassification, 'baseline'>; state: MetricConvergenceState } {
+  const currentState = readMetricConvergenceState(sessionDir);
+  if (!currentState) throw new Error('Microverse metric state disappeared during an iteration.');
+  const measurement = measureMetric(currentState.command, {
+    cwd: workingDir,
+    timeoutMs: metricTimeoutMs(loopConfig),
+  });
+  const attemptedHead = getHeadSha(workingDir) || checkpoint.head;
+  const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
+  const repositoryChanged = attemptedHead !== checkpoint.head || dirtyPaths.length > 0;
+  const natural = recordMetricIteration(currentState, measurement, {
+    iteration,
+    headBefore: checkpoint.head,
+    headAfter: attemptedHead,
+  }).classification;
+  const classification = natural === 'improved' && !repositoryChanged ? 'held' : natural;
+
+  if (classification === 'improved') {
+    if (dirtyPaths.length > 0) {
+      const plan = salvageDirtyTree({
+        workingDir,
+        sessionDir,
+        owned: dirtyPaths,
+        foreign: [],
+        log: (message) => appendRunnerLog(sessionDir, message),
+      });
+      stageOwnedPaths(workingDir, plan.stagePaths);
+      commitTrackedChanges(workingDir, `microverse: accept metric improvement to ${measurement.score}`);
+    }
+  } else {
+    revertMetricIterationSafely(sessionDir, workingDir, checkpoint);
+  }
+
+  const recorded = recordMetricIteration(currentState, measurement, {
+    iteration,
+    headBefore: checkpoint.head,
+    headAfter: attemptedHead,
+    classificationOverride: classification,
+  });
+  writeMetricConvergenceState(sessionDir, recorded.state);
+  writeMetricSummary(sessionDir, recorded.state);
+  appendRunnerLog(sessionDir, `microverse metric ${classification}: ${currentState.best.score} -> ${measurement.score} (${recorded.state.stall_count} stalled)`);
+  return recorded;
+}
+
+function ensureAdvancedLoopCleanTrackedPreflight(sessionDir: string, loopConfig: LoopConfig, workingDir: string): void {
+  if (!['anatomy-park', 'szechuan-sauce'].includes(loopConfig.mode) || loopConfig.dry_run) {
     return;
   }
   if (!isGitRepo(workingDir)) {
-    throw new Error('Working tree is dirty - not a git repo, cannot auto-commit before anatomy-park start');
+    if (isWorkingTreeDirty(workingDir)) {
+      throw new Error(`Working tree is dirty - not a git repo, cannot establish ${loopConfig.mode} change ownership`);
+    }
+    return;
   }
   const statusLines = getWorkingTreeStatus(workingDir)
     .split('\n')
     .map((line) => line.trimEnd())
     .filter(Boolean);
-  if (statusLines.length > 0 && statusLines.every((line) => line.startsWith('?? '))) {
-    appendRunnerLog(sessionDir, 'working tree has only pre-existing untracked files before anatomy-park start; skipping tracked preflight commit');
+  if (statusLines.length === 0) {
     return;
   }
-
-  appendRunnerLog(sessionDir, 'working tree is dirty before anatomy-park start; auto-committing tracked changes');
-  try {
-    stageTrackedChanges(workingDir);
-    commitTrackedChanges(workingDir, 'anatomy-park: auto-commit dirty tree before start');
-    appendRunnerLog(sessionDir, `preflight auto-committed: ${getHeadSha(workingDir)}`);
-  } catch (error) {
-    resetGitIndex(workingDir);
-    throw new Error(`Working tree is dirty and anatomy-park preflight auto-commit failed: ${safeErrorMessage(error)}`, { cause: error });
+  const tracked = statusLines.filter((line) => !line.startsWith('?? '));
+  if (tracked.length > 0) {
+    appendRunnerLog(sessionDir, `refusing ${loopConfig.mode} start with ${tracked.length} pre-existing tracked change(s)`);
+    throw new Error(`${loopConfig.mode} requires a clean tracked working tree; commit or stash pre-existing tracked changes before starting`);
   }
+  const untracked = statusLines.filter((line) => line.startsWith('?? '));
+  appendRunnerLog(sessionDir, `refusing ${loopConfig.mode} start with ${untracked.length} pre-existing untracked path(s)`);
+  throw new Error(`${loopConfig.mode} requires a completely clean working tree; remove, commit, or stash pre-existing untracked paths before starting`);
 }
 
-function autoCommitAnatomyParkIteration(
+function autoCommitAdvancedLoopIteration(
   sessionDir: string,
   loopConfig: LoopConfig,
   workingDir: string,
@@ -184,31 +336,84 @@ function autoCommitAnatomyParkIteration(
   iteration: number,
   beforeUntrackedFiles: string[] = [],
 ): boolean {
-  if (loopConfig.mode !== 'anatomy-park' || loopConfig.dry_run) {
+  if (!['anatomy-park', 'szechuan-sauce'].includes(loopConfig.mode) || loopConfig.dry_run) {
     return false;
   }
-  if (!isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
+  if (!isGitRepo(workingDir)) {
     return false;
   }
+  const capturedUntracked = beforeUntrackedFiles.filter((relativePath) => isPathTracked(workingDir, relativePath));
+  if (capturedUntracked.length > 0) {
+    if (beforeSnapshot.head_sha && getHeadSha(workingDir) !== beforeSnapshot.head_sha) {
+      resetHeadPreservingWorktree(workingDir, beforeSnapshot.head_sha);
+    } else {
+      resetGitIndex(workingDir);
+    }
+    throw new Error(`${loopConfig.mode} worker committed pre-existing untracked paths: ${capturedUntracked.join(', ')}`);
+  }
+  const baselineUntracked = new Set(beforeUntrackedFiles);
+  const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
+  const foreign = dirtyPaths.filter((relativePath) => baselineUntracked.has(relativePath));
+  const owned = dirtyPaths.filter((relativePath) => !baselineUntracked.has(relativePath));
   if (beforeSnapshot.head_sha && getHeadSha(workingDir) !== beforeSnapshot.head_sha) {
+    if (owned.length > 0) {
+      throw new Error(`${loopConfig.mode} worker advanced HEAD but left an ambiguous dirty tree`);
+    }
+    return false;
+  }
+  if (owned.length === 0) {
+    if (foreign.length > 0) {
+      appendRunnerLog(sessionDir, `no owned ${loopConfig.mode} changes to commit; preserving ${foreign.length} pre-existing path(s)`);
+    }
     return false;
   }
 
-  appendRunnerLog(sessionDir, 'no anatomy-park commit detected after iteration; auto-committing iteration changes');
+  appendRunnerLog(sessionDir, `no ${loopConfig.mode} commit detected after iteration; auto-committing iteration changes`);
   try {
-    const baselineUntracked = new Set(beforeUntrackedFiles);
-    const newUntrackedFiles = listUntrackedFiles(workingDir)
+    const plan = salvageDirtyTree({
+      workingDir,
+      sessionDir,
+      owned,
+      foreign,
+      log: (message) => appendRunnerLog(sessionDir, message),
+    });
+    stageOwnedPaths(workingDir, plan.stagePaths);
+    const commitMessage = loopConfig.mode === 'anatomy-park'
+      ? anatomyParkCommitMessage(sessionDir, loopConfig, iteration)
+      : `szechuan-sauce: iteration ${iteration}`;
+    commitTrackedChanges(workingDir, commitMessage);
+    const remainingOwned = listWorkingTreeDirtyPaths(workingDir)
       .filter((relativePath) => !baselineUntracked.has(relativePath));
-    stageTrackedChanges(workingDir);
-    stagePaths(workingDir, newUntrackedFiles);
-    commitTrackedChanges(workingDir, anatomyParkCommitMessage(sessionDir, loopConfig, iteration));
-    appendRunnerLog(sessionDir, `anatomy-park auto-committed: ${getHeadSha(workingDir)}`);
+    if (remainingOwned.length > 0) {
+      throw new Error(`${loopConfig.mode} auto-commit left iteration-owned dirty paths: ${remainingOwned.join(', ')}`);
+    }
+    appendRunnerLog(sessionDir, `${loopConfig.mode} auto-committed: ${getHeadSha(workingDir)}`);
     return true;
   } catch (error) {
     resetGitIndex(workingDir);
-    appendRunnerLog(sessionDir, `anatomy-park auto-commit failed: ${safeErrorMessage(error)}`);
-    return false;
+    appendRunnerLog(sessionDir, `${loopConfig.mode} auto-commit failed: ${safeErrorMessage(error)}`);
+    throw error;
   }
+}
+
+function enforceAdvancedLoopScope(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  workingDir: string,
+  beforeSnapshot: ProgressSnapshot,
+  beforeUntrackedFiles: string[],
+): void {
+  if (!['anatomy-park', 'szechuan-sauce'].includes(loopConfig.mode) || loopConfig.dry_run) return;
+  if (!Array.isArray(loopConfig.allowed_paths)) return;
+  enforceLoopMutationScope({
+    sessionDir,
+    workingDir,
+    mode: loopConfig.mode,
+    beforeHead: String(beforeSnapshot.head_sha || ''),
+    allowedPaths: loopConfig.allowed_paths.map((entry) => String(entry)),
+    preserveUntracked: beforeUntrackedFiles,
+    log: (message) => appendRunnerLog(sessionDir, message),
+  });
 }
 
 function stopSummaryFromState(state: PersistedState, loopConfig: LoopConfig, exitReason: string, sessionDir: string) {
@@ -274,11 +479,13 @@ export async function runLoop(sessionDir: string): Promise<void> {
   const initialState = manager.read(statePath);
 
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
-  ensureAnatomyParkPreflightCommit(sessionDir, loopConfig, initialState.working_dir as string);
+  ensureAdvancedLoopCleanTrackedPreflight(sessionDir, loopConfig, initialState.working_dir as string);
+  ensureMetricBaseline(sessionDir, loopConfig, initialState.working_dir as string);
   enterLoopRunnerPhase(manager, statePath, loopConfig.mode);
 
   let exitReason = 'success';
   let thrownError: unknown = null;
+  let pendingMetricIteration: { cwd: string; checkpoint: MetricIterationCheckpoint } | null = null;
   try {
     while (true) {
       const state = manager.read(statePath);
@@ -297,6 +504,11 @@ export async function runLoop(sessionDir: string): Promise<void> {
           break;
         }
       }
+      if (config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
+        exitReason = 'circuit_open';
+        appendRunnerLog(sessionDir, 'refusing iteration: circuit breaker is OPEN');
+        break;
+      }
 
       const beforeSnapshot = captureProgressSnapshot({
         sessionDir,
@@ -305,6 +517,12 @@ export async function runLoop(sessionDir: string): Promise<void> {
         step: state.step as string | null,
         currentTicket: state.current_ticket as string | null,
       });
+      const metricCheckpoint = isMeasuredMicroverse(loopConfig)
+        ? captureMetricIterationCheckpoint(state.working_dir as string)
+        : null;
+      pendingMetricIteration = metricCheckpoint
+        ? { cwd: state.working_dir as string, checkpoint: metricCheckpoint }
+        : null;
       const beforeUntrackedFiles = isGitRepo(state.working_dir as string)
         ? listUntrackedFiles(state.working_dir as string)
         : [];
@@ -327,6 +545,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
         }),
         timeoutMs: getWorkerTimeoutMs(state, config),
         outputLastMessagePath,
+        progressArtifactPaths: Object.values(summaryPaths(sessionDir, loopConfig.mode)),
         addDirs: [sessionDir],
         successCheck: loopSuccessCheck(outputLastMessagePath),
         successSignalGraceMs: 150,
@@ -336,6 +555,8 @@ export async function runLoop(sessionDir: string): Promise<void> {
             current.active_child_pid = child.pid;
             current.active_child_kind = 'codex';
             current.active_child_command = loopConfig.mode;
+            current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+            current.active_child_controller_pid = process.pid;
             return current;
           });
         },
@@ -345,6 +566,8 @@ export async function runLoop(sessionDir: string): Promise<void> {
         current.active_child_pid = null;
         current.active_child_kind = null;
         current.active_child_command = null;
+        current.active_child_identity = null;
+        current.active_child_controller_pid = null;
         return current;
       });
       if (result.cancelled || manager.read(statePath).active === false) {
@@ -356,7 +579,15 @@ export async function runLoop(sessionDir: string): Promise<void> {
       const lastMessage = scrubWorkerOutput(result.lastMessage || '');
       appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} finished`);
 
-      autoCommitAnatomyParkIteration(
+      enforceAdvancedLoopScope(
+        sessionDir,
+        loopConfig,
+        state.working_dir as string,
+        beforeSnapshot,
+        beforeUntrackedFiles,
+      );
+
+      autoCommitAdvancedLoopIteration(
         sessionDir,
         loopConfig,
         state.working_dir as string,
@@ -364,6 +595,17 @@ export async function runLoop(sessionDir: string): Promise<void> {
         (state.iteration as number) + 1,
         beforeUntrackedFiles,
       );
+
+      const metricResult = metricCheckpoint
+        ? processMetricIteration(
+          sessionDir,
+          loopConfig,
+          state.working_dir as string,
+          metricCheckpoint,
+          (state.iteration as number) + 1,
+        )
+        : null;
+      pendingMetricIteration = null;
 
       const afterSnapshot = captureProgressSnapshot({
         sessionDir,
@@ -377,7 +619,9 @@ export async function runLoop(sessionDir: string): Promise<void> {
         diffProgressSnapshot(beforeSnapshot, afterSnapshot).filter((reason) => reason !== 'initial_snapshot'),
       );
       const latest = manager.update(statePath, (current) => {
-        current.loop_stall_count = progressReasons.length ? 0 : Number(current.loop_stall_count || 0) + 1;
+        current.loop_stall_count = metricResult
+          ? metricResult.state.stall_count
+          : progressReasons.length ? 0 : Number(current.loop_stall_count || 0) + 1;
         current.last_loop_message = lastMessage.trim();
         return current;
       });
@@ -385,7 +629,21 @@ export async function runLoop(sessionDir: string): Promise<void> {
         appendRunnerLog(sessionDir, `iteration ${(state.iteration as number) + 1} progress: ${progressReasons.join(',')}`);
       }
 
-      if (loopShouldExit(outputLastMessagePath, result)) {
+      if (config.defaults.circuit_breaker.enabled) {
+        const circuitState = recordIteration(sessionDir, {
+          working_dir: latest.working_dir as string,
+          step: latest.step as string,
+          current_ticket: latest.current_ticket as string | null,
+          loop_mode: loopConfig.mode,
+        });
+        if (!canExecute(circuitState)) {
+          exitReason = 'circuit_open';
+          appendRunnerLog(sessionDir, `circuit breaker opened after iteration ${(state.iteration as number) + 1}`);
+          break;
+        }
+      }
+
+      if (loopShouldExit(outputLastMessagePath, result) && (!metricResult || metricResult.classification === 'improved')) {
         exitReason = 'success';
         break;
       }
@@ -402,6 +660,21 @@ export async function runLoop(sessionDir: string): Promise<void> {
       thrownError = error;
     }
   } finally {
+    if (pendingMetricIteration) {
+      try {
+        revertMetricIterationSafely(sessionDir, pendingMetricIteration.cwd, pendingMetricIteration.checkpoint);
+        appendRunnerLog(sessionDir, `microverse iteration rolled back after ${exitReason}`);
+      } catch (rollbackError) {
+        appendRunnerLog(sessionDir, `microverse rollback failed after ${exitReason}: ${safeErrorMessage(rollbackError)}`);
+        thrownError = thrownError
+          ? new AggregateError(
+            [thrownError, rollbackError],
+            `Microverse iteration failed and rollback did not complete: ${safeErrorMessage(rollbackError)}`,
+          )
+          : rollbackError;
+        exitReason = 'error';
+      }
+    }
     const finalReason = exitLoopRunnerPhase(manager, statePath, exitReason);
     writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), finalReason);
     appendRunnerLog(sessionDir, `loop-runner finished: ${finalReason}`);

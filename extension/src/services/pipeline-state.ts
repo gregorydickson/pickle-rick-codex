@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { nowIso, atomicWriteJson, STATE_SCHEMA_VERSION } from './pickle-utils.js';
 import { StateManager, type PersistedState } from './state-manager.js';
+import { finalizeTerminalStateObject } from './state-terminal.js';
 import {
   buildPipelineStateMirror,
   PIPELINE_SCHEMA_VERSION,
@@ -696,17 +697,10 @@ function appendHistoryEntry(sessionState: PersistedState, step: string, ticket: 
   });
 }
 
-function clearRuntimeState(sessionState: PersistedState): void {
-  sessionState.active = false;
-  sessionState.tmux_runner_pid = null;
-  sessionState.worker_pid = null;
-  sessionState.active_child_pid = null;
-  sessionState.active_child_kind = null;
-  sessionState.active_child_command = null;
-}
-
 function isBlockedExitReason(exitReason: string): boolean {
-  return exitReason === 'verification-contract-failed' || String(exitReason).startsWith('preflight-');
+  return exitReason === 'verification-contract-failed'
+    || exitReason === 'scope-violation'
+    || String(exitReason).startsWith('preflight-');
 }
 
 export function createInitialPipelineState(pipeline: unknown, now: string = nowIso()): PipelineState {
@@ -910,6 +904,11 @@ export function beginPipelinePhase(
     pipelineState.last_error = null;
     pipelineState.last_exit_reason = null;
     sessionState.pipeline_mode = true;
+    sessionState.active = true;
+    sessionState.last_exit_reason = null;
+    if (Number.isInteger(options.runnerPid) && Number(options.runnerPid) > 0) {
+      sessionState.tmux_runner_pid = options.runnerPid;
+    }
     sessionState.step = phase;
     appendHistoryEntry(sessionState, phase, (sessionState.current_ticket as string | null) || undefined);
   }, options);
@@ -937,8 +936,7 @@ export function finishPipelinePhase(
     if (nextPhase == null && exitReason === 'success') {
       pipelineState.completed_at = options.completedAt || nowIso();
     }
-    clearRuntimeState(sessionState);
-    sessionState.last_exit_reason = exitReason;
+    finalizeTerminalStateObject(sessionState, { exitReason });
     sessionState.pipeline_mode = true;
     if (exitReason === 'success') {
       sessionState.current_ticket = null;
@@ -986,8 +984,7 @@ export function cancelPipelineSession(
     pipelineState.last_exit_reason = options.exitReason || 'cancelled';
     pipelineState.last_error = options.lastError || null;
     pipelineState.completed_at = null;
-    clearRuntimeState(sessionState);
-    sessionState.last_exit_reason = options.exitReason || 'cancelled';
+    finalizeTerminalStateObject(sessionState, { exitReason: options.exitReason || 'cancelled' });
     sessionState.cancel_requested_at = cancelledAt;
     sessionState.pipeline_mode = true;
     appendHistoryEntry(sessionState, 'inactive', (sessionState.current_ticket as string | null) || undefined);

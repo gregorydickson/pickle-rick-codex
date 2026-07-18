@@ -1,39 +1,52 @@
-# Codex API Validation
+# Codex Integration Validation
 
-Validated locally on `2026-04-16` against `codex-cli 0.121.0`.
+Current distribution baseline: `2026-07-18`, `codex-cli 0.144.5`, Node.js 20 or newer. The checked-in `validate:codex` probe records CLI identity and the command contract; it is not an authenticated execution probe.
 
-## Verified Facts
+This records the supported integration contract, not a promise that behavior observed in one Codex release applies forever. CI verifies source and installed-runtime layouts without requiring a Codex login. A release operator must run the authenticated probe when changing Codex invocation or hook behavior.
 
-- Codex CLI version: `codex-cli 0.121.0`
-- Guaranteed automation path: `codex exec --full-auto`
-- Hook usage is gated by local validation of the installed build
-- Native multi-agent controls are not part of the guaranteed v1 contract
-- Reliable progress signaling for v1 comes from session state plus filesystem artifacts under `~/.codex/pickle-rick/`
+## Historical authenticated pipeline evidence (pre-hardening)
 
-## Installation Facts
+On July 18, 2026, installed runtime `0.2.17-beta.1` completed session `2026-07-18-1c18e785` against a disposable clean Git repository using `codex-cli 0.144.5`. That historical run used the earlier five-phase worker, before persisted `research_review`, `plan_review`, and `conformance` artifacts, exact Citadel acceptance-criteria coverage, progress-aware shutdown, and recoverable destructive-operation hardening were added. Its Citadel report recorded no acceptance criteria. It is useful evidence for the older sequential process shape, but it is **not current release evidence** and must not be cited as validation of the hardened pipeline now in this repository.
 
-- `bash install.sh` installs the runtime into the local Codex root at `~/.codex/pickle-rick/`, installs Pickle Rick skills into `~/.codex/skills/`, and merges managed Pickle Rick instructions into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
-- `bash install.sh --project <path-to-project>` is optional and adds repo-local Pickle Rick persona files plus Pickle Rick skill directories to the target project
-- Existing `AGENTS.md` content is preserved under a managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
-- The Pickle Rick persona is active generally once Codex reads the global `~/.codex/AGENTS.md` and the `pickle` skill is available
-- The install flow stays local-only; no marketplace publishing is required for the validated path
-- A clean `codex exec` probe in a temp directory returned `Pickle Rick` when asked for the active persona after global install
-- If `PICKLE_DATA_ROOT` overrides the runtime root, the installer renders global and project-facing skills plus optional hooks to the actual installed path
+No replacement authenticated run is claimed here. Before calling the current build release-validated, install it into an isolated Codex home and run a clean authenticated pipeline that produces all eight lifecycle artifacts, exact acceptance-criteria conformance, a clean repository boundary, and final Citadel approval. CI remains intentionally unauthenticated and uses controlled fake Codex workers.
 
-## Local Hook Surface
+## Guaranteed contract
 
-Project-local hooks are optional and are only installed when the user passes `--enable-hooks`:
+- Automation uses sequential `codex exec --full-auto` processes.
+- Runtime state lives under `~/.codex/pickle-rick/`, or `PICKLE_DATA_ROOT` when set.
+- `bash install.sh` installs global skills under `~/.agents/skills` and merges one managed block into `~/.codex/AGENTS.md`; it does not modify `CLAUDE.md`.
+- `bash install.sh --project <path>` adds a project-local override without deleting unrelated Codex state.
+- Native multi-agent features may accelerate interactive work, but are not required by the runtime.
+- Hooks are disabled. `--enable-hooks` fails before mutation until authenticated validation proves the installed Codex release's event, payload, decision, and trust contracts.
 
-- `SessionStart` -> `bin/session-start.js`
-- `Stop` -> `bin/stop-hook.js`
-- `PreToolUse` -> `bin/config-protection.js`
-- `PostToolUse` -> `bin/log-commit.js`
+## Reproducible release evidence
 
-These handlers are present for the local install, but the event registrations remain outside the guaranteed path and should stay gated by the installed Codex build's validated support.
+Run from a clean checkout:
 
-## Guaranteed Fallback
+```bash
+npm ci --prefix extension
+npm run release:gate
 
-- Use `codex exec` for the guaranteed path
-- Do not assume `UserPromptSubmit`
-- Do not assume `spawn_agent`, `send_message`, `list_agents`, `LastNTurns(0)`, or `job_max_runtime_seconds` in default behavior
-- If a hook event or native control is not validated locally, keep it out of the default runtime path
+validation_root="$(mktemp -d)"
+CODEX_HOME="$validation_root/codex" \
+PICKLE_DATA_ROOT="$validation_root/runtime" \
+bash install.sh
+npm --prefix "$validation_root/runtime" test
+```
+
+The gate must prove TypeScript compilation, lint, both test tiers, package installation, and execution of the installed suite against `extension/services` and `extension/bin`. The GitHub workflow performs these checks on supported Node versions.
+
+The installed suite covers the causal eight-phase worker and recoverable reset behavior with controlled workers. It does not substitute for the authenticated current-build pipeline required above.
+
+For changes to Codex invocation, additionally run:
+
+```bash
+codex --version
+npm run validate:codex
+```
+
+Record the date, exact CLI version, and probe result in the pull request or release notes. Do not rewrite the baseline merely because a newer CLI is installed.
+
+## Disabled hook surface
+
+The legacy template maps `SessionStart`, `Stop`, `PreToolUse`, and `PostToolUse` handlers to compiled files under `extension/bin/`, but it is inactive reference material. A handler existing on disk is not evidence that a Codex build emits the event or accepts the template's matcher, payload, and decision schemas. The installer therefore rejects `--enable-hooks` before changing state.

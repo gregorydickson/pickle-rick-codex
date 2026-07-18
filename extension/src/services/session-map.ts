@@ -21,6 +21,7 @@ type SessionMap = Record<string, string>;
  */
 interface SessionMapEntryState {
   active?: boolean;
+  recovery_required?: boolean;
   started_at?: string;
   session_map_cwds?: string[];
   working_dir?: string;
@@ -211,7 +212,7 @@ export async function pruneSessionMap(maxAgeDays: number = 7): Promise<void> {
           changed = true;
           continue;
         }
-        if (state.active === true) continue;
+        if (state.active === true || state.recovery_required === true) continue;
         const startedAt = state.started_at ?? '';
         const startedMs = Number.isFinite(new Date(startedAt).getTime())
           ? new Date(startedAt).getTime()

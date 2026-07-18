@@ -18,8 +18,7 @@ import {
   fallbackRefinePrd,
   readManifest,
   validateRefinementManifest,
-  writeManifest,
-  writeTicketFiles,
+  restructureTicketFiles,
 } from '../services/tickets.js';
 import type { CodexSpawnResult, CodexUsage, ConfigVerificationInput, RefinementManifest } from '../types/index.js';
 
@@ -190,16 +189,13 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
   }
   const enrichedManifest = enrichRefinementManifest(manifest, config as unknown as ConfigVerificationInput);
   manifest = enrichedManifest.manifest;
-  if (enrichedManifest.changed || !fs.existsSync(path.join(sessionDir, 'refinement_manifest.json'))) {
-    writeManifest(sessionDir, manifest);
-  }
   const manifestIssues = validateRefinementManifest(manifest);
   if (manifestIssues.length > 0) {
     appendRefineLog(sessionDir, `Refinement manifest rejected: ${manifestIssues.join('; ')}`);
     throw new Error(`Refinement manifest rejected: ${manifestIssues.join('; ')}`);
   }
   markRefinePhase(manager, statePath, sessionDir, 'refine:materialize', 'Materializing ticket files.');
-  writeTicketFiles(sessionDir, manifest);
+  restructureTicketFiles(sessionDir, manifest);
 
   if (!manifest.tickets.length) {
     throw new Error('Refinement produced zero tickets.');

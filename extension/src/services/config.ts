@@ -33,8 +33,8 @@ export const DEFAULT_CONFIG: Config = {
     },
   },
   hooks: {
-    enabled: true,
-    validated_events: ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse'],
+    enabled: false,
+    validated_events: [],
   },
 };
 
@@ -169,13 +169,19 @@ function shouldMigrateLegacyMaxTimeConfig(raw: unknown): raw is LegacyMaxTimeCon
   }
 
   const normalized = normalizeConfig(raw);
+  const legacyHooks = {
+    enabled: true,
+    validated_events: ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse'],
+  };
+  const hooksAreManagedDefaults = JSON.stringify(normalized.hooks) === JSON.stringify(DEFAULT_CONFIG.hooks)
+    || JSON.stringify(normalized.hooks) === JSON.stringify(legacyHooks);
   return (
     JSON.stringify(normalized.runtime) === JSON.stringify(DEFAULT_CONFIG.runtime)
     && JSON.stringify(normalized.defaults) === JSON.stringify({
       ...DEFAULT_CONFIG.defaults,
       max_time_minutes: legacyDefaultMaxTime,
     })
-    && JSON.stringify(normalized.hooks) === JSON.stringify(DEFAULT_CONFIG.hooks)
+    && hooksAreManagedDefaults
   );
 }
 
@@ -190,14 +196,21 @@ export function ensureConfigFile(configPath: string = getConfigPath()): Config {
     atomicWriteJson(configPath, DEFAULT_CONFIG);
   } else {
     const raw = readJsonFile<unknown>(configPath, null);
-    if (shouldMigrateLegacyMaxTimeConfig(raw)) {
-      atomicWriteJson(configPath, {
-        ...raw,
-        defaults: {
-          ...raw.defaults,
-          max_time_minutes: DEFAULT_CONFIG.defaults.max_time_minutes,
-        },
-      });
+    if (isPlainObject(raw)) {
+      let migrated = raw;
+      let changed = false;
+      if (shouldMigrateLegacyMaxTimeConfig(raw)) {
+        migrated = {
+          ...migrated,
+          defaults: {
+            ...(migrated.defaults as Record<string, unknown>),
+            max_time_minutes: DEFAULT_CONFIG.defaults.max_time_minutes,
+          },
+          hooks: DEFAULT_CONFIG.hooks,
+        };
+        changed = true;
+      }
+      if (changed) atomicWriteJson(configPath, migrated);
     }
   }
   return loadConfig(configPath);

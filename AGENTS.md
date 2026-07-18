@@ -24,12 +24,12 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 - Optional project-local override: `bash install.sh --project <path-to-project>`
 - Keep installs local; do not assume marketplace publishing
 - Preserve unrelated runtime data under the Codex root when reinstalling
-- The installed runtime keeps its source `.codex/skills` and `.codex/hooks` trees so `~/.codex/pickle-rick/install.sh --project <path>` remains supported after global install
+- The plugin uses canonical root `skills/`; the installed runtime exposes `.codex/skills` as a compatibility symlink and keeps `.codex/hooks` only as inactive reference material
 
 ## Persona Activation
 
 - To activate the Pickle Rick persona generally, run `bash install.sh`
-- That installs the runtime, copies Pickle Rick skill directories into `~/.codex/skills`, and merges the managed Pickle Rick marker block into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
+- That installs the runtime, copies Pickle Rick skill directories into `~/.agents/skills`, and merges the managed Pickle Rick marker block into `~/.codex/AGENTS.md` (Codex reads `AGENTS.md`; the installer does not touch `CLAUDE.md`)
 - Open any project in Codex after the install; the persona is active when Codex reads the global instructions and the `pickle` skill is available
 - If you want a repo-local override, run `bash install.sh --project <path-to-project>`
 - Existing `AGENTS.md` content is preserved below the managed Pickle Rick block, with backups written under `.codex/pickle-rick-backups/`
@@ -39,7 +39,7 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 ## Skills
 
 - `pickle` is the primary entrypoint for the autonomous loop
-- `pickle-pipeline` launches one detached tmux session that runs `pickle`, then optional `anatomy-park`, then optional `szechuan-sauce`
+- `pickle-pipeline` launches one detached tmux session that runs `pickle`, optional `anatomy-park` and `szechuan-sauce`, then a mandatory final `citadel` release gate
 - `pickle-tmux` bootstraps from a PRD or resumes a prepared session in detached tmux with a live monitor
 - `pickle-prd` drafts the PRD
 - `pickle-refine` runs three analyst passes, synthesizes the result, and decomposes the PRD into tickets
@@ -52,9 +52,9 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 
 ## Hooks
 
-- Hooks are optional; install them explicitly with `bash install.sh --project <path> --enable-hooks`
-- The installed runtime ships `.codex/hooks/hooks.json` as an empty default contract and `.codex/hooks/hooks.template.json` for rendered project hooks
-- Keep `.codex/hooks/hooks.json` limited to handlers that exist locally
+- Hook installation is disabled; `--enable-hooks` fails closed until event delivery, payload, decision, and trust behavior pass authenticated validation on the installed Codex build
+- The installed runtime ships `.codex/hooks/hooks.json` as an empty default contract and `.codex/hooks/hooks.template.json` only as inactive reference material
+- Do not copy the legacy template into a project hook layer
 - Do not encode unsupported hook events into the default path
 - Hook failures should fail open unless the operation is explicitly safety-critical
 

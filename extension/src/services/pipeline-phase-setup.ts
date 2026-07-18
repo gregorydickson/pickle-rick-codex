@@ -4,6 +4,7 @@ import { appendHistory, markRunStart } from './session.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { setupSession } from './setup-session.js';
 import { StateManager, type PersistedState } from './state-manager.js';
+import { finalizeTerminalStateObject } from './state-terminal.js';
 import type { PipelineContract } from '../types/index.js';
 
 interface LoopConfig {
@@ -184,12 +185,14 @@ export async function preparePipelineLoopPhaseSession(
   sessionDir: string,
   pipeline: PipelineContract,
   preparePhase: (pipeline: PipelineContract) => LoopPhaseSetup,
+  allowedPaths: string[],
 ): Promise<LoopConfig> {
   const { setupArgs, loopConfig } = preparePhase(pipeline);
   await setupSession(['--resume', sessionDir, ...setupArgs], {
     cwd: pipeline.working_dir,
     updateSessionMap: false,
   });
+  loopConfig.allowed_paths = [...allowedPaths];
   atomicWriteJson(path.join(sessionDir, 'loop_config.json'), loopConfig);
   return loopConfig;
 }
@@ -222,15 +225,7 @@ export function exitLoopRunnerPhase(
   exitReason: string,
 ): string {
   const state = manager.update(statePath, (current) => {
-    const finalReason: string = current.active === false && current.last_exit_reason
-      ? (current.last_exit_reason as string)
-      : exitReason;
-    current.active = false;
-    current.tmux_runner_pid = null;
-    current.active_child_pid = null;
-    current.active_child_kind = null;
-    current.active_child_command = null;
-    current.last_exit_reason = finalReason;
+    const finalReason = finalizeTerminalStateObject(current, { exitReason });
     current.step = finalReason === 'success' ? 'complete' : 'paused';
     appendHistory(current, finalReason === 'success' ? 'complete' : finalReason, (current.current_ticket as string | null) || undefined);
     return current;

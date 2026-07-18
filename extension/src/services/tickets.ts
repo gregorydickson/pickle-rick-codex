@@ -18,6 +18,8 @@ import type {
   RefinementManifest,
   Ticket,
 } from '../types/index.js';
+import { resolveTicketScope } from './execution-gate.js';
+import { recoverInterruptedTicketTransaction, runTicketTransaction } from './ticket-transaction.js';
 
 export function getManifestPath(sessionDir: string): string {
   return path.join(sessionDir, 'refinement_manifest.json');
@@ -232,24 +234,25 @@ export function ensureTicketFilesMaterialized(
   sessionDir: string,
   manifest: RefinementManifest = readManifest(sessionDir),
 ): ParsedTicket[] {
+  recoverInterruptedTicketTransaction(sessionDir);
   const fileTickets = listTickets(sessionDir);
   const manifestTickets = manifest.tickets || [];
   if (manifestTickets.length === 0) {
     if (!fs.existsSync(getManifestPath(sessionDir))) {
       return fileTickets;
     }
-    pruneObsoleteTicketFiles(fileTickets, manifestTickets);
+    writeTicketFiles(sessionDir, manifest);
     return [];
   }
   if (fileTicketsCoverManifest(fileTickets, manifestTickets)) {
     return fileTickets;
   }
-  pruneObsoleteTicketFiles(fileTickets, manifestTickets);
   writeTicketFiles(sessionDir, manifest);
   return listTickets(sessionDir);
 }
 
 export function readManifest(sessionDir: string): RefinementManifest {
+  recoverInterruptedTicketTransaction(sessionDir);
   const manifest = readJsonFile<RefinementManifest>(getManifestPath(sessionDir), { tickets: [] }) || { tickets: [] };
   const normalized = enrichRefinementManifest(manifest);
   if (normalized.changed) {
@@ -259,7 +262,10 @@ export function readManifest(sessionDir: string): RefinementManifest {
 }
 
 export function writeManifest(sessionDir: string, manifest: RefinementManifest): string {
-  atomicWriteJson(getManifestPath(sessionDir), manifest);
+  const manifestPath = getManifestPath(sessionDir);
+  runTicketTransaction(sessionDir, 'write-manifest', [manifestPath], () => {
+    atomicWriteJson(manifestPath, manifest);
+  });
   return getManifestPath(sessionDir);
 }
 
@@ -449,6 +455,22 @@ function normalizeTicketContracts(ticket: Ticket): { ticket: Ticket; changed: bo
     nextTicket.proof_corpus = proofCorpus;
   }
   for (const alias of ['proofCorpus', 'proof_artifacts', 'proofArtifacts', 'corpus']) {
+    if (alias in nextTicket) {
+      delete nextTicket[alias as keyof Ticket];
+      changed = true;
+    }
+  }
+
+  const allowedPaths = normalizePathList(
+    ticket.allowed_paths ?? ticket.allowedPaths ?? ticket.files,
+  );
+  if (allowedPaths.length > 0) {
+    if (JSON.stringify(ticket.allowed_paths || []) !== JSON.stringify(allowedPaths)) {
+      changed = true;
+    }
+    nextTicket.allowed_paths = allowedPaths;
+  }
+  for (const alias of ['allowedPaths', 'files']) {
     if (alias in nextTicket) {
       delete nextTicket[alias as keyof Ticket];
       changed = true;
@@ -717,6 +739,10 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
 
   tickets.forEach((ticket, index) => {
     const label = ticket?.id || `ticket-${index + 1}`;
+    const scope = resolveTicketScope(ticket);
+    if (scope.error) {
+      issues.push(`${label}: ${scope.error}`);
+    }
     const acceptance = Array.isArray(ticket?.acceptance_criteria) ? ticket.acceptance_criteria : [];
     if (acceptance.length === 0) {
       issues.push(`${label}: missing acceptance criteria`);
@@ -855,23 +881,45 @@ function ticketFrontmatter(ticket: Ticket, order: number): string {
   ].join('\n');
 }
 
-export function writeTicketFiles(sessionDir: string, manifest: RefinementManifest): string[] {
+function materializeTicketFiles(
+  sessionDir: string,
+  manifest: RefinementManifest,
+  replaceManifest: boolean,
+): string[] {
+  recoverInterruptedTicketTransaction(sessionDir);
   const normalized = enrichRefinementManifest(manifest);
-  if (normalized.changed || !readJsonFile(getManifestPath(sessionDir), null)) {
-    writeManifest(sessionDir, normalized.manifest);
-  }
-  pruneObsoleteTicketFiles(listTickets(sessionDir), normalized.manifest.tickets || []);
+  const existingTicketPaths = listTicketFiles(sessionDir);
   const ticketPaths: string[] = [];
   normalized.manifest.tickets.forEach((ticket, index) => {
     const ticketId = canonicalTicketId(ticket, index);
+    ticketPaths.push(path.join(sessionDir, ticketId, `linear_ticket_${ticketId}.md`));
+  });
+  const transactionPaths = [getManifestPath(sessionDir), ...existingTicketPaths, ...ticketPaths];
+  return runTicketTransaction(sessionDir, 'materialize-tickets', transactionPaths, () => {
+    if (replaceManifest || normalized.changed || !readJsonFile(getManifestPath(sessionDir), null)) {
+      atomicWriteJson(getManifestPath(sessionDir), normalized.manifest);
+    }
+    pruneObsoleteTicketFiles(listTickets(sessionDir), normalized.manifest.tickets || []);
+    const writtenPaths: string[] = [];
+    normalized.manifest.tickets.forEach((ticket, index) => {
+      const ticketId = canonicalTicketId(ticket, index);
     const ticketDir = path.join(sessionDir, ticketId);
     ensureDir(ticketDir);
     const content = renderTicketFileContent(ticket, index + 1, ticketId);
     const filePath = path.join(ticketDir, `linear_ticket_${ticketId}.md`);
     atomicWriteFile(filePath, content);
-    ticketPaths.push(filePath);
+      writtenPaths.push(filePath);
+    });
+    return writtenPaths;
   });
-  return ticketPaths;
+}
+
+export function writeTicketFiles(sessionDir: string, manifest: RefinementManifest): string[] {
+  return materializeTicketFiles(sessionDir, manifest, false);
+}
+
+export function restructureTicketFiles(sessionDir: string, manifest: RefinementManifest): string[] {
+  return materializeTicketFiles(sessionDir, manifest, true);
 }
 
 export function listTickets(sessionDir: string): ParsedTicket[] {
@@ -945,6 +993,7 @@ export function fallbackRefinePrd(prdText: string): RefinementManifest {
       `Complete ${row.Title || row.ID || 'the task'} in the guaranteed Codex v1 path.`,
       `Satisfy dependencies: ${row['Depends On'] || 'none'}.`,
     ],
+    allowed_paths: [],
     verification: ['npm test'],
     priority: row.Priority || 'P1',
     status: 'Todo',
@@ -969,6 +1018,7 @@ export function fallbackRefinePrd(prdText: string): RefinementManifest {
         title: 'Implement PRD',
         description: 'Fallback ticket generated because no Task Breakdown table was found.',
         acceptance_criteria: ['Implement the requested work.', 'Run npm test.'],
+        allowed_paths: [],
         verification: ['npm test'],
         priority: 'P1',
         status: 'Todo',
@@ -999,15 +1049,24 @@ export function updateTicketStatus(
     }
     return content.replace(/^---\n/, `---\n${key}: ${JSON.stringify(value)}\n`);
   }, nextContent);
-  atomicWriteFile(ticket.filePath, rewritten);
-  const manifestTicket = manifest.tickets.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedId);
-  if (manifestTicket) {
-    Object.assign(manifestTicket, updates);
-    if (updates.status) {
-      manifestTicket.status = updates.status as string;
+  if (!Object.hasOwn(updates, 'completion_commit')) {
+    const beforeEvidence = ticket.content.match(/^completion_commit:\s*.*$/m)?.[0] || null;
+    const afterEvidence = rewritten.match(/^completion_commit:\s*.*$/m)?.[0] || null;
+    if (beforeEvidence !== afterEvidence) {
+      throw new Error(`Ticket status update would rewrite completion_commit evidence for ${normalizedId}.`);
     }
-    writeManifest(sessionDir, manifest);
   }
+  const manifestTicket = manifest.tickets.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedId);
+  runTicketTransaction(sessionDir, 'update-ticket-status', [getManifestPath(sessionDir), ticket.filePath], () => {
+    atomicWriteFile(ticket.filePath, rewritten);
+    if (manifestTicket) {
+      Object.assign(manifestTicket, updates);
+      if (updates.status) {
+        manifestTicket.status = updates.status as string;
+      }
+      atomicWriteJson(getManifestPath(sessionDir), manifest);
+    }
+  });
   return parseTicketFile(ticket.filePath);
 }
 
