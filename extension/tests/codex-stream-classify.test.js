@@ -47,6 +47,66 @@ test('codex-block parsing keeps only codex content and observes serialized tool 
   assert.equal(observation?.command, 'node bin/setup.js --resume /tmp/session');
 });
 
+test('assistant extraction tolerates variant JSONL content blocks and fallback event shapes', () => {
+  const completed = [
+    JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', content: ['first', { text: 'second' }, null] } }),
+    JSON.stringify({ type: 'assistant', message: { content: 'ignored fallback' } }),
+  ].join('\n');
+  assert.equal(extractAssistantContent(completed), 'first\nsecond');
+
+  const fallback = [
+    JSON.stringify({ type: 'assistant', message: { content: [{ text: 'assistant block' }] } }),
+    JSON.stringify({ type: 'result', result: 'result block' }),
+    JSON.stringify({ type: 'response.output_text.done', text: 'response block' }),
+  ].join('\n');
+  assert.equal(extractAssistantContent(fallback), 'assistant block\nresult block\nresponse block');
+
+  assert.equal(extractAssistantContent('{"metadata":true}\n{"alsoMetadata":1}'), '');
+});
+
+test('tool-call observation tolerates malformed arguments and deduplicates equivalent calls', () => {
+  const direct = observeCodexToolCallStream('node bin/setup.js --resume "/tmp/session path"', 'codex-block');
+  assert.deepEqual(direct?.argv, ['node', 'bin/setup.js', '--resume', '/tmp/session path']);
+  assert.equal(direct?.isSetupInvocation, true);
+
+  const malformed = JSON.stringify({
+    type: 'function_call',
+    name: 'custom',
+    arguments: '{not-json',
+  });
+  const parsed = observeCodexToolCallStream(malformed, 'stream-json');
+  assert.equal(parsed?.arguments, '{not-json');
+  assert.equal(parsed?.command, null);
+  assert.equal(observeCodexToolCallStream('ordinary codex prose', 'codex-block'), null);
+
+  const command = JSON.stringify({
+    type: 'command_execution',
+    command: 'node ./bin/setup.ts --resume',
+    input: ['ignored-non-object'],
+  });
+  const calls = collectCodexToolCalls([command, command, malformed, '{bad-json'].join('\n'));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].name, 'shell');
+  assert.equal(calls[0].isSetupInvocation, true);
+  assert.equal(calls[1].name, 'custom');
+});
+
+test('usage extraction accumulates direct and nested counters while ignoring non-object events', () => {
+  const output = [
+    JSON.stringify({ usage: { input_tokens: 2, output_tokens: 3, cache_creation_input_tokens: 4, cached_input_tokens: 5 } }),
+    JSON.stringify({ response: { usage: { input_tokens: 7, cache_read_input_tokens: 11 } } }),
+    JSON.stringify({ result: { usage: { output_tokens: 13 } } }),
+    JSON.stringify(['ignored']),
+    'not-json',
+  ].join('\n');
+  assert.deepEqual(extractCodexUsage(output), {
+    input_tokens: 9,
+    output_tokens: 16,
+    cache_creation_input_tokens: 4,
+    cache_read_input_tokens: 16,
+  });
+});
+
 test('codex runner results and success checks expose classified events without replacing raw stdout', async () => {
   let observed = null;
   const result = await runCommand({
