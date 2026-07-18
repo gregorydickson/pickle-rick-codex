@@ -72,6 +72,42 @@ function createReadyFixture() {
   return { dataRoot, sessionDir, workingDir };
 }
 
+function createMeasuredMicroverseFixture() {
+  const dataRoot = makeTempRoot('pickle-readiness-microverse-data-');
+  const workingDir = makeTempRoot('pickle-readiness-microverse-project-');
+  const sessionDir = path.join(dataRoot, 'sessions', 'microverse-session');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  git(workingDir, ['init']);
+  git(workingDir, ['config', 'user.name', 'Readiness Test']);
+  git(workingDir, ['config', 'user.email', 'readiness@example.com']);
+  fs.writeFileSync(path.join(workingDir, 'metric.js'), 'console.log(73.72);\n');
+  git(workingDir, ['add', 'metric.js']);
+  git(workingDir, ['commit', '-m', 'baseline']);
+  writeJson(path.join(dataRoot, 'config.json'), { runtime: { command: process.execPath } });
+  writeJson(path.join(sessionDir, 'state.json'), {
+    schema_version: 1,
+    active: false,
+    working_dir: workingDir,
+    step: 'setup',
+    tmux_mode: true,
+    recovery_required: false,
+  });
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse',
+    metric: 'node metric.js',
+    goal: null,
+    direction: 'higher',
+    target: 90,
+    target_relation: 'gte',
+    tolerance: 0,
+    metric_timeout_seconds: 120,
+    worker_failure_limit: 3,
+    stall_limit: 8,
+    protected_paths: ['metric.js'],
+  });
+  return { dataRoot, sessionDir, workingDir };
+}
+
 test('checkReadiness approves a prepared session and bounds readiness cycle history', () => {
   const fixture = createReadyFixture();
   const previousRoot = process.env.PICKLE_DATA_ROOT;
@@ -162,6 +198,79 @@ test('checkReadiness rejects malformed or contract-mismatched quality results', 
     writeJson(statePath, state);
     const mismatched = checkReadiness(fixture.sessionDir, { runtimeRoot: projectRoot });
     assert.equal(mismatched.ready, false);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('checkReadiness approves a prepared measured Microverse without ticket-run artifacts and probes tmux with -V', () => {
+  const fixture = createMeasuredMicroverseFixture();
+  const fakeBin = makeTempRoot('pickle-readiness-tmux-bin-');
+  const tmuxLog = path.join(fakeBin, 'tmux.log');
+  const fakeTmux = path.join(fakeBin, 'tmux');
+  fs.writeFileSync(fakeTmux, [
+    '#!/bin/sh',
+    'printf "%s\\n" "$*" >> "$FAKE_TMUX_LOG"',
+    '[ "$1" = "-V" ] || exit 97',
+    'echo "tmux 3.4"',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = fixture.dataRoot;
+  try {
+    const report = checkReadiness(fixture.sessionDir, {
+      runtimeRoot: projectRoot,
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH || ''}`,
+        FAKE_TMUX_LOG: tmuxLog,
+      },
+    });
+    assert.equal(report.ready, true, JSON.stringify(report.findings));
+    const codes = new Set(report.findings.map((entry) => entry.code));
+    assert.ok(codes.has('advanced-loop-config-valid'));
+    assert.ok(codes.has('advanced-loop-target-valid'));
+    assert.ok(codes.has('advanced-loop-protection-valid'));
+    assert.ok(codes.has('refinement-manifest-not-applicable'));
+    assert.ok(codes.has('quality-baseline-not-applicable'));
+    assert.ok(codes.has('lifecycle-evidence-not-applicable'));
+    assert.equal(codes.has('refinement-manifest-invalid'), false);
+    assert.equal(codes.has('quality-baseline-not-ready'), false);
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8').trim(), '-V');
+  } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('checkReadiness fails closed on invalid measured Microverse target and protected-path contracts', () => {
+  const fixture = createMeasuredMicroverseFixture();
+  const loopConfigPath = path.join(fixture.sessionDir, 'loop_config.json');
+  const loopConfig = JSON.parse(fs.readFileSync(loopConfigPath, 'utf8'));
+  loopConfig.target_relation = 'lte';
+  loopConfig.protected_paths = ['/absolute/metric.js'];
+  writeJson(loopConfigPath, loopConfig);
+  const statePath = path.join(fixture.sessionDir, 'state.json');
+  writeJson(statePath, { ...JSON.parse(fs.readFileSync(statePath, 'utf8')), tmux_mode: false });
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = fixture.dataRoot;
+  try {
+    const invalidTarget = checkReadiness(fixture.sessionDir, { runtimeRoot: projectRoot });
+    assert.equal(invalidTarget.ready, false);
+    assert.match(
+      invalidTarget.findings.find((entry) => entry.code === 'advanced-loop-config-invalid')?.evidence || '',
+      /incompatible with direction higher/,
+    );
+
+    loopConfig.target_relation = 'gte';
+    writeJson(loopConfigPath, loopConfig);
+    const invalidProtection = checkReadiness(fixture.sessionDir, { runtimeRoot: projectRoot });
+    assert.equal(invalidProtection.ready, false);
+    assert.match(
+      invalidProtection.findings.find((entry) => entry.code === 'advanced-loop-config-invalid')?.evidence || '',
+      /repository-relative paths or globs/,
+    );
   } finally {
     if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
     else process.env.PICKLE_DATA_ROOT = previousRoot;

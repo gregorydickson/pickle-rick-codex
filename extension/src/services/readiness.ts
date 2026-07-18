@@ -5,6 +5,8 @@ import { loadConfig } from './config.js';
 import { canExecute, loadCircuitState } from './circuit-breaker.js';
 import { deriveCitadelAcceptanceCriteria, validateCitadelReport } from './citadel.js';
 import { assertQualityBaselineFresh, resolveTicketScope } from './execution-gate.js';
+import { normalizeMetricTargetContract, normalizeMetricTolerance } from './metric-convergence.js';
+import { captureProtectedPathManifest } from './microverse-protection.js';
 import { atomicWriteJson, listTicketFiles, parseTicketFile, readJsonFile } from './pickle-utils.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
 import { assertSchemaVersionDeployParity, RUNTIME_STATE_SCHEMA_VERSION } from './state-manager.js';
@@ -54,9 +56,94 @@ function readJsonStrict<T>(filePath: string): T {
   return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
 }
 
-function commandAvailable(command: string): boolean {
-  const result = spawnSync(command, ['--version'], { encoding: 'utf8', timeout: 10_000 });
+function commandAvailable(command: string, env: NodeJS.ProcessEnv): boolean {
+  const versionArgs = command === 'tmux' ? ['-V'] : ['--version'];
+  const result = spawnSync(command, versionArgs, { encoding: 'utf8', timeout: 10_000, env });
   return !result.error && result.status === 0;
+}
+
+const ADVANCED_LOOP_MODES = new Set(['microverse', 'anatomy-park', 'szechuan-sauce']);
+
+function validatePositiveInteger(value: unknown, field: string): void {
+  if (!Number.isInteger(value) || Number(value) <= 0) {
+    throw new Error(`${field} must be a positive integer.`);
+  }
+}
+
+function validateAdvancedLoopConfig(
+  sessionDir: string,
+  workingDir: string,
+): { advanced: boolean; findings: ReadinessFinding[] } {
+  const loopConfigPath = path.join(sessionDir, 'loop_config.json');
+  if (!fs.existsSync(loopConfigPath)) return { advanced: false, findings: [] };
+
+  const findings: ReadinessFinding[] = [];
+  try {
+    const config = readJsonStrict<Record<string, unknown>>(loopConfigPath);
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+      throw new Error('loop_config.json must contain an object.');
+    }
+    const mode = typeof config.mode === 'string' ? config.mode.trim() : '';
+    if (!ADVANCED_LOOP_MODES.has(mode)) {
+      throw new Error(`loop_config.json mode must be one of ${[...ADVANCED_LOOP_MODES].join(', ')}.`);
+    }
+
+    if (config.stall_limit !== undefined && config.stall_limit !== null) {
+      validatePositiveInteger(config.stall_limit, 'stall_limit');
+    }
+
+    if (mode === 'microverse') {
+      const metric = typeof config.metric === 'string' ? config.metric.trim() : '';
+      const goal = typeof config.goal === 'string' ? config.goal.trim() : '';
+      if (Boolean(metric) === Boolean(goal)) {
+        throw new Error('Microverse loop_config.json must declare exactly one non-empty metric or goal.');
+      }
+      const direction = config.direction ?? 'higher';
+      normalizeMetricTolerance(config.tolerance);
+      if (config.worker_failure_limit !== undefined && config.worker_failure_limit !== null) {
+        validatePositiveInteger(config.worker_failure_limit, 'worker_failure_limit');
+      }
+      if (config.metric_timeout_seconds !== undefined && config.metric_timeout_seconds !== null) {
+        const timeout = Number(config.metric_timeout_seconds);
+        if (!Number.isFinite(timeout) || timeout <= 0) {
+          throw new Error('metric_timeout_seconds must be a positive finite number.');
+        }
+      }
+      const target = normalizeMetricTargetContract(direction, config.target, config.target_relation);
+      if (!metric && target.target !== null) {
+        throw new Error('Free-form Microverse goal sessions cannot declare a numeric metric target.');
+      }
+      if (config.protected_paths !== undefined && config.protected_paths !== null
+          && (!Array.isArray(config.protected_paths)
+            || config.protected_paths.some((entry) => typeof entry !== 'string'))) {
+        throw new Error('protected_paths must be an array of repository-relative path or glob strings.');
+      }
+      const protectedManifest = captureProtectedPathManifest(workingDir, config.protected_paths);
+      findings.push(finding(
+        'info',
+        'advanced-loop-protection-valid',
+        `Microverse protected-path contract has ${protectedManifest.patterns.length} pattern(s) covering ${Object.keys(protectedManifest.files).length} current path(s).`,
+      ));
+      findings.push(finding(
+        'info',
+        'advanced-loop-target-valid',
+        target.target === null
+          ? 'Measured Microverse has no numeric stop target.'
+          : `Measured Microverse target is ${target.target_relation} ${target.target}.`,
+      ));
+    } else {
+      const target = typeof config.target === 'string' ? config.target.trim() : '';
+      if (!target) throw new Error(`${mode} loop_config.json requires a non-empty target path.`);
+      if (!fs.existsSync(path.resolve(target))) {
+        throw new Error(`${mode} target does not exist: ${target}`);
+      }
+    }
+
+    findings.push(finding('info', 'advanced-loop-config-valid', `${mode} loop_config.json passed readiness validation.`));
+  } catch (error) {
+    findings.push(finding('error', 'advanced-loop-config-invalid', error instanceof Error ? error.message : String(error)));
+  }
+  return { advanced: true, findings };
 }
 
 function checkRuntimeLayout(runtimeRoot: string): ReadinessFinding[] {
@@ -148,57 +235,75 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   if (workingDir) findings.push(...checkGitTree(workingDir));
   else findings.push(finding('error', 'working-dir-missing', 'Session state has no working_dir.'));
 
-  const manifestPath = path.join(resolvedSessionDir, 'refinement_manifest.json');
   let manifest: RefinementManifest = { tickets: [] };
-  try {
-    manifest = readJsonStrict<RefinementManifest>(manifestPath);
-    const issues = validateRefinementManifest(structuredClone(manifest));
-    if (issues.length) {
-      for (const issue of issues) findings.push(finding('error', 'refinement-manifest-invalid', issue));
+  const advancedProfile = validateAdvancedLoopConfig(resolvedSessionDir, workingDir);
+  findings.push(...advancedProfile.findings);
+  if (advancedProfile.advanced) {
+    if (state?.tmux_mode !== true) {
+      findings.push(finding('error', 'advanced-loop-state-invalid', 'Advanced-loop readiness requires state.tmux_mode=true.'));
     } else {
-      findings.push(finding('info', 'refinement-manifest-valid', `${manifest.tickets.length} refined ticket(s) passed validation.`));
+      findings.push(finding('info', 'advanced-loop-state-valid', 'Session state is prepared for detached advanced-loop execution.'));
     }
-  } catch (error) {
-    findings.push(finding('error', 'refinement-manifest-invalid', error instanceof Error ? error.message : String(error)));
-  }
+    findings.push(
+      finding('info', 'refinement-manifest-not-applicable', 'Advanced-loop sessions do not use refinement manifests.'),
+      finding('info', 'ticket-files-not-applicable', 'Advanced-loop sessions do not materialize ticket files.'),
+      finding('info', 'scope-contract-not-applicable', 'Advanced-loop mutation scope is enforced by its loop configuration and runtime.'),
+      finding('info', 'quality-baseline-not-applicable', 'Advanced-loop sessions use loop-specific metric or review evidence instead of a ticket quality baseline.'),
+    );
+  } else {
+    const manifestPath = path.join(resolvedSessionDir, 'refinement_manifest.json');
+    try {
+      manifest = readJsonStrict<RefinementManifest>(manifestPath);
+      const issues = validateRefinementManifest(structuredClone(manifest));
+      if (issues.length) {
+        for (const issue of issues) findings.push(finding('error', 'refinement-manifest-invalid', issue));
+      } else {
+        findings.push(finding('info', 'refinement-manifest-valid', `${manifest.tickets.length} refined ticket(s) passed validation.`));
+      }
+    } catch (error) {
+      findings.push(finding('error', 'refinement-manifest-invalid', error instanceof Error ? error.message : String(error)));
+    }
 
-  const tickets = Array.isArray(manifest.tickets) ? manifest.tickets : [];
-  const materializedIds = new Set(listTicketFiles(resolvedSessionDir)
-    .map((filePath) => parseTicketFile(filePath)?.id)
-    .filter((value): value is string => Boolean(value))
-    .map((value) => normalizeTicketId(value)));
-  for (const ticket of tickets) {
-    const ticketId = normalizeTicketId(ticket.id || ticket.title, 'ticket');
-    if (!materializedIds.has(ticketId)) findings.push(finding('error', 'ticket-file-missing', `No materialized ticket file exists for ${ticketId}.`));
-    const scope = resolveTicketScope(ticket);
-    if (scope.error) findings.push(finding('error', 'scope-contract-invalid', `${ticketId}: ${scope.error}`));
-    if (workingDir) {
-      try {
-        assertTicketVerificationReady({
-          ticket,
-          config: loadConfig() as unknown as ConfigVerificationInput,
-          ambientEnv: options.env || process.env,
-          cwd: workingDir,
-        });
-      } catch (error) {
-        findings.push(finding('error', 'verification-preflight-failed', `${ticketId}: ${error instanceof Error ? error.message : String(error)}`));
+    const tickets = Array.isArray(manifest.tickets) ? manifest.tickets : [];
+    const materializedIds = new Set(listTicketFiles(resolvedSessionDir)
+      .map((filePath) => parseTicketFile(filePath)?.id)
+      .filter((value): value is string => Boolean(value))
+      .map((value) => normalizeTicketId(value)));
+    for (const ticket of tickets) {
+      const ticketId = normalizeTicketId(ticket.id || ticket.title, 'ticket');
+      if (!materializedIds.has(ticketId)) findings.push(finding('error', 'ticket-file-missing', `No materialized ticket file exists for ${ticketId}.`));
+      const scope = resolveTicketScope(ticket);
+      if (scope.error) findings.push(finding('error', 'scope-contract-invalid', `${ticketId}: ${scope.error}`));
+      if (workingDir) {
+        try {
+          assertTicketVerificationReady({
+            ticket,
+            config: loadConfig() as unknown as ConfigVerificationInput,
+            ambientEnv: options.env || process.env,
+            cwd: workingDir,
+          });
+        } catch (error) {
+          findings.push(finding('error', 'verification-preflight-failed', `${ticketId}: ${error instanceof Error ? error.message : String(error)}`));
+        }
       }
     }
-  }
-  if (workingDir) {
-    const scopeAudit = auditPersistedScopeForCitadel(resolvedSessionDir, workingDir);
-    if (scopeAudit) findings.push(finding('error', 'scope-contract-stale', scopeAudit));
+    if (workingDir) {
+      const scopeAudit = auditPersistedScopeForCitadel(resolvedSessionDir, workingDir);
+      if (scopeAudit) findings.push(finding('error', 'scope-contract-stale', scopeAudit));
+    }
+
+    try {
+      assertQualityBaselineFresh(state?.quality_baseline, workingDir);
+      findings.push(finding('info', 'quality-baseline-fresh', 'Persisted quality baseline matches HEAD and the current command contract.'));
+    } catch (error) {
+      findings.push(finding('error', 'quality-baseline-not-ready', error instanceof Error ? error.message : String(error)));
+    }
   }
 
-  try {
-    assertQualityBaselineFresh(state?.quality_baseline, workingDir);
-    findings.push(finding('info', 'quality-baseline-fresh', 'Persisted quality baseline matches HEAD and the current command contract.'));
-  } catch (error) {
-    findings.push(finding('error', 'quality-baseline-not-ready', error instanceof Error ? error.message : String(error)));
-  }
-
+  const toolEnv = options.env || process.env;
   for (const command of ['git', 'node', loadConfig().runtime.command, ...(state?.tmux_mode === true ? ['tmux'] : [])]) {
-    if (!commandAvailable(command)) findings.push(finding('error', 'required-tool-missing', `${command} is unavailable or failed --version.`));
+    const versionFlag = command === 'tmux' ? '-V' : '--version';
+    if (!commandAvailable(command, toolEnv)) findings.push(finding('error', 'required-tool-missing', `${command} is unavailable or failed ${versionFlag}.`));
   }
 
   const circuit = loadCircuitState(resolvedSessionDir);
@@ -209,7 +314,11 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   }
   if (state?.active === true) findings.push(finding('error', 'session-active', 'Session is already active; readiness must be checked before a new launch.'));
 
-  findings.push(...checkLifecycle(resolvedSessionDir, tickets));
+  if (advancedProfile.advanced) {
+    findings.push(finding('info', 'lifecycle-evidence-not-applicable', 'Advanced-loop iterations use loop-specific evidence rather than ticket worker lifecycle artifacts.'));
+  } else {
+    findings.push(...checkLifecycle(resolvedSessionDir, Array.isArray(manifest.tickets) ? manifest.tickets : []));
+  }
   const citadelPath = path.join(resolvedSessionDir, 'citadel-report.json');
   const citadelRequired = state?.step === 'complete' || state?.pipeline_phase === 'citadel';
   if (fs.existsSync(citadelPath)) {
