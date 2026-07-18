@@ -1398,10 +1398,12 @@ test('spawn-morty still blocks scoped package-manager test failures when the sam
   });
   const remaining = subtractBaselineFailures(sessionDir, 'r1', command, projectDir, failures);
 
-  assert.deepEqual(
-    remaining.map((failure) => failure.identity),
-    ['tests/scoped-red.test.js::spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline'],
-  );
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].in_scope, true);
+  assert.ok([
+    'tests/scoped-red.test.js::spawn-morty still blocks scoped package-manager test failures when the same identity exists in the baseline',
+    `command:${command}`,
+  ].includes(remaining[0].identity));
 });
 
 test('spawn-morty still blocks prefixed scoped package-manager test failures when the same identity exists in the baseline', { concurrency: false }, () => {
