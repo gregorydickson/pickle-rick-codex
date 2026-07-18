@@ -13,7 +13,36 @@ import {
   validateCitadelReport,
 } from '../services/citadel.js';
 import { StateManager } from '../services/state-manager.js';
-import { makeTempRoot } from './helpers.js';
+import { makeTempRoot, writeExecutable } from './helpers.js';
+
+function initCitadelRepo() {
+  const cwd = makeTempRoot('pickle-citadel-lifecycle-repo-');
+  execFileSync('git', ['init', '-q'], { cwd });
+  execFileSync('git', ['config', 'user.email', 'pickle@example.test'], { cwd });
+  execFileSync('git', ['config', 'user.name', 'Pickle Test'], { cwd });
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: 'node -e "process.exit(0)"' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'release checkpoint'], { cwd });
+  return cwd;
+}
+
+function makeCitadelLifecycleSession(criterion) {
+  const cwd = initCitadelRepo();
+  const sessionDir = makeTempRoot('pickle-citadel-lifecycle-session-');
+  const startCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({
+    schema_version: 1,
+    working_dir: cwd,
+    start_commit: startCommit,
+    worker_timeout_seconds: 10,
+  }));
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{ acceptance_criteria: [criterion] }],
+  }));
+  return { cwd, sessionDir };
+}
 
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({
@@ -238,4 +267,55 @@ test('runCitadel fails closed before monitored checks when release evidence is u
   assert.equal(scopeReport.verdict, 'block');
   assert.match(scopeReport.findings[0].title, /scope contract is invalid/i);
   assert.match(scopeReport.findings[0].evidence, /scope\.json identity is malformed/);
+});
+
+test('runCitadel monitors checks and enforces reviewer evidence and approval signals', async () => {
+  const fakeBin = makeTempRoot('pickle-citadel-lifecycle-bin-');
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
+const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
+const mode = criteria[0] || '';
+fs.writeFileSync(reportPath, JSON.stringify({
+  schema_version: 1,
+  verdict: 'approve',
+  reviewed_range: 'provided by gate',
+  acceptance_criteria_checked: mode.includes('invalid evidence') ? [] : criteria,
+  findings: [],
+  generated_at: '2026-07-18T00:00:00.000Z'
+}));
+const message = mode.includes('missing promise') ? 'review complete' : '<promise>THE_CITADEL_APPROVES</promise>';
+const outputIndex = args.indexOf('--output-last-message');
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], message);
+console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_tokens: 1 } }));
+`);
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+  try {
+    const approved = makeCitadelLifecycleSession('approved release evidence');
+    assert.equal(await runCitadel(approved.sessionDir), 'success');
+    const approvedReport = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'citadel-report.json'), 'utf8'));
+    const checks = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'citadel-checks.json'), 'utf8')).checks;
+    const approvedState = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'state.json'), 'utf8'));
+    assert.equal(approvedReport.verdict, 'approve');
+    assert.deepEqual(checks.map(({ status }) => status), ['skipped', 'skipped', 'passed']);
+    assert.equal(approvedState.active_child_pid, null);
+    assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: approved.cwd, encoding: 'utf8' }), '');
+
+    const invalid = makeCitadelLifecycleSession('invalid evidence');
+    assert.equal(await runCitadel(invalid.sessionDir), 'citadel-blocked');
+    const invalidReport = JSON.parse(fs.readFileSync(path.join(invalid.sessionDir, 'citadel-report.json'), 'utf8'));
+    assert.match(invalidReport.findings[0].title, /report evidence is invalid/i);
+    assert.match(invalidReport.findings[0].evidence, /coverage is incomplete/i);
+
+    const missingPromise = makeCitadelLifecycleSession('missing promise');
+    assert.equal(await runCitadel(missingPromise.sessionDir), 'citadel-blocked');
+    const missingPromiseReport = JSON.parse(fs.readFileSync(path.join(missingPromise.sessionDir, 'citadel-report.json'), 'utf8'));
+    assert.match(missingPromiseReport.findings[0].title, /approval signal missing/i);
+  } finally {
+    process.env.PATH = originalPath;
+  }
 });
