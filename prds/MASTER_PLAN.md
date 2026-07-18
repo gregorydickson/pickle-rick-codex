@@ -4,16 +4,15 @@
 `prds/`; shipped detail lives in `git log`. `AGENTS.md` is the canonical runtime contract.
 
 **Updated 2026-07-18.** A fresh source, installation, integration, safety, and Claude-parity audit replaced
-the stale June snapshot. The TypeScript migration and detached pipeline with mandatory Citadel are present, but the
-port remains beta while missing safety gates and reduced parity surfaces are hardened. Distribution
-findings—truthful source/installed tests, package metadata, command paths, prerequisites, and CI install
-smoke—are release-gate work rather than documentation-only claims.
+the stale June snapshot. The TypeScript migration, eight-phase worker lifecycle, recoverable safety seams, scoped
+detached pipeline, and mandatory Citadel gate are present. The port remains beta until the hardened pipeline gains
+current authenticated dogfood evidence and the remaining reduced parity surfaces are exercised in the field.
 
 ## Status
 
 | Item | Value |
 |---|---|
-| Version | **0.2.17-beta.1** (`package.json`) |
+| Version | **0.2.17-beta.2** (`package.json`) |
 | Runtime data root | `~/.codex/pickle-rick/` (override `PICKLE_DATA_ROOT`) |
 | Source → deploy | `extension/src/**/*.ts` → `npm ci` + `tsc` → `rsync` compiled runtime → `~/.codex/pickle-rick/extension/` |
 | Guaranteed path | sequential `codex exec`; native multi-agent only after local validation |
