@@ -1400,7 +1400,21 @@ async function main(argv: string[]): Promise<void> {
   if (!sessionDir) {
     throw new Error('Usage: node bin/loop-runner.js <session-dir>');
   }
-  await runLoop(sessionDir);
+  try {
+    await runLoop(sessionDir);
+  } catch (error) {
+    const statePath = path.join(sessionDir, 'state.json');
+    try {
+      const manager = new StateManager();
+      if (manager.read(statePath).active !== false) {
+        const finalReason = exitLoopRunnerPhase(manager, statePath, 'error');
+        appendRunnerLog(sessionDir, `loop-runner emergency finalization: ${finalReason}: ${safeErrorMessage(error)}`);
+      }
+    } catch (finalizeError) {
+      console.error(`Loop runner emergency finalization failed: ${safeErrorMessage(finalizeError)}`);
+    }
+    throw error;
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

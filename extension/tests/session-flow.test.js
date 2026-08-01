@@ -2373,11 +2373,11 @@ test('microverse expands a saturated metric timeout and continues from the stabl
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse',
     task: 'keep a growing evaluator from stopping convergence',
-    metric: `if test -f growing-metric; then sleep 0.3; wc -c < growing-metric; elif test -f '${counterPath}'; then sleep 0.3; printf 0; else printf 0; fi`,
+    metric: `if test -f growing-metric; then sleep 1.25; wc -c < growing-metric; elif test -f '${counterPath}'; then sleep 1.25; printf 0; else printf 0; fi`,
     direction: 'higher',
     target: 1,
     target_relation: 'gte',
-    metric_timeout_seconds: 0.2,
+    metric_timeout_seconds: 1,
     stall_limit: 3,
     worker_failure_limit: 3,
   });
@@ -2393,10 +2393,10 @@ test('microverse expands a saturated metric timeout and continues from the stabl
   assert.equal(ledger.experiments[0].attempt, 2);
   assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'worker_incomplete');
   assert.equal(ledger.experiments[0].worker_attempts[1].classification, 'improved');
-  assert.ok(loopConfig.metric_timeout_seconds >= 0.4);
+  assert.ok(loopConfig.metric_timeout_seconds >= 2);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   assert.match(log, /metric timeout increased/);
-  assert.match(log, /checkpoint replay exceeded 200ms/);
+  assert.match(log, /checkpoint replay exceeded 1000ms/);
 });
 
 test('microverse fails closed when the metric remains invalid after rollback', () => {
@@ -4073,6 +4073,9 @@ test('loop-runner fails closed without committing a dirty anatomy-park git tree'
     target: projectDir,
     stall_limit: 2,
   });
+  const launchedState = readJsonFile(path.join(sessionDir, 'state.json'));
+  launchedState.active = true;
+  writeJson(path.join(sessionDir, 'state.json'), launchedState);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir }),
@@ -4082,10 +4085,13 @@ test('loop-runner fails closed without committing a dirty anatomy-park git tree'
   const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
   const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
   const commitSubject = runGit(projectDir, ['log', '-1', '--pretty=%s']);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
 
   assert.equal(afterHead, beforeHead);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), 'M index.js');
   assert.equal(commitSubject, 'base');
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'error');
   assert.match(runnerLog, /refusing anatomy-park start with 1 pre-existing tracked change/);
 });
 
@@ -4124,9 +4130,11 @@ test('loop-runner refuses untracked-only anatomy-park preflight dirt', () => {
 
   const afterHead = runGit(projectDir, ['rev-parse', 'HEAD']);
   const runnerLog = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
 
   assert.equal(afterHead, beforeHead);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '?? scratch.txt');
+  assert.equal(state.active, false);
   assert.match(runnerLog, /refusing anatomy-park start with 1 pre-existing untracked path/);
   assert.doesNotMatch(runnerLog, /preflight auto-committed:/);
 });
