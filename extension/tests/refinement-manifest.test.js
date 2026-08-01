@@ -227,6 +227,40 @@ test('normalizeManifestTicketIds rewrites dependency references to canonical ids
   assert.equal(manifest.tickets[1].depends_on, 'r1');
 });
 
+test('validateRefinementManifest rejects ticket ids that collide after normalization', () => {
+  const enriched = enrichRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [
+      {
+        id: 'API Client',
+        title: 'Implement API client',
+        description: 'Build the client transport.',
+        acceptance_criteria: ['The API client sends authenticated requests.'],
+        verification: ['node --test tests/api-client.test.js'],
+        allowed_paths: ['src/api-client.ts'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+      {
+        id: 'api-client',
+        title: 'Verify API client retries',
+        description: 'Cover retry behavior separately.',
+        acceptance_criteria: ['Transient failures retry within the configured limit.'],
+        verification: ['node --test tests/api-client-retry.test.js'],
+        allowed_paths: ['tests/api-client-retry.test.js'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  assert.deepEqual(enriched.manifest.tickets.map((ticket) => ticket.id), ['api-client', 'api-client']);
+  assert.ok(
+    validateRefinementManifest(enriched.manifest)
+      .some((issue) => issue.includes('duplicate normalized ticket id "api-client"')),
+  );
+});
+
 test('enrichRefinementManifest normalizes dependency aliases and materializes verification_env', () => {
   const manifest = {
     tickets: [

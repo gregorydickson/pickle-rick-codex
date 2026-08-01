@@ -697,6 +697,21 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
     issues.push(`manifest source "${manifest?.source}" is a fallback parser output and is not safe to execute`);
   }
 
+  // Ticket IDs become directory and file keys during materialization. Detect
+  // slug collisions here or a later ticket silently overwrites an earlier one.
+  const firstTicketIndexById = new Map<string, number>();
+  tickets.forEach((ticket, index) => {
+    const ticketId = canonicalTicketId(ticket, index);
+    const firstIndex = firstTicketIndexById.get(ticketId);
+    if (firstIndex !== undefined) {
+      issues.push(
+        `duplicate normalized ticket id "${ticketId}" at ticket indexes ${firstIndex} and ${index}`,
+      );
+      return;
+    }
+    firstTicketIndexById.set(ticketId, index);
+  });
+
   const ownedArtifacts = new Map<string, string[]>();
   const authoritativeFreezeByArtifact = new Map<string, { owner: string; contract: FreezeContract; signature: string }>();
   const contractDecisionByArtifact = new Map<string, string[]>();
