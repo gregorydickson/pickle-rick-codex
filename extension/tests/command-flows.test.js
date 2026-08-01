@@ -473,6 +473,90 @@ process.exit(1);
   assert.equal(state.history.at(-1).step, 'refine');
 });
 
+test('spawn-refinement-team rejects partial fallback output after a clean codex exit', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+const addDirs = [];
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+if (prompt.includes('Refinement analyst role:')) {
+  console.error('fake analyst failure');
+  process.exit(1);
+} else if (prompt.includes('Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.')) {
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      generated_at: '2026-08-01T00:00:00.000Z',
+      source: 'partial-fallback',
+      tickets: [
+        {
+          id: 'ticket-001',
+          title: 'Partial fallback must not run',
+          description: 'This manifest was written before fallback completed its artifact contract.',
+          acceptance_criteria: ['Only complete fallback output can become executable work.'],
+          verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
+          priority: 'P1',
+          status: 'Todo'
+        }
+      ]
+    }, null, 2),
+  );
+  // Exit zero without prd_refined.md or the REFINEMENT_COMPLETE promise.
+} else {
+  console.error('unexpected prompt');
+  process.exit(1);
+}
+
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+      cwd: projectDir,
+      env,
+    }),
+    /PRD refinement failed: fallback did not complete its artifact contract/,
+  );
+
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'prd_refined.md')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')), false);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'refine:fallback');
+});
+
 test('spawn-refinement-team rejects partial synthesis output after a clean codex exit', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

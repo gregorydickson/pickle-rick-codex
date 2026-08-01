@@ -37,6 +37,17 @@ function hasPromiseToken(text: string, token: string): boolean {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
 }
 
+function hasCompleteRefinementOutput(
+  result: CodexSpawnResult,
+  refinedPath: string,
+  manifestPath: string,
+): boolean {
+  return result.exitCode === 0 &&
+    fs.existsSync(refinedPath) &&
+    fs.existsSync(manifestPath) &&
+    hasPromiseToken(result.lastMessage, 'REFINEMENT_COMPLETE');
+}
+
 function analystSpecs(sessionDir: string): AnalystSpec[] {
   return [
     {
@@ -99,12 +110,7 @@ async function runSynthesis(state: PersistedState, sessionDir: string, prdPath: 
       hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
   });
 
-  const synthesisComplete =
-    result.exitCode === 0 &&
-    fs.existsSync(refinedPath) &&
-    fs.existsSync(manifestPath) &&
-    hasPromiseToken(result.lastMessage, 'REFINEMENT_COMPLETE');
-  if (!synthesisComplete) {
+  if (!hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
     fs.rmSync(refinedPath, { force: true });
     fs.rmSync(manifestPath, { force: true });
     assertCodexSucceeded(result, 'PRD refinement failed');
@@ -181,7 +187,12 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
         fs.existsSync(manifestPath) &&
         hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
     });
-    assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
+    if (!hasCompleteRefinementOutput(fallbackResult, refinedPath, manifestPath)) {
+      fs.rmSync(refinedPath, { force: true });
+      fs.rmSync(manifestPath, { force: true });
+      assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
+      throw new Error('PRD refinement failed: fallback did not complete its artifact contract');
+    }
     refinementResults = [fallbackResult];
   }
 
