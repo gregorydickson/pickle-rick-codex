@@ -48,6 +48,12 @@ function hasCompleteRefinementOutput(
     hasPromiseToken(result.lastMessage, 'REFINEMENT_COMPLETE');
 }
 
+function hasCompleteAnalystOutput(result: CodexSpawnResult, spec: AnalystSpec): boolean {
+  return result.exitCode === 0 &&
+    fs.existsSync(spec.analysisPath) &&
+    hasPromiseToken(result.lastMessage, 'ANALYST_COMPLETE');
+}
+
 function analystSpecs(sessionDir: string): AnalystSpec[] {
   return [
     {
@@ -88,7 +94,12 @@ async function runAnalyst(state: PersistedState, prdPath: string, spec: AnalystS
       fs.existsSync(spec.analysisPath) &&
       hasPromiseToken(lastMessage, 'ANALYST_COMPLETE'),
   });
-  assertCodexSucceeded(result, `Refinement analyst failed: ${spec.role}`);
+  if (!hasCompleteAnalystOutput(result, spec)) {
+    fs.rmSync(spec.analysisPath, { force: true });
+    fs.rmSync(spec.messagePath, { force: true });
+    assertCodexSucceeded(result, `Refinement analyst failed: ${spec.role}`);
+    throw new Error(`Refinement analyst failed: ${spec.role} did not complete its artifact contract`);
+  }
   return result;
 }
 

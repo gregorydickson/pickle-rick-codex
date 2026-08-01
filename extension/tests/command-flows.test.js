@@ -212,6 +212,113 @@ test('spawn-refinement-team writes the manifest and ticket files', () => {
   assert.equal(state.history.at(-1).step, 'refine');
 });
 
+test('spawn-refinement-team falls back when an analyst exits zero without completing its artifact contract', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+const addDirs = [];
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  } else if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const refinedPath = path.join(sessionDir, 'prd_refined.md');
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+function extractPathAfter(prefix) {
+  const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim().replace(/[.)]+$/, '') : '';
+}
+
+function writeRefinement(source) {
+  fs.writeFileSync(refinedPath, '# Refined PRD\\n');
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      generated_at: '2026-08-01T00:00:00.000Z',
+      source,
+      tickets: [
+        {
+          id: 'ticket-001',
+          title: 'Require complete analyst evidence',
+          description: 'Only a complete analyst fanout may enter synthesis.',
+          acceptance_criteria: ['Incomplete analyst output forces the single-pass fallback.'],
+          verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
+          priority: 'P1',
+          status: 'Todo'
+        }
+      ]
+    }, null, 2),
+  );
+  if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>REFINEMENT_COMPLETE</promise>');
+}
+
+if (prompt.includes('Refinement analyst role:')) {
+  const analysisPath = extractPathAfter('Write your analyst report to ');
+  fs.mkdirSync(path.dirname(analysisPath), { recursive: true });
+  fs.writeFileSync(analysisPath, '# Analyst Report\\n\\n- Partial analyst output.\\n');
+  if (!prompt.includes('Refinement analyst role: requirements-gaps') && outputLastMessagePath) {
+    fs.writeFileSync(outputLastMessagePath, '<promise>ANALYST_COMPLETE</promise>');
+  }
+  // The requirements analyst exits zero without its ANALYST_COMPLETE promise.
+} else if (prompt.includes('You are synthesizing parallel PRD refinement analyst reports')) {
+  writeRefinement('synthesis-with-partial-analyst');
+} else if (prompt.includes('Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.')) {
+  writeRefinement('fallback-after-partial-analyst');
+} else {
+  console.error('unexpected prompt');
+  process.exit(1);
+}
+
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+
+  const output = runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+    cwd: projectDir,
+    env,
+  }).trim();
+
+  const manifest = JSON.parse(output);
+  assert.equal(manifest.source, 'fallback-after-partial-analyst');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-requirements.md')), false);
+  assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+  const refineLog = fs.readFileSync(path.join(sessionDir, 'refine.log'), 'utf8');
+  assert.match(refineLog, /Analyst fanout failed\. Falling back to single-pass refinement\./);
+  assert.doesNotMatch(refineLog, /Starting refinement synthesis\./);
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'research');
+});
+
 test('spawn-refinement-team rejects fallback task-table manifests instead of materializing placeholder tickets', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
