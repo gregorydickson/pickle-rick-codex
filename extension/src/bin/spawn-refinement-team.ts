@@ -154,7 +154,8 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
   const config = loadConfig();
   const timeoutMs = options.timeoutMs || config.defaults.refinement_timeout_seconds * 1000;
 
-  let analystResults: CodexSpawnResult[];
+  let analystResults: CodexSpawnResult[] | null = null;
+  let refinementResults: CodexSpawnResult[] = [];
   try {
     markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
     analystResults = await Promise.all(
@@ -181,11 +182,14 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
         hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
     });
     assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
-    analystResults = [fallbackResult];
+    refinementResults = [fallbackResult];
   }
 
-  markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
-  const synthesisResult = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
+  if (analystResults) {
+    markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
+    const synthesisResult = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
+    refinementResults = [...analystResults, synthesisResult];
+  }
 
   let manifest = readManifest(sessionDir);
   if (!manifest.tickets.length) {
@@ -213,7 +217,7 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
   });
   appendRefineLog(sessionDir, 'Refinement complete.');
 
-  const usage = sumUsage([...analystResults, synthesisResult]);
+  const usage = sumUsage(refinementResults);
   logActivity({
     event: 'feature',
     source: 'pickle',
