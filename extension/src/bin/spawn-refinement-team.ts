@@ -54,6 +54,11 @@ function hasCompleteAnalystOutput(result: CodexSpawnResult, spec: AnalystSpec): 
     hasPromiseToken(result.lastMessage, 'ANALYST_COMPLETE');
 }
 
+function discardRefinementOutput(sessionDir: string): void {
+  fs.rmSync(path.join(sessionDir, 'prd_refined.md'), { force: true });
+  fs.rmSync(path.join(sessionDir, 'refinement_manifest.json'), { force: true });
+}
+
 function analystSpecs(sessionDir: string): AnalystSpec[] {
   return [
     {
@@ -122,8 +127,7 @@ async function runSynthesis(state: PersistedState, sessionDir: string, prdPath: 
   });
 
   if (!hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
-    fs.rmSync(refinedPath, { force: true });
-    fs.rmSync(manifestPath, { force: true });
+    discardRefinementOutput(sessionDir);
     assertCodexSucceeded(result, 'PRD refinement failed');
     throw new Error('PRD refinement failed: synthesis did not complete its artifact contract');
   }
@@ -199,8 +203,7 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
         hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
     });
     if (!hasCompleteRefinementOutput(fallbackResult, refinedPath, manifestPath)) {
-      fs.rmSync(refinedPath, { force: true });
-      fs.rmSync(manifestPath, { force: true });
+      discardRefinementOutput(sessionDir);
       assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
       throw new Error('PRD refinement failed: fallback did not complete its artifact contract');
     }
@@ -213,15 +216,23 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
     refinementResults = [...analystResults, synthesisResult];
   }
 
-  let manifest = readManifest(sessionDir);
-  if (!manifest.tickets.length) {
-    appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
-    manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
+  let manifest: RefinementManifest;
+  let manifestIssues: string[];
+  try {
+    manifest = readManifest(sessionDir);
+    if (!manifest.tickets.length) {
+      appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
+      manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
+    }
+    const enrichedManifest = enrichRefinementManifest(manifest, config as unknown as ConfigVerificationInput);
+    manifest = enrichedManifest.manifest;
+    manifestIssues = validateRefinementManifest(manifest);
+  } catch (error) {
+    discardRefinementOutput(sessionDir);
+    throw error;
   }
-  const enrichedManifest = enrichRefinementManifest(manifest, config as unknown as ConfigVerificationInput);
-  manifest = enrichedManifest.manifest;
-  const manifestIssues = validateRefinementManifest(manifest);
   if (manifestIssues.length > 0) {
+    discardRefinementOutput(sessionDir);
     appendRefineLog(sessionDir, `Refinement manifest rejected: ${manifestIssues.join('; ')}`);
     throw new Error(`Refinement manifest rejected: ${manifestIssues.join('; ')}`);
   }

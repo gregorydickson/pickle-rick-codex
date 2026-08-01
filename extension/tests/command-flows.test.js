@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runCodexExecMonitored } from '../services/codex.js';
+import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { makeTempRoot, repoRoot, runNode, createFakeCodex, prependPath, waitFor, writeExecutable } from './helpers.js';
 
@@ -394,6 +395,114 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     /Refinement manifest rejected/,
   );
   assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+});
+
+test('spawn-refinement-team discards rejected manifests before bootstrap resume', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+const addDirs = [];
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  } else if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const refinedPath = path.join(sessionDir, 'prd_refined.md');
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+function extractPathAfter(prefix) {
+  const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim().replace(/[.)]+$/, '') : '';
+}
+
+if (prompt.includes('Refinement analyst role:')) {
+  const analysisPath = extractPathAfter('Write your analyst report to ');
+  fs.mkdirSync(path.dirname(analysisPath), { recursive: true });
+  fs.writeFileSync(analysisPath, '# Analyst Report\\n\\n- Complete.\\n');
+  if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>ANALYST_COMPLETE</promise>');
+} else if (prompt.includes('You are synthesizing parallel PRD refinement analyst reports')) {
+  fs.writeFileSync(refinedPath, '# Rejected Refined PRD\\n');
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      source: 'rejected-synthesis',
+      tickets: [
+        {
+          id: 'API Client',
+          title: 'Implement API client',
+          description: 'First ticket at the normalized file key.',
+          acceptance_criteria: ['The client sends authenticated requests.'],
+          verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
+          priority: 'P1',
+          status: 'Todo'
+        },
+        {
+          id: 'api-client',
+          title: 'Verify API client retries',
+          description: 'Second ticket colliding at the same normalized file key.',
+          acceptance_criteria: ['Transient failures retry within the configured limit.'],
+          verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
+          priority: 'P1',
+          status: 'Todo'
+        }
+      ]
+    }, null, 2),
+  );
+  if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>REFINEMENT_COMPLETE</promise>');
+} else {
+  console.error('unexpected prompt');
+  process.exit(1);
+}
+
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+      cwd: projectDir,
+      env,
+    }),
+    /duplicate normalized ticket id "api-client"/,
+  );
+
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'prd_refined.md')), false);
+  await assert.rejects(
+    () => ensureBootstrapSessionReady(sessionDir, { resumeReadyOnly: true }),
+    /missing .*refinement_manifest\.json/,
+  );
+  assert.equal(fs.existsSync(path.join(sessionDir, 'api-client', 'linear_ticket_api-client.md')), false);
 });
 
 test('spawn-refinement-team stops when analyst fallback refinement fails before synthesis', () => {
