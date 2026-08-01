@@ -381,6 +381,104 @@ process.exit(1);
   assert.equal(state.step, 'refine:fallback');
 });
 
+test('spawn-refinement-team rejects partial synthesis output after a clean codex exit', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+
+let outputLastMessagePath = '';
+const addDirs = [];
+for (let index = 1; index < args.length; index += 1) {
+  if (args[index] === '--output-last-message') {
+    outputLastMessagePath = args[index + 1] || '';
+    index += 1;
+  } else if (args[index] === '--add-dir') {
+    addDirs.push(args[index + 1] || '');
+    index += 1;
+  }
+}
+
+const sessionDir = addDirs.at(-1) || process.cwd();
+const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+
+function extractPathAfter(prefix) {
+  const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim().replace(/[.)]+$/, '') : '';
+}
+
+if (prompt.includes('Refinement analyst role:')) {
+  const analysisPath = extractPathAfter('Write your analyst report to ');
+  fs.mkdirSync(path.dirname(analysisPath), { recursive: true });
+  fs.writeFileSync(analysisPath, '# Analyst Report\\n\\n- Complete.\\n');
+  if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>ANALYST_COMPLETE</promise>');
+} else if (prompt.includes('You are synthesizing parallel PRD refinement analyst reports')) {
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      generated_at: '2026-08-01T00:00:00.000Z',
+      source: 'partial-failed-synthesis',
+      tickets: [
+        {
+          id: 'ticket-001',
+          title: 'Partial synthesis must not run',
+          description: 'This manifest was written before synthesis completed its artifact contract.',
+          acceptance_criteria: ['Only complete synthesis output can become executable work.'],
+          verification: ['test -f README.md'],
+          allowed_paths: ['README.md'],
+          priority: 'P1',
+          status: 'Todo'
+        }
+      ]
+    }, null, 2),
+  );
+  // Exit zero without prd_refined.md or the REFINEMENT_COMPLETE promise.
+} else {
+  console.error('unexpected prompt');
+  process.exit(1);
+}
+
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(
+    path.join(sessionDir, 'prd.md'),
+    '# PRD\n\n## Summary\nRefinement test\n',
+  );
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+      cwd: projectDir,
+      env,
+    }),
+    /PRD refinement failed: synthesis did not complete its artifact contract/,
+  );
+
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'prd_refined.md')), false);
+  assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'refine:synthesis');
+});
+
 test('spawn-refinement-team exits promptly after success artifacts even if codex lingers', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');

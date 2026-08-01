@@ -99,11 +99,16 @@ async function runSynthesis(state: PersistedState, sessionDir: string, prdPath: 
       hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
   });
 
-  if (!fs.existsSync(refinedPath)) {
-    // Preserve the previous truthful fallback if synthesis wrote nothing.
-    fs.copyFileSync(prdPath, refinedPath);
-  } else {
+  const synthesisComplete =
+    result.exitCode === 0 &&
+    fs.existsSync(refinedPath) &&
+    fs.existsSync(manifestPath) &&
+    hasPromiseToken(result.lastMessage, 'REFINEMENT_COMPLETE');
+  if (!synthesisComplete) {
+    fs.rmSync(refinedPath, { force: true });
+    fs.rmSync(manifestPath, { force: true });
     assertCodexSucceeded(result, 'PRD refinement failed');
+    throw new Error('PRD refinement failed: synthesis did not complete its artifact contract');
   }
 
   return result;
