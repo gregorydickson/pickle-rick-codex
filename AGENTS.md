@@ -18,6 +18,11 @@ Canonical agent instructions for the Codex CLI port of Pickle Rick.
 - Native multi-agent behavior: optional only after local validation documents it
 - Project-local hooks: wired for local handlers, but treated as validated only after the installed build proves the event
 
+## Autonomous Reliability
+
+- Reliable autonomous execution is paramount. Verification must reject bad work without turning recoverable worker, evaluator, or infrastructure failures into terminal loop exits.
+- Prefer rollback, checkpoint revalidation, bounded retries, adaptive budgets, and resumable state. Stop only for completion, cancellation, exhausted safeguards, or verified unsafe/corrupt state; a crashed or needlessly stopped loop has zero autonomous reliability.
+
 ## Install
 
 - Use the local installer: `bash install.sh`

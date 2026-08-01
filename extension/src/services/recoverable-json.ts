@@ -70,6 +70,30 @@ function listEntries(dir: string): string[] | null {
   }
 }
 
+export interface RecoverableTmpEntry {
+  entry: string;
+  pid: number;
+}
+
+export function listRecoverableTmpEntries(
+  entries: readonly string[],
+  baseName: string,
+): RecoverableTmpEntry[] {
+  const tmpPrefix = baseName + '.tmp.';
+  const escapedBaseName = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const tmpPattern = new RegExp(`^${escapedBaseName}\\.tmp\\.(\\d+)(?:\\..+)?$`);
+  const matching: RecoverableTmpEntry[] = [];
+
+  for (const entry of entries) {
+    if (!entry.startsWith(tmpPrefix)) continue;
+    const match = entry.match(tmpPattern);
+    if (!match) continue;
+    matching.push({ entry, pid: Number(match[1]) });
+  }
+
+  return matching;
+}
+
 function parseDeadTmp(
   tmpPath: string,
   baseMtimeMs: number,
@@ -106,8 +130,6 @@ export function readRecoverableJsonObject(filePath: string): object | null {
   const entries = listEntries(dir);
   if (!entries) return base;
 
-  const tmpPrefix = baseName + '.tmp.';
-  const tmpPattern = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.tmp\\.(\\d+)(?:\\..+)?$`);
   let baseMtimeMs: number;
   try {
     baseMtimeMs = fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
@@ -116,11 +138,8 @@ export function readRecoverableJsonObject(filePath: string): object | null {
   }
   let winner: { tmpPath: string; parsed: object; mtimeMs: number } | null = null;
 
-  for (const entry of entries.filter(e => e.startsWith(tmpPrefix))) {
-    const match = entry.match(tmpPattern);
-    if (!match) continue;
+  for (const { entry, pid: tmpPid } of listRecoverableTmpEntries(entries, baseName)) {
     const tmpPath = path.join(dir, entry);
-    const tmpPid = Number(match[1]);
     if (shouldSkipLiveTmp(tmpPid, tmpPath)) continue;
 
     const candidate = parseDeadTmp(tmpPath, baseMtimeMs);

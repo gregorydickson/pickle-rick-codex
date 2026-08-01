@@ -23,6 +23,11 @@ Resume:
 
 Command metrics are measured by the runtime before the first iteration and after every valid experiment. The command must exit successfully and print exactly one finite number. Improved iterations are retained; held or regressed iterations are archived to the experiment ledger and reverted. Use `--metric-timeout <seconds>` to bound each measurement. Use `--protected-path <repo-relative-path-or-glob>` repeatedly to prevent workers from changing evaluation inputs. `--worker-failure-limit <N>` defaults to 3; the research stall limit defaults to 8.
 
+Microverse sessions have no wall-clock limit. They stop only when the target,
+iteration budget, convergence, worker-failure limit, cancellation, or another
+explicit runtime-owned stop condition is reached. Resuming a legacy session
+clears its stored wall-clock limit.
+
 ## Process
 
 1. Establish baseline measurement
@@ -44,3 +49,21 @@ Command metrics are measured by the runtime before the first iteration and after
 - held/regressed: a valid experiment did not improve the metric
 
 Worker failures use a separate retry counter and never count as scientific stalls.
+
+Measured iterations use a fixed-size bootstrap prompt plus a small worker-local
+handoff containing current metric state and five recent experiments. Complete
+history remains in durable session files and should be queried narrowly only
+when older evidence is relevant; never inject or load the full ledger by default.
+
+If the metric command fails only after a worker change, the runtime archives the
+attempt, restores the clean checkpoint, and measures again. A valid restored
+checkpoint classifies the attempt as `worker_incomplete` and retries the same
+experiment without consuming an iteration or scientific stall. If the metric
+still fails or produces a different score after rollback, the evaluator or its
+environment is unstable and the session fails closed.
+
+Successful measurements that consume at least 75% of the configured timeout
+automatically reserve 2x duration headroom for later iterations. If a restored
+checkpoint times out before that headroom exists, the runtime doubles the metric
+timeout once and replays the checkpoint before deciding that the evaluator is
+unstable. The expanded timeout is persisted for resumed and later iterations.

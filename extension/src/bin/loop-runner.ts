@@ -23,6 +23,7 @@ import {
   captureMetricIterationCheckpoint,
   createMetricConvergenceState,
   measureMetric,
+  MetricTimeoutError,
   normalizeMetricDirection,
   normalizeMetricTargetContract,
   normalizeMetricTolerance,
@@ -33,16 +34,17 @@ import {
   type MetricClassification,
   type MetricConvergenceState,
   type MetricIterationCheckpoint,
+  type MetricMeasurement,
 } from '../services/metric-convergence.js';
 import {
   abandonPlannedExperiment,
   assertExperimentStrategy,
-  compactExperimentMemory,
   completeExperiment,
   planExperiment,
   readExperimentLedger,
   reconcileRunningExperiments,
   recordWorkerAttemptFailure,
+  resetWorkerFailureCount,
   researchConvergenceState,
   startExperiment,
   updateExperimentPlan,
@@ -50,6 +52,7 @@ import {
   type MicroverseExperimentRecord,
 } from '../services/experiment-ledger.js';
 import { archiveMicroverseExperiment } from '../services/microverse-experiment-archive.js';
+import { writeMicroverseWorkerHandoff } from '../services/microverse-handoff.js';
 import {
   captureProtectedPathManifest,
   changedProtectedPaths,
@@ -94,6 +97,16 @@ interface MicroverseAttemptTransaction {
   checkpoint: MetricIterationCheckpoint;
   metric_state_before: MetricConvergenceState;
   created_at: string;
+}
+
+class PostWorkerMetricMeasurementError extends Error {
+  readonly measurementError: unknown;
+
+  constructor(measurementError: unknown) {
+    super(`Post-worker metric measurement failed: ${safeErrorMessage(measurementError)}`);
+    this.name = 'PostWorkerMetricMeasurementError';
+    this.measurementError = measurementError;
+  }
 }
 
 function appendRunnerLog(sessionDir: string, message: string): void {
@@ -312,6 +325,46 @@ function metricTimeoutMs(loopConfig: LoopConfig): number {
   return seconds * 1000;
 }
 
+const METRIC_TIMEOUT_HEADROOM_RATIO = 0.75;
+const METRIC_TIMEOUT_HEADROOM_MULTIPLIER = 2;
+const MAX_AUTO_METRIC_TIMEOUT_MS = 30 * 60 * 1000;
+
+function persistMetricTimeout(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  timeoutMs: number,
+  reason: string,
+): void {
+  const timeoutSeconds = Math.ceil(timeoutMs / 1000);
+  loopConfig.metric_timeout_seconds = timeoutSeconds;
+  atomicWriteJson(path.join(sessionDir, 'loop_config.json'), loopConfig);
+  appendRunnerLog(sessionDir, `microverse metric timeout increased to ${timeoutSeconds}s: ${reason}`);
+}
+
+function ensureMetricTimeoutHeadroom(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  measurement: MetricMeasurement,
+): void {
+  const durationMs = Number(measurement.duration_ms ?? 0);
+  const currentTimeoutMs = metricTimeoutMs(loopConfig);
+  if (!Number.isFinite(durationMs) || durationMs <= 0
+      || durationMs < currentTimeoutMs * METRIC_TIMEOUT_HEADROOM_RATIO) {
+    return;
+  }
+  const desiredTimeoutMs = Math.min(
+    MAX_AUTO_METRIC_TIMEOUT_MS,
+    Math.ceil((durationMs * METRIC_TIMEOUT_HEADROOM_MULTIPLIER) / 1000) * 1000,
+  );
+  if (desiredTimeoutMs <= currentTimeoutMs) return;
+  persistMetricTimeout(
+    sessionDir,
+    loopConfig,
+    desiredTimeoutMs,
+    `last successful measurement took ${durationMs}ms`,
+  );
+}
+
 interface WorkerExperimentArtifact {
   experiment_id: string;
   hypothesis: string;
@@ -333,9 +386,13 @@ function readWorkerExperimentArtifact(workerArtifactDir: string, experimentId: s
   if (!artifact || artifact.experiment_id !== experimentId
       || typeof artifact.hypothesis !== 'string' || !artifact.hypothesis.trim()
       || typeof artifact.rationale !== 'string' || !artifact.rationale.trim()
-      || (artifact.target_paths != null && (!Array.isArray(artifact.target_paths) || artifact.target_paths.some((entry) => typeof entry !== 'string' || !entry.trim())))
-      || (artifact.verification != null && (!Array.isArray(artifact.verification) || artifact.verification.some((entry) => typeof entry !== 'string' || !entry.trim())))) {
+      || (artifact.target_paths != null && (!Array.isArray(artifact.target_paths) || artifact.target_paths.some((entry) => typeof entry !== 'string' || !entry.trim())))) {
     throw new Error(`Measured Microverse iteration requires a valid ${artifactPath} for ${experimentId}.`);
+  }
+  if (artifact.verification != null
+      && (!Array.isArray(artifact.verification)
+        || artifact.verification.some((entry) => typeof entry !== 'string' || !entry.trim()))) {
+    throw new Error(`Measured Microverse artifact ${artifactPath} verification must be a non-empty string array when present; object entries are invalid.`);
   }
   return artifact;
 }
@@ -384,24 +441,16 @@ function planMicroverseExperiment(
   const pending = ledger?.experiments.find((entry) => entry.status === 'planned') || null;
   if (pending) return startExperiment(sessionDir, pending.id);
   const parent = ledger?.experiments.filter((entry) => entry.status === 'accepted').at(-1) || null;
+  const sequence = ledger?.next_sequence || 1;
   const record = planExperiment(sessionDir, {
     parentId: parent?.id || null,
     hypothesis: `Runtime placeholder for Microverse iteration ${iteration}`,
-    differentiator: `iteration ${iteration}`,
+    differentiator: `iteration ${iteration}; experiment ${sequence}`,
     rationale: String(loopConfig.task || 'Measured metric improvement'),
     targetPaths: [],
     baselineScore,
   });
   return startExperiment(sessionDir, record.id);
-}
-
-function microversePromptContext(sessionDir: string): { memory: string; convergence: string } {
-  const ledger = readExperimentLedger(sessionDir);
-  if (!ledger) return { memory: '{}', convergence: 'none' };
-  return {
-    memory: JSON.stringify(compactExperimentMemory(ledger)),
-    convergence: researchConvergenceState(ledger).level,
-  };
 }
 
 function revertMetricIterationSafely(
@@ -546,6 +595,7 @@ function ensureMetricBaseline(sessionDir: string, loopConfig: LoopConfig, workin
     throw error;
   }
   const state = createMetricConvergenceState(baseline, direction, tolerance, target.target, target.target_relation);
+  ensureMetricTimeoutHeadroom(sessionDir, loopConfig, baseline);
   writeMetricConvergenceState(sessionDir, state);
   appendRunnerLog(sessionDir, `microverse baseline measured: ${baseline.score}`);
   return state;
@@ -612,10 +662,16 @@ function processMetricIteration(
       excludeUntrackedPaths: checkpoint.untracked,
     })
     : null;
-  const measurement = measureMetric(currentState.command, {
-    cwd: workingDir,
-    timeoutMs: metricTimeoutMs(loopConfig),
-  });
+  let measurement;
+  try {
+    measurement = measureMetric(currentState.command, {
+      cwd: workingDir,
+      timeoutMs: metricTimeoutMs(loopConfig),
+    });
+  } catch (error) {
+    throw new PostWorkerMetricMeasurementError(error);
+  }
+  ensureMetricTimeoutHeadroom(sessionDir, loopConfig, measurement);
   const natural = recordMetricIteration(currentState, measurement, {
     iteration,
     headBefore: checkpoint.head,
@@ -653,6 +709,67 @@ function processMetricIteration(
     changedPaths: evidence?.changedPaths ?? [],
     diffArtifact: evidence?.artifact ?? null,
   };
+}
+
+function recoverCandidateInducedMetricFailure(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  workingDir: string,
+  checkpoint: MetricIterationCheckpoint,
+  metricState: MetricConvergenceState,
+  failure: PostWorkerMetricMeasurementError,
+): string {
+  revertMetricIterationSafely(sessionDir, workingDir, checkpoint);
+
+  let restoredMeasurement;
+  let restoredTimeoutMs = metricTimeoutMs(loopConfig);
+  let timeoutExpansion: string | null = null;
+  try {
+    restoredMeasurement = measureMetric(metricState.command, {
+      cwd: workingDir,
+      timeoutMs: restoredTimeoutMs,
+    });
+  } catch (restoredError) {
+    if (restoredError instanceof MetricTimeoutError && restoredTimeoutMs < MAX_AUTO_METRIC_TIMEOUT_MS) {
+      const previousTimeoutMs = restoredTimeoutMs;
+      restoredTimeoutMs = Math.min(
+        MAX_AUTO_METRIC_TIMEOUT_MS,
+        restoredTimeoutMs * METRIC_TIMEOUT_HEADROOM_MULTIPLIER,
+      );
+      timeoutExpansion = `checkpoint replay exceeded ${previousTimeoutMs}ms; expanded metric timeout to ${restoredTimeoutMs}ms`;
+      persistMetricTimeout(sessionDir, loopConfig, restoredTimeoutMs, timeoutExpansion);
+      try {
+        restoredMeasurement = measureMetric(metricState.command, {
+          cwd: workingDir,
+          timeoutMs: restoredTimeoutMs,
+        });
+      } catch (expandedError) {
+        throw new AggregateError(
+          [failure.measurementError, restoredError, expandedError],
+          `Post-worker metric measurement failed and the checkpoint metric remained invalid after automatic timeout expansion: ${safeErrorMessage(expandedError)}`,
+          { cause: expandedError },
+        );
+      }
+    } else {
+      throw new AggregateError(
+        [failure.measurementError, restoredError],
+        `Post-worker metric measurement failed and the checkpoint metric remained invalid after rollback: ${safeErrorMessage(restoredError)}`,
+        { cause: restoredError },
+      );
+    }
+  }
+
+  if (restoredMeasurement.score !== metricState.best.score) {
+    throw new Error(
+      `Post-worker metric measurement failed and rollback produced score ${restoredMeasurement.score}; expected stable checkpoint score ${metricState.best.score}.`,
+    );
+  }
+
+  ensureMetricTimeoutHeadroom(sessionDir, loopConfig, restoredMeasurement);
+  writeMetricConvergenceState(sessionDir, metricState);
+  writeMetricSummary(sessionDir, metricState);
+  const expansionDetail = timeoutExpansion ? `; ${timeoutExpansion}` : '';
+  return `Post-worker metric validation failed while the restored checkpoint remained valid at ${restoredMeasurement.score}${expansionDetail}: ${safeErrorMessage(failure.measurementError)}`;
 }
 
 function ensureAdvancedLoopCleanTrackedPreflight(sessionDir: string, loopConfig: LoopConfig, workingDir: string): void {
@@ -835,6 +952,14 @@ export async function runLoop(sessionDir: string): Promise<void> {
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
   assertControlPlaneOutsideWorkerCwd(sessionDir, initialState.working_dir as string);
   if (isMeasuredMicroverse(loopConfig)) {
+    const resetFailures = resetWorkerFailureCount(sessionDir);
+    if (resetFailures > 0) {
+      manager.update(statePath, (current) => {
+        current.worker_failure_count = 0;
+        return current;
+      });
+      appendRunnerLog(sessionDir, `microverse reset ${resetFailures} prior-run worker failures on relaunch`);
+    }
     const recovered = recoverInterruptedMicroverseAttempt(sessionDir, initialState.working_dir as string);
     if (recovered.length > 0) {
       appendRunnerLog(sessionDir, `microverse restored interrupted attempt checkpoint: ${recovered.join(', ')}`);
@@ -914,7 +1039,6 @@ export async function runLoop(sessionDir: string): Promise<void> {
       const protectedManifest: ProtectedPathManifest | null = metricCheckpoint
         ? captureProtectedPathManifest(state.working_dir as string, loopConfig.protected_paths)
         : null;
-      const promptContext = experiment ? microversePromptContext(sessionDir) : null;
       const beforeUntrackedFiles = isGitRepo(state.working_dir as string)
         ? listUntrackedFiles(state.working_dir as string)
         : [];
@@ -931,6 +1055,18 @@ export async function runLoop(sessionDir: string): Promise<void> {
       const experimentArtifactPath = experiment
         ? workerExperimentArtifactPath(workerArtifactDir)
         : null;
+      const experimentContextPath = experiment && experimentArtifactPath && currentMetricState
+        ? writeMicroverseWorkerHandoff({
+          sessionDir,
+          workerArtifactDir,
+          workingDir: state.working_dir as string,
+          iteration,
+          loopConfig,
+          metricState: currentMetricState,
+          experiment,
+          experimentArtifactPath,
+        })
+        : null;
       const controlSnapshots = captureControlFiles(sessionDir);
       const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attempt);
       fs.rmSync(outputLastMessagePath, { force: true });
@@ -946,8 +1082,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
             ...loopConfig,
             experiment_id: experiment?.id,
             experiment_artifact_path: experimentArtifactPath || undefined,
-            experiment_memory: promptContext?.memory,
-            convergence_level: promptContext?.convergence,
+            experiment_context_path: experimentContextPath || undefined,
           } as unknown as LoopPromptConfig,
         }),
         timeoutMs: getWorkerTimeoutMs(state, config),
@@ -1078,16 +1213,56 @@ export async function runLoop(sessionDir: string): Promise<void> {
         beforeUntrackedFiles,
       );
 
-      const metricResult = metricCheckpoint
-        ? processMetricIteration(
-          sessionDir,
-          loopConfig,
-          state.working_dir as string,
-          metricCheckpoint,
-          iteration,
-          experiment!.id,
-        )
-        : null;
+      let metricResult: ReturnType<typeof processMetricIteration> | null = null;
+      if (metricCheckpoint && experiment && currentMetricState) {
+        try {
+          metricResult = processMetricIteration(
+            sessionDir,
+            loopConfig,
+            state.working_dir as string,
+            metricCheckpoint,
+            iteration,
+            experiment.id,
+          );
+        } catch (error) {
+          if (!(error instanceof PostWorkerMetricMeasurementError)) throw error;
+
+          const workerFailureDetail = recoverCandidateInducedMetricFailure(
+            sessionDir,
+            loopConfig,
+            state.working_dir as string,
+            metricCheckpoint,
+            currentMetricState,
+            error,
+          );
+          pendingMetricIteration = null;
+          recordWorkerAttemptFailure(sessionDir, experiment.id, {
+            classification: 'worker_incomplete',
+            insight: workerFailureDetail,
+          });
+          const failures = readExperimentLedger(sessionDir)?.worker_failure_count || 0;
+          manager.update(statePath, (current) => {
+            current.worker_failure_count = failures;
+            current.last_loop_message = workerFailureDetail;
+            return current;
+          });
+          appendRunnerLog(
+            sessionDir,
+            `microverse worker_incomplete: ${workerFailureDetail} (${failures} consecutive worker failures)`,
+          );
+          if (failures >= Number(loopConfig.worker_failure_limit || 3)) {
+            abandonPlannedExperiment(sessionDir, experiment.id, {
+              classification: 'worker_incomplete',
+              insight: `${workerFailureDetail}; worker failure limit reached.`,
+            });
+            clearMicroverseAttemptTransaction(sessionDir);
+            exitReason = 'worker_failure_limit';
+            break;
+          }
+          clearMicroverseAttemptTransaction(sessionDir);
+          continue;
+        }
+      }
 
       if (metricResult && experiment) {
         completeExperiment(sessionDir, experiment.id, {

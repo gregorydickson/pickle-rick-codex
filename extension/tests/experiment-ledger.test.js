@@ -11,11 +11,13 @@ import {
   compactExperimentMemory,
   completeExperiment,
   createExperimentLedger,
+  MICROVERSE_PROMPT_MEMORY_MAX_CHARS,
   normalizeExperimentHypothesis,
   planExperiment,
   readExperimentLedger,
   reconcileRunningExperiments,
   recordWorkerAttemptFailure,
+  resetWorkerFailureCount,
   researchConvergenceState,
   startExperiment,
   updateExperimentPlan,
@@ -187,6 +189,69 @@ test('worker retries retain one scientific experiment id and preserve attempt ev
   );
   assert.equal(completed.worker_failure_count, 0);
   assert.equal(completed.experiment_stall_count, 0);
+});
+
+test('runner relaunch resets only the consecutive worker failure streak', () => {
+  const sessionDir = makeTempRoot('pickle-experiment-relaunch-');
+  const experiment = plan(sessionDir, 'Preserve failed attempt evidence');
+  startExperiment(sessionDir, experiment.id);
+  recordWorkerAttemptFailure(sessionDir, experiment.id, {
+    classification: 'worker_error',
+    insight: 'Transport failed before the worker started.',
+  });
+
+  assert.equal(resetWorkerFailureCount(sessionDir), 1);
+  assert.equal(resetWorkerFailureCount(sessionDir), 0);
+  const ledger = readExperimentLedger(sessionDir);
+  assert.equal(ledger.worker_failure_count, 0);
+  assert.equal(ledger.experiments[0].retry_count, 1);
+  assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'worker_error');
+});
+
+test('prompt experiment memory remains bounded while retaining the newest evidence', () => {
+  const ledger = createExperimentLedger(T0);
+  for (let index = 1; index <= 80; index += 1) {
+    const id = `exp-${String(index).padStart(4, '0')}`;
+    const evidence = `${index}-${'evidence '.repeat(1_000)}`;
+    ledger.experiments.push({
+      id,
+      parent_id: index === 1 ? null : `exp-${String(index - 1).padStart(4, '0')}`,
+      hypothesis: `Hypothesis ${evidence}`,
+      hypothesis_key: `hypothesis ${evidence}`,
+      hypothesis_family: `family-${index % 5}`,
+      differentiator: `differentiator-${evidence}`,
+      rationale: `rationale-${evidence}`,
+      target_paths: [`extension/tests/target-${index}.test.js`],
+      status: 'accepted',
+      baseline_score: index - 1,
+      result_score: index,
+      classification: 'improved',
+      changed_paths: [`extension/tests/target-${index}.test.js`],
+      diff_artifact: null,
+      insight: `insight-${evidence}`,
+      verification: [`verification-${evidence}`],
+      attempt: 1,
+      retry_count: 0,
+      worker_attempts: [{
+        attempt: 1,
+        status: 'completed',
+        classification: 'improved',
+        started_at: T0,
+        completed_at: T0,
+        insight: `insight-${evidence}`,
+      }],
+      created_at: T0,
+      started_at: T0,
+      completed_at: T0,
+    });
+  }
+  ledger.next_sequence = 81;
+
+  const memory = compactExperimentMemory(ledger);
+  assert.ok(JSON.stringify(memory).length <= MICROVERSE_PROMPT_MEMORY_MAX_CHARS);
+  assert.equal(memory.accepted_lineage.at(-1).id, 'exp-0080');
+  assert.ok(memory.omitted.accepted_lineage > 0);
+  assert.equal(memory.full_ledger_required_for_omitted_details, true);
 });
 
 test('retry exhaustion abandons the same experiment without inventing another attempt', () => {

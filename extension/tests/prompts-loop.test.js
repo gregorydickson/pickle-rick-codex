@@ -1,7 +1,7 @@
 // @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildLoopPrompt } from '../services/prompts.js';
+import { buildLoopPrompt, MICROVERSE_ITERATION_PROMPT_MAX_CHARS } from '../services/prompts.js';
 
 const baseArgs = {
   sessionDir: '/sessions/pickle-1',
@@ -27,20 +27,43 @@ test('buildLoopPrompt emits the measured microverse experiment contract', () => 
       stall_limit: 4,
       experiment_id: 'exp-0042',
       experiment_artifact_path: '/artifacts/worker-1/experiment.json',
-      experiment_memory: '{"rejected":[]}',
-      convergence_level: 'family-shift',
+      experiment_context_path: '/artifacts/worker-1/microverse-handoff.json',
     },
   });
 
   assert.match(prompt, /Loop mode: microverse/);
-  assert.match(prompt, /Metric command: npm run coverage/);
-  assert.match(prompt, /Runtime target: best score gt 90/);
+  assert.match(prompt, /Iteration handoff \(read first\): \/artifacts\/worker-1\/microverse-handoff\.json/);
   assert.match(prompt, /Current experiment ID: exp-0042/);
   assert.match(prompt, /Before modifying the repository, write \/artifacts\/worker-1\/experiment\.json/);
-  assert.match(prompt, /Compact experiment memory:\n\{"rejected":\[\]\}/);
-  assert.match(prompt, /Research convergence intervention: family-shift/);
-  assert.match(prompt, /runtime—not the worker—measures this command/i);
+  assert.match(prompt, /verification as a non-empty string\[\]/);
+  assert.match(prompt, /plain command\/result summaries—never objects/);
+  assert.match(prompt, /five recent experiments/);
+  assert.match(prompt, /never load the full experiment ledger into context/);
+  assert.doesNotMatch(prompt, /Raise deterministic coverage|npm run coverage|experiment memory/);
+  assert.ok(prompt.length <= MICROVERSE_ITERATION_PROMPT_MAX_CHARS);
   assert.doesNotMatch(prompt, /Severity rubric:/);
+});
+
+test('measured microverse prompt size is constant as durable task state grows', () => {
+  const prompt = buildLoopPrompt({
+    ...baseArgs,
+    mode: 'microverse',
+    state: {
+      ...baseArgs.state,
+      original_prompt: 'original-state '.repeat(100_000),
+      iteration: 10_000,
+    },
+    loopConfig: {
+      task: 'task-state '.repeat(100_000),
+      metric: 'metric-state '.repeat(100_000),
+      experiment_id: 'exp-9999',
+      experiment_artifact_path: '/artifacts/worker-1/experiment.json',
+      experiment_context_path: '/artifacts/worker-1/microverse-handoff.json',
+    },
+  });
+
+  assert.ok(prompt.length <= MICROVERSE_ITERATION_PROMPT_MAX_CHARS);
+  assert.doesNotMatch(prompt, /original-state|task-state|metric-state/);
 });
 
 test('buildLoopPrompt emits scoped szechuan cleanup constraints', () => {

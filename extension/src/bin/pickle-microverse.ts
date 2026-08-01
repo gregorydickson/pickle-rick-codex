@@ -175,14 +175,25 @@ function parseArgs(argv: string[]): MicroverseArgs {
 
 async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv);
-  const setupArgs = ['--tmux', '--command-template', 'microverse.md'];
+  // Microverse convergence owns its scientific stop conditions (target,
+  // iterations, stalls, and worker failures). A wall-clock default can stop a
+  // healthy experiment before the metric converges, so microverse sessions are
+  // deliberately unbounded in time, including when an older session resumes.
+  const setupArgs = [
+    '--tmux',
+    '--command-template',
+    'microverse.md',
+    '--max-time',
+    '0',
+    '--max-iterations',
+    String(parsed.maxIterations ?? 0),
+  ];
   if (parsed.resume) {
     setupArgs.push('--resume');
     if (parsed.resume !== '__LAST__') {
       setupArgs.push(parsed.resume);
     }
   } else {
-    if (Number.isInteger(parsed.maxIterations)) setupArgs.push('--max-iterations', String(parsed.maxIterations));
     setupArgs.push('--task', parsed.task ?? '');
   }
 

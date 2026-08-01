@@ -224,11 +224,12 @@ if (prompt.includes('You are the Citadel release reviewer')) {
   const experimentMatch = prompt.match(/Current experiment ID: (exp-\\d+)/);
   const experimentArtifactPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)?.[1]?.trim();
   if (loopMode === 'microverse' && experimentMatch) {
+    const stableExperiment = process.env.FAKE_LOOP_STABLE_EXPERIMENT === '1';
     fs.writeFileSync(experimentArtifactPath || path.join(workerArtifactDir, 'microverse-experiment.json'), JSON.stringify({
       experiment_id: experimentMatch[1],
-      hypothesis: 'Fake measured hypothesis ' + current,
+      hypothesis: stableExperiment ? 'Fake stable measured hypothesis' : 'Fake measured hypothesis ' + current,
       hypothesis_family: 'fake/metric',
-      differentiator: 'iteration ' + current,
+      differentiator: stableExperiment ? 'stable retry experiment' : 'iteration ' + current,
       rationale: 'Exercise the measured Microverse runtime contract.',
       target_paths: process.env.FAKE_LOOP_MUTATE_FILE ? [process.env.FAKE_LOOP_MUTATE_FILE] : [],
       insight: 'Fake worker completed measured iteration ' + current,

@@ -18,6 +18,7 @@ export interface MetricMeasurement {
   score: number;
   raw: string;
   measured_at: string;
+  duration_ms?: number;
 }
 
 export interface MetricHistoryEntry extends MetricMeasurement {
@@ -63,6 +64,16 @@ export class MetricMutationError extends Error {
   constructor() {
     super('Metric command modified the target repository; metric commands must be read-only.');
     this.name = 'MetricMutationError';
+  }
+}
+
+export class MetricTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Metric command timed out after ${timeoutMs}ms.`);
+    this.name = 'MetricTimeoutError';
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -161,6 +172,7 @@ export function measureMetric(command: string, options: MeasureMetricOptions): M
   }
   const before = repositoryFingerprint(options.cwd);
   const shell = options.shell || process.env.SHELL || '/bin/sh';
+  const startedAt = Date.now();
   const result = spawnSync(shell, ['-lc', command], {
     cwd: options.cwd,
     encoding: 'utf8',
@@ -174,9 +186,8 @@ export function measureMetric(command: string, options: MeasureMetricOptions): M
   }
   if (result.error) {
     const timedOut = (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
-    throw new Error(timedOut
-      ? `Metric command timed out after ${options.timeoutMs ?? 120_000}ms.`
-      : `Metric command failed to start: ${result.error.message}`);
+    if (timedOut) throw new MetricTimeoutError(options.timeoutMs ?? 120_000);
+    throw new Error(`Metric command failed to start: ${result.error.message}`);
   }
   if (result.status !== 0) {
     const diagnostic = String(result.stderr || result.stdout || '').trim();
@@ -188,6 +199,7 @@ export function measureMetric(command: string, options: MeasureMetricOptions): M
     score: parseFiniteScore(raw),
     raw,
     measured_at: new Date().toISOString(),
+    duration_ms: Date.now() - startedAt,
   };
 }
 

@@ -11,6 +11,7 @@ import {
   measureMetric,
   metricStateTargetSatisfied,
   normalizeMetricTargetContract,
+  MetricTimeoutError,
   readMetricConvergenceState,
   recordMetricIteration,
   revertMetricIteration,
@@ -28,6 +29,16 @@ test('measureMetric executes the command and requires exactly one numeric score'
   assert.equal(measureMetric('printf "12.5"', { cwd }).score, 12.5);
   assert.throws(() => measureMetric('printf "score=12.5"', { cwd }), /exactly one finite numeric score/);
   assert.throws(() => measureMetric('exit 7', { cwd }), /exited 7/);
+});
+
+test('measureMetric reports a typed timeout and successful duration', () => {
+  const cwd = makeTempRoot('pickle-metric-timeout-');
+  const measurement = measureMetric('sleep 0.02; printf 1', { cwd, timeoutMs: 500 });
+  assert.ok(measurement.duration_ms >= 20);
+  assert.throws(
+    () => measureMetric('sleep 0.2; printf 1', { cwd, timeoutMs: 50 }),
+    (error) => error instanceof MetricTimeoutError && error.timeoutMs === 50,
+  );
 });
 
 test('measureMetric rejects commands that mutate a git repository', () => {

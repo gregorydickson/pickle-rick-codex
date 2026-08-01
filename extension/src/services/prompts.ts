@@ -192,13 +192,14 @@ export interface LoopPromptConfig {
   target_relation?: string;
   experiment_id?: string;
   experiment_artifact_path?: string;
-  experiment_memory?: string;
-  convergence_level?: string;
+  experiment_context_path?: string;
   allowed_paths?: string[];
   focus?: string;
   domain?: string;
   dry_run?: boolean;
 }
+
+export const MICROVERSE_ITERATION_PROMPT_MAX_CHARS = 8_192;
 
 export interface LoopPromptInput {
   mode: string;
@@ -222,6 +223,29 @@ export function buildLoopPrompt({
   const maxIterations = Number.isInteger(state.max_iterations) && (state.max_iterations ?? 0) > 0
     ? state.max_iterations
     : 'unlimited';
+
+  if (mode === 'microverse' && loopConfig.experiment_id) {
+    const handoffPath = loopConfig.experiment_context_path || path.join(artifactDir, 'microverse-handoff.json');
+    const prompt = [
+      'Loop mode: microverse',
+      `Iteration: ${iteration} / ${maxIterations}`,
+      `Working directory: ${workingDir}`,
+      `Session control dir (read-only): ${sessionDir}`,
+      `Worker artifact dir: ${artifactDir}`,
+      `Iteration handoff (read first): ${handoffPath}`,
+      `Current experiment ID: ${loopConfig.experiment_id}`,
+      `Before modifying the repository, write ${loopConfig.experiment_artifact_path || path.join(artifactDir, 'microverse-experiment.json')} with keys: experiment_id (exactly ${loopConfig.experiment_id}); non-empty string hypothesis, hypothesis_family, differentiator, rationale; non-empty string[] target_paths. Before returning the promise token, add insight as a non-empty string and verification as a non-empty string[] of plain command/result summaries—never objects. This is the only measured-experiment output artifact.`,
+      'Read the iteration handoff before choosing an approach. It contains the objective, metric state, five recent experiments, and paths to durable reference state. Query older state narrowly only when needed; never load the full experiment ledger into context.',
+      'Make exactly one bounded, falsifiable experiment. The runtime measures the metric and accepts or reverts the repository change.',
+      'Runtime control files are read-only. Write only the experiment output artifact above and repository changes required by the experiment.',
+      'Return <promise>CONTINUE</promise> after completing the experiment, or <promise>LOOP_COMPLETE</promise> only when the objective is genuinely complete. Stop immediately after the promise token.',
+    ].join('\n\n');
+    if (prompt.length > MICROVERSE_ITERATION_PROMPT_MAX_CHARS) {
+      throw new Error(`Microverse iteration prompt exceeded ${MICROVERSE_ITERATION_PROMPT_MAX_CHARS} characters.`);
+    }
+    return prompt;
+  }
+
   const common = [
     `Loop mode: ${mode}`,
     `Session control dir (read-only): ${sessionDir}`,
@@ -242,17 +266,8 @@ export function buildLoopPrompt({
     return [
       ...common,
       `Objective: ${loopConfig.task}`,
-      loopConfig.metric ? `Metric command: ${loopConfig.metric}` : `Goal: ${loopConfig.goal}`,
-      `Direction: ${loopConfig.direction || 'higher'}`,
-      loopConfig.target != null ? `Runtime target: best score ${loopConfig.target_relation || 'gte'} ${loopConfig.target}. The runtime alone decides whether this target is satisfied.` : '',
-      `Stall limit: ${loopConfig.stall_limit || 8}`,
-      loopConfig.metric ? `The runtime—not the worker—measures this command before and after the iteration. It will retain only a real improvement and revert held/regressed work. Read ${sessionDir}/microverse-metrics.json and ${sessionDir}/microverse-experiments.json before choosing an approach.` : '',
-      loopConfig.experiment_id ? `Current experiment ID: ${loopConfig.experiment_id}` : '',
-      loopConfig.experiment_id ? `Before modifying the repository, write ${loopConfig.experiment_artifact_path || path.join(artifactDir, 'microverse-experiment.json')} with keys: experiment_id (exactly ${loopConfig.experiment_id}), hypothesis, hypothesis_family, differentiator, rationale, target_paths. Before returning the promise token, add insight and verification. This is the only measured-experiment handoff artifact.` : '',
-      loopConfig.experiment_memory ? `Compact experiment memory:\n${loopConfig.experiment_memory}` : '',
-      loopConfig.convergence_level && loopConfig.convergence_level !== 'none' ? `Research convergence intervention: ${loopConfig.convergence_level}. Select a materially different hypothesis family; do not repeat an exhausted sibling approach.` : '',
-      'Do not write metric state, the experiment ledger, loop configuration, or runtime summaries; the runtime owns them.',
-      'Process: state one falsifiable hypothesis, make one targeted change, verify it, record the learned insight, and converge deliberately.',
+      `Goal: ${loopConfig.goal}`,
+      'Make one bounded iteration toward the qualitative goal and persist useful repository or summary progress.',
     ].join('\n\n');
   }
 

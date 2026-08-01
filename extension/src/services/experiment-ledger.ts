@@ -6,6 +6,7 @@ export const MICROVERSE_EXPERIMENT_LEDGER_SCHEMA_VERSION = 1;
 export const MICROVERSE_WARN_STALL_COUNT = 3;
 export const MICROVERSE_PARADIGM_SHIFT_STALL_COUNT = 5;
 export const MICROVERSE_STALLED_COUNT = 8;
+export const MICROVERSE_PROMPT_MEMORY_MAX_CHARS = 131_072;
 
 export type ExperimentStatus = 'planned' | 'running' | 'accepted' | 'rejected' | 'invalid';
 export type ExperimentClassification =
@@ -493,6 +494,21 @@ export function recordWorkerAttemptFailure(
   return record;
 }
 
+/**
+ * A relaunched runner starts a new transport-recovery window. Preserve every
+ * recorded attempt, but do not let the previous runner's consecutive failure
+ * streak consume the resumed runner's retry budget.
+ */
+export function resetWorkerFailureCount(sessionDir: string): number {
+  const ledger = readExperimentLedger(sessionDir);
+  if (!ledger || ledger.worker_failure_count === 0) return 0;
+  const previous = ledger.worker_failure_count;
+  ledger.worker_failure_count = 0;
+  ledger.updated_at = nowIso();
+  writeExperimentLedger(sessionDir, ledger);
+  return previous;
+}
+
 /** Marks a retry-exhausted planned experiment terminal without inventing another worker attempt. */
 export function abandonPlannedExperiment(
   sessionDir: string,
@@ -685,21 +701,188 @@ export function assertExperimentStrategy(
   if (!validation.valid) throw new Error(validation.reason ?? 'Invalid experiment strategy.');
 }
 
-export function compactExperimentMemory(ledger: MicroverseExperimentLedger): {
-  accepted_lineage: MicroverseExperimentRecord[];
-  rejected: MicroverseExperimentRecord[];
-  invalid: MicroverseExperimentRecord[];
-  invalid_attempts: Array<{ experiment_id: string; attempt: ExperimentWorkerAttempt }>;
-  convergence: ResearchConvergenceState;
-} {
-  assertExperimentLedger(ledger);
-  return {
-    accepted_lineage: ledger.experiments.filter((record) => record.status === 'accepted'),
-    rejected: ledger.experiments.filter((record) => record.status === 'rejected'),
-    invalid: ledger.experiments.filter((record) => record.status === 'invalid'),
-    invalid_attempts: ledger.experiments.flatMap((record) => record.worker_attempts
-      .filter((attempt) => attempt.status === 'invalid')
-      .map((attempt) => ({ experiment_id: record.id, attempt }))),
-    convergence: researchConvergenceState(ledger),
+interface CompactExperimentRecord {
+  id: string;
+  hypothesis: string;
+  hypothesis_key: string;
+  hypothesis_family: string | null;
+  differentiator: string | null;
+  target_paths: string[];
+  status: ExperimentStatus;
+  classification: ExperimentClassification | null;
+  result_score: number | null;
+  changed_paths: string[];
+  insight: string | null;
+}
+
+interface CompactInvalidAttempt {
+  experiment_id: string;
+  attempt: Pick<ExperimentWorkerAttempt, 'attempt' | 'classification' | 'insight'>;
+}
+
+export interface CompactExperimentMemory {
+  schema_version: 1;
+  ordering: 'oldest_to_newest';
+  full_ledger_required_for_omitted_details: boolean;
+  totals: {
+    experiments: number;
+    accepted_lineage: number;
+    rejected: number;
+    invalid: number;
+    invalid_attempts: number;
   };
+  omitted: {
+    accepted_lineage: number;
+    rejected: number;
+    invalid: number;
+    invalid_attempts: number;
+  };
+  accepted_lineage: CompactExperimentRecord[];
+  rejected: CompactExperimentRecord[];
+  invalid: CompactExperimentRecord[];
+  invalid_attempts: CompactInvalidAttempt[];
+  convergence: ResearchConvergenceState;
+}
+
+function boundedMemoryText(value: string | null, maxChars: number): string | null {
+  if (value === null || value.length <= maxChars) return value;
+  const omitted = value.length - maxChars;
+  return `${value.slice(0, maxChars)}…[${omitted} chars omitted]`;
+}
+
+function boundedMemoryStrings(values: string[], maxItems = 12, maxChars = 384): string[] {
+  const selected = values.slice(0, maxItems).map((value) => boundedMemoryText(value, maxChars) as string);
+  if (values.length > maxItems) selected.push(`…[${values.length - maxItems} items omitted]`);
+  return selected;
+}
+
+function compactExperimentRecord(record: MicroverseExperimentRecord): CompactExperimentRecord {
+  return {
+    id: record.id,
+    hypothesis: boundedMemoryText(record.hypothesis, 2_048) as string,
+    hypothesis_key: boundedMemoryText(record.hypothesis_key, 2_048) as string,
+    hypothesis_family: boundedMemoryText(record.hypothesis_family, 384),
+    differentiator: boundedMemoryText(record.differentiator, 768),
+    target_paths: boundedMemoryStrings(record.target_paths),
+    status: record.status,
+    classification: record.classification,
+    result_score: record.result_score,
+    changed_paths: boundedMemoryStrings(record.changed_paths),
+    insight: boundedMemoryText(record.insight, 2_048),
+  };
+}
+
+function compactInvalidAttempt(experimentId: string, attempt: ExperimentWorkerAttempt): CompactInvalidAttempt {
+  return {
+    experiment_id: experimentId,
+    attempt: {
+      attempt: attempt.attempt,
+      classification: attempt.classification,
+      insight: boundedMemoryText(attempt.insight, 1_024),
+    },
+  };
+}
+
+function compactMemoryChars(memory: CompactExperimentMemory): number {
+  return JSON.stringify(memory).length;
+}
+
+function experimentSequence(id: string): number {
+  return Number(id.slice('exp-'.length));
+}
+
+/**
+ * Build a bounded, recent-first prompt projection of the durable ledger. The
+ * complete evidence remains in microverse-experiments.json; this projection is
+ * only enough context to select the next experiment without growing Codex's
+ * initial input on every iteration.
+ */
+export function compactExperimentMemory(ledger: MicroverseExperimentLedger): CompactExperimentMemory {
+  assertExperimentLedger(ledger);
+  const accepted = ledger.experiments.filter((record) => record.status === 'accepted');
+  const rejected = ledger.experiments.filter((record) => record.status === 'rejected');
+  const invalid = ledger.experiments.filter((record) => record.status === 'invalid');
+  const invalidAttempts = ledger.experiments.flatMap((record) => record.worker_attempts
+    .filter((attempt) => attempt.status === 'invalid')
+    .map((attempt) => ({ experimentId: record.id, attempt })));
+  const convergence = researchConvergenceState(ledger);
+  convergence.exhausted_hypothesis_families = boundedMemoryStrings(
+    convergence.exhausted_hypothesis_families,
+    12,
+    384,
+  );
+  const memory: CompactExperimentMemory = {
+    schema_version: 1,
+    ordering: 'oldest_to_newest',
+    full_ledger_required_for_omitted_details: false,
+    totals: {
+      experiments: ledger.experiments.length,
+      accepted_lineage: accepted.length,
+      rejected: rejected.length,
+      invalid: invalid.length,
+      invalid_attempts: invalidAttempts.length,
+    },
+    omitted: {
+      accepted_lineage: accepted.length,
+      rejected: rejected.length,
+      invalid: invalid.length,
+      invalid_attempts: invalidAttempts.length,
+    },
+    accepted_lineage: [],
+    rejected: [],
+    invalid: [],
+    invalid_attempts: [],
+    convergence,
+  };
+  const included = new Set<string>();
+
+  const tryRecord = (record: MicroverseExperimentRecord): boolean => {
+    if (included.has(record.id)) return true;
+    const key = record.status === 'accepted' ? 'accepted_lineage' : record.status;
+    if (key !== 'accepted_lineage' && key !== 'rejected' && key !== 'invalid') return true;
+    const target = memory[key];
+    const compact = compactExperimentRecord(record);
+    target.push(compact);
+    memory.omitted[key] -= 1;
+    if (compactMemoryChars(memory) > MICROVERSE_PROMPT_MEMORY_MAX_CHARS) {
+      target.pop();
+      memory.omitted[key] += 1;
+      return false;
+    }
+    included.add(record.id);
+    return true;
+  };
+
+  // Guarantee recent evidence from every terminal outcome family before using
+  // the remaining budget for the newest overall scientific history.
+  for (const records of [accepted, rejected, invalid]) {
+    for (const record of records.slice(-8).reverse()) tryRecord(record);
+  }
+  for (const record of [...ledger.experiments].reverse()) {
+    if (!tryRecord(record)) break;
+  }
+
+  for (const entry of invalidAttempts.slice(-12).reverse()) {
+    const compact = compactInvalidAttempt(entry.experimentId, entry.attempt);
+    memory.invalid_attempts.push(compact);
+    memory.omitted.invalid_attempts -= 1;
+    if (compactMemoryChars(memory) > MICROVERSE_PROMPT_MEMORY_MAX_CHARS) {
+      memory.invalid_attempts.pop();
+      memory.omitted.invalid_attempts += 1;
+      break;
+    }
+  }
+
+  for (const records of [memory.accepted_lineage, memory.rejected, memory.invalid]) {
+    records.sort((left, right) => experimentSequence(left.id) - experimentSequence(right.id));
+  }
+  memory.invalid_attempts.sort((left, right) => {
+    const experimentOrder = experimentSequence(left.experiment_id) - experimentSequence(right.experiment_id);
+    return experimentOrder || left.attempt.attempt - right.attempt.attempt;
+  });
+  memory.full_ledger_required_for_omitted_details = Object.values(memory.omitted).some((count) => count > 0);
+  if (compactMemoryChars(memory) > MICROVERSE_PROMPT_MEMORY_MAX_CHARS) {
+    throw new Error('Internal Microverse prompt memory budget exceeded.');
+  }
+  return memory;
 }
