@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {
+  isMicroverseExperimentPlanFrozen,
   readExperimentLedger,
   researchConvergenceState,
   type MicroverseExperimentRecord,
@@ -9,6 +10,13 @@ import type { MetricConvergenceState } from './metric-convergence.js';
 
 export const MICROVERSE_RECENT_HANDOFF_LIMIT = 5;
 export const MICROVERSE_WORKER_HANDOFF_MAX_CHARS = 24_576;
+export const MICROVERSE_FROZEN_PLAN_FIELDS = [
+  'hypothesis',
+  'hypothesis_family',
+  'differentiator',
+  'rationale',
+  'target_paths',
+] as const;
 
 interface MicroverseHandoffLoopConfig {
   task?: unknown;
@@ -83,6 +91,17 @@ export function writeMicroverseWorkerHandoff(input: WriteMicroverseWorkerHandoff
   const terminal = ledger.experiments.filter((record) => ['accepted', 'rejected', 'invalid'].includes(record.status));
   const convergence = researchConvergenceState(ledger);
   const handoffPath = path.join(workerArtifactDir, 'microverse-handoff.json');
+  const frozenPlan = isMicroverseExperimentPlanFrozen(experiment);
+  if (frozenPlan) {
+    atomicWriteJson(experimentArtifactPath, {
+      experiment_id: experiment.id,
+      hypothesis: experiment.hypothesis,
+      hypothesis_family: experiment.hypothesis_family,
+      differentiator: experiment.differentiator,
+      rationale: experiment.rationale,
+      target_paths: [...experiment.target_paths],
+    });
+  }
   const handoff = {
     schema_version: 1,
     mode: 'microverse',
@@ -110,6 +129,19 @@ export function writeMicroverseWorkerHandoff(input: WriteMicroverseWorkerHandoff
       attempt: experiment.attempt,
       baseline_score: experiment.baseline_score,
       artifact_path: experimentArtifactPath,
+      plan_contract: frozenPlan
+        ? {
+          state: 'frozen',
+          artifact_preseeded: true,
+          immutable_fields: MICROVERSE_FROZEN_PLAN_FIELDS,
+          worker_action: 'Preserve the preseeded plan fields exactly; add only insight and verification evidence.',
+        }
+        : {
+          state: 'worker_defined',
+          artifact_preseeded: false,
+          immutable_fields: [],
+          worker_action: 'Define one bounded plan in the experiment artifact before modifying the repository.',
+        },
     },
     recent_experiments: terminal.slice(-MICROVERSE_RECENT_HANDOFF_LIMIT).map(recentExperiment),
     history_counts: {

@@ -7,6 +7,7 @@ export const MICROVERSE_WARN_STALL_COUNT = 3;
 export const MICROVERSE_PARADIGM_SHIFT_STALL_COUNT = 5;
 export const MICROVERSE_STALLED_COUNT = 8;
 export const MICROVERSE_PROMPT_MEMORY_MAX_CHARS = 131_072;
+export const MICROVERSE_RUNTIME_PLACEHOLDER_PREFIX = 'Runtime placeholder for Microverse iteration ';
 
 export type ExperimentStatus = 'planned' | 'running' | 'accepted' | 'rejected' | 'invalid';
 export type ExperimentClassification =
@@ -55,6 +56,10 @@ export interface MicroverseExperimentRecord {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export function isMicroverseExperimentPlanFrozen(record: MicroverseExperimentRecord): boolean {
+  return !record.hypothesis.startsWith(MICROVERSE_RUNTIME_PLACEHOLDER_PREFIX);
 }
 
 export interface MicroverseExperimentLedger {

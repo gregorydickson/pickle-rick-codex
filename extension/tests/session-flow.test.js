@@ -2868,6 +2868,8 @@ fs.writeFileSync(artifactPath, JSON.stringify({
   differentiator: 'fixed differentiator',
   rationale: 'fixed rationale',
   target_paths: ['score.txt'],
+  insight: 'Exercise frozen-plan tamper rejection.',
+  verification: ['frozen-plan retry probe completed'],
 }));
 if (attempt === 1) fs.appendFileSync('score.txt', 'tamper');
 fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
@@ -2889,6 +2891,96 @@ fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONT
   assert.equal(ledger.experiments[0].hypothesis_family, 'original family');
   assert.match(ledger.experiments[0].worker_attempts[1].insight, /must preserve its frozen hypothesis/);
   assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'a');
+});
+
+test('measured microverse preseeds a frozen retry plan so the worker need not reconstruct ledger prose', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-preseeded-plan-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const attemptCounter = path.join(makeTempRoot('pickle-rick-preseed-counter-'), 'count.txt');
+  const observedSeedPath = path.join(dataRoot, 'observed-retry-seed.json');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  fs.writeFileSync(path.join(projectDir, 'protected.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'score.txt', 'protected.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const counterPath = ${JSON.stringify(attemptCounter)};
+const attempt = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) + 1 : 1;
+fs.writeFileSync(counterPath, String(attempt));
+const artifactPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)[1].trim();
+const handoffPath = prompt.match(/Iteration handoff \\(read first\\): ([^\\n]+)/)[1].trim();
+const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)[1];
+if (attempt === 1) {
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    experiment_id: experimentId,
+    hypothesis: 'Frozen retry hypothesis',
+    hypothesis_family: 'frozen-retry-family',
+    differentiator: 'exact frozen differentiator',
+    rationale: 'Continue exactly this experiment after a recoverable worker failure.',
+    target_paths: ['score.txt'],
+    insight: 'The first attempt deliberately touched a protected evaluator input.',
+    verification: ['protected-path recovery probe completed'],
+  }));
+  fs.writeFileSync('protected.txt', 'tampered\\n');
+} else {
+  if (!fs.existsSync(artifactPath)) {
+    console.error('retry artifact was not preseeded');
+    process.exit(2);
+  }
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  const handoff = JSON.parse(fs.readFileSync(handoffPath, 'utf8'));
+  fs.writeFileSync(${JSON.stringify(observedSeedPath)}, JSON.stringify({ artifact, plan_contract: handoff.current_experiment.plan_contract }));
+  artifact.insight = 'The retry reused the runtime-owned frozen plan without reading the experiment ledger.';
+  artifact.verification = ['wc -c < score.txt => 2'];
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact));
+  fs.writeFileSync('score.txt', 'aa');
+}
+fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
+`);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'preseed frozen retry'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse',
+    task: 'retry one frozen experiment without reconstructing its prose',
+    metric: 'wc -c < score.txt',
+    direction: 'higher',
+    target: 2,
+    target_relation: 'gte',
+    protected_paths: ['protected.txt'],
+    worker_failure_limit: 3,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const ledger = readExperimentLedger(sessionDir);
+  const observed = readJsonFile(observedSeedPath);
+  assert.equal(ledger.experiments.length, 1);
+  assert.equal(ledger.experiments[0].status, 'accepted');
+  assert.equal(ledger.experiments[0].attempt, 2);
+  assert.equal(ledger.experiments[0].retry_count, 1);
+  assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'protected_path_tamper');
+  assert.equal(ledger.experiments[0].worker_attempts[1].classification, 'improved');
+  assert.deepEqual(observed.artifact, {
+    experiment_id: ledger.experiments[0].id,
+    hypothesis: 'Frozen retry hypothesis',
+    hypothesis_family: 'frozen-retry-family',
+    differentiator: 'exact frozen differentiator',
+    rationale: 'Continue exactly this experiment after a recoverable worker failure.',
+    target_paths: ['score.txt'],
+  });
+  assert.equal(observed.plan_contract.state, 'frozen');
+  assert.equal(observed.plan_contract.artifact_preseeded, true);
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'aa');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'protected.txt'), 'utf8'), 'baseline\n');
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
 test('measured microverse restores a durable interrupted repository and metric transaction on resume', () => {

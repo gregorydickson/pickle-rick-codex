@@ -40,6 +40,8 @@ import {
   abandonPlannedExperiment,
   assertExperimentStrategy,
   completeExperiment,
+  isMicroverseExperimentPlanFrozen,
+  MICROVERSE_RUNTIME_PLACEHOLDER_PREFIX,
   planExperiment,
   readExperimentLedger,
   reconcileRunningExperiments,
@@ -380,7 +382,11 @@ function workerExperimentArtifactPath(workerArtifactDir: string): string {
   return path.join(workerArtifactDir, 'microverse-experiment.json');
 }
 
-function readWorkerExperimentArtifact(workerArtifactDir: string, experimentId: string): WorkerExperimentArtifact {
+function readWorkerExperimentArtifact(
+  workerArtifactDir: string,
+  experimentId: string,
+  requireCompletionEvidence = false,
+): WorkerExperimentArtifact {
   const artifactPath = workerExperimentArtifactPath(workerArtifactDir);
   const artifact = readJsonFile<WorkerExperimentArtifact>(artifactPath, null);
   if (!artifact || artifact.experiment_id !== experimentId
@@ -393,6 +399,11 @@ function readWorkerExperimentArtifact(workerArtifactDir: string, experimentId: s
       && (!Array.isArray(artifact.verification)
         || artifact.verification.some((entry) => typeof entry !== 'string' || !entry.trim()))) {
     throw new Error(`Measured Microverse artifact ${artifactPath} verification must be a non-empty string array when present; object entries are invalid.`);
+  }
+  if (requireCompletionEvidence
+      && (typeof artifact.insight !== 'string' || !artifact.insight.trim()
+        || !Array.isArray(artifact.verification) || artifact.verification.length === 0)) {
+    throw new Error(`Frozen Microverse retry artifact ${artifactPath} must add a non-empty insight and verification string array.`);
   }
   return artifact;
 }
@@ -409,7 +420,7 @@ function adoptOrValidateWorkerExperimentPlan(
     hypothesisFamily: artifact.hypothesis_family,
     targetPaths: artifact.target_paths,
   });
-  if (record.hypothesis.startsWith('Runtime placeholder for Microverse iteration ')) {
+  if (!isMicroverseExperimentPlanFrozen(record)) {
     updateExperimentPlan(sessionDir, experimentId, {
       hypothesis: artifact.hypothesis,
       hypothesisFamily: artifact.hypothesis_family,
@@ -444,7 +455,7 @@ function planMicroverseExperiment(
   const sequence = ledger?.next_sequence || 1;
   const record = planExperiment(sessionDir, {
     parentId: parent?.id || null,
-    hypothesis: `Runtime placeholder for Microverse iteration ${iteration}`,
+    hypothesis: `${MICROVERSE_RUNTIME_PLACEHOLDER_PREFIX}${iteration}`,
     differentiator: `iteration ${iteration}; experiment ${sequence}`,
     rationale: String(loopConfig.task || 'Measured metric improvement'),
     targetPaths: [],
@@ -1145,7 +1156,11 @@ export async function runLoop(sessionDir: string): Promise<void> {
       let experimentArtifact: WorkerExperimentArtifact | null = null;
       if (!workerFailure && experiment) {
         try {
-          experimentArtifact = readWorkerExperimentArtifact(workerArtifactDir, experiment.id);
+          experimentArtifact = readWorkerExperimentArtifact(
+            workerArtifactDir,
+            experiment.id,
+            isMicroverseExperimentPlanFrozen(experiment),
+          );
           adoptOrValidateWorkerExperimentPlan(sessionDir, experiment.id, experimentArtifact);
         } catch (error) {
           workerFailure = 'worker_incomplete';

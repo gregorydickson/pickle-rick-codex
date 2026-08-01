@@ -37,6 +37,8 @@ test('buildLoopPrompt emits the measured microverse experiment contract', () => 
   assert.match(prompt, /Before modifying the repository, write \/artifacts\/worker-1\/experiment\.json/);
   assert.match(prompt, /verification as a non-empty string\[\]/);
   assert.match(prompt, /plain command\/result summaries—never objects/);
+  assert.match(prompt, /runtime has preseeded the artifact/);
+  assert.match(prompt, /preserve those plan fields exactly/);
   assert.match(prompt, /five recent experiments/);
   assert.match(prompt, /never load the full experiment ledger into context/);
   assert.doesNotMatch(prompt, /Raise deterministic coverage|npm run coverage|experiment memory/);
