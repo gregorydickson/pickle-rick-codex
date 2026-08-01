@@ -127,3 +127,18 @@ test('codex runner results and success checks expose classified events without r
   assert.equal(result.usage.cache_read_input_tokens, 40);
   assert.equal(observed?.outputFormat, 'stream-json');
 });
+
+test('codex runner treats EPIPE from a closed child stdin as a process outcome', async () => {
+  const result = await runCommand({
+    command: process.execPath,
+    args: [
+      '-e',
+      'require("node:fs").closeSync(0); setTimeout(() => process.exit(0), 50);',
+    ],
+    input: 'x'.repeat(8 * 1024 * 1024),
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+});
