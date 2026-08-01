@@ -33,6 +33,8 @@ test('buildRefinePrdPrompt requires executable ticket and ambiguity contracts', 
   assert.match(prompt, /non-empty allowed_paths array/);
   assert.match(prompt, /create an explicit contract-decision ticket first/);
   assert.match(prompt, /do not silently hard-code fixed-SHA enforcement/);
+  assert.match(prompt, /Internal leaf-worker boundary: the refinement orchestrator is already running/);
+  assert.match(prompt, /Do not launch another workflow, command, skill, or agent/);
   assert.match(prompt, /<promise>REFINEMENT_COMPLETE<\/promise>/);
 });
 
@@ -50,6 +52,7 @@ test('buildRefinementAnalystPrompt scopes the analyst role and output', () => {
   assert.match(prompt, /Write your analyst report to \/sessions\/pickle-9\/analysis\/verification\.md/);
   assert.match(prompt, /Findings, Recommended Changes, Verification Gaps, and Ticketing Notes/);
   assert.match(prompt, /Do not write the final manifest/);
+  assert.match(prompt, /Internal leaf-worker boundary: the refinement orchestrator is already running/);
   assert.match(prompt, /<promise>ANALYST_COMPLETE<\/promise>/);
 });
 
@@ -66,5 +69,6 @@ test('buildRefinementSynthesisPrompt preserves ordered reports and proof obligat
   assert.match(prompt, /Write \/sessions\/pickle-10\/refinement_manifest\.json/);
   assert.match(prompt, /verification_env, output_artifacts, proof_corpus, and freeze_contract/);
   assert.match(prompt, /Parity-style port work must preserve full mirrored proof obligations/);
+  assert.match(prompt, /Internal leaf-worker boundary: the refinement orchestrator is already running/);
   assert.match(prompt, /<promise>REFINEMENT_COMPLETE<\/promise>/);
 });

@@ -143,9 +143,6 @@ async function runSpawnedCommand({
       detached: process.platform !== 'win32',
     });
 
-    onSpawn?.(child);
-    child.stdin.end(input ?? '');
-
     const cleanup = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
@@ -311,6 +308,20 @@ async function runSpawnedCommand({
       };
       setTimeout(finalizeAfterFlush, flushQuietMs);
     });
+
+    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+      // A short-lived command may exit before the prompt has finished writing.
+      // Its process exit remains authoritative; an EPIPE on stdin is only the
+      // expected consequence of the child closing its read end first.
+      if (error.code === 'EPIPE') return;
+      if (settled) return;
+      cleanup();
+      terminateProcessTree(child, 'SIGTERM');
+      reject(error);
+    });
+
+    onSpawn?.(child);
+    child.stdin.end(input ?? '');
   });
 }
 

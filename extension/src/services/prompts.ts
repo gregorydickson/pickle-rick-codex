@@ -3,6 +3,11 @@ import { describeVerificationContract, normalizeVerificationCommands } from './v
 import { serializeApprovedWorkerContext, type WorkerLifecycleArtifact, type WorkerLifecyclePhase } from './worker-lifecycle.js';
 import type { Ticket, VerificationContract } from '../types/index.js';
 
+const REFINEMENT_LEAF_BOUNDARY = [
+  'Internal leaf-worker boundary: the refinement orchestrator is already running.',
+  'Produce the requested artifact directly. Do not launch another workflow, command, skill, or agent that drafts or refines PRDs or starts orchestration.',
+].join(' ');
+
 export interface DraftPrdPromptInput {
   task: string;
   sessionDir: string;
@@ -28,6 +33,7 @@ export interface RefinePrdPromptInput {
 export function buildRefinePrdPrompt({ sessionDir, prdPath }: RefinePrdPromptInput): string {
   return [
     'Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.',
+    REFINEMENT_LEAF_BOUNDARY,
     `Read ${prdPath}.`,
     `Write ${sessionDir}/prd_refined.md with clarified acceptance criteria.`,
     `Write ${sessionDir}/refinement_manifest.json with a top-level {"tickets":[...]} array.`,
@@ -59,6 +65,7 @@ export function buildRefinementAnalystPrompt({
 }: RefinementAnalystPromptInput): string {
   return [
     'You are one of three parallel PRD refinement analysts for the Pickle Rick Codex runtime.',
+    REFINEMENT_LEAF_BOUNDARY,
     `Refinement analyst role: ${role}`,
     `Focus: ${focus}`,
     `Read ${prdPath}`,
@@ -85,6 +92,7 @@ export function buildRefinementSynthesisPrompt({
 }: RefinementSynthesisPromptInput): string {
   return [
     'You are synthesizing parallel PRD refinement analyst reports into final executable artifacts for the Pickle Rick Codex runtime.',
+    REFINEMENT_LEAF_BOUNDARY,
     `Read ${prdPath}`,
     'Read these analyst reports:',
     ...analystReports.map((report) => `- ${report}`),
