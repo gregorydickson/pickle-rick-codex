@@ -33,6 +33,10 @@ interface RefinePrdOptions {
   timeoutMs?: number;
 }
 
+const REFINEMENT_LEAF_ENV = 'PICKLE_REFINEMENT_LEAF';
+const REFINEMENT_WORKER_ENV: NodeJS.ProcessEnv = { [REFINEMENT_LEAF_ENV]: '1' };
+const SYNTHESIS_ATTEMPTS = 2;
+
 function hasPromiseToken(text: string, token: string): boolean {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
 }
@@ -82,7 +86,13 @@ function analystSpecs(sessionDir: string): AnalystSpec[] {
   ];
 }
 
-async function runAnalyst(state: PersistedState, prdPath: string, spec: AnalystSpec, timeoutMs: number): Promise<CodexSpawnResult> {
+async function runAnalyst(
+  state: PersistedState,
+  prdPath: string,
+  spec: AnalystSpec,
+  timeoutMs: number,
+  cancelCheck: () => boolean,
+): Promise<CodexSpawnResult> {
   const result = await runCodexExecMonitored({
     cwd: state.working_dir as string,
     prompt: buildRefinementAnalystPrompt({
@@ -92,9 +102,11 @@ async function runAnalyst(state: PersistedState, prdPath: string, spec: AnalystS
       analysisPath: spec.analysisPath,
     }),
     timeoutMs,
+    env: REFINEMENT_WORKER_ENV,
     outputLastMessagePath: spec.messagePath,
     addDirs: [path.dirname(prdPath)],
     cleanupPaths: [spec.analysisPath],
+    cancelCheck,
     successCheck: ({ lastMessage }) =>
       fs.existsSync(spec.analysisPath) &&
       hasPromiseToken(lastMessage, 'ANALYST_COMPLETE'),
@@ -108,31 +120,59 @@ async function runAnalyst(state: PersistedState, prdPath: string, spec: AnalystS
   return result;
 }
 
-async function runSynthesis(state: PersistedState, sessionDir: string, prdPath: string, timeoutMs: number): Promise<CodexSpawnResult> {
+async function runSynthesis(
+  state: PersistedState,
+  sessionDir: string,
+  prdPath: string,
+  timeoutMs: number,
+): Promise<CodexSpawnResult[]> {
   const refinedPath = path.join(sessionDir, 'prd_refined.md');
   const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
   const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
   const analystReports = analystSpecs(sessionDir).map((spec) => spec.analysisPath);
-  const result = await runCodexExecMonitored({
-    cwd: state.working_dir as string,
-    prompt: buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystReports }),
-    timeoutMs,
-    outputLastMessagePath,
-    addDirs: [sessionDir],
-    cleanupPaths: [refinedPath, manifestPath],
-    successCheck: ({ lastMessage }) =>
-      fs.existsSync(refinedPath) &&
-      fs.existsSync(manifestPath) &&
-      hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
-  });
+  const basePrompt = buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystReports });
+  const results: CodexSpawnResult[] = [];
 
-  if (!hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
+  for (let attempt = 1; attempt <= SYNTHESIS_ATTEMPTS; attempt += 1) {
+    const prompt = attempt === 1
+      ? basePrompt
+      : [
+        basePrompt,
+        `Bounded recovery attempt ${attempt} of ${SYNTHESIS_ATTEMPTS}: the prior synthesis did not atomically complete both final artifacts and its completion marker. Recreate both final artifacts from the source PRD and analyst reports.`,
+      ].join('\n\n');
+    const result = await runCodexExecMonitored({
+      cwd: state.working_dir as string,
+      prompt,
+      timeoutMs,
+      env: REFINEMENT_WORKER_ENV,
+      outputLastMessagePath,
+      addDirs: [sessionDir],
+      cleanupPaths: [refinedPath, manifestPath],
+      successCheck: ({ lastMessage }) =>
+        fs.existsSync(refinedPath) &&
+        fs.existsSync(manifestPath) &&
+        hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
+    });
+    results.push(result);
+
+    if (hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
+      return results;
+    }
+
     discardRefinementOutput(sessionDir);
+    if (attempt < SYNTHESIS_ATTEMPTS) {
+      appendRefineLog(
+        sessionDir,
+        `Synthesis attempt ${attempt} did not complete its artifact contract. Retrying once from analyst checkpoints.`,
+      );
+      continue;
+    }
+
     assertCodexSucceeded(result, 'PRD refinement failed');
     throw new Error('PRD refinement failed: synthesis did not complete its artifact contract');
   }
 
-  return result;
+  throw new Error('PRD refinement failed: synthesis attempts exhausted');
 }
 
 function sumUsage(results: CodexSpawnResult[]): CodexUsage {
@@ -163,7 +203,7 @@ function markRefinePhase(manager: StateManager, statePath: string, sessionDir: s
   console.error(`[refine] ${message}`);
 }
 
-export async function refinePrd(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
+async function refinePrdWithLease(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
   const prdPath = path.join(sessionDir, 'prd.md');
   if (!fs.existsSync(prdPath)) {
     throw new Error(`PRD not found: ${prdPath}`);
@@ -177,14 +217,19 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
 
   let analystResults: CodexSpawnResult[] | null = null;
   let refinementResults: CodexSpawnResult[] = [];
+  let cancelAnalysts = false;
+  let analystPromises: Promise<CodexSpawnResult>[] = [];
   try {
     markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
-    analystResults = await Promise.all(
-      analystSpecs(sessionDir).map((spec) => runAnalyst(state, prdPath, spec, timeoutMs)),
+    analystPromises = analystSpecs(sessionDir).map(
+      (spec) => runAnalyst(state, prdPath, spec, timeoutMs, () => cancelAnalysts),
     );
+    analystResults = await Promise.all(analystPromises);
     appendRefineLog(sessionDir, 'Analyst fanout complete.');
   } catch {
     // If analyst fanout fails, keep the prior single-pass refinement path as fallback.
+    cancelAnalysts = true;
+    await Promise.allSettled(analystPromises);
     markRefinePhase(manager, statePath, sessionDir, 'refine:fallback', 'Analyst fanout failed. Falling back to single-pass refinement.');
     const fallbackPrompt = buildRefinePrdPrompt({ sessionDir, prdPath });
     const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
@@ -194,6 +239,7 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
       cwd: state.working_dir as string,
       prompt: fallbackPrompt,
       timeoutMs,
+      env: REFINEMENT_WORKER_ENV,
       outputLastMessagePath,
       addDirs: [sessionDir],
       cleanupPaths: [refinedPath, manifestPath],
@@ -212,8 +258,8 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
 
   if (analystResults) {
     markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
-    const synthesisResult = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
-    refinementResults = [...analystResults, synthesisResult];
+    const synthesisResults = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
+    refinementResults = [...analystResults, ...synthesisResults];
   }
 
   let manifest: RefinementManifest;
@@ -263,6 +309,26 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
   }, { enabled: config.defaults.activity_logging });
 
   return manifest;
+}
+
+export async function refinePrd(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
+  if (process.env[REFINEMENT_LEAF_ENV] === '1') {
+    throw new Error('Refinement leaf workers cannot launch refinement orchestration.');
+  }
+
+  const leaseManager = new StateManager({ acquireTimeoutMs: 250 });
+  const leasePath = path.join(sessionDir, '.refinement-run');
+  try {
+    leaseManager.acquireLock(leasePath);
+  } catch {
+    throw new Error(`Refinement is already running for session: ${sessionDir}`);
+  }
+
+  try {
+    return await refinePrdWithLease(sessionDir, options);
+  } finally {
+    leaseManager.releaseLock(leasePath);
+  }
 }
 
 async function main(argv: string[]): Promise<void> {
