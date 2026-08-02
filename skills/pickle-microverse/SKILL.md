@@ -21,12 +21,13 @@ Resume:
 
 `node $HOME/.codex/pickle-rick/extension/bin/pickle-microverse.js --resume`
 
-Command metrics are measured by the runtime before the first iteration and after every valid experiment. The command must exit successfully and print exactly one finite number. Improved iterations are retained; held or regressed iterations are archived to the experiment ledger and reverted. Use `--metric-timeout <seconds>` to bound each measurement. Use `--protected-path <repo-relative-path-or-glob>` repeatedly to prevent workers from changing evaluation inputs. `--worker-failure-limit <N>` defaults to 3; the research stall limit defaults to 8.
+Command metrics are measured by the runtime before the first iteration and after every valid experiment. The command must exit successfully and print exactly one finite number. Improved iterations are retained; held or regressed iterations are archived to the experiment ledger and reverted. Use `--metric-timeout <seconds>` to bound each measurement. Use `--protected-path <repo-relative-path-or-glob>` repeatedly to prevent workers from changing evaluation inputs. `--worker-failure-limit <N>` is retained as the legacy name for the recovery-window threshold and defaults to 3; it does not stop an ordinary below-target session. The research stall threshold defaults to 8 and forces a paradigm shift instead of stopping.
 
-Microverse sessions have no wall-clock limit. They stop only when the target,
-iteration budget, convergence, worker-failure limit, cancellation, or another
-explicit runtime-owned stop condition is reached. Resuming a legacy session
-clears its stored wall-clock limit.
+Microverse sessions have no default wall-clock limit. Below a runtime-owned
+target, worker failures, research stalls, and no-progress circuits trigger
+recovery and continue. Sessions stop only for target completion, cancellation,
+an explicit operator budget, or verified unsafe/corrupt checkpoint or evaluator
+state. Resuming a legacy session clears its stored wall-clock limit.
 
 ## Process
 
@@ -37,8 +38,8 @@ clears its stored wall-clock limit.
 5. Measure result
 6. Compare: improved/held/regressed (with tolerance)
 7. Accept improvement or archive and revert the rejected experiment
-8. Escalate at 3/5/8 valid stalls: warn/paradigm shift/stop
-9. Repeat until the runtime-owned target is met or convergence is reached
+8. Escalate at 3/5/8 valid stalls: warn/paradigm shift/mandatory new family
+9. Repeat until the runtime-owned target is met or the user cancels
 
 ## Failure Classification
 

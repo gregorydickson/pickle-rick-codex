@@ -23,7 +23,7 @@ Arbor's useful pattern is not parallelism by itself. It separates hypothesis sel
 3. Make the runtime, not the worker, decide whether a numeric target has been reached.
 4. Persist a structured experiment ledger containing hypotheses, changes, results, and learned insights.
 5. Prevent metric gaming by protecting declared evaluation inputs and detecting suspicious scope changes.
-6. Escalate stalled research from warning to forced strategy change before stopping.
+6. Escalate stalled research from warning to forced strategy change without stopping below the runtime-owned target.
 7. Preserve the sequential `codex exec` path and recoverable rollback guarantees.
 
 ## Non-goals
@@ -87,7 +87,7 @@ Add two counters:
 - `worker_failure_count`: consecutive attempts that did not produce valid completion evidence.
 - `experiment_stall_count`: completed, valid experiments that held or regressed.
 
-Only the second counter participates in convergence. A worker failure restores the checkpoint and retries the same planned experiment. A configurable `worker_failure_limit` defaults to 3 and terminates with `worker_failure_limit`, not `stalled`.
+Only the second counter participates in convergence. A worker failure restores the checkpoint and retries without ending a below-target session. The legacy-named `worker_failure_limit` defaults to 3 but now defines a recovery-window threshold: timeouts expand the persisted worker budget, repeated transport failures retry the same plan, and repeated incomplete evidence rotates to a new experiment. Protected-path or control-plane tampering remains fail-closed because it is verified unsafe state, not an ordinary worker failure.
 
 Metric measurement must not run after an invalid worker attempt. This avoids converting infrastructure failure or premature termination into fake scientific evidence.
 
@@ -148,7 +148,7 @@ Replace a single hard stall threshold with deterministic escalation:
 
 - after 3 valid non-improving experiments: `warn`, requiring a different target or hypothesis family;
 - after 5: `paradigm_shift`, forbidding another sibling of the exhausted approach;
-- after 8: `stalled`, unless unresolved planned hypotheses remain;
+- after 8: `stalled`, requiring another non-exhausted hypothesis family while the loop continues;
 - any accepted improvement resets valid-experiment stall state.
 
 Execution failures never advance this ladder. The ledger records exhausted parents/families and the prompt explicitly includes them. This borrows Arbor's plateau intervention model without requiring concurrent executors.
@@ -162,6 +162,8 @@ Execution failures never advance this ladder. The ledger records exhausted paren
 - Rejected code may be rolled back, but its hypothesis, diff, and insight must survive.
 - Worker-declared completion cannot override a runtime-owned numeric target.
 - Protected evaluation files must be checked after worker execution and before metric acceptance.
+- Worker-failure, scientific-stall, and no-progress circuit thresholds are recovery signals below a runtime-owned target; they must not set the session inactive.
+- Worker diagnostics within one scientific iteration need an iteration-wide attempt ordinal because experiment rotation resets the experiment-local attempt counter.
 
 ## Machine-checkable Acceptance Criteria
 
@@ -210,7 +212,16 @@ Execution failures never advance this ladder. The ledger records exhausted paren
 - The improvement is never promoted to `best`.
 - Command: `cd extension && node --test tests/metric-convergence.test.js tests/session-flow.test.js`
 
-### AC-8: Full release gates remain green
+### AC-8: Recoverable thresholds never stop a below-target Microverse
+
+- A worker that exceeds its initial timeout completes after the runtime persists a larger timeout and retries in the same runner.
+- Crossing the worker recovery threshold resets the consecutive failure window without setting `last_exit_reason` to `worker_failure_limit`.
+- A pre-existing scientific stall or OPEN no-progress circuit forces recovery and still permits a later accepted experiment to satisfy the target.
+- Rotating experiments within one scientific iteration preserves every worker diagnostic under a unique iteration-wide attempt ordinal.
+- Protected-path or control-plane tampering remains fail-closed.
+- Command: `cd extension && node --test tests/session-flow.test.js`
+
+### AC-9: Full release gates remain green
 
 - `cd extension && npm run typecheck`
 - `cd extension && npm run lint`
@@ -224,7 +235,7 @@ Execution failures never advance this ladder. The ledger records exhausted paren
 2. **Target contract:** Slice 3 and AC-4.
 3. **Research memory:** Slice 4 and AC-6.
 4. **Integrity and convergence:** Slices 5-6 and AC-7 plus remaining AC-5 cases.
-5. **Dogfood gate:** Resume the coverage objective from the accepted 73.72 commit. The run must reach its configured target or stop with a ledger that contains distinct, valid rejected hypotheses; empty last messages may not appear as scientific stalls.
+5. **Dogfood gate:** Resume the coverage objective from the accepted 73.72 commit. The run must reach its configured target unless the user cancels or checkpoint/evaluator state is verified unsafe or corrupt; empty last messages may not appear as scientific stalls.
 
 ## Design Decision
 

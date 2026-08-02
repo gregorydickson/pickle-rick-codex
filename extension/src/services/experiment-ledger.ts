@@ -500,9 +500,9 @@ export function recordWorkerAttemptFailure(
 }
 
 /**
- * A relaunched runner starts a new transport-recovery window. Preserve every
- * recorded attempt, but do not let the previous runner's consecutive failure
- * streak consume the resumed runner's retry budget.
+ * Starts a new transport-recovery window without erasing attempt evidence.
+ * Used both after a runner relaunch and when a live Microverse crosses its
+ * recovery threshold but remains below the runtime-owned target.
  */
 export function resetWorkerFailureCount(sessionDir: string): number {
   const ledger = readExperimentLedger(sessionDir);

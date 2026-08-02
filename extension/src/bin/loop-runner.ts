@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runCodexExecMonitored, assertCodexSucceeded } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
-import { canExecute, loadCircuitState, recordIteration } from '../services/circuit-breaker.js';
+import { canExecute, loadCircuitState, recordIteration, resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { logActivity } from '../services/activity-logger.js';
 import {
   commitTrackedChanges,
@@ -126,6 +126,78 @@ function getWorkerTimeoutMs(state: PersistedState, config: Config): number {
     ? Number(state.worker_timeout_seconds)
     : config.defaults.worker_timeout_seconds;
   return timeoutSeconds * 1000;
+}
+
+const MAX_MICROVERSE_WORKER_TIMEOUT_SECONDS = 86_400;
+
+type MicroverseWorkerFailure = Extract<
+  ExperimentClassification,
+  'worker_incomplete' | 'worker_error' | 'worker_timeout' | 'protected_path_tamper'
+>;
+
+function increaseMicroverseWorkerTimeout(
+  manager: StateManager,
+  statePath: string,
+  config: Config,
+): { previous: number; next: number } {
+  const current = manager.read(statePath);
+  const previous = Math.max(1, Math.ceil(getWorkerTimeoutMs(current, config) / 1000));
+  const next = Math.min(MAX_MICROVERSE_WORKER_TIMEOUT_SECONDS, Math.max(previous + 1, previous * 2));
+  manager.update(statePath, (state) => {
+    state.worker_timeout_seconds = next;
+    return state;
+  });
+  return { previous, next };
+}
+
+function recoverMicroverseWorkerFailure(
+  sessionDir: string,
+  statePath: string,
+  manager: StateManager,
+  config: Config,
+  loopConfig: LoopConfig,
+  experiment: MicroverseExperimentRecord,
+  failure: MicroverseWorkerFailure,
+  detail: string,
+  failures: number,
+): boolean {
+  if (failure === 'worker_timeout') {
+    const timeout = increaseMicroverseWorkerTimeout(manager, statePath, config);
+    appendRunnerLog(
+      sessionDir,
+      timeout.next > timeout.previous
+        ? `microverse worker timeout increased: ${timeout.previous}s -> ${timeout.next}s`
+        : `microverse worker timeout remains at recovery ceiling: ${timeout.next}s`,
+    );
+  }
+
+  const threshold = Number(loopConfig.worker_failure_limit || 3);
+  if (failures < threshold) return true;
+
+  // Control-plane or protected-input tampering is the one worker classification
+  // that is unsafe to retry forever. The caller fails closed after the configured
+  // evidence window; ordinary transport, timeout, and completion failures recover.
+  if (failure === 'protected_path_tamper') return false;
+
+  let recoveryAction = `retrying ${experiment.id}`;
+  if (failure === 'worker_incomplete') {
+    abandonPlannedExperiment(sessionDir, experiment.id, {
+      classification: failure,
+      insight: `${detail}; recovery threshold reached, rotating to a new experiment.`,
+    });
+    recoveryAction = `archived ${experiment.id} and will plan a different experiment`;
+  }
+  const resetFailures = resetWorkerFailureCount(sessionDir);
+  manager.update(statePath, (state) => {
+    state.worker_failure_count = 0;
+    state.last_loop_message = `${detail}; recovery window reset after ${resetFailures} failures.`;
+    return state;
+  });
+  appendRunnerLog(
+    sessionDir,
+    `microverse recovery threshold reached after ${resetFailures} worker failures: ${recoveryAction}`,
+  );
+  return true;
 }
 
 function summaryPaths(sessionDir: string, mode: string): SummaryPaths {
@@ -468,6 +540,27 @@ function planMicroverseExperiment(
     baselineScore,
   });
   return startExperiment(sessionDir, record.id);
+}
+
+function microverseAttemptOrdinal(
+  sessionDir: string,
+  experiment: MicroverseExperimentRecord | null,
+  fallback: number,
+): number {
+  if (!experiment) return fallback;
+  const records = readExperimentLedger(sessionDir)?.experiments || [];
+  let priorScientificOutcome = -1;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (records[index].status === 'accepted' || records[index].status === 'rejected') {
+      priorScientificOutcome = index;
+      break;
+    }
+  }
+  return Math.max(
+    1,
+    records.slice(priorScientificOutcome + 1)
+      .reduce((total, record) => total + record.worker_attempts.length, 0),
+  );
 }
 
 function revertMetricIterationSafely(
@@ -1019,9 +1112,10 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       }
       const currentLedger = currentMetricState ? readExperimentLedger(sessionDir) : null;
       if (currentLedger && researchConvergenceState(currentLedger).level === 'stalled') {
-        exitReason = 'stalled';
-        appendRunnerLog(sessionDir, 'microverse research convergence already stalled before starting another experiment');
-        break;
+        appendRunnerLog(
+          sessionDir,
+          'microverse research stall threshold reached; continuing with a mandatory non-exhausted hypothesis family',
+        );
       }
       if (Number.isInteger(state.max_iterations) && (state.max_iterations as number) > 0 && (state.iteration as number) >= (state.max_iterations as number)) {
         exitReason = 'max_iterations';
@@ -1035,9 +1129,14 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         }
       }
       if (config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
-        exitReason = 'circuit_open';
-        appendRunnerLog(sessionDir, 'refusing iteration: circuit breaker is OPEN');
-        break;
+        if (currentMetricState) {
+          resetCircuitBreaker(sessionDir, 'microverse recovery continues below target');
+          appendRunnerLog(sessionDir, 'microverse reset an OPEN no-progress circuit and continued below target');
+        } else {
+          exitReason = 'circuit_open';
+          appendRunnerLog(sessionDir, 'refusing iteration: circuit breaker is OPEN');
+          break;
+        }
       }
 
       const beforeSnapshot = captureProgressSnapshot({
@@ -1074,7 +1173,8 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       });
 
       const attempt = experiment?.attempt ?? 1;
-      const workerArtifactDir = createWorkerArtifactDir(sessionDir, loopConfig.mode, iteration, attempt);
+      const attemptOrdinal = microverseAttemptOrdinal(sessionDir, experiment, attempt);
+      const workerArtifactDir = createWorkerArtifactDir(sessionDir, loopConfig.mode, iteration, attemptOrdinal);
       const workerSummaries = workerSummaryPaths(workerArtifactDir, loopConfig.mode);
       const experimentArtifactPath = experiment
         ? workerExperimentArtifactPath(workerArtifactDir)
@@ -1092,7 +1192,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         })
         : null;
       const controlSnapshots = captureControlFiles(sessionDir);
-      const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attempt);
+      const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attemptOrdinal);
       fs.rmSync(outputLastMessagePath, { force: true });
       const result = await runCodexExecMonitored({
         cwd: state.working_dir as string,
@@ -1147,12 +1247,12 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         sessionDir,
         loopConfig.mode,
         iteration,
-        attempt,
+        attemptOrdinal,
         outputLastMessagePath,
         result,
         completionToken,
       );
-      let workerFailure: Extract<ExperimentClassification, 'worker_incomplete' | 'worker_error' | 'worker_timeout' | 'protected_path_tamper'> | null = result.timedOut
+      let workerFailure: MicroverseWorkerFailure | null = result.timedOut
         ? 'worker_timeout'
         : result.exitCode !== 0
           ? 'worker_error'
@@ -1204,10 +1304,21 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           return current;
         });
         appendRunnerLog(sessionDir, `microverse ${workerFailure}: ${workerFailureDetail} (${failures} consecutive worker failures)`);
-        if (failures >= Number(loopConfig.worker_failure_limit || 3)) {
+        const recovered = recoverMicroverseWorkerFailure(
+          sessionDir,
+          statePath,
+          manager,
+          config,
+          loopConfig,
+          experiment,
+          workerFailure,
+          workerFailureDetail,
+          failures,
+        );
+        if (!recovered) {
           abandonPlannedExperiment(sessionDir, experiment.id, {
             classification: workerFailure,
-            insight: `${workerFailureDetail}; worker failure limit reached.`,
+            insight: `${workerFailureDetail}; unsafe worker failure limit reached.`,
           });
           clearMicroverseAttemptTransaction(sessionDir);
           exitReason = 'worker_failure_limit';
@@ -1278,10 +1389,21 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
             sessionDir,
             `microverse worker_incomplete: ${workerFailureDetail} (${failures} consecutive worker failures)`,
           );
-          if (failures >= Number(loopConfig.worker_failure_limit || 3)) {
+          const recovered = recoverMicroverseWorkerFailure(
+            sessionDir,
+            statePath,
+            manager,
+            config,
+            loopConfig,
+            experiment,
+            'worker_incomplete',
+            workerFailureDetail,
+            failures,
+          );
+          if (!recovered) {
             abandonPlannedExperiment(sessionDir, experiment.id, {
               classification: 'worker_incomplete',
-              insight: `${workerFailureDetail}; worker failure limit reached.`,
+              insight: `${workerFailureDetail}; unsafe worker failure limit reached.`,
             });
             clearMicroverseAttemptTransaction(sessionDir);
             exitReason = 'worker_failure_limit';
@@ -1344,9 +1466,17 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           loop_mode: loopConfig.mode,
         });
         if (!canExecute(circuitState)) {
-          exitReason = 'circuit_open';
-          appendRunnerLog(sessionDir, `circuit breaker opened after iteration ${iteration}`);
-          break;
+          if (metricResult) {
+            resetCircuitBreaker(sessionDir, 'microverse recovery continues below target');
+            appendRunnerLog(
+              sessionDir,
+              `microverse reset no-progress circuit after iteration ${iteration} and continued below target`,
+            );
+          } else {
+            exitReason = 'circuit_open';
+            appendRunnerLog(sessionDir, `circuit breaker opened after iteration ${iteration}`);
+            break;
+          }
         }
       }
 
@@ -1365,8 +1495,15 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         ? researchConvergenceState(convergence).level === 'stalled'
         : (latest.loop_stall_count as number) >= Number(loopConfig.stall_limit || 8);
       if (scientificallyStalled) {
-        exitReason = 'stalled';
-        break;
+        if (metricResult) {
+          appendRunnerLog(
+            sessionDir,
+            `microverse research stall threshold reached after iteration ${iteration}; continuing with a mandatory paradigm shift`,
+          );
+        } else {
+          exitReason = 'stalled';
+          break;
+        }
       }
     }
   } catch (error) {
