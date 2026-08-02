@@ -125,6 +125,7 @@ export function buildRefinementSynthesisPrompt({
     'allowed_paths entries are literal repo-relative files or directories. Framework route brackets such as [lenderId] and [[...slug]] are valid literal names; glob patterns and repository-root scope "." are forbidden.',
     'Prefer atomic tickets with explicit dependencies and realistic verification commands.',
     'Verification commands must be shell-safe: quote test-runner regex/glob values (for example, `--testPathPattern="appraisal.*evaluator"`) and never rely on unquoted shell expansion.',
+    'Use allowed_paths for implementation scope. output_artifacts and proof_corpus are optional: omit them unless they are literal, durable paths exclusively owned by this one ticket. Never use either field to list a shared source directory or a later ticket’s test directory.',
     'Do not let wrapper commands hide contracts. Emit verification_env, output_artifacts, proof_corpus, and freeze_contract whenever they are needed for truthful execution.',
     'Do not invent fixed-SHA sibling validation just because the PRD mentions sibling repos, freezes, or SHAs. Emit freeze_contract.sha_source only when the PRD explicitly requires commit pinning or exact revision capture.',
     'If the PRD mixes sibling SHA/freeze language with an evolving external system or current-compatible mounted-system contract, treat that as ambiguous until resolved. Create an explicit contract-decision ticket first, mark it with contract_decision: true, and make downstream tickets depend on it.',

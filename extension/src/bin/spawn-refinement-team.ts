@@ -698,16 +698,48 @@ async function refinePrdWithLease(sessionDir: string, options: RefinePrdOptions 
   if (failedAnalysts.length === 0) {
     appendRefineLog(sessionDir, 'Analyst fanout complete.');
     markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
-    accepted = await runSynthesis(
-      state,
-      statePath,
-      manager,
-      sessionDir,
-      prdSnapshotPath,
-      timeoutMs,
-      overallDeadlineMs,
-      config as unknown as ConfigVerificationInput,
-    );
+    try {
+      accepted = await runSynthesis(
+        state,
+        statePath,
+        manager,
+        sessionDir,
+        prdSnapshotPath,
+        timeoutMs,
+        overallDeadlineMs,
+        config as unknown as ConfigVerificationInput,
+      );
+    } catch (error) {
+      if (error instanceof RefinementCancelledError || isRefinementCancelled(manager, statePath)) {
+        throw error;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      markRefinePhase(
+        manager,
+        statePath,
+        sessionDir,
+        'refine:fallback',
+        `Synthesis retries exhausted; using independent fallback refinement. ${reason}`,
+      );
+      accepted = await runFinalArtifactAttempts({
+        label: 'fallback',
+        state,
+        statePath,
+        manager,
+        sessionDir,
+        prdPath,
+        timeoutMs,
+        deadlineMs: overallDeadlineMs,
+        config: config as unknown as ConfigVerificationInput,
+        buildPrompt: (refinedPath, manifestPath) => buildRefinePrdPrompt({
+          sessionDir,
+          prdPath: prdSnapshotPath,
+          workingDir: state.working_dir as string,
+          refinedPath,
+          manifestPath,
+        }),
+      });
+    }
   } else {
     const failures = failedAnalysts
       .map((outcome) => `${outcome.spec.role}: ${outcome.error?.message || 'unknown failure'}`)
