@@ -52,13 +52,15 @@ test('verification preflight rejects unquoted glob expansion but accepts an expl
 
 test('verification normalization quotes generated Jest pattern flags before preflight', () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-command-pattern-'));
-  const [normalized] = normalizeVerificationCommands([
+  const [starPattern, alternationPattern] = normalizeVerificationCommands([
     '/usr/bin/true --testPathPattern=appraisal.*evaluator',
+    '/usr/bin/true --testNamePattern=(catalog|provenance)',
   ]);
 
-  assert.equal(normalized, "/usr/bin/true '--testPathPattern=appraisal.*evaluator'");
+  assert.equal(starPattern, "/usr/bin/true '--testPathPattern=appraisal.*evaluator'");
+  assert.equal(alternationPattern, "/usr/bin/true '--testNamePattern=(catalog|provenance)'");
   assert.doesNotThrow(() => assertTicketVerificationReady({
-    ticket: { id: 'R1', verification: [normalized] },
+    ticket: { id: 'R1', verification: [starPattern, alternationPattern] },
     config: null,
     cwd,
   }));

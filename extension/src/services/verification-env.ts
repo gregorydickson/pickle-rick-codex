@@ -551,16 +551,17 @@ function rewriteScopedVerificationCommands(commands: string[], cwd: string | und
 
 /**
  * Jest and Vitest treat these flag values as regular expressions, but an
- * unquoted `*`, `?`, or `[` is a shell glob before either runner sees it.
+ * unquoted pattern can be interpreted by the shell before either runner sees
+ * it (for example `*` expands and `|` starts a pipeline).
  * Refinement artifacts are generated input, so canonicalize this known-safe
  * argument form instead of turning a correct test intent into a terminal loop
  * failure. Deliberate filesystem globs remain rejected by preflight.
  */
 function quoteTestPatternArguments(command: string): string {
   return command.replace(
-    /(^|\s)(--(?:testPathPattern|testNamePattern)=)([^\s'"`;&|]+)/g,
+    /(^|\s)(--(?:testPathPattern|testNamePattern)=)([^\s'";&]+)/g,
     (match, prefix: string, flag: string, value: string) => (
-      /[*?[]/.test(value) ? `${prefix}${shellQuote(`${flag}${value}`)}` : match
+      `${prefix}${shellQuote(`${flag}${value}`)}`
     ),
   );
 }
