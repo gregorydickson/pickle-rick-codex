@@ -404,6 +404,8 @@ export interface RunSpawnedCommandOptions {
 
 export interface CodexExecOptions {
   command?: string;
+  /** Per-call exec arguments. Used by artifact-only workers to avoid inheriting unsafe global sandbox overrides. */
+  execArgs?: string[];
   cwd?: string;
   prompt?: string;
   timeoutMs?: number;
@@ -527,6 +529,7 @@ export interface PipelineStateOptions {
 
 export interface BeginPipelinePhaseOptions extends PipelineStateOptions {
   startedAt?: string;
+  runStartedAtMs?: number;
   runnerPid?: number;
 }
 

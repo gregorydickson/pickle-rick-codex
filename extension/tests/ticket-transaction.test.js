@@ -69,6 +69,20 @@ test('ticket transaction rolls back all touched files when a multi-file mutation
   assert.equal(ledger.history.at(-1).status, 'rolled_back');
 });
 
+test('ticket transaction treats nested state.json as an ordinary artifact', () => {
+  const sessionDir = makeTempRoot('pickle-ticket-nested-state-');
+  const nestedState = path.join(sessionDir, 'fixtures', 'state.json');
+  fs.mkdirSync(path.dirname(nestedState), { recursive: true });
+  fs.writeFileSync(nestedState, '{"fixture":true}\n');
+
+  assert.throws(() => runTicketTransaction(sessionDir, 'nested-state-test', [nestedState], () => {
+    fs.writeFileSync(nestedState, '{"fixture":false}\n');
+    throw new Error('rollback nested state');
+  }), /rollback nested state/);
+
+  assert.equal(fs.readFileSync(nestedState, 'utf8'), '{"fixture":true}\n');
+});
+
 test('status and rematerialization transactions preserve completion_commit evidence', () => {
   const sessionDir = makeTempRoot('pickle-ticket-evidence-');
   const manifest = { source: 'codex-refinement', tickets: [ticket('r1')] };

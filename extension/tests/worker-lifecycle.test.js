@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile } from '../services/pickle-utils.js';
 import { WORKER_LIFECYCLE_PHASES } from '../services/worker-lifecycle.js';
-import { createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
+import { acceptTestRefinement, createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -41,15 +41,25 @@ function setupLifecycleRun(env) {
       status: 'Todo',
     }],
   });
+  acceptTestRefinement(sessionDir, projectDir);
   return { projectDir, sessionDir, baseline };
 }
 
 test('worker lifecycle persists eight validated phases and reads approved research and plan into implement', () => {
   const fakeBin = makeTempRoot('pickle-worker-lifecycle-bin-');
   createFakeCodex(fakeBin);
+  const dataRoot = makeTempRoot();
   const promptLog = makeTempRoot('pickle-worker-lifecycle-prompts-');
+  const invocationLog = path.join(dataRoot, 'codex-invocations.jsonl');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    runtime: {
+      add_dirs: [dataRoot],
+      exec_args: ['--dangerously-bypass-approvals-and-sandbox'],
+    },
+  });
   const env = prependPath(fakeBin, {
-    PICKLE_DATA_ROOT: makeTempRoot(),
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
     FAKE_CODEX_MUTATE_FILE: 'feature.txt',
     FAKE_CODEX_MUTATE_PHASE: 'implement',
     FAKE_CODEX_APPEND_TEXT: 'implemented\n',
@@ -71,6 +81,20 @@ test('worker lifecycle persists eight validated phases and reads approved resear
   assert.match(implementPrompt, /approved plan marker/);
   assert.match(implementPrompt, /Approved research_review artifact/);
   assert.match(implementPrompt, /Approved plan_review artifact/);
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.args[0] === 'exec');
+  assert.equal(invocations.length, WORKER_LIFECYCLE_PHASES.length);
+  for (const invocation of invocations) {
+    assert.ok(invocation.args.includes('--full-auto'));
+    assert.ok(!invocation.args.includes('--dangerously-bypass-approvals-and-sandbox'));
+    const addDirs = invocation.args.flatMap((arg, index) => arg === '--add-dir' ? [invocation.args[index + 1]] : []);
+    assert.equal(addDirs.length, 1);
+    assert.ok(addDirs[0].startsWith(`${path.join(sessionDir, 'worker-lifecycle-candidates')}${path.sep}`));
+    assert.notEqual(addDirs[0], sessionDir);
+    assert.notEqual(addDirs[0], dataRoot);
+  }
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), false);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
 });
 

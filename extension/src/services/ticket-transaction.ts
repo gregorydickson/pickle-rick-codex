@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
+import { StateManager } from './state-manager.js';
 
 export const TICKET_TRANSACTION_SCHEMA_VERSION = 1;
 export const TICKET_TRANSACTION_HISTORY_LIMIT = 20;
@@ -94,13 +95,35 @@ function releaseLock(sessionDir: string, fd: number): void {
   fs.rmSync(lockPath(sessionDir), { force: true });
 }
 
-function replayReverseEntries(sessionDir: string, reverse: ReverseEntry[]): void {
+function replayReverseEntries(
+  sessionDir: string,
+  reverse: ReverseEntry[],
+  preparedAt: string,
+): void {
   for (const entry of reverse) {
     const filePath = path.resolve(sessionDir, entry.relative_path);
     normalizeRelativePath(sessionDir, filePath);
     if (entry.existed) {
       ensureDir(path.dirname(filePath));
-      atomicWriteFile(filePath, entry.content || '');
+      if (filePath === path.join(path.resolve(sessionDir), 'state.json')) {
+        const restored = JSON.parse(entry.content || '{}') as Record<string, unknown>;
+        const preparedAtMs = Date.parse(preparedAt);
+        new StateManager().update(filePath, (current) => {
+          const cancellationAtMs = Date.parse(String(current.cancel_requested_at || ''));
+          if (
+            Number.isFinite(preparedAtMs)
+            && Number.isFinite(cancellationAtMs)
+            && cancellationAtMs >= preparedAtMs
+          ) {
+            restored.active = false;
+            restored.last_exit_reason = 'cancelled';
+            restored.cancel_requested_at = current.cancel_requested_at;
+          }
+          return restored;
+        });
+      } else {
+        atomicWriteFile(filePath, entry.content || '');
+      }
     } else {
       fs.rmSync(filePath, { force: true });
       try { fs.rmdirSync(path.dirname(filePath)); } catch { /* retain non-empty ticket artifact directories */ }
@@ -128,7 +151,7 @@ function recoverWhileLocked(sessionDir: string): boolean {
   const ledger = readLedger(sessionDir);
   if (!ledger.active) return false;
   const active = ledger.active;
-  replayReverseEntries(sessionDir, active.reverse);
+  replayReverseEntries(sessionDir, active.reverse, active.prepared_at);
   finish(sessionDir, ledger, active, 'recovered');
   return true;
 }
@@ -184,21 +207,25 @@ export function prepareTicketTransaction(
 export function runTicketTransaction<T>(
   sessionDir: string,
   operation: string,
-  filePaths: string[],
+  filePaths: string[] | (() => string[]),
   mutate: () => T,
 ): T {
   const resolved = path.resolve(sessionDir);
   const fd = acquireLock(resolved);
   try {
     recoverWhileLocked(resolved);
-    const transaction = prepareWhileLocked(resolved, operation, filePaths);
+    const transaction = prepareWhileLocked(
+      resolved,
+      operation,
+      typeof filePaths === 'function' ? filePaths() : filePaths,
+    );
     try {
       const result = mutate();
       const ledger = readLedger(resolved);
       finish(resolved, ledger, transaction, 'committed');
       return result;
     } catch (error) {
-      replayReverseEntries(resolved, transaction.reverse);
+      replayReverseEntries(resolved, transaction.reverse, transaction.prepared_at);
       const ledger = readLedger(resolved);
       finish(resolved, ledger, transaction, 'rolled_back');
       throw error;

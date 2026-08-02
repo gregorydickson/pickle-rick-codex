@@ -18,7 +18,7 @@ import type {
   RefinementManifest,
   Ticket,
 } from '../types/index.js';
-import { resolveTicketScope } from './execution-gate.js';
+import { normalizeTicketScopePath, resolveTicketScope } from './execution-gate.js';
 import { recoverInterruptedTicketTransaction, runTicketTransaction } from './ticket-transaction.js';
 
 export function getManifestPath(sessionDir: string): string {
@@ -148,7 +148,27 @@ export interface TicketSummary {
 export function summarizeTickets(sessionDir: string): TicketSummary {
   const manifest = readManifest(sessionDir);
   const fileTickets = ensureTicketFilesMaterialized(sessionDir, manifest);
-  const sourceTickets: Ticket[] = manifest.tickets.length > 0 ? fileTickets : fileTickets.length > 0 ? fileTickets : manifest.tickets;
+  const filesById = new Map<string, ParsedTicket>(
+    fileTickets.map((ticket) => [normalizeTicketId(ticket.id, ticket.id), ticket]),
+  );
+  const sourceTickets: Ticket[] = manifest.tickets.length > 0
+    ? manifest.tickets.map((ticket, index) => {
+      const ticketId = canonicalTicketId(ticket, index);
+      const runtime = filesById.get(ticketId);
+      if (!runtime) return ticket;
+      // The manifest remains authoritative for executable contracts. Only
+      // operational fields that evolve during execution come from the
+      // materialized ticket file.
+      return {
+        ...ticket,
+        status: runtime.status,
+        order: runtime.order,
+        filePath: runtime.filePath,
+        content: runtime.content,
+        frontmatter: runtime.frontmatter,
+      };
+    })
+    : fileTickets;
   const summary: TicketSummary = {
     queued: 0,
     done: 0,
@@ -253,7 +273,12 @@ export function ensureTicketFilesMaterialized(
 
 export function readManifest(sessionDir: string): RefinementManifest {
   recoverInterruptedTicketTransaction(sessionDir);
-  const manifest = readJsonFile<RefinementManifest>(getManifestPath(sessionDir), { tickets: [] }) || { tickets: [] };
+  const manifestPath = getManifestPath(sessionDir);
+  if (!fs.existsSync(manifestPath)) return { tickets: [] };
+  const manifest = readJsonFile<RefinementManifest>(manifestPath, null);
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || !Array.isArray(manifest.tickets)) {
+    throw new Error(`Invalid refinement manifest JSON: ${manifestPath}`);
+  }
   const normalized = enrichRefinementManifest(manifest);
   if (normalized.changed) {
     atomicWriteJson(getManifestPath(sessionDir), normalized.manifest);
@@ -300,12 +325,7 @@ function firstNonEmptyString(...values: unknown[]): string {
 }
 
 function normalizeRepoRelativePath(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  const trimmed = value.trim().replaceAll('\\', '/');
-  if (!trimmed || trimmed.startsWith('/') || trimmed.startsWith('$')) return '';
-  const normalized = path.posix.normalize(trimmed.replace(/^\.\//, ''));
-  if (!normalized || normalized === '.' || normalized.startsWith('../')) return '';
-  return normalized;
+  return normalizeTicketScopePath(value);
 }
 
 function normalizePathList(value: unknown): string[] {
@@ -406,6 +426,36 @@ function normalizeFreezeContract(value: unknown): FreezeContract | null {
   };
 }
 
+function validateDeclaredFreezeContract(ticket: Ticket, label: string): string[] {
+  const declared = ticket.freeze_contract
+    ?? ticket.freezeContract
+    ?? ticket.freeze_artifact
+    ?? ticket.freezeArtifact;
+  if (declared == null) return [];
+  const parsed = parseMaybeJson(declared);
+  if (!isPlainObject(parsed)) return [`${label}: freeze_contract must be an object`];
+  const rawArtifactPath = firstNonEmptyString(
+    parsed.artifact_path,
+    parsed.artifactPath,
+    parsed.artifact,
+    parsed.output_artifact,
+    parsed.outputArtifact,
+    parsed.path,
+  );
+  const normalized = normalizeFreezeContract(parsed);
+  const issues: string[] = [];
+  if (!rawArtifactPath || !normalizeRepoRelativePath(rawArtifactPath)) {
+    issues.push(`${label}: freeze_contract.artifact_path must be a literal repo-relative path`);
+  }
+  if (!normalized?.root_env) {
+    issues.push(`${label}: freeze_contract.root_env must identify the sibling repository root`);
+  }
+  if (!normalized?.sibling) {
+    issues.push(`${label}: freeze_contract.sibling must identify the sibling repository`);
+  }
+  return issues;
+}
+
 function freezeContractSignature(contract: FreezeContract | null | undefined): string {
   if (!contract) return '';
   return JSON.stringify({
@@ -489,6 +539,21 @@ function normalizeTicketContracts(ticket: Ticket): { ticket: Ticket; changed: bo
   for (const alias of ['freezeContract', 'freeze_artifact', 'freezeArtifact']) {
     if (alias in nextTicket) {
       delete nextTicket[alias as keyof Ticket];
+      changed = true;
+    }
+  }
+
+  for (const [canonical, alias] of [
+    ['formatter_ticket', 'formatterTicket'],
+    ['contract_decision', 'contractDecision'],
+  ] as const) {
+    const value = nextTicket[canonical] ?? nextTicket[alias];
+    if (typeof value === 'boolean' && nextTicket[canonical] !== value) {
+      nextTicket[canonical] = value;
+      changed = true;
+    }
+    if (alias in nextTicket) {
+      delete nextTicket[alias];
       changed = true;
     }
   }
@@ -612,13 +677,6 @@ const WRAPPER_CONTRACT_RULES: WrapperContractRule[] = [
   },
 ];
 
-function isOpaqueVerificationWrapper(command: unknown): boolean {
-  const normalized = String(command ?? '').trim().toLowerCase();
-  if (!normalized) return false;
-  if (normalized === 'npm test' || normalized === 'bun test') return false;
-  return /^(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?[a-z0-9:_-]+(?:\s|$)/i.test(normalized) || /^make\s+\S+/.test(normalized);
-}
-
 function looksLikeFormatterTicket(ticket: Ticket | null | undefined): boolean {
   if (ticket?.formatter === true || ticket?.formatter_ticket === true || ticket?.formatterTicket === true) {
     return true;
@@ -684,9 +742,107 @@ function wrapperRulesForTicket(ticket: Ticket): WrapperContractRule[] {
     .flatMap((command) => WRAPPER_CONTRACT_RULES.filter((rule) => rule.pattern.test(command)));
 }
 
-export function validateRefinementManifest(manifest: RefinementManifest | null | undefined): string[] {
+export interface ValidateRefinementManifestOptions {
+  /** Fresh model output may contain only new Todo work, never terminal state. */
+  fresh?: boolean;
+}
+
+export function validateRefinementManifest(
+  manifest: RefinementManifest | null | undefined,
+  options: ValidateRefinementManifestOptions = {},
+): string[] {
   const issues: string[] = [];
-  const tickets: Ticket[] = Array.isArray(manifest?.tickets) ? manifest!.tickets.map((ticket) => normalizeTicketContracts(ticket).ticket) : [];
+  const rawEntries: unknown[] = Array.isArray(manifest?.tickets) ? manifest!.tickets as unknown[] : [];
+  const rawTickets: Ticket[] = [];
+
+  rawEntries.forEach((entry, index) => {
+    if (!isPlainObject(entry)) {
+      issues.push(`ticket-${index + 1}: ticket must be an object`);
+      return;
+    }
+    const ticket = entry as Ticket;
+    const label = firstNonEmptyString(ticket.id, ticket.title) || `ticket-${index + 1}`;
+    rawTickets.push(ticket);
+
+    for (const [field, value] of [
+      ['id', ticket.id],
+      ['title', ticket.title],
+      ['description', ticket.description],
+      ['priority', ticket.priority],
+    ] as const) {
+      if (typeof value !== 'string' || !value.trim()) {
+        issues.push(`${label}: ${field} must be a non-empty string`);
+      }
+    }
+
+    const acceptance = ticket.acceptance_criteria;
+    if (!Array.isArray(acceptance) || acceptance.length === 0) {
+      issues.push(`${label}: missing acceptance criteria`);
+    } else if (acceptance.some((criterion) => typeof criterion !== 'string' || !criterion.trim())) {
+      issues.push(`${label}: acceptance criteria must be non-empty strings`);
+    }
+
+    const verification = normalizeVerificationCommands(ticket.verification, { verify: ticket.verify });
+    if (verification.length === 0) {
+      issues.push(`${label}: verification must contain at least one executable command`);
+    }
+
+    const rawScope = ticket.allowed_paths ?? ticket.allowedPaths ?? ticket.files;
+    const explicitScope = normalizePathList(rawScope);
+    if (!Array.isArray(rawScope)) {
+      issues.push(`${label}: allowed_paths must contain at least one literal repo-relative path`);
+    } else {
+      if (explicitScope.length === 0) {
+        issues.push(`${label}: allowed_paths must contain at least one literal repo-relative path`);
+      }
+      rawScope.forEach((scopePath, scopeIndex) => {
+        if (typeof scopePath !== 'string' || !normalizeRepoRelativePath(scopePath)) {
+          issues.push(`${label}: allowed_paths[${scopeIndex}] must be a literal repo-relative path`);
+        }
+      });
+    }
+
+    for (const [field, rawPaths] of [
+      ['output_artifacts', ticket.output_artifacts ?? ticket.outputArtifacts],
+      ['proof_corpus', ticket.proof_corpus ?? ticket.proofCorpus],
+    ] as const) {
+      if (rawPaths == null) continue;
+      if (!Array.isArray(rawPaths)) {
+        issues.push(`${label}: ${field} must be an array of literal repo-relative paths`);
+        continue;
+      }
+      rawPaths.forEach((artifactPath, artifactIndex) => {
+        if (typeof artifactPath !== 'string' || !normalizeRepoRelativePath(artifactPath)) {
+          issues.push(`${label}: ${field}[${artifactIndex}] must be a literal repo-relative path`);
+        }
+      });
+    }
+    issues.push(...validateDeclaredFreezeContract(ticket, label));
+
+    const dependencies = ticket.depends_on ?? ticket.dependsOn ?? ticket.dependencies;
+    if (
+      dependencies != null
+      && !isNoneDependency(dependencies)
+      && !(typeof dependencies === 'string' && dependencies.trim())
+      && !(Array.isArray(dependencies) && dependencies.every((value) => typeof value === 'string' && value.trim()))
+    ) {
+      issues.push(`${label}: depends_on must be a ticket id or an array of ticket ids`);
+    }
+
+    const status = normalizeTicketStatus(ticket.status);
+    const supportedStatuses = new Set(['', 'todo', 'in progress', 'done', 'blocked', 'skipped']);
+    if (!supportedStatuses.has(status)) {
+      issues.push(`${label}: unsupported ticket status "${String(ticket.status)}"`);
+    } else if (options.fresh && status && status !== 'todo') {
+      issues.push(`${label}: fresh refinement tickets must start in Todo status`);
+    }
+  });
+
+  const normalizedManifest = enrichRefinementManifest({
+    ...(manifest || {}),
+    tickets: structuredClone(rawTickets),
+  } as RefinementManifest).manifest;
+  const tickets: Ticket[] = normalizedManifest.tickets || [];
 
   if (tickets.length === 0) {
     issues.push('manifest contains zero tickets');
@@ -711,6 +867,46 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
     }
     firstTicketIndexById.set(ticketId, index);
   });
+
+  const ticketIds = new Set(firstTicketIndexById.keys());
+  for (const ticket of tickets) {
+    const label = ticket.id || ticket.title || 'ticket';
+    for (const dependencyId of ticketDependencyIds(ticket)) {
+      if (dependencyId === ticket.id) {
+        issues.push(`${label}: ticket cannot depend on itself`);
+      } else if (!ticketIds.has(dependencyId)) {
+        issues.push(`${label}: dependency "${dependencyId}" does not exist`);
+      }
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const cycleSignatures = new Set<string>();
+  const ticketsById = new Map(tickets.map((ticket) => [ticket.id, ticket]));
+  const visit = (ticketId: string, stack: string[]): void => {
+    if (visiting.has(ticketId)) {
+      const cycleStart = stack.indexOf(ticketId);
+      const cycle = [...stack.slice(Math.max(0, cycleStart)), ticketId];
+      const signature = [...new Set(cycle)].sort().join('|');
+      if (!cycleSignatures.has(signature)) {
+        cycleSignatures.add(signature);
+        issues.push(`dependency cycle detected: ${cycle.join(' -> ')}`);
+      }
+      return;
+    }
+    if (visited.has(ticketId)) return;
+    visiting.add(ticketId);
+    const ticket = ticketsById.get(ticketId);
+    for (const dependencyId of ticketDependencyIds(ticket)) {
+      if (ticketsById.has(dependencyId) && dependencyId !== ticketId) {
+        visit(dependencyId, [...stack, ticketId]);
+      }
+    }
+    visiting.delete(ticketId);
+    visited.add(ticketId);
+  };
+  for (const ticketId of ticketIds) visit(ticketId, []);
 
   const ownedArtifacts = new Map<string, string[]>();
   const authoritativeFreezeByArtifact = new Map<string, { owner: string; contract: FreezeContract; signature: string }>();
@@ -752,13 +948,21 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
     }
   }
 
+  for (const [artifactPath, owners] of ownedArtifacts) {
+    if (owners.length > 1) {
+      issues.push(`output artifact "${artifactPath}" has multiple owners: ${owners.join(', ')}`);
+    }
+  }
+
   tickets.forEach((ticket, index) => {
     const label = ticket?.id || `ticket-${index + 1}`;
     const scope = resolveTicketScope(ticket);
     if (scope.error) {
       issues.push(`${label}: ${scope.error}`);
     }
-    const acceptance = Array.isArray(ticket?.acceptance_criteria) ? ticket.acceptance_criteria : [];
+    const acceptance = Array.isArray(ticket?.acceptance_criteria)
+      ? ticket.acceptance_criteria.filter((criterion): criterion is string => typeof criterion === 'string' && Boolean(criterion.trim()))
+      : [];
     if (acceptance.length === 0) {
       issues.push(`${label}: missing acceptance criteria`);
     }
@@ -778,9 +982,6 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
       !ticketDependencyIds(ticket).some((dependencyId) => formatterOwners.has(dependencyId))
     ) {
       issues.push(`${label}: formatter-sensitive verification runs before formatter ownership is declared`);
-    }
-    if (ticketVerificationCommands(ticket).some(isOpaqueVerificationWrapper) && !hasDeclaredVerificationContracts(ticket)) {
-      issues.push(`${label}: opaque verification wrapper commands require explicit verification_env, output_artifacts, proof_corpus, or freeze_contract`);
     }
     for (const rule of wrapperRulesForTicket(ticket)) {
       if (rule.requireArtifacts && (!Array.isArray(ticket.output_artifacts) || ticket.output_artifacts.length === 0)) {
@@ -844,7 +1045,7 @@ export function validateRefinementManifest(manifest: RefinementManifest | null |
     }
   });
 
-  return issues;
+  return [...new Set(issues)];
 }
 
 function collectTicketFrontmatter(ticket: Ticket, order: number): Map<string, unknown> {
@@ -896,12 +1097,17 @@ function ticketFrontmatter(ticket: Ticket, order: number): string {
   ].join('\n');
 }
 
-function materializeTicketFiles(
+interface TicketMaterializationPlan {
+  manifest: RefinementManifest;
+  changed: boolean;
+  existingTicketPaths: string[];
+  ticketPaths: string[];
+}
+
+function planTicketMaterialization(
   sessionDir: string,
   manifest: RefinementManifest,
-  replaceManifest: boolean,
-): string[] {
-  recoverInterruptedTicketTransaction(sessionDir);
+): TicketMaterializationPlan {
   const normalized = enrichRefinementManifest(manifest);
   const existingTicketPaths = listTicketFiles(sessionDir);
   const ticketPaths: string[] = [];
@@ -909,24 +1115,63 @@ function materializeTicketFiles(
     const ticketId = canonicalTicketId(ticket, index);
     ticketPaths.push(path.join(sessionDir, ticketId, `linear_ticket_${ticketId}.md`));
   });
-  const transactionPaths = [getManifestPath(sessionDir), ...existingTicketPaths, ...ticketPaths];
-  return runTicketTransaction(sessionDir, 'materialize-tickets', transactionPaths, () => {
-    if (replaceManifest || normalized.changed || !readJsonFile(getManifestPath(sessionDir), null)) {
-      atomicWriteJson(getManifestPath(sessionDir), normalized.manifest);
-    }
-    pruneObsoleteTicketFiles(listTickets(sessionDir), normalized.manifest.tickets || []);
-    const writtenPaths: string[] = [];
-    normalized.manifest.tickets.forEach((ticket, index) => {
-      const ticketId = canonicalTicketId(ticket, index);
+  return {
+    manifest: normalized.manifest,
+    changed: normalized.changed,
+    existingTicketPaths,
+    ticketPaths,
+  };
+}
+
+function applyTicketMaterialization(
+  sessionDir: string,
+  plan: TicketMaterializationPlan,
+  replaceManifest: boolean,
+): string[] {
+  if (replaceManifest || plan.changed || !readJsonFile(getManifestPath(sessionDir), null)) {
+    atomicWriteJson(getManifestPath(sessionDir), plan.manifest);
+  }
+  pruneObsoleteTicketFiles(listTickets(sessionDir), plan.manifest.tickets || []);
+  const writtenPaths: string[] = [];
+  plan.manifest.tickets.forEach((ticket, index) => {
+    const ticketId = canonicalTicketId(ticket, index);
     const ticketDir = path.join(sessionDir, ticketId);
     ensureDir(ticketDir);
     const content = renderTicketFileContent(ticket, index + 1, ticketId);
     const filePath = path.join(ticketDir, `linear_ticket_${ticketId}.md`);
     atomicWriteFile(filePath, content);
-      writtenPaths.push(filePath);
-    });
-    return writtenPaths;
+    writtenPaths.push(filePath);
   });
+  return writtenPaths;
+}
+
+function materializeTicketFiles(
+  sessionDir: string,
+  manifest: RefinementManifest,
+  replaceManifest: boolean,
+): string[] {
+  recoverInterruptedTicketTransaction(sessionDir);
+  const plan = planTicketMaterialization(sessionDir, manifest);
+  const transactionPaths = [getManifestPath(sessionDir), ...plan.existingTicketPaths, ...plan.ticketPaths];
+  return runTicketTransaction(sessionDir, 'materialize-tickets', transactionPaths, () => (
+    applyTicketMaterialization(sessionDir, plan, replaceManifest)
+  ));
+}
+
+export function refinementTicketMaterializationPaths(
+  sessionDir: string,
+  manifest: RefinementManifest,
+): string[] {
+  const plan = planTicketMaterialization(sessionDir, manifest);
+  return [getManifestPath(sessionDir), ...plan.existingTicketPaths, ...plan.ticketPaths];
+}
+
+/** Only call while an outer ticket transaction owns every materialization path. */
+export function restructureTicketFilesInTransaction(
+  sessionDir: string,
+  manifest: RefinementManifest,
+): string[] {
+  return applyTicketMaterialization(sessionDir, planTicketMaterialization(sessionDir, manifest), true);
 }
 
 export function writeTicketFiles(sessionDir: string, manifest: RefinementManifest): string[] {
@@ -954,17 +1199,11 @@ export function getTicketById(sessionDir: string, ticketId: string): ParsedTicke
 }
 
 export function getNextRunnableTicket(sessionDir: string): Ticket | ParsedTicket | null {
-  const manifest = readManifest(sessionDir);
-  ensureTicketFilesMaterialized(sessionDir, manifest);
-  const currentTickets = listTickets(sessionDir);
-  const manifestById = new Map<string, Ticket>(
-    (manifest.tickets || []).map((ticket) => [normalizeTicketId(ticket.id, ticket.id), ticket]),
-  );
-
+  const currentTickets = summarizeTickets(sessionDir).tickets;
   for (const ticket of currentTickets) {
     if (!isRunnableTicketStatus(ticket.status)) continue;
     if (!areTicketDependenciesSatisfied(ticket, currentTickets)) continue;
-    return manifestById.get(normalizeTicketId(ticket.id, ticket.id)) || ticket;
+    return ticket;
   }
 
   return null;
@@ -1046,6 +1285,10 @@ export function updateTicketStatus(
   sessionDir: string,
   ticketId: string,
   updates: Record<string, unknown>,
+  options: {
+    transactionPaths?: string[];
+    afterWrite?: () => void;
+  } = {},
 ): ParsedTicket | null {
   const manifest = readManifest(sessionDir);
   const normalizedId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
@@ -1072,7 +1315,11 @@ export function updateTicketStatus(
     }
   }
   const manifestTicket = manifest.tickets.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedId);
-  runTicketTransaction(sessionDir, 'update-ticket-status', [getManifestPath(sessionDir), ticket.filePath], () => {
+  runTicketTransaction(
+    sessionDir,
+    'update-ticket-status',
+    [getManifestPath(sessionDir), ticket.filePath, ...(options.transactionPaths || [])],
+    () => {
     atomicWriteFile(ticket.filePath, rewritten);
     if (manifestTicket) {
       Object.assign(manifestTicket, updates);
@@ -1081,7 +1328,9 @@ export function updateTicketStatus(
       }
       atomicWriteJson(getManifestPath(sessionDir), manifest);
     }
-  });
+      options.afterWrite?.();
+    },
+  );
   return parseTicketFile(ticket.filePath);
 }
 

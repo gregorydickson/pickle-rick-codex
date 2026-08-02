@@ -897,6 +897,14 @@ export function beginPipelinePhase(
     if (!pipeline.phases.includes(phase)) {
       throw new PipelineStateError(`Unknown pipeline phase "${phase}".`, 'PIPELINE_PHASE_INVALID');
     }
+    const cancellationAtMs = Date.parse(String(sessionState.cancel_requested_at || ''));
+    if (
+      Number.isFinite(options.runStartedAtMs)
+      && Number.isFinite(cancellationAtMs)
+      && cancellationAtMs >= Number(options.runStartedAtMs)
+    ) {
+      throw new PipelineStateError('Pipeline execution was cancelled during runner startup.', 'PIPELINE_CANCELLED');
+    }
     pipelineState.current_phase = phase;
     pipelineState.current_phase_index = phaseIndex(pipeline.phases, phase);
     pipelineState.phase_statuses[phase] = PHASE_STATUS_RUNNING;
@@ -906,6 +914,7 @@ export function beginPipelinePhase(
     sessionState.pipeline_mode = true;
     sessionState.active = true;
     sessionState.last_exit_reason = null;
+    sessionState.cancel_requested_at = null;
     if (Number.isInteger(options.runnerPid) && Number(options.runnerPid) > 0) {
       sessionState.tmux_runner_pid = options.runnerPid;
     }

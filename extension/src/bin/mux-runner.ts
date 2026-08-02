@@ -11,7 +11,6 @@ import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
   areTicketDependenciesSatisfied,
-  listTickets,
   normalizeTicketId,
   summarizeTickets,
   unresolvedTicketDependencies,
@@ -20,6 +19,7 @@ import {
 import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
 import { scrubTicketWorkerMessages } from '../services/worker-output.js';
 import { decideTicketRecovery } from '../services/recovery-controller.js';
+import { acquireSessionOperation } from '../services/session-operation.js';
 import { runTicket } from './spawn-morty.js';
 
 interface RunSequentialOptions {
@@ -49,6 +49,16 @@ function parseFailureMode(argv: string[]): string {
   return mode;
 }
 
+function parseLaunchOwnerPid(argv: string[]): number | null {
+  const value = Number(argv.find((arg) => arg.startsWith('--launch-owner='))?.split('=')[1]);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function parseRunStartedAtMs(argv: string[]): number | null {
+  const value = Number(argv.find((arg) => arg.startsWith('--run-started-at='))?.split('=')[1]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 function shouldStop(state: PersistedState): string | null {
   if (state.active === false) {
     return (state.last_exit_reason as string | null) || 'cancelled';
@@ -65,7 +75,7 @@ function shouldStop(state: PersistedState): string | null {
   return null;
 }
 
-export async function runSequential(
+async function runSequentialWithLease(
   sessionDir: string,
   options: RunSequentialOptions = {},
   deps: RunSequentialDeps = {},
@@ -82,14 +92,17 @@ export async function runSequential(
   let failedTicketId: string | null = null;
 
   appendRunnerLog(sessionDir, runnerMode, runnerDescriptor.runnerStartMarker);
-  enterMuxRunnerPhase(manager, statePath, { markRunStart });
+  enterMuxRunnerPhase(manager, statePath, {
+    markRunStart,
+    runStartedAtMs: Number(options.runStartedAtMs),
+  });
 
   const summary = summarizeTickets(sessionDir);
   if (!summary.total) {
     exitReason = 'no_tickets';
     appendRunnerLog(sessionDir, runnerMode, 'no tickets found in refinement manifest');
   } else if (!summary.runnable.length) {
-    exitReason = 'no_tickets';
+    exitReason = summary.done === summary.total ? 'success' : 'no_tickets';
     appendRunnerLog(
       sessionDir,
       runnerMode,
@@ -97,30 +110,32 @@ export async function runSequential(
     );
   }
 
-  const executionTickets = listTickets(sessionDir);
-  for (const ticket of executionTickets.length ? executionTickets : summary.tickets) {
-    if (exitReason !== 'success') break;
-    if (ticket.status === 'Done' || ticket.status === 'Skipped' || ticket.status === 'Blocked') continue;
+  const pendingTicketIds = new Set(
+    summary.tickets
+      .filter((ticket) => !['done', 'skipped', 'blocked'].includes(String(ticket.status || '').trim().toLowerCase()))
+      .map((ticket) => normalizeTicketId(ticket.id, ticket.id)),
+  );
+  while (pendingTicketIds.size > 0 && exitReason === 'success') {
+    const currentSummary = summarizeTickets(sessionDir);
+    const ticket = currentSummary.tickets.find((candidate) => (
+      pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
+      && areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
+    ));
+    if (!ticket) {
+      failedTicketId = [...pendingTicketIds][0] || null;
+      exitReason = 'error';
+      const unresolved = currentSummary.tickets
+        .filter((candidate) => pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id)))
+        .map((candidate) => `${candidate.id}: ${unresolvedTicketDependencies(candidate, currentSummary.tickets).join(', ') || 'no satisfiable predecessor'}`);
+      appendRunnerLog(sessionDir, runnerMode, `no dependency-runnable ticket remains (${unresolved.join('; ')})`);
+      break;
+    }
+    pendingTicketIds.delete(normalizeTicketId(ticket.id, ticket.id));
 
     const ticketStopReason = shouldStop(manager.read(statePath));
     if (ticketStopReason) {
       exitReason = ticketStopReason;
       appendRunnerLog(sessionDir, runnerMode, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
-      break;
-    }
-
-    const currentTickets = listTickets(sessionDir);
-    const currentTicket = currentTickets.find((entry) => entry.id === ticket.id) || ticket;
-    if (!areTicketDependenciesSatisfied(currentTicket, currentTickets)) {
-      const unresolved = unresolvedTicketDependencies(currentTicket, currentTickets);
-      failedTicketId = ticket.id;
-      exitReason = 'error';
-      updateTicketStatus(sessionDir, ticket.id, {
-        status: 'Blocked',
-        failed_at: new Date().toISOString(),
-        failure_reason: `Unresolved dependencies: ${unresolved.join(', ')}`,
-      });
-      appendRunnerLog(sessionDir, runnerMode, `blocking ticket ${ticket.id}: unresolved dependencies ${unresolved.join(', ')}`);
       break;
     }
 
@@ -250,12 +265,41 @@ export async function runSequential(
   return finalReason;
 }
 
+export async function runSequential(
+  sessionDir: string,
+  options: RunSequentialOptions = {},
+  deps: RunSequentialDeps = {},
+): Promise<string> {
+  const configuredRunStartedAtMs = Number(options.runStartedAtMs);
+  const runStartedAtMs = Number.isFinite(configuredRunStartedAtMs) && configuredRunStartedAtMs > 0
+    ? configuredRunStartedAtMs
+    : Date.now();
+  if (options.operationLeaseHeld === true) {
+    return await runSequentialWithLease(sessionDir, { ...options, runStartedAtMs }, deps);
+  }
+  const launchOwnerPid = Number(options.launchOwnerPid);
+  const releaseOperation = acquireSessionOperation(
+    sessionDir,
+    undefined,
+    Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
+  );
+  try {
+    return await runSequentialWithLease(sessionDir, { ...options, runStartedAtMs }, deps);
+  } finally {
+    releaseOperation();
+  }
+}
+
 async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
-  const exitReason = await runSequential(sessionDir, { onFailure: parseFailureMode(argv) });
+  const exitReason = await runSequential(sessionDir, {
+    onFailure: parseFailureMode(argv),
+    launchOwnerPid: parseLaunchOwnerPid(argv),
+    runStartedAtMs: parseRunStartedAtMs(argv),
+  });
   if (
     exitReason === 'error'
     || exitReason === 'no_tickets'

@@ -1,9 +1,11 @@
 // @tier: fast
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { reconcileSessionLiveness } from '../services/session.js';
+import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { makeTempRoot, writeJson } from './helpers.js';
 
 function state(overrides = {}) {
@@ -70,4 +72,35 @@ test('reconcileSessionLiveness blocks and preserves discoverability for a live o
   assert.equal(result.state.recovery_required, true);
   assert.equal(result.state.active_child_pid, process.pid);
   assert.equal(result.state.orphan_child_pid, process.pid);
+});
+
+test('reconcileSessionLiveness reaps an identity-matched lifecycle child using a nested candidate add-dir', () => {
+  const sessionDir = makeTempRoot('pickle-liveness-identity-orphan-');
+  const candidateDir = path.join(sessionDir, 'worker-lifecycle-candidates', 'ticket-implement');
+  fs.mkdirSync(candidateDir, { recursive: true });
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', '--', '--add-dir', candidateDir], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const identity = captureSpawnedProcessIdentity(Number(child.pid));
+  assert.ok(identity);
+  writeJson(path.join(sessionDir, 'state.json'), state({
+    session_dir: sessionDir,
+    tmux_mode: true,
+    tmux_runner_pid: 999_999_999,
+    active_child_pid: child.pid,
+    active_child_kind: 'codex',
+    active_child_identity: identity,
+  }));
+  try {
+    const result = reconcileSessionLiveness(sessionDir, undefined, 1_700_000_100_000);
+    assert.equal(result.stale, true);
+    assert.equal(result.state.active, false);
+    assert.equal(result.state.last_exit_reason, 'runner_lost');
+    assert.equal(result.state.recovery_required, false);
+    assert.equal(result.state.orphan_child_pid, null);
+  } finally {
+    try { process.kill(-Number(child.pid), 'SIGKILL'); } catch {}
+  }
 });

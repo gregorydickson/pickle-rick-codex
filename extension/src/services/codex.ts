@@ -121,8 +121,28 @@ async function runSpawnedCommand({
 }: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
   removeStaleOutputs([...cleanupPaths, outputLastMessagePath]);
 
+  const maxCapturedStreamBytes = 4 * 1024 * 1024;
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
+  let stdoutBytesSeen = 0;
+  let stderrBytesSeen = 0;
+  let stdoutBytesRetained = 0;
+  let stderrBytesRetained = 0;
+
+  const appendBoundedChunk = (chunks: Buffer[], chunk: Buffer, retained: number): number => {
+    chunks.push(Buffer.from(chunk));
+    let retainedBytes = retained + chunk.length;
+    while (retainedBytes > maxCapturedStreamBytes && chunks.length > 0) {
+      const overflow = retainedBytes - maxCapturedStreamBytes;
+      if (chunks[0].length <= overflow) {
+        retainedBytes -= chunks.shift()!.length;
+      } else {
+        chunks[0] = chunks[0].subarray(overflow);
+        retainedBytes -= overflow;
+      }
+    }
+    return retainedBytes;
+  };
 
   return await new Promise((resolve, reject) => {
     let settled = false;
@@ -165,8 +185,8 @@ async function runSpawnedCommand({
     const currentStderr = (): string => Buffer.concat(stderrChunks).toString('utf8');
     const observedArtifactPaths = [...new Set([outputLastMessagePath, ...progressArtifactPaths].filter(Boolean))];
     const currentProgressSignature = (): string => JSON.stringify({
-      stdout: stdoutChunks.reduce((total, chunk) => total + chunk.length, 0),
-      stderr: stderrChunks.reduce((total, chunk) => total + chunk.length, 0),
+      stdout: stdoutBytesSeen,
+      stderr: stderrBytesSeen,
       artifacts: observedArtifactPaths.map((filePath) => {
         try {
           const stat = fs.statSync(filePath);
@@ -255,12 +275,14 @@ async function runSpawnedCommand({
     }
 
     child.stdout.on('data', (chunk: Buffer) => {
-      stdoutChunks.push(Buffer.from(chunk));
+      stdoutBytesSeen += chunk.length;
+      stdoutBytesRetained = appendBoundedChunk(stdoutChunks, chunk, stdoutBytesRetained);
       checkForSuccess();
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
-      stderrChunks.push(Buffer.from(chunk));
+      stderrBytesSeen += chunk.length;
+      stderrBytesRetained = appendBoundedChunk(stderrChunks, chunk, stderrBytesRetained);
       checkForSuccess();
     });
 
@@ -320,7 +342,17 @@ async function runSpawnedCommand({
       reject(error);
     });
 
-    onSpawn?.(child);
+    try {
+      onSpawn?.(child);
+    } catch (error) {
+      cleanup();
+      terminateProcessTree(child, 'SIGTERM');
+      const killTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 1_000);
+      killTimer.unref?.();
+      child.stdin.destroy();
+      reject(error);
+      return;
+    }
     child.stdin.end(input ?? '');
   });
 }
@@ -340,7 +372,7 @@ export function getCodexVersion(): string {
 function buildCodexExecInvocation(options: CodexExecOptions): { command: string; args: string[] } {
   const config = loadConfig();
   const command = options.command || config.runtime.command;
-  const args = ['exec', ...(config.runtime.exec_args || ['--full-auto'])];
+  const args = ['exec', ...(options.execArgs ?? config.runtime.exec_args ?? ['--full-auto'])];
 
   if (options.cwd) {
     args.push('--cd', options.cwd);

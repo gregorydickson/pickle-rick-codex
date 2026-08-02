@@ -18,10 +18,18 @@ import {
 import {
   getNextRunnableTicket,
   isRunnableTicketStatus,
+  readManifest,
   summarizeTickets,
   updateTicketStatus,
+  validateRefinementManifest,
   type TicketSummary,
 } from './tickets.js';
+import {
+  reconcileVerifiedRefinementRepositoryAdvance,
+  validateRefinementAcceptance,
+  writeRefinementAcceptance,
+} from './refinement-artifacts.js';
+import { recoverInterruptedTicketTransaction } from './ticket-transaction.js';
 import { assertTicketVerificationReady, normalizeVerificationCommands, type PreflightError } from './verification-env.js';
 import { loadConfig } from './config.js';
 import { nowIso, readJsonFile } from './pickle-utils.js';
@@ -56,6 +64,7 @@ interface MaterializeBootstrapSessionOptions extends CreateBootstrapSessionOptio
 
 interface EnsureBootstrapSessionReadyOptions {
   resumeReadyOnly?: boolean;
+  runStartedAtMs?: number;
 }
 
 interface BootstrapReady {
@@ -63,8 +72,24 @@ interface BootstrapReady {
   summary: TicketSummary;
 }
 
+function unacceptedManifestMustBePreserved(manifestPath: string, acceptanceReason: string | null): boolean {
+  if (!fs.existsSync(manifestPath)) return false;
+  if (
+    acceptanceReason === 'refinement acceptance receipt is missing or invalid'
+    || acceptanceReason === 'refinement acceptance receipt version is stale'
+  ) {
+    return true;
+  }
+  const manifest = readJsonFile<{ tickets?: Array<Record<string, unknown>> }>(manifestPath, null);
+  return Boolean(manifest?.tickets?.some((ticket) => {
+    const status = String(ticket.status || 'Todo').trim().toLowerCase();
+    return status !== 'todo' || Boolean(ticket.completion_commit);
+  }));
+}
+
 interface EnterMuxRunnerPhaseOptions {
   runnerPid?: number;
+  runStartedAtMs?: number;
   markRunStart?: (state: PersistedState) => unknown;
 }
 
@@ -353,19 +378,81 @@ export async function ensureBootstrapSessionReady(
   const manager = new StateManager();
   const prdPath = path.join(sessionDir, 'prd.md');
   const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  recoverInterruptedTicketTransaction(sessionDir);
+  const current = manager.read(statePath);
+  const validateAcceptance = () => validateRefinementAcceptance(sessionDir, {
+    workingDir: current.working_dir as string | undefined,
+    verifyRepository: true,
+  });
 
   if (!fs.existsSync(prdPath) && !options.resumeReadyOnly) {
     throw new Error(`Session is not bootstrapped for tmux: missing ${prdPath}. Start with --prd <path>.`);
   }
 
-  if (!fs.existsSync(manifestPath)) {
+  let artifactAcceptance = validateRefinementAcceptance(sessionDir);
+  if (artifactAcceptance.ok && typeof current.working_dir === 'string') {
+    reconcileVerifiedRefinementRepositoryAdvance(sessionDir, current.working_dir);
+    artifactAcceptance = validateRefinementAcceptance(sessionDir);
+  }
+  let acceptance = validateAcceptance();
+
+  if (!acceptance.ok) {
+    if (artifactAcceptance.ok) {
+      throw new Error(
+        `Session repository changed outside a safely verified ticket boundary: ${acceptance.reason}. Refusing to replace accepted refinement artifacts.`,
+      );
+    }
+    if (unacceptedManifestMustBePreserved(manifestPath, artifactAcceptance.reason)) {
+      throw new Error(
+        `Session has existing refinement artifacts that cannot be verified (${artifactAcceptance.reason}). Refusing automatic replacement; run explicit PRD refinement after reviewing preserved progress.`,
+      );
+    }
     if (options.resumeReadyOnly) {
-      throw new Error(`Session is not ready to resume: missing ${manifestPath}. Re-run without --resume-ready-only to refine first.`);
+      throw new Error(`Session is not ready to resume: ${acceptance.reason}. Re-run without --resume-ready-only to refine first.`);
     }
     if (!fs.existsSync(prdPath)) {
       throw new Error(`Cannot refine this session because ${prdPath} is missing.`);
     }
-    await refinePrd(sessionDir);
+    await refinePrd(sessionDir, { runStartedAtMs: options.runStartedAtMs });
+    acceptance = validateAcceptance();
+    if (!acceptance.ok) {
+      throw new Error(`Session is not runnable: ${acceptance.reason}.`);
+    }
+  }
+
+  let manifestIssues: string[];
+  try {
+    const manifestBeforeNormalization = fs.readFileSync(manifestPath, 'utf8');
+    const manifest = readManifest(sessionDir);
+    manifestIssues = validateRefinementManifest(manifest);
+    const manifestAfterNormalization = fs.readFileSync(manifestPath, 'utf8');
+    const normalizedAcceptance = validateAcceptance();
+    if (
+      acceptance.ok
+      && manifestIssues.length === 0
+      && manifestBeforeNormalization !== manifestAfterNormalization
+      && normalizedAcceptance.reason === 'manifest_sha256 does not match the accepted refinement'
+    ) {
+      writeRefinementAcceptance(sessionDir, { workingDir: current.working_dir as string | undefined });
+      acceptance = validateAcceptance();
+    } else {
+      acceptance = normalizedAcceptance;
+    }
+  } catch (error) {
+    manifestIssues = [error instanceof Error ? error.message : String(error)];
+  }
+  if (manifestIssues.length > 0) {
+    if (options.resumeReadyOnly) {
+      throw new Error(`Session is not ready to resume: refinement manifest is invalid: ${manifestIssues.join('; ')}`);
+    }
+    await refinePrd(sessionDir, { runStartedAtMs: options.runStartedAtMs });
+    acceptance = validateAcceptance();
+    if (!acceptance.ok) {
+      throw new Error(`Session is not runnable: ${acceptance.reason}.`);
+    }
+  }
+  if (!acceptance.ok) {
+    throw new Error(`Session is not runnable: ${acceptance.reason}.`);
   }
 
   const summary = summarizeTickets(sessionDir);
@@ -373,7 +460,9 @@ export async function ensureBootstrapSessionReady(
     throw new Error('Session is not runnable: refinement produced zero tickets.');
   }
   if (!summary.runnable.length) {
-    throw new Error(`Session has no runnable tickets (done=${summary.done}, blocked=${summary.blocked}, skipped=${summary.skipped}).`);
+    if (summary.done !== summary.total) {
+      throw new Error(`Session has no runnable tickets (done=${summary.done}, blocked=${summary.blocked}, skipped=${summary.skipped}).`);
+    }
   }
 
   const nextTicket = getNextRunnableTicket(sessionDir);
@@ -434,6 +523,14 @@ export function enterMuxRunnerPhase(
   options: EnterMuxRunnerPhaseOptions = {},
 ): PersistedState {
   return manager.update(statePath, (state) => {
+    const cancellationAtMs = Date.parse(String(state.cancel_requested_at || ''));
+    if (
+      Number.isFinite(options.runStartedAtMs)
+      && Number.isFinite(cancellationAtMs)
+      && cancellationAtMs >= Number(options.runStartedAtMs)
+    ) {
+      throw new Error('Session execution was cancelled during runner startup.');
+    }
     state.active = true;
     state.tmux_runner_pid = options.runnerPid || process.pid;
     state.last_exit_reason = null;

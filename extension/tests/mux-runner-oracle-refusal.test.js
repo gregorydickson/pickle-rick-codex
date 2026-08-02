@@ -1,11 +1,15 @@
 // @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { runSequential } from '../bin/mux-runner.js';
+import { StateManager } from '../services/state-manager.js';
+import { updateTicketStatus } from '../services/tickets.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 
 function createSessionWithTodoTicket(taskLabel) {
   const dataRoot = makeTempRoot();
@@ -23,11 +27,15 @@ function createSessionWithTodoTicket(taskLabel) {
         description: 'Runner must honor the oracle completion verdict.',
         acceptance_criteria: ['The runner only marks Done when the oracle accepts completion.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Runner fixture PRD\n');
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Runner fixture refined PRD\n');
+  writeRefinementAcceptance(sessionDir);
   return { dataRoot, sessionDir };
 }
 
@@ -153,4 +161,119 @@ test('mux-runner refuses ticket execution while the circuit is OPEN', async () =
   assert.equal(calls, 0);
   assert.equal(finalReason, 'circuit_open');
   assert.match(readRunnerLog(sessionDir), /refusing ticket r1: circuit breaker is OPEN/);
+});
+
+test('mux-runner chooses dependency-runnable work even when the manifest is not topologically sorted', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('dependency order task');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'dependent',
+        title: 'Dependent ticket',
+        description: 'Runs after its prerequisite.',
+        acceptance_criteria: ['The prerequisite is Done first.'],
+        verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['dependent.txt'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: ['root'],
+      },
+      {
+        id: 'root',
+        title: 'Root ticket',
+        description: 'Runs before its dependent.',
+        acceptance_criteria: ['The root ticket is executable immediately.'],
+        verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['root.txt'],
+        priority: 'P1',
+        status: 'Todo',
+      },
+    ],
+  });
+  const calls = [];
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'abort', runnerMode: 'pickle' },
+    {
+      runTicket: async (_sessionDir, ticketId) => {
+        calls.push(ticketId);
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success');
+  assert.deepEqual(calls, ['root', 'dependent']);
+});
+
+test('mux-runner refuses to overlap another live session operation', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('operation lease task');
+  const manager = new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });
+  const leasePath = path.join(sessionDir, '.session-operation');
+  manager.acquireLock(leasePath);
+  try {
+    await assert.rejects(
+      () => withDataRoot(dataRoot, () => runSequential(sessionDir)),
+      /Another session operation is already running/,
+    );
+  } finally {
+    manager.releaseLock(leasePath);
+  }
+});
+
+test('mux-runner preserves cancellation requested during startup', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('startup cancellation task');
+  const statePath = path.join(sessionDir, 'state.json');
+  const runStartedAtMs = Date.now();
+  new StateManager().update(statePath, (state) => {
+    state.active = false;
+    state.last_exit_reason = 'cancelled';
+    state.cancel_requested_at = new Date(runStartedAtMs + 1).toISOString();
+    return state;
+  });
+  let calls = 0;
+
+  await assert.rejects(
+    () => withDataRoot(dataRoot, () => runSequential(
+      sessionDir,
+      { runStartedAtMs },
+      { runTicket: async () => {
+        calls += 1;
+        return { status: 'done', applied: true };
+      } },
+    )),
+    /cancelled during runner startup/,
+  );
+  assert.equal(calls, 0);
+  const state = readJsonFile(statePath);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.ok(state.cancel_requested_at);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.session-operation.lock')), false);
+});
+
+test('mux-runner requires the live tmux launch owner for operation handoff', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('launch handoff task');
+  const launcher = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  assert.ok(launcher.pid);
+  fs.writeFileSync(path.join(sessionDir, '.tmux-launch.lock'), String(launcher.pid));
+  try {
+    await assert.rejects(
+      () => withDataRoot(dataRoot, () => runSequential(sessionDir)),
+      /tmux launch is already in progress/,
+    );
+    const result = await withDataRoot(dataRoot, () => runSequential(
+      sessionDir,
+      { launchOwnerPid: launcher.pid },
+      { runTicket: async (_sessionDir, ticketId) => {
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      } },
+    ));
+    assert.equal(result, 'success');
+  } finally {
+    launcher.kill('SIGTERM');
+    fs.rmSync(path.join(sessionDir, '.tmux-launch.lock'), { force: true });
+  }
 });

@@ -5,7 +5,6 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runCodexExecMonitored } from '../services/codex.js';
-import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { makeTempRoot, repoRoot, runNode, createFakeCodex, prependPath, waitFor, writeExecutable } from './helpers.js';
 
@@ -180,7 +179,11 @@ test('spawn-refinement-team writes the manifest and ticket files', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
-  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const invocationLog = path.join(makeTempRoot('pickle-refinement-invocations-'), 'calls.jsonl');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+  });
   createFakeCodex(fakeBin);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'refine this task'], {
@@ -211,6 +214,16 @@ test('spawn-refinement-team writes the manifest and ticket files', () => {
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(state.step, 'research');
   assert.equal(state.history.at(-1).step, 'refine');
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(invocations.length, 4);
+  const workerRoot = fs.realpathSync(path.join(sessionDir, '.refinement-workers')) + path.sep;
+  for (const invocation of invocations) {
+    assert.ok(fs.realpathSync(invocation.cwd).startsWith(workerRoot));
+    assert.ok(invocation.args.includes('--full-auto'));
+    assert.equal(invocation.args.includes('--dangerously-bypass-approvals-and-sandbox'), false);
+    assert.equal(invocation.args.includes('--add-dir'), false);
+    assert.match(invocation.prompt, /working repository is read-only/i);
+  }
 });
 
 test('spawn-refinement-team falls back when an analyst exits zero without completing its artifact contract', () => {
@@ -314,7 +327,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-requirements.md')), false);
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
   const refineLog = fs.readFileSync(path.join(sessionDir, 'refine.log'), 'utf8');
-  assert.match(refineLog, /Analyst fanout failed\. Falling back to single-pass refinement\./);
+  assert.match(refineLog, /Analyst retries exhausted; using explicit single-pass fallback\./);
   assert.doesNotMatch(refineLog, /Starting refinement synthesis\./);
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(state.step, 'research');
@@ -354,6 +367,8 @@ for (let index = 1; index < args.length; index += 1) {
 const sessionDir = addDirs.at(-1) || process.cwd();
 const refinedPath = path.join(sessionDir, 'prd_refined.md');
 const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+const sourcePrd = prompt.match(/^Read (.+)$/m)?.[1]?.trim().replace(/\.$/, '') || path.join(sessionDir, 'prd.md');
+const controlSessionDir = path.dirname(sourcePrd);
 
 function extractPathAfter(prefix) {
   const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
@@ -379,7 +394,7 @@ async function main() {
       return;
     }
 
-    const activePath = path.join(sessionDir, 'analyst-active-' + role);
+    const activePath = path.join(controlSessionDir, 'analyst-active-' + role);
     fs.writeFileSync(activePath, String(process.pid));
     const stop = () => {
       fs.rmSync(activePath, { force: true });
@@ -394,7 +409,7 @@ async function main() {
     fs.writeFileSync(analysisPath, '# Late Analyst Report\\n');
     if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>ANALYST_COMPLETE</promise>');
   } else if (prompt.includes('Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.')) {
-    const activeAnalysts = fs.readdirSync(sessionDir).filter((entry) => entry.startsWith('analyst-active-'));
+    const activeAnalysts = fs.readdirSync(controlSessionDir).filter((entry) => entry.startsWith('analyst-active-'));
     if (activeAnalysts.length > 0) {
       console.error('fallback overlapped active analysts: ' + activeAnalysts.join(', '));
       process.exit(1);
@@ -453,8 +468,8 @@ main().catch((error) => {
     fs.readdirSync(sessionDir).filter((entry) => entry.startsWith('analyst-active-')),
     [],
   );
-  assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-codebase.md')), false);
-  assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-risk.md')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-codebase.md')), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'analyst-risk.md')), true);
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(state.step, 'research');
@@ -537,7 +552,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
 });
 
-test('spawn-refinement-team discards rejected manifests before bootstrap resume', async () => {
+test('spawn-refinement-team preserves canonical artifacts when candidate synthesis is rejected', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -627,6 +642,22 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     env,
   }).trim();
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+  const priorRefined = '# Previously accepted refined PRD\n';
+  const priorManifest = JSON.stringify({
+    source: 'previously-accepted',
+    tickets: [{
+      id: 'existing-ticket',
+      title: 'Keep accepted output',
+      description: 'A rejected replacement cannot overwrite the last accepted refinement.',
+      acceptance_criteria: ['The canonical artifacts remain byte-identical after rejection.'],
+      verification: ['test -f README.md'],
+      allowed_paths: ['README.md'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  }, null, 2) + '\n';
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), priorRefined);
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), priorManifest);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
@@ -636,12 +667,8 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     /duplicate normalized ticket id "api-client"/,
   );
 
-  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
-  assert.equal(fs.existsSync(path.join(sessionDir, 'prd_refined.md')), false);
-  await assert.rejects(
-    () => ensureBootstrapSessionReady(sessionDir, { resumeReadyOnly: true }),
-    /missing .*refinement_manifest\.json/,
-  );
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), priorManifest);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'prd_refined.md'), 'utf8'), priorRefined);
   assert.equal(fs.existsSync(path.join(sessionDir, 'api-client', 'linear_ticket_api-client.md')), false);
 });
 
@@ -729,7 +756,7 @@ process.exit(1);
       cwd: projectDir,
       env,
     }),
-    /PRD refinement failed: fake fallback failure/,
+    /PRD refinement fallback failed: fake fallback failure/,
   );
 
   assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
@@ -872,13 +899,15 @@ if (prompt.includes('Refinement analyst role:')) {
   console.error('force single-pass fallback');
   process.exit(1);
 } else if (prompt.includes('Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.')) {
+  const sourcePrd = prompt.match(/^Read (.+)$/m)?.[1]?.trim().replace(/\.$/, '') || path.join(sessionDir, 'prd.md');
+  const controlSessionDir = process.env.CONTROL_SESSION_DIR || path.dirname(sourcePrd);
   const nested = spawnSync(
     process.execPath,
-    [process.env.REFINEMENT_ENTRY_PATH, sessionDir],
+    [process.env.REFINEMENT_ENTRY_PATH, controlSessionDir],
     { env: process.env, encoding: 'utf8' },
   );
   fs.writeFileSync(
-    path.join(sessionDir, 'nested-refinement-result.json'),
+    path.join(controlSessionDir, 'nested-refinement-result.json'),
     JSON.stringify({ status: nested.status, stderr: nested.stderr }, null, 2),
   );
   if (
@@ -923,6 +952,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     env,
   }).trim();
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+  env.CONTROL_SESSION_DIR = sessionDir;
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
     cwd: projectDir,
@@ -1043,7 +1073,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
       cwd: projectDir,
       env,
     }),
-    /PRD refinement failed: fallback did not complete its artifact contract/,
+    /Refinement manifest rejected after bounded fallback repair/,
   );
 
   assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
@@ -1141,7 +1171,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
       cwd: projectDir,
       env,
     }),
-    /PRD refinement failed: synthesis did not complete its artifact contract/,
+    /Refinement manifest rejected after bounded synthesis repair/,
   );
 
   assert.equal(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')), false);
@@ -1151,7 +1181,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(state.step, 'refine:synthesis');
 });
 
-test('spawn-refinement-team retries synthesis once after the refined PRD is written without a manifest', () => {
+test('spawn-refinement-team feeds semantic validation errors into one clean synthesis repair', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -1185,7 +1215,8 @@ for (let index = 1; index < args.length; index += 1) {
 const sessionDir = addDirs.at(-1) || process.cwd();
 const refinedPath = path.join(sessionDir, 'prd_refined.md');
 const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
-const attemptsPath = path.join(sessionDir, 'synthesis-attempts.txt');
+const sourcePrd = prompt.match(/^Read (.+)$/m)?.[1]?.trim().replace(/\.$/, '') || path.join(sessionDir, 'prd.md');
+const attemptsPath = process.env.SYNTHESIS_ATTEMPTS_PATH || path.join(path.dirname(sourcePrd), 'synthesis-attempts.txt');
 
 function extractPathAfter(prefix) {
   const line = prompt.split('\\n').find((candidate) => candidate.startsWith(prefix));
@@ -1201,8 +1232,26 @@ if (prompt.includes('Refinement analyst role:')) {
   const attempt = Number(fs.existsSync(attemptsPath) ? fs.readFileSync(attemptsPath, 'utf8') : '0') + 1;
   fs.writeFileSync(attemptsPath, String(attempt));
   if (attempt === 1) {
-    fs.writeFileSync(refinedPath, '# Refined PRD without its manifest\\n');
+    fs.writeFileSync(refinedPath, '# Semantically invalid refined PRD\\n');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+      source: 'invalid-first-synthesis',
+      tickets: [{
+        id: 'ticket-001',
+        title: 'Reject glob scope',
+        description: 'The first candidate contains a scope contract the runtime cannot enforce.',
+        acceptance_criteria: ['The repair replaces the glob with a literal path.'],
+        verification: ['test -f README.md'],
+        allowed_paths: ['**/*.ts'],
+        priority: 'P1',
+        status: 'Todo'
+      }]
+    }, null, 2));
+    if (outputLastMessagePath) fs.writeFileSync(outputLastMessagePath, '<promise>REFINEMENT_COMPLETE</promise>');
   } else if (attempt === 2) {
+    if (!prompt.includes('allowed_paths must contain at least one literal repo-relative path')) {
+      console.error('repair prompt omitted the production validator diagnostics');
+      process.exit(1);
+    }
     if (fs.existsSync(refinedPath) || fs.existsSync(manifestPath)) {
       console.error('partial synthesis artifacts were not discarded before retry');
       process.exit(1);
@@ -1245,6 +1294,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     env,
   }).trim();
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nRefinement test\n');
+  env.SYNTHESIS_ATTEMPTS_PATH = path.join(sessionDir, 'synthesis-attempts.txt');
 
   const output = runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
     cwd: projectDir,
@@ -1257,7 +1307,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
   assert.match(
     fs.readFileSync(path.join(sessionDir, 'refine.log'), 'utf8'),
-    /Synthesis attempt 1 did not complete its artifact contract\. Retrying once from analyst checkpoints\./,
+    /synthesis attempt 1 rejected; retrying once from preserved checkpoints/,
   );
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(state.step, 'research');
@@ -1446,6 +1496,65 @@ main().catch((error) => {
   assert.match(refineLog, /Refinement complete\./);
   assert.match(stderr, /\[refine\] Starting analyst fanout\./);
   assert.match(stderr, /\[refine\] Starting refinement synthesis\./);
+});
+
+test('cancel stops every concurrent refinement analyst and releases session ownership', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  writeExecutable(
+    path.join(fakeBin, 'codex'),
+    `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('codex 9.9.9-test');
+  process.exit(0);
+}
+fs.readFileSync(0, 'utf8');
+const stop = () => process.exit(143);
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+setInterval(() => {}, 1000);
+`,
+  );
+
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'cancel refinement task'], {
+    cwd: projectDir,
+    env,
+  }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# PRD\n\n## Summary\nCancel the analyst fanout.\n');
+  const controller = spawn('node', [path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+    cwd: projectDir,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  controller.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+  const identities = await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return Array.isArray(state.refinement_child_identities) && state.refinement_child_identities.length === 3
+      ? state.refinement_child_identities
+      : null;
+  }, { timeoutMs: 5_000, message: 'refinement did not persist all analyst identities' });
+
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    cwd: projectDir,
+    env,
+  });
+  const exitCode = await new Promise((resolve) => controller.on('exit', resolve));
+  assert.notEqual(exitCode, 0, stderr);
+  for (const identity of identities) {
+    assert.throws(() => process.kill(identity.pid, 0));
+  }
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.deepEqual(state.refinement_child_identities, []);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.session-operation.lock')), false);
 });
 
 test('runCodexExecMonitored ignores stale last-message success artifacts', async () => {

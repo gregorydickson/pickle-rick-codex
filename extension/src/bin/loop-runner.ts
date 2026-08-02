@@ -65,11 +65,17 @@ import { enforceLoopMutationScope } from '../services/pipeline-scope.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
 import { buildLoopPrompt, type LoopPromptConfig, type LoopPromptState } from '../services/prompts.js';
 import { appendHistory, getRunStartEpoch } from '../services/session.js';
-import { enterLoopRunnerPhase, exitLoopRunnerPhase, readLoopConfig } from '../services/pipeline-phase-setup.js';
+import {
+  claimLoopRunnerStartup,
+  enterLoopRunnerPhase,
+  exitLoopRunnerPhase,
+  readLoopConfig,
+} from '../services/pipeline-phase-setup.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { scrubWorkerOutput } from '../services/worker-output.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
+import { acquireSessionOperation } from '../services/session-operation.js';
 import type {
   Config,
   ProgressSnapshot,
@@ -953,13 +959,20 @@ function writeStopSummaryArtifacts(sessionDir: string, loopConfig: LoopConfig, s
   fs.writeFileSync(paths.stopMarkdown, markdown);
 }
 
-export async function runLoop(sessionDir: string): Promise<void> {
+interface RunLoopOptions {
+  operationLeaseHeld?: boolean;
+  launchOwnerPid?: number | null;
+  runStartedAtMs?: number;
+}
+
+async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Promise<void> {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
   const config = loadConfig();
   const loopConfig = readLoopConfig(sessionDir);
   const initialState = manager.read(statePath);
 
+  claimLoopRunnerStartup(manager, statePath, { runStartedAtMs });
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
   assertControlPlaneOutsideWorkerCwd(sessionDir, initialState.working_dir as string);
   if (isMeasuredMicroverse(loopConfig)) {
@@ -984,7 +997,7 @@ export async function runLoop(sessionDir: string): Promise<void> {
     }
   }
   ensureMetricBaseline(sessionDir, loopConfig, initialState.working_dir as string);
-  enterLoopRunnerPhase(manager, statePath, loopConfig.mode);
+  enterLoopRunnerPhase(manager, statePath, loopConfig.mode, { runStartedAtMs });
 
   let exitReason = 'success';
   let thrownError: unknown = null;
@@ -1410,18 +1423,50 @@ export async function runLoop(sessionDir: string): Promise<void> {
   }
 }
 
+export async function runLoop(sessionDir: string, options: RunLoopOptions = {}): Promise<void> {
+  const configuredStart = Number(options.runStartedAtMs);
+  const runStartedAtMs = Number.isFinite(configuredStart) && configuredStart > 0
+    ? configuredStart
+    : Date.now();
+  const launchOwnerPid = Number(options.launchOwnerPid);
+  const releaseOperation = options.operationLeaseHeld
+    ? null
+    : acquireSessionOperation(
+      sessionDir,
+      undefined,
+      Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
+    );
+  try {
+    await runLoopWithLease(sessionDir, runStartedAtMs);
+  } finally {
+    releaseOperation?.();
+  }
+}
+
+function parseRunnerNumber(argv: string[], name: string): number | null {
+  const value = Number(argv.find((arg) => arg.startsWith(`${name}=`))?.split('=')[1]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 async function main(argv: string[]): Promise<void> {
-  const [sessionDir] = argv;
+  const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/loop-runner.js <session-dir>');
   }
   try {
-    await runLoop(sessionDir);
+    await runLoop(sessionDir, {
+      launchOwnerPid: parseRunnerNumber(argv, '--launch-owner'),
+      runStartedAtMs: parseRunnerNumber(argv, '--run-started-at') || undefined,
+    });
   } catch (error) {
     const statePath = path.join(sessionDir, 'state.json');
     try {
       const manager = new StateManager();
-      if (manager.read(statePath).active !== false) {
+      const state = manager.read(statePath);
+      if (
+        Number(state.tmux_runner_pid) === process.pid
+        && (state.active !== false || state.runner_starting === true)
+      ) {
         const finalReason = exitLoopRunnerPhase(manager, statePath, 'error');
         appendRunnerLog(sessionDir, `loop-runner emergency finalization: ${finalReason}: ${safeErrorMessage(error)}`);
       }

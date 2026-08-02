@@ -22,7 +22,7 @@ import { StateManager } from './state-manager.js';
 import type { PersistedState } from './state-manager.js';
 import type { Config } from '../types/index.js';
 import { tmuxSessionExists } from './tmux.js';
-import { reapOwnedOrphanProcessGroup } from './orphan-reaper.js';
+import { recoverSessionOrphanState } from './orphan-reaper.js';
 
 export interface SessionResult {
   sessionDir: string;
@@ -251,7 +251,7 @@ export function reconcileSessionLiveness(
   const reason = runnerMissing ? 'runner_lost' : 'max_time';
   let orphanChildPid = isProcessAlive(state.active_child_pid) ? Number(state.active_child_pid) : null;
   const orphanRecovery = orphanChildPid
-    ? reapOwnedOrphanProcessGroup(sessionDir, orphanChildPid)
+    ? recoverSessionOrphanState(sessionDir, state)
     : null;
   if (orphanRecovery?.status === 'reaped' || orphanRecovery?.status === 'not-running') {
     orphanChildPid = null;

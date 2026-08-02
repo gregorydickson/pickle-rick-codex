@@ -6,21 +6,48 @@ import { logActivity } from '../services/activity-logger.js';
 import { assertCodexSucceeded, runCodexExecMonitored } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
 import {
+  captureSpawnedProcessIdentity,
+  reapRecordedLiveProcessGroup,
+  type PersistedProcessIdentity,
+} from '../services/orphan-reaper.js';
+import { atomicWriteFile, atomicWriteJson, readJsonFile, readTextFile } from '../services/pickle-utils.js';
+import {
   buildRefinementAnalystPrompt,
   buildRefinementSynthesisPrompt,
   buildRefinePrdPrompt,
 } from '../services/prompts.js';
+import {
+  assertRefinementInputIdentity,
+  captureRefinementInputIdentity,
+  createRefinementWorkerDir,
+  hasReusableAnalystCheckpoint,
+  isNonBlankArtifact,
+  pruneRefinementWorkerHistory,
+  promoteAnalystCheckpoint,
+  reconcileVerifiedRefinementRepositoryAdvance,
+  refinementAcceptancePath,
+  refinementRepositoryAdvancePath,
+  clearRefinementRepositoryAdvance,
+  writeRefinementAcceptance,
+} from '../services/refinement-artifacts.js';
 import { appendHistory } from '../services/session.js';
+import { acquireSessionOperation, assertNoForeignTmuxLaunch } from '../services/session-operation.js';
 import { StateManager } from '../services/state-manager.js';
 import type { PersistedState } from '../services/state-manager.js';
 import {
   enrichRefinementManifest,
-  fallbackRefinePrd,
-  readManifest,
+  refinementTicketMaterializationPaths,
   validateRefinementManifest,
-  restructureTicketFiles,
+  restructureTicketFilesInTransaction,
 } from '../services/tickets.js';
-import type { CodexSpawnResult, CodexUsage, ConfigVerificationInput, RefinementManifest } from '../types/index.js';
+import { recoverInterruptedTicketTransaction, runTicketTransaction } from '../services/ticket-transaction.js';
+import type {
+  CodexExecOptions,
+  CodexSpawnResult,
+  CodexUsage,
+  ConfigVerificationInput,
+  RefinementManifest,
+} from '../types/index.js';
 
 interface AnalystSpec {
   role: string;
@@ -29,16 +56,79 @@ interface AnalystSpec {
   messagePath: string;
 }
 
-interface RefinePrdOptions {
+export interface RefinePrdOptions {
   timeoutMs?: number;
+  runStartedAtMs?: number;
+  beforePromotionCommit?: () => void;
 }
 
 const REFINEMENT_LEAF_ENV = 'PICKLE_REFINEMENT_LEAF';
 const REFINEMENT_WORKER_ENV: NodeJS.ProcessEnv = { [REFINEMENT_LEAF_ENV]: '1' };
-const SYNTHESIS_ATTEMPTS = 2;
+const REFINEMENT_EXEC_ARGS = ['--full-auto'];
+const ANALYST_ATTEMPTS = 2;
+const FINAL_ARTIFACT_ATTEMPTS = 2;
+const MAX_REFINEMENT_ARTIFACT_BYTES = 2_000_000;
+const MAX_ANALYST_REPORT_BYTES = 256_000;
+const MAX_REFINEMENT_TICKETS = 200;
+const MAX_REPAIR_DIAGNOSTICS = 50;
+const MAX_REPAIR_DIAGNOSTIC_CHARS = 500;
+const MAX_REPAIR_PROMPT_CHARS = 32_768;
+
+class RefinementCancelledError extends Error {
+  constructor() {
+    super('PRD refinement cancelled.');
+    this.name = 'RefinementCancelledError';
+  }
+}
+
+class RefinementAnalystError extends Error {
+  readonly results: CodexSpawnResult[];
+
+  constructor(message: string, results: CodexSpawnResult[], options: ErrorOptions = {}) {
+    super(message, options);
+    this.name = 'RefinementAnalystError';
+    this.results = results;
+  }
+}
 
 function hasPromiseToken(text: string, token: string): boolean {
   return new RegExp(`<promise>\\s*${token}\\s*</promise>`).test(text || '');
+}
+
+function remainingAttemptTimeout(deadlineMs: number, perAttemptTimeoutMs: number): number {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) throw new Error('PRD refinement exceeded its overall retry deadline.');
+  return Math.max(1, Math.min(perAttemptTimeoutMs, remaining));
+}
+
+function artifactSizeIssue(
+  filePath: string,
+  label: string,
+  maxBytes: number = MAX_REFINEMENT_ARTIFACT_BYTES,
+): string | null {
+  try {
+    const bytes = fs.statSync(filePath).size;
+    return bytes > maxBytes
+      ? `${label} exceeds the ${maxBytes}-byte refinement artifact limit`
+      : null;
+  } catch {
+    return `${label} is missing`;
+  }
+}
+
+function isBoundedNonBlankArtifact(filePath: string, maxBytes: number): boolean {
+  return artifactSizeIssue(filePath, path.basename(filePath), maxBytes) === null
+    && isNonBlankArtifact(filePath);
+}
+
+function isBoundedArtifact(filePath: string, maxBytes: number): boolean {
+  return artifactSizeIssue(filePath, path.basename(filePath), maxBytes) === null;
+}
+
+function boundedDiagnostics(issues: string[]): string[] {
+  return issues
+    .slice(0, MAX_REPAIR_DIAGNOSTICS)
+    .map((issue) => issue.slice(0, MAX_REPAIR_DIAGNOSTIC_CHARS));
 }
 
 function hasCompleteRefinementOutput(
@@ -47,20 +137,15 @@ function hasCompleteRefinementOutput(
   manifestPath: string,
 ): boolean {
   return result.exitCode === 0 &&
-    fs.existsSync(refinedPath) &&
-    fs.existsSync(manifestPath) &&
+    isBoundedNonBlankArtifact(refinedPath, MAX_REFINEMENT_ARTIFACT_BYTES) &&
+    isBoundedArtifact(manifestPath, MAX_REFINEMENT_ARTIFACT_BYTES) &&
     hasPromiseToken(result.lastMessage, 'REFINEMENT_COMPLETE');
 }
 
 function hasCompleteAnalystOutput(result: CodexSpawnResult, spec: AnalystSpec): boolean {
   return result.exitCode === 0 &&
-    fs.existsSync(spec.analysisPath) &&
+    isBoundedNonBlankArtifact(spec.analysisPath, MAX_ANALYST_REPORT_BYTES) &&
     hasPromiseToken(result.lastMessage, 'ANALYST_COMPLETE');
-}
-
-function discardRefinementOutput(sessionDir: string): void {
-  fs.rmSync(path.join(sessionDir, 'prd_refined.md'), { force: true });
-  fs.rmSync(path.join(sessionDir, 'refinement_manifest.json'), { force: true });
 }
 
 function analystSpecs(sessionDir: string): AnalystSpec[] {
@@ -86,93 +171,381 @@ function analystSpecs(sessionDir: string): AnalystSpec[] {
   ];
 }
 
+function refinementChildIdentities(state: PersistedState): PersistedProcessIdentity[] {
+  if (!Array.isArray(state.refinement_child_identities)) return [];
+  return state.refinement_child_identities.filter((entry): entry is PersistedProcessIdentity => Boolean(
+    entry
+      && typeof entry === 'object'
+      && Number.isInteger(Number((entry as PersistedProcessIdentity).pid))
+      && Number((entry as PersistedProcessIdentity).pid) > 0
+      && Number.isInteger(Number((entry as PersistedProcessIdentity).pgid))
+      && typeof (entry as PersistedProcessIdentity).start_time === 'string'
+      && typeof (entry as PersistedProcessIdentity).fingerprint === 'string',
+  ));
+}
+
+function isRefinementCancelled(manager: StateManager, statePath: string): boolean {
+  const current = manager.read(statePath);
+  return current.last_exit_reason === 'cancelled' || Boolean(current.cancel_requested_at);
+}
+
+function terminateSpawnedProcess(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    if (process.platform !== 'win32') process.kill(-pid, 'SIGTERM');
+    else process.kill(pid, 'SIGTERM');
+  } catch {
+    // The child may have exited before ownership persistence failed.
+  }
+  const killTimer = setTimeout(() => {
+    try {
+      if (process.platform !== 'win32') process.kill(-pid, 'SIGKILL');
+      else process.kill(pid, 'SIGKILL');
+    } catch {
+      // The child exited after TERM.
+    }
+  }, 1_000);
+  killTimer.unref?.();
+}
+
+function recoverRefinementChildren(manager: StateManager, statePath: string): void {
+  const state = manager.read(statePath);
+  const identities = refinementChildIdentities(state);
+  for (const identity of identities) {
+    const result = reapRecordedLiveProcessGroup(identity);
+    if (result.status !== 'reaped' && result.status !== 'not-running') {
+      throw new Error(`Cannot recover refinement worker ${identity.pid}: ${result.reason}`);
+    }
+  }
+  if (identities.length === 0 && !state.refinement_child_identities) return;
+  manager.update(statePath, (current) => {
+    current.refinement_child_identities = [];
+    current.active_child_pid = null;
+    current.active_child_kind = null;
+    current.active_child_command = null;
+    current.active_child_identity = null;
+    current.active_child_controller_pid = process.pid;
+    return current;
+  });
+}
+
+async function runRefinementCodex(
+  options: CodexExecOptions,
+  manager: StateManager,
+  statePath: string,
+  label: string,
+  localCancelCheck: () => boolean = () => false,
+): Promise<CodexSpawnResult> {
+  let childPid = 0;
+  try {
+    return await runCodexExecMonitored({
+      ...options,
+      execArgs: REFINEMENT_EXEC_ARGS,
+      skipGitRepoCheck: true,
+      inheritConfiguredAddDirs: false,
+      addDirs: [],
+      env: { ...REFINEMENT_WORKER_ENV, ...(options.env || {}) },
+      cancelCheck: () => localCancelCheck() || isRefinementCancelled(manager, statePath),
+      onSpawn: (child) => {
+        childPid = Number(child.pid || 0);
+        const identity = captureSpawnedProcessIdentity(childPid);
+        if (!identity) {
+          terminateSpawnedProcess(childPid);
+          throw new Error(`Could not persist a safe process identity for refinement worker ${childPid}.`);
+        }
+        try {
+          manager.update(statePath, (current) => {
+            const identities = refinementChildIdentities(current)
+              .filter((entry) => entry.pid !== childPid);
+            if (identity) identities.push(identity);
+            current.refinement_child_identities = identities;
+            current.active_child_pid = childPid || null;
+            current.active_child_kind = 'refinement';
+            current.active_child_command = label;
+            current.active_child_identity = identity;
+            current.active_child_controller_pid = process.pid;
+            return current;
+          });
+        } catch (error) {
+          terminateSpawnedProcess(childPid);
+          throw error;
+        }
+        options.onSpawn?.(child);
+      },
+    });
+  } finally {
+    if (childPid > 0) {
+      manager.update(statePath, (current) => {
+        const identities = refinementChildIdentities(current)
+          .filter((entry) => entry.pid !== childPid);
+        current.refinement_child_identities = identities;
+        const next = identities.at(-1) || null;
+        current.active_child_pid = next?.pid || null;
+        current.active_child_kind = next ? 'refinement' : null;
+        current.active_child_command = next ? 'refinement-worker' : null;
+        current.active_child_identity = next;
+        current.active_child_controller_pid = process.pid;
+        return current;
+      });
+    }
+  }
+}
+
 async function runAnalyst(
   state: PersistedState,
+  sessionDir: string,
+  statePath: string,
+  manager: StateManager,
   prdPath: string,
   spec: AnalystSpec,
   timeoutMs: number,
-  cancelCheck: () => boolean,
-): Promise<CodexSpawnResult> {
-  const result = await runCodexExecMonitored({
-    cwd: state.working_dir as string,
-    prompt: buildRefinementAnalystPrompt({
-      role: spec.role,
-      focus: spec.focus,
-      prdPath,
-      analysisPath: spec.analysisPath,
-    }),
-    timeoutMs,
-    env: REFINEMENT_WORKER_ENV,
-    outputLastMessagePath: spec.messagePath,
-    addDirs: [path.dirname(prdPath)],
-    cleanupPaths: [spec.analysisPath],
-    cancelCheck,
-    successCheck: ({ lastMessage }) =>
-      fs.existsSync(spec.analysisPath) &&
-      hasPromiseToken(lastMessage, 'ANALYST_COMPLETE'),
-  });
-  if (!hasCompleteAnalystOutput(result, spec)) {
-    fs.rmSync(spec.analysisPath, { force: true });
-    fs.rmSync(spec.messagePath, { force: true });
-    assertCodexSucceeded(result, `Refinement analyst failed: ${spec.role}`);
-    throw new Error(`Refinement analyst failed: ${spec.role} did not complete its artifact contract`);
+  deadlineMs: number,
+  inputIdentity: ReturnType<typeof captureRefinementInputIdentity>,
+): Promise<CodexSpawnResult[]> {
+  if (hasReusableAnalystCheckpoint({
+    prdPath,
+    reportPath: spec.analysisPath,
+    role: spec.role,
+    workingDir: state.working_dir as string,
+    maxBytes: MAX_ANALYST_REPORT_BYTES,
+  })) {
+    appendRefineLog(sessionDir, `Reusing ${spec.role} analyst checkpoint.`);
+    return [];
   }
-  return result;
+
+  const results: CodexSpawnResult[] = [];
+  for (let attempt = 1; attempt <= ANALYST_ATTEMPTS; attempt += 1) {
+    if (isRefinementCancelled(manager, statePath)) throw new RefinementCancelledError();
+    const workerDir = createRefinementWorkerDir(sessionDir, `analyst-${spec.role}-${attempt}`);
+    const candidateSpec: AnalystSpec = {
+      ...spec,
+      analysisPath: path.join(workerDir, 'analyst-report.md'),
+      messagePath: path.join(workerDir, 'last-message.txt'),
+    };
+    const result = await runRefinementCodex({
+      cwd: workerDir,
+      prompt: buildRefinementAnalystPrompt({
+        role: spec.role,
+        focus: spec.focus,
+        prdPath,
+        analysisPath: candidateSpec.analysisPath,
+        workingDir: state.working_dir as string,
+      }),
+      timeoutMs: remainingAttemptTimeout(deadlineMs, timeoutMs),
+      outputLastMessagePath: candidateSpec.messagePath,
+      progressArtifactPaths: [candidateSpec.analysisPath],
+      cleanupPaths: [candidateSpec.analysisPath],
+      successCheck: ({ lastMessage }) =>
+        isBoundedNonBlankArtifact(candidateSpec.analysisPath, MAX_ANALYST_REPORT_BYTES)
+        && hasPromiseToken(lastMessage, 'ANALYST_COMPLETE'),
+    }, manager, statePath, `refinement-analyst:${spec.role}`);
+    results.push(result);
+    if (result.cancelled || isRefinementCancelled(manager, statePath)) throw new RefinementCancelledError();
+    if (hasCompleteAnalystOutput(result, candidateSpec)) {
+      const sizeIssue = artifactSizeIssue(
+        candidateSpec.analysisPath,
+        `${spec.role} analyst report`,
+        MAX_ANALYST_REPORT_BYTES,
+      );
+      if (sizeIssue) throw new RefinementAnalystError(sizeIssue, results);
+      assertRefinementInputIdentity(inputIdentity, {
+        prdPath,
+        workingDir: state.working_dir as string,
+      });
+      promoteAnalystCheckpoint({
+        prdPath,
+        candidateReportPath: candidateSpec.analysisPath,
+        reportPath: spec.analysisPath,
+        role: spec.role,
+        workingDir: state.working_dir as string,
+        inputIdentity,
+      });
+      atomicWriteFile(spec.messagePath, result.lastMessage);
+      return results;
+    }
+    if (attempt < ANALYST_ATTEMPTS) {
+      appendRefineLog(sessionDir, `${spec.role} analyst attempt ${attempt} failed; retrying once.`);
+      continue;
+    }
+    try {
+      assertCodexSucceeded(result, `Refinement analyst failed: ${spec.role}`);
+    } catch (error) {
+      throw new RefinementAnalystError(
+        error instanceof Error ? error.message : String(error),
+        results,
+        { cause: error },
+      );
+    }
+    throw new RefinementAnalystError(
+      `Refinement analyst failed: ${spec.role} did not complete its artifact contract`,
+      results,
+    );
+  }
+  throw new Error(`Refinement analyst failed: ${spec.role} attempts exhausted`);
 }
 
-async function runSynthesis(
-  state: PersistedState,
-  sessionDir: string,
-  prdPath: string,
-  timeoutMs: number,
-): Promise<CodexSpawnResult[]> {
-  const refinedPath = path.join(sessionDir, 'prd_refined.md');
-  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
-  const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
-  const analystReports = analystSpecs(sessionDir).map((spec) => spec.analysisPath);
-  const basePrompt = buildRefinementSynthesisPrompt({ sessionDir, prdPath, analystReports });
-  const results: CodexSpawnResult[] = [];
+interface AcceptedFinalArtifacts {
+  manifest: RefinementManifest;
+  refinedPath: string;
+  manifestPath: string;
+  results: CodexSpawnResult[];
+}
 
-  for (let attempt = 1; attempt <= SYNTHESIS_ATTEMPTS; attempt += 1) {
+interface AnalystOutcome {
+  spec: AnalystSpec;
+  results: CodexSpawnResult[];
+  error: Error | null;
+}
+
+function evaluateFinalArtifacts(
+  refinedPath: string,
+  manifestPath: string,
+  config: ConfigVerificationInput,
+): { manifest: RefinementManifest | null; issues: string[] } {
+  const issues: string[] = [];
+  const refinedSizeIssue = artifactSizeIssue(refinedPath, 'prd_refined.md');
+  const manifestSizeIssue = artifactSizeIssue(manifestPath, 'refinement_manifest.json');
+  if (refinedSizeIssue) issues.push(refinedSizeIssue);
+  if (manifestSizeIssue) issues.push(manifestSizeIssue);
+  if (issues.length > 0) return { manifest: null, issues };
+  if (!isNonBlankArtifact(refinedPath)) {
+    issues.push('prd_refined.md must contain non-empty Markdown');
+  }
+  const rawManifest = readJsonFile<RefinementManifest>(manifestPath, null);
+  if (!rawManifest || typeof rawManifest !== 'object' || Array.isArray(rawManifest) || !Array.isArray(rawManifest.tickets)) {
+    issues.push('refinement_manifest.json must be a valid object with a tickets array');
+    return { manifest: null, issues };
+  }
+  if (rawManifest.tickets.length > MAX_REFINEMENT_TICKETS) {
+    issues.push(`refinement_manifest.json exceeds the ${MAX_REFINEMENT_TICKETS}-ticket limit`);
+    return { manifest: null, issues };
+  }
+  issues.push(...validateRefinementManifest(rawManifest, { fresh: true }));
+  const manifest = enrichRefinementManifest(rawManifest, config).manifest;
+  return { manifest, issues: [...new Set(issues)] };
+}
+
+async function runFinalArtifactAttempts(input: {
+  label: 'synthesis' | 'fallback';
+  state: PersistedState;
+  statePath: string;
+  manager: StateManager;
+  sessionDir: string;
+  prdPath: string;
+  timeoutMs: number;
+  deadlineMs: number;
+  config: ConfigVerificationInput;
+  buildPrompt: (refinedPath: string, manifestPath: string) => string;
+}): Promise<AcceptedFinalArtifacts> {
+  const results: CodexSpawnResult[] = [];
+  let priorIssues: string[] = [];
+  let priorRefinedPath = '';
+  let priorManifestPath = '';
+
+  for (let attempt = 1; attempt <= FINAL_ARTIFACT_ATTEMPTS; attempt += 1) {
+    if (isRefinementCancelled(input.manager, input.statePath)) throw new RefinementCancelledError();
+    const workerDir = createRefinementWorkerDir(input.sessionDir, `${input.label}-${attempt}`);
+    const refinedPath = path.join(workerDir, 'prd_refined.md');
+    const manifestPath = path.join(workerDir, 'refinement_manifest.json');
+    const outputLastMessagePath = path.join(workerDir, 'last-message.txt');
+    const basePrompt = input.buildPrompt(refinedPath, manifestPath);
     const prompt = attempt === 1
       ? basePrompt
       : [
         basePrompt,
-        `Bounded recovery attempt ${attempt} of ${SYNTHESIS_ATTEMPTS}: the prior synthesis did not atomically complete both final artifacts and its completion marker. Recreate both final artifacts from the source PRD and analyst reports.`,
-      ].join('\n\n');
-    const result = await runCodexExecMonitored({
-      cwd: state.working_dir as string,
+        `Bounded repair attempt ${attempt} of ${FINAL_ARTIFACT_ATTEMPTS}.`,
+        `The prior candidate was rejected by the production validator: ${JSON.stringify(priorIssues)}.`,
+        priorRefinedPath ? `Prior rejected refined PRD (read-only evidence): ${priorRefinedPath}` : null,
+        priorManifestPath ? `Prior rejected manifest (read-only evidence): ${priorManifestPath}` : null,
+        'Recreate both candidate artifacts and correct every listed issue. Do not merely restate the diagnostics.',
+      ].filter(Boolean).join('\n\n');
+    if (prompt.length > MAX_REPAIR_PROMPT_CHARS) {
+      throw new Error(`Refinement repair prompt exceeded ${MAX_REPAIR_PROMPT_CHARS} characters.`);
+    }
+    const result = await runRefinementCodex({
+      cwd: workerDir,
       prompt,
-      timeoutMs,
-      env: REFINEMENT_WORKER_ENV,
+      timeoutMs: remainingAttemptTimeout(input.deadlineMs, input.timeoutMs),
       outputLastMessagePath,
-      addDirs: [sessionDir],
+      progressArtifactPaths: [refinedPath, manifestPath],
       cleanupPaths: [refinedPath, manifestPath],
       successCheck: ({ lastMessage }) =>
-        fs.existsSync(refinedPath) &&
-        fs.existsSync(manifestPath) &&
-        hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
-    });
+        isBoundedNonBlankArtifact(refinedPath, MAX_REFINEMENT_ARTIFACT_BYTES)
+        && isBoundedArtifact(manifestPath, MAX_REFINEMENT_ARTIFACT_BYTES)
+        && hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
+    }, input.manager, input.statePath, `refinement-${input.label}`);
     results.push(result);
-
-    if (hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
-      return results;
+    if (result.cancelled || isRefinementCancelled(input.manager, input.statePath)) {
+      throw new RefinementCancelledError();
     }
 
-    discardRefinementOutput(sessionDir);
-    if (attempt < SYNTHESIS_ATTEMPTS) {
+    if (hasCompleteRefinementOutput(result, refinedPath, manifestPath)) {
+      const evaluated = evaluateFinalArtifacts(refinedPath, manifestPath, input.config);
+      if (evaluated.manifest && evaluated.issues.length === 0) {
+        return { manifest: evaluated.manifest, refinedPath, manifestPath, results };
+      }
+      priorIssues = boundedDiagnostics(evaluated.issues);
+    } else {
+      priorIssues = boundedDiagnostics([
+        result.timedOut
+          ? `${input.label} worker timed out before completing its artifact contract`
+          : `${input.label} worker exited ${result.exitCode} before completing its artifact contract`,
+      ]);
+    }
+    priorRefinedPath = refinedPath;
+    priorManifestPath = manifestPath;
+    atomicWriteJson(path.join(workerDir, 'rejection.json'), {
+      schema_version: 1,
+      attempt,
+      label: input.label,
+      issues: priorIssues,
+      exit_code: result.exitCode,
+      timed_out: result.timedOut,
+    });
+
+    if (attempt < FINAL_ARTIFACT_ATTEMPTS) {
       appendRefineLog(
-        sessionDir,
-        `Synthesis attempt ${attempt} did not complete its artifact contract. Retrying once from analyst checkpoints.`,
+        input.sessionDir,
+        `${input.label} attempt ${attempt} rejected; retrying once from preserved checkpoints: ${priorIssues.join('; ')}`,
       );
       continue;
     }
-
-    assertCodexSucceeded(result, 'PRD refinement failed');
-    throw new Error('PRD refinement failed: synthesis did not complete its artifact contract');
+    assertCodexSucceeded(result, `PRD refinement ${input.label} failed`);
+    throw new Error(`Refinement manifest rejected after bounded ${input.label} repair: ${priorIssues.join('; ')}`);
   }
+  throw new Error(`PRD refinement ${input.label} attempts exhausted`);
+}
 
-  throw new Error('PRD refinement failed: synthesis attempts exhausted');
+async function runSynthesis(
+  state: PersistedState,
+  statePath: string,
+  manager: StateManager,
+  sessionDir: string,
+  prdPath: string,
+  timeoutMs: number,
+  deadlineMs: number,
+  config: ConfigVerificationInput,
+): Promise<AcceptedFinalArtifacts> {
+  const analystReports = analystSpecs(sessionDir).map((spec) => spec.analysisPath);
+  return await runFinalArtifactAttempts({
+    label: 'synthesis',
+    state,
+    statePath,
+    manager,
+    sessionDir,
+    prdPath,
+    timeoutMs,
+    deadlineMs,
+    config,
+    buildPrompt: (refinedPath, manifestPath) => buildRefinementSynthesisPrompt({
+      sessionDir,
+      prdPath,
+      analystReports,
+      workingDir: state.working_dir as string,
+      refinedPath,
+      manifestPath,
+    }),
+  });
 }
 
 function sumUsage(results: CodexSpawnResult[]): CodexUsage {
@@ -203,6 +576,63 @@ function markRefinePhase(manager: StateManager, statePath: string, sessionDir: s
   console.error(`[refine] ${message}`);
 }
 
+export function promoteRefinementArtifacts(input: {
+  sessionDir: string;
+  statePath: string;
+  manager: StateManager;
+  refinedPrd: string;
+  manifest: RefinementManifest;
+  inputIdentity?: ReturnType<typeof captureRefinementInputIdentity>;
+  workingDir?: string;
+  beforeCommit?: () => void;
+}): void {
+  const canonicalRefinedPath = path.join(input.sessionDir, 'prd_refined.md');
+  try {
+    runTicketTransaction(input.sessionDir, 'promote-refinement', () => [
+      canonicalRefinedPath,
+      refinementAcceptancePath(input.sessionDir),
+      refinementRepositoryAdvancePath(input.sessionDir),
+      input.statePath,
+      ...refinementTicketMaterializationPaths(input.sessionDir, input.manifest),
+    ], () => {
+      if (isRefinementCancelled(input.manager, input.statePath)) throw new RefinementCancelledError();
+      if (input.inputIdentity && input.workingDir) {
+        assertRefinementInputIdentity(input.inputIdentity, {
+          prdPath: path.join(input.sessionDir, 'prd.md'),
+          workingDir: input.workingDir,
+        });
+      }
+      atomicWriteFile(canonicalRefinedPath, input.refinedPrd);
+      restructureTicketFilesInTransaction(input.sessionDir, input.manifest);
+      clearRefinementRepositoryAdvance(input.sessionDir);
+      writeRefinementAcceptance(input.sessionDir, {
+        workingDir: input.workingDir,
+        expectedInputIdentity: input.inputIdentity,
+      });
+      input.beforeCommit?.();
+      input.manager.update(input.statePath, (current) => {
+        if (current.last_exit_reason === 'cancelled' || current.cancel_requested_at) {
+          throw new RefinementCancelledError();
+        }
+        current.step = 'research';
+        current.refinement_child_identities = [];
+        current.active_child_controller_pid = null;
+        appendHistory(current, 'refine');
+        return current;
+      });
+    });
+  } catch (error) {
+    if (error instanceof RefinementCancelledError) {
+      input.manager.update(input.statePath, (current) => {
+        current.last_exit_reason = 'cancelled';
+        current.cancel_requested_at ||= new Date().toISOString();
+        return current;
+      });
+    }
+    throw error;
+  }
+}
+
 async function refinePrdWithLease(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
   const prdPath = path.join(sessionDir, 'prd.md');
   if (!fs.existsSync(prdPath)) {
@@ -211,88 +641,122 @@ async function refinePrdWithLease(sessionDir: string, options: RefinePrdOptions 
 
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
+  recoverRefinementChildren(manager, statePath);
+  pruneRefinementWorkerHistory(sessionDir);
   const state = manager.read(statePath);
   const config = loadConfig();
-  const timeoutMs = options.timeoutMs || config.defaults.refinement_timeout_seconds * 1000;
+  const workingDir = state.working_dir as string;
+  const prdSizeIssue = artifactSizeIssue(prdPath, 'prd.md');
+  if (prdSizeIssue) throw new Error(prdSizeIssue);
+  const inputIdentity = captureRefinementInputIdentity({ prdPath, workingDir });
+  const inputDir = createRefinementWorkerDir(sessionDir, 'run-input');
+  const prdSnapshotPath = path.join(inputDir, 'prd.md');
+  atomicWriteFile(prdSnapshotPath, readTextFile(prdPath, '') || '');
+  const timeoutMs = options.timeoutMs ?? Math.max(
+    config.defaults.refinement_timeout_seconds,
+    Number(state.worker_timeout_seconds || 0),
+    900,
+  ) * 1000;
+  const overallDeadlineMs = Date.now() + (timeoutMs * 4);
+  const refinementResults: CodexSpawnResult[] = [];
 
-  let analystResults: CodexSpawnResult[] | null = null;
-  let refinementResults: CodexSpawnResult[] = [];
-  let cancelAnalysts = false;
-  let analystPromises: Promise<CodexSpawnResult>[] = [];
-  try {
-    markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
-    analystPromises = analystSpecs(sessionDir).map(
-      (spec) => runAnalyst(state, prdPath, spec, timeoutMs, () => cancelAnalysts),
-    );
-    analystResults = await Promise.all(analystPromises);
+  markRefinePhase(manager, statePath, sessionDir, 'refine:analysts', 'Starting analyst fanout.');
+  const analystOutcomes: AnalystOutcome[] = await Promise.all(analystSpecs(sessionDir).map(async (spec) => {
+    try {
+      return {
+        spec,
+        results: await runAnalyst(
+          state,
+          sessionDir,
+          statePath,
+          manager,
+          prdSnapshotPath,
+          spec,
+          timeoutMs,
+          overallDeadlineMs,
+          inputIdentity,
+        ),
+        error: null,
+      };
+    } catch (error) {
+      return {
+        spec,
+        results: error instanceof RefinementAnalystError ? error.results : [],
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  }));
+  if (analystOutcomes.some((outcome) => outcome.error instanceof RefinementCancelledError)
+      || isRefinementCancelled(manager, statePath)) {
+    throw new RefinementCancelledError();
+  }
+  refinementResults.push(...analystOutcomes.flatMap((outcome) => outcome.results));
+  assertRefinementInputIdentity(inputIdentity, { prdPath, workingDir });
+
+  let accepted: AcceptedFinalArtifacts;
+  const failedAnalysts = analystOutcomes.filter((outcome) => outcome.error);
+  if (failedAnalysts.length === 0) {
     appendRefineLog(sessionDir, 'Analyst fanout complete.');
-  } catch {
-    // If analyst fanout fails, keep the prior single-pass refinement path as fallback.
-    cancelAnalysts = true;
-    await Promise.allSettled(analystPromises);
-    markRefinePhase(manager, statePath, sessionDir, 'refine:fallback', 'Analyst fanout failed. Falling back to single-pass refinement.');
-    const fallbackPrompt = buildRefinePrdPrompt({ sessionDir, prdPath });
-    const outputLastMessagePath = path.join(sessionDir, 'refine-prd.last-message.txt');
-    const refinedPath = path.join(sessionDir, 'prd_refined.md');
-    const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
-    const fallbackResult = await runCodexExecMonitored({
-      cwd: state.working_dir as string,
-      prompt: fallbackPrompt,
-      timeoutMs,
-      env: REFINEMENT_WORKER_ENV,
-      outputLastMessagePath,
-      addDirs: [sessionDir],
-      cleanupPaths: [refinedPath, manifestPath],
-      successCheck: ({ lastMessage }) =>
-        fs.existsSync(refinedPath) &&
-        fs.existsSync(manifestPath) &&
-        hasPromiseToken(lastMessage, 'REFINEMENT_COMPLETE'),
-    });
-    if (!hasCompleteRefinementOutput(fallbackResult, refinedPath, manifestPath)) {
-      discardRefinementOutput(sessionDir);
-      assertCodexSucceeded(fallbackResult, 'PRD refinement failed');
-      throw new Error('PRD refinement failed: fallback did not complete its artifact contract');
-    }
-    refinementResults = [fallbackResult];
-  }
-
-  if (analystResults) {
     markRefinePhase(manager, statePath, sessionDir, 'refine:synthesis', 'Starting refinement synthesis.');
-    const synthesisResults = await runSynthesis(state, sessionDir, prdPath, timeoutMs);
-    refinementResults = [...analystResults, ...synthesisResults];
+    accepted = await runSynthesis(
+      state,
+      statePath,
+      manager,
+      sessionDir,
+      prdSnapshotPath,
+      timeoutMs,
+      overallDeadlineMs,
+      config as unknown as ConfigVerificationInput,
+    );
+  } else {
+    const failures = failedAnalysts
+      .map((outcome) => `${outcome.spec.role}: ${outcome.error?.message || 'unknown failure'}`)
+      .join('; ');
+    markRefinePhase(
+      manager,
+      statePath,
+      sessionDir,
+      'refine:fallback',
+      `Analyst retries exhausted; using explicit single-pass fallback. ${failures}`,
+    );
+    accepted = await runFinalArtifactAttempts({
+      label: 'fallback',
+      state,
+      statePath,
+      manager,
+      sessionDir,
+      prdPath,
+      timeoutMs,
+      deadlineMs: overallDeadlineMs,
+      config: config as unknown as ConfigVerificationInput,
+      buildPrompt: (refinedPath, manifestPath) => buildRefinePrdPrompt({
+        sessionDir,
+        prdPath: prdSnapshotPath,
+        workingDir: state.working_dir as string,
+        refinedPath,
+        manifestPath,
+      }),
+    });
   }
+  refinementResults.push(...accepted.results);
 
-  let manifest: RefinementManifest;
-  let manifestIssues: string[];
-  try {
-    manifest = readManifest(sessionDir);
-    if (!manifest.tickets.length) {
-      appendRefineLog(sessionDir, 'Synthesis manifest empty. Falling back to PRD table extraction.');
-      manifest = fallbackRefinePrd(fs.readFileSync(prdPath, 'utf8'));
-    }
-    const enrichedManifest = enrichRefinementManifest(manifest, config as unknown as ConfigVerificationInput);
-    manifest = enrichedManifest.manifest;
-    manifestIssues = validateRefinementManifest(manifest);
-  } catch (error) {
-    discardRefinementOutput(sessionDir);
-    throw error;
-  }
-  if (manifestIssues.length > 0) {
-    discardRefinementOutput(sessionDir);
-    appendRefineLog(sessionDir, `Refinement manifest rejected: ${manifestIssues.join('; ')}`);
-    throw new Error(`Refinement manifest rejected: ${manifestIssues.join('; ')}`);
-  }
+  assertRefinementInputIdentity(inputIdentity, { prdPath, workingDir });
+  if (isRefinementCancelled(manager, statePath)) throw new RefinementCancelledError();
+  const refinedPrd = readTextFile(accepted.refinedPath, '') || '';
+  if (!refinedPrd.trim()) throw new Error('Accepted refinement PRD became empty before promotion.');
   markRefinePhase(manager, statePath, sessionDir, 'refine:materialize', 'Materializing ticket files.');
-  restructureTicketFiles(sessionDir, manifest);
-
-  if (!manifest.tickets.length) {
+  if (!accepted.manifest.tickets.length) {
     throw new Error('Refinement produced zero tickets.');
   }
-
-  manager.update(statePath, (current) => {
-    current.step = 'research';
-    appendHistory(current, 'refine');
-    return current;
+  promoteRefinementArtifacts({
+    sessionDir,
+    statePath,
+    manager,
+    refinedPrd,
+    manifest: accepted.manifest,
+    inputIdentity,
+    workingDir,
+    beforeCommit: options.beforePromotionCommit,
   });
   appendRefineLog(sessionDir, 'Refinement complete.');
 
@@ -308,7 +772,8 @@ async function refinePrdWithLease(sessionDir: string, options: RefinePrdOptions 
     cache_read_input_tokens: usage.cache_read_input_tokens,
   }, { enabled: config.defaults.activity_logging });
 
-  return manifest;
+  pruneRefinementWorkerHistory(sessionDir);
+  return accepted.manifest;
 }
 
 export async function refinePrd(sessionDir: string, options: RefinePrdOptions = {}): Promise<RefinementManifest> {
@@ -316,18 +781,84 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
     throw new Error('Refinement leaf workers cannot launch refinement orchestration.');
   }
 
-  const leaseManager = new StateManager({ acquireTimeoutMs: 250 });
+  const leaseManager = new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });
   const leasePath = path.join(sessionDir, '.refinement-run');
+  const configuredRunStartedAtMs = Number(options.runStartedAtMs);
+  const runStartedAtMs = Number.isFinite(configuredRunStartedAtMs) && configuredRunStartedAtMs > 0
+    ? configuredRunStartedAtMs
+    : Date.now();
+  assertNoForeignTmuxLaunch(sessionDir);
+  const releaseOperation = acquireSessionOperation(sessionDir);
   try {
     leaseManager.acquireLock(leasePath);
   } catch {
+    releaseOperation();
     throw new Error(`Refinement is already running for session: ${sessionDir}`);
   }
+  try {
+    recoverInterruptedTicketTransaction(sessionDir);
+    const pendingAdvancePath = refinementRepositoryAdvancePath(sessionDir);
+    if (fs.existsSync(pendingAdvancePath)) {
+      const pendingState = new StateManager().read(path.join(sessionDir, 'state.json'));
+      const workingDir = String(pendingState.working_dir || '');
+      if (!workingDir) {
+        throw new Error('Cannot refine while a ticket repository advance is pending without a working directory.');
+      }
+      reconcileVerifiedRefinementRepositoryAdvance(sessionDir, workingDir);
+      if (fs.existsSync(pendingAdvancePath)) {
+        throw new Error('Cannot refine until the pending ticket repository advance is safely reconciled.');
+      }
+    }
+  } catch (error) {
+    leaseManager.releaseLock(leasePath);
+    releaseOperation();
+    throw error;
+  }
 
+  const ownershipManager = new StateManager();
+  const statePath = path.join(sessionDir, 'state.json');
+  ownershipManager.update(statePath, (current) => {
+    const cancellationAtMs = Date.parse(String(current.cancel_requested_at || ''));
+    const cancelledThisRun = Number.isFinite(cancellationAtMs) && cancellationAtMs >= runStartedAtMs;
+    if (!cancelledThisRun) {
+      current.cancel_requested_at = null;
+      if (current.last_exit_reason === 'cancelled') current.last_exit_reason = null;
+    }
+    current.active_child_controller_pid = process.pid;
+    return current;
+  });
+  const requestCancellation = (): void => {
+    try {
+      ownershipManager.update(statePath, (current) => {
+        if (current.active_child_controller_pid === process.pid) {
+          current.last_exit_reason = 'cancelled';
+          current.cancel_requested_at = new Date().toISOString();
+        }
+        return current;
+      });
+    } catch {
+      // The main flow will surface state corruption or ownership loss.
+    }
+  };
+  process.once('SIGINT', requestCancellation);
+  process.once('SIGTERM', requestCancellation);
   try {
     return await refinePrdWithLease(sessionDir, options);
   } finally {
+    process.removeListener('SIGINT', requestCancellation);
+    process.removeListener('SIGTERM', requestCancellation);
+    try {
+      ownershipManager.update(statePath, (current) => {
+        if (current.active_child_controller_pid === process.pid) {
+          current.active_child_controller_pid = null;
+        }
+        return current;
+      });
+    } catch {
+      // Preserve the original refinement failure.
+    }
     leaseManager.releaseLock(leasePath);
+    releaseOperation();
   }
 }
 

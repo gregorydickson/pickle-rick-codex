@@ -111,8 +111,14 @@ export function amendCommitTrailer(cwd: string, sha: string, trailer: string): s
   }
 }
 
-export function getWorkingTreeStatus(cwd: string): string {
-  return runGit(['status', '--porcelain'], cwd, { allowFailure: true }) || '';
+export function getWorkingTreeStatus(cwd: string, excludePrefixes?: string[]): string {
+  const args = ['status', '--porcelain'];
+  const excluded = normalizeExcludePrefixes(excludePrefixes);
+  if (excluded.length > 0) {
+    args.push('--', '.');
+    for (const prefix of excluded) args.push(`:!${prefix}`, `:!${prefix}/**`);
+  }
+  return runGit(args, cwd, { allowFailure: true }) || '';
 }
 
 function porcelainStatusLines(status: string): string[] {
@@ -236,7 +242,18 @@ export function resetHeadPreservingWorktree(cwd: string, sha: string): void {
   runGit(['reset', '--mixed', sha], cwd);
 }
 
-function appendFilesystemEntryFingerprint(hash: crypto.Hash, rootDir: string, relativePath: string = ''): void {
+function pathMatchesExcludedPrefix(relativePath: string, excludedPrefixes: string[]): boolean {
+  const normalized = relativePath.split(path.sep).join('/').replace(/^\.\//, '').replace(/\/$/, '');
+  return excludedPrefixes.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
+}
+
+function appendFilesystemEntryFingerprint(
+  hash: crypto.Hash,
+  rootDir: string,
+  relativePath: string = '',
+  excludedPrefixes: string[] = [],
+): void {
+  if (relativePath && pathMatchesExcludedPrefix(relativePath, excludedPrefixes)) return;
   const absolutePath = relativePath ? path.join(rootDir, relativePath) : rootDir;
   let stat: fs.Stats;
   try {
@@ -269,7 +286,7 @@ function appendFilesystemEntryFingerprint(hash: crypto.Hash, rootDir: string, re
       const childRelativePath = relativePath
         ? path.join(relativePath, entry.name)
         : entry.name;
-      appendFilesystemEntryFingerprint(hash, rootDir, childRelativePath);
+      appendFilesystemEntryFingerprint(hash, rootDir, childRelativePath, excludedPrefixes);
     }
     return;
   }
@@ -279,18 +296,24 @@ function appendFilesystemEntryFingerprint(hash: crypto.Hash, rootDir: string, re
   hash.update('\0');
 }
 
-function getFilesystemFingerprint(cwd: string): string {
+function getFilesystemFingerprint(cwd: string, excludePrefixes?: string[]): string {
   const hash = crypto.createHash('sha256');
-  appendFilesystemEntryFingerprint(hash, cwd);
+  appendFilesystemEntryFingerprint(hash, cwd, '', normalizeExcludePrefixes(excludePrefixes));
   return hash.digest('hex');
 }
 
-export function getWorkingTreeFingerprint(cwd: string): string {
+export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[]): string {
   if (!isGitRepo(cwd)) {
-    return getFilesystemFingerprint(cwd);
+    return getFilesystemFingerprint(cwd, excludePrefixes);
   }
 
-  const filesOutput = runGit(['ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd, {
+  const args = ['ls-files', '--cached', '--others', '--exclude-standard', '-z'];
+  const excluded = normalizeExcludePrefixes(excludePrefixes);
+  if (excluded.length > 0) {
+    args.push('--', '.');
+    for (const prefix of excluded) args.push(`:!${prefix}`, `:!${prefix}/**`);
+  }
+  const filesOutput = runGit(args, cwd, {
     allowFailure: true,
     trim: false,
   });

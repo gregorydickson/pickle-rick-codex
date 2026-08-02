@@ -246,6 +246,7 @@ test('session state pins the verified start commit for later completion and Cita
 test('scope resolution rejects missing, traversal, and out-of-scope changes', () => {
   assert.match(resolveTicketScope({ id: 'x', title: 'x' }).error, /declares no/);
   assert.match(resolveTicketScope({ id: 'x', title: 'x', allowed_paths: ['../escape'] }).error, /invalid/);
+  assert.match(resolveTicketScope({ id: 'x', title: 'x', allowed_paths: ['src/../escape'] }).error, /invalid/);
   assert.match(resolveTicketScope({ id: 'x', title: 'x', allowed_paths: ['.'] }).error, /invalid ticket scope path/);
   assert.deepEqual(resolveTicketScope({
     id: 'x',
@@ -260,4 +261,26 @@ test('scope resolution rejects missing, traversal, and out-of-scope changes', ()
   );
   assert.equal(verdict.ok, false);
   assert.deepEqual(verdict.violations, ['foreign.js']);
+});
+
+test('scope resolution treats framework route brackets literally while rejecting real globs', () => {
+  const dynamicRoute = 'packages/app/src/app/(app)/admin/rule-explorer/[lenderId]/page.tsx';
+  const catchAllRoute = 'packages/app/src/app/(app)/docs/[[...slug]]';
+  assert.deepEqual(resolveTicketScope({
+    id: 'next-routes',
+    title: 'Next routes',
+    allowed_paths: [dynamicRoute, catchAllRoute],
+  }).allowedPaths, [dynamicRoute, catchAllRoute]);
+  assert.match(resolveTicketScope({
+    id: 'glob',
+    title: 'Glob',
+    allowed_paths: ['packages/app/src/**/*.tsx'],
+  }).error, /invalid ticket scope path/);
+
+  const verdict = evaluateTicketScope(
+    { id: 'next-routes', title: 'Next routes', allowed_paths: [catchAllRoute] },
+    [`${catchAllRoute}/page.tsx`, 'packages/app/src/app/foreign/page.tsx'],
+  );
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(verdict.violations, ['packages/app/src/app/foreign/page.tsx']);
 });

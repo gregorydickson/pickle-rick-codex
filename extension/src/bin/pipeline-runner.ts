@@ -14,6 +14,7 @@ import { readJsonFile } from '../services/pickle-utils.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager } from '../services/state-manager.js';
 import { finalizeTerminalState } from '../services/state-terminal.js';
+import { acquireSessionOperation } from '../services/session-operation.js';
 import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
 import { runCitadel } from '../services/citadel.js';
@@ -34,6 +35,16 @@ function parseFailureMode(argv: string[]): string {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
+}
+
+function parseLaunchOwnerPid(argv: string[]): number | null {
+  const value = Number(argv.find((arg) => arg.startsWith('--launch-owner='))?.split('=')[1]);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function parseRunStartedAtMs(argv: string[]): number | null {
+  const value = Number(argv.find((arg) => arg.startsWith('--run-started-at='))?.split('=')[1]);
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function appendRunnerLog(sessionDir: string, message: string): void {
@@ -63,8 +74,13 @@ function readSessionExitReason(sessionDir: string): string {
   return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
 }
 
-async function runPipelinePhase(sessionDir: string, phase: PipelinePhase, executePhase: () => Promise<string>): Promise<string> {
-  beginPipelinePhase(sessionDir, phase, { runnerPid: process.pid });
+async function runPipelinePhase(
+  sessionDir: string,
+  phase: PipelinePhase,
+  runStartedAtMs: number,
+  executePhase: () => Promise<string>,
+): Promise<string> {
+  beginPipelinePhase(sessionDir, phase, { runnerPid: process.pid, runStartedAtMs });
   try {
     const exitReason = await executePhase();
     if (exitReason === 'cancelled') {
@@ -81,6 +97,14 @@ async function runPipelinePhase(sessionDir: string, phase: PipelinePhase, execut
     return exitReason;
   } catch (error) {
     const recordedExitReason = readSessionExitReason(sessionDir);
+    if (recordedExitReason === 'cancelled') {
+      cancelPipelineSession(sessionDir, {
+        phase,
+        exitReason: 'cancelled',
+        lastError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     const phaseExitReason = error instanceof PipelineScopeError
       ? 'scope-violation'
       : isBlockingExitReason(recordedExitReason) ? recordedExitReason : 'error';
@@ -97,17 +121,25 @@ async function runPipelineLoopPhase(
   phase: PipelinePhase,
   pipeline: PipelineContract,
   preparePhase: PreparePipelineLoopPhase,
+  runStartedAtMs: number,
 ): Promise<string> {
-  return await runPipelinePhase(sessionDir, phase, async () => {
+  return await runPipelinePhase(sessionDir, phase, runStartedAtMs, async () => {
     const scope = resolvePipelineScope(sessionDir, pipeline);
     appendRunnerLog(sessionDir, `${phase} immutable scope (${scope.source}): ${scope.paths.join(', ')}`);
     await preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase, scope.paths);
-    await runLoop(sessionDir);
+    await runLoop(sessionDir, {
+      operationLeaseHeld: true,
+      runStartedAtMs,
+    });
     return readSessionExitReason(sessionDir);
   });
 }
 
-export async function runPipeline(sessionDir: string, options: RunPipelineOptions = {}): Promise<string> {
+async function runPipelineWithLease(
+  sessionDir: string,
+  options: RunPipelineOptions = {},
+  runStartedAtMs: number,
+): Promise<string> {
   let exitReason = 'error';
   appendRunnerLog(sessionDir, getRunnerDescriptor('pipeline').runnerStartMarker);
   try {
@@ -120,15 +152,19 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
         exitReason = await runPipelinePhase(
           sessionDir,
           'pickle',
+          runStartedAtMs,
           async () => await runSequential(sessionDir, {
             ...options,
             runnerMode: 'pipeline',
+            operationLeaseHeld: true,
+            runStartedAtMs,
           }),
         );
       } else if (nextPhase === 'citadel') {
         exitReason = await runPipelinePhase(
           sessionDir,
           'citadel',
+          runStartedAtMs,
           async () => await runCitadel(sessionDir),
         );
       } else if (nextPhase === 'anatomy-park') {
@@ -137,6 +173,7 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
           'anatomy-park',
           pipeline,
           preparePipelineAnatomyParkPhase,
+          runStartedAtMs,
         );
       } else if (nextPhase === 'szechuan-sauce') {
         exitReason = await runPipelineLoopPhase(
@@ -144,6 +181,7 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
           'szechuan-sauce',
           pipeline,
           preparePipelineSzechuanSaucePhase,
+          runStartedAtMs,
         );
       } else {
         throw new Error(`Unsupported pipeline phase: ${nextPhase}.`);
@@ -165,6 +203,7 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
     const recordedExitReason = readSessionExitReason(sessionDir);
     exitReason = error instanceof PipelineScopeError
       ? 'scope-violation'
+      : recordedExitReason === 'cancelled' ? 'cancelled'
       : isBlockingExitReason(recordedExitReason) ? recordedExitReason : 'error';
     try {
       finalizeTerminalState(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
@@ -181,12 +220,34 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
   }
 }
 
+export async function runPipeline(sessionDir: string, options: RunPipelineOptions = {}): Promise<string> {
+  const configuredRunStartedAtMs = Number(options.runStartedAtMs);
+  const runStartedAtMs = Number.isFinite(configuredRunStartedAtMs) && configuredRunStartedAtMs > 0
+    ? configuredRunStartedAtMs
+    : Date.now();
+  const launchOwnerPid = Number(options.launchOwnerPid);
+  const releaseOperation = acquireSessionOperation(
+    sessionDir,
+    undefined,
+    Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
+  );
+  try {
+    return await runPipelineWithLease(sessionDir, options, runStartedAtMs);
+  } finally {
+    releaseOperation();
+  }
+}
+
 async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
     throw new Error('Usage: node bin/pipeline-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
   }
-  const exitReason = await runPipeline(sessionDir, { onFailure: parseFailureMode(argv) });
+  const exitReason = await runPipeline(sessionDir, {
+    onFailure: parseFailureMode(argv),
+    launchOwnerPid: parseLaunchOwnerPid(argv),
+    runStartedAtMs: parseRunStartedAtMs(argv),
+  });
   if (pipelineExitFailed(exitReason)) {
     process.exitCode = 1;
   }

@@ -28,16 +28,27 @@ export function buildDraftPrdPrompt({ task, sessionDir }: DraftPrdPromptInput): 
 export interface RefinePrdPromptInput {
   sessionDir: string;
   prdPath: string;
+  workingDir?: string;
+  refinedPath?: string;
+  manifestPath?: string;
 }
 
-export function buildRefinePrdPrompt({ sessionDir, prdPath }: RefinePrdPromptInput): string {
+export function buildRefinePrdPrompt({
+  sessionDir,
+  prdPath,
+  workingDir,
+  refinedPath = `${sessionDir}/prd_refined.md`,
+  manifestPath = `${sessionDir}/refinement_manifest.json`,
+}: RefinePrdPromptInput): string {
   return [
     'Refine the PRD into atomic implementation tickets for the guaranteed Codex v1 path.',
     REFINEMENT_LEAF_BOUNDARY,
+    workingDir ? `Working repository (read-only): ${workingDir}` : null,
     `Read ${prdPath}.`,
-    `Write ${sessionDir}/prd_refined.md with clarified acceptance criteria.`,
-    `Write ${sessionDir}/refinement_manifest.json with a top-level {"tickets":[...]} array.`,
-    'Each ticket should be self-contained, sequentially executable, and include id, title, description, acceptance_criteria, verification, priority, and a non-empty allowed_paths array of specific repo-relative files or directories the ticket may modify. Repository-root scopes such as "." are forbidden.',
+    `Write ${refinedPath} with clarified acceptance criteria.`,
+    `Write ${manifestPath} with a top-level {"tickets":[...]} array.`,
+    'Each ticket should be self-contained, sequentially executable, start in Todo status, and include non-empty id, title, description, acceptance_criteria, verification, priority, and a non-empty allowed_paths array.',
+    'allowed_paths entries are literal repo-relative files or directories. Framework route brackets such as [lenderId] and [[...slug]] are valid literal names; glob patterns and repository-root scope "." are forbidden.',
     'Emit explicit machine-readable contracts instead of hiding them in wrapper commands.',
     'When verification depends on sibling repos or repo-owned wrappers, include verification_env with required vars such as ATTRACTOR_ROOT and DIPPIN_ROOT.',
     'When a ticket creates or updates proof artifacts, include output_artifacts with repo-relative paths.',
@@ -46,8 +57,9 @@ export function buildRefinePrdPrompt({ sessionDir, prdPath }: RefinePrdPromptInp
     'If the PRD describes a currently evolving external or sibling system that should be validated against the current compatible mounted state, do not silently hard-code fixed-SHA enforcement.',
     'If the source contract is ambiguous between pinned-SHA validation and current-compatible mounted-system validation, create an explicit contract-decision ticket first. Mark it with contract_decision: true and make the dependent implementation tickets wait on it.',
     'Return <promise>REFINEMENT_COMPLETE</promise> when both files are written.',
+    'The working repository is read-only for this phase. Write only the two requested artifacts.',
     'Stop immediately after writing the files and the promise token. Do not continue with extra analysis or follow-up turns.',
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 export interface RefinementAnalystPromptInput {
@@ -55,6 +67,7 @@ export interface RefinementAnalystPromptInput {
   focus: string;
   prdPath: string;
   analysisPath: string;
+  workingDir?: string;
 }
 
 export function buildRefinementAnalystPrompt({
@@ -62,10 +75,12 @@ export function buildRefinementAnalystPrompt({
   focus,
   prdPath,
   analysisPath,
+  workingDir,
 }: RefinementAnalystPromptInput): string {
   return [
     'You are one of three parallel PRD refinement analysts for the Pickle Rick Codex runtime.',
     REFINEMENT_LEAF_BOUNDARY,
+    workingDir ? `Working repository (read-only): ${workingDir}` : null,
     `Refinement analyst role: ${role}`,
     `Focus: ${focus}`,
     `Read ${prdPath}`,
@@ -74,40 +89,50 @@ export function buildRefinementAnalystPrompt({
     'Call out gaps, contradictions, risky assumptions, missing verification, and ticketization concerns.',
     'Output sections: Findings, Recommended Changes, Verification Gaps, and Ticketing Notes.',
     'Do not write the final manifest or the final refined PRD in this step.',
+    'The working repository is read-only for this phase. Write only the requested analyst report.',
     'Return <promise>ANALYST_COMPLETE</promise> when the analyst report is written.',
     'Stop immediately after writing the file and the promise token.',
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 export interface RefinementSynthesisPromptInput {
   sessionDir: string;
   prdPath: string;
   analystReports: string[];
+  workingDir?: string;
+  refinedPath?: string;
+  manifestPath?: string;
 }
 
 export function buildRefinementSynthesisPrompt({
   sessionDir,
   prdPath,
   analystReports,
+  workingDir,
+  refinedPath = `${sessionDir}/prd_refined.md`,
+  manifestPath = `${sessionDir}/refinement_manifest.json`,
 }: RefinementSynthesisPromptInput): string {
   return [
     'You are synthesizing parallel PRD refinement analyst reports into final executable artifacts for the Pickle Rick Codex runtime.',
     REFINEMENT_LEAF_BOUNDARY,
+    workingDir ? `Working repository (read-only): ${workingDir}` : null,
     `Read ${prdPath}`,
     'Read these analyst reports:',
     ...analystReports.map((report) => `- ${report}`),
-    `Write ${sessionDir}/prd_refined.md with clarified acceptance criteria, architecture details, sequencing, and concrete execution notes`,
-    `Write ${sessionDir}/refinement_manifest.json with a top-level {"tickets":[...]} array`,
-    'Each ticket must be self-contained, sequentially executable, and include id, title, description, acceptance_criteria, verification, priority, and a non-empty allowed_paths array of specific repo-relative files or directories the ticket may modify. Repository-root scopes such as "." are forbidden.',
+    `Write ${refinedPath} with clarified acceptance criteria, architecture details, sequencing, and concrete execution notes`,
+    `Write ${manifestPath} with a top-level {"tickets":[...]} array`,
+    'Each ticket must be self-contained, sequentially executable, start in Todo status, and include non-empty id, title, description, acceptance_criteria, verification, priority, and a non-empty allowed_paths array.',
+    'allowed_paths entries are literal repo-relative files or directories. Framework route brackets such as [lenderId] and [[...slug]] are valid literal names; glob patterns and repository-root scope "." are forbidden.',
     'Prefer atomic tickets with explicit dependencies and realistic verification commands.',
     'Do not let wrapper commands hide contracts. Emit verification_env, output_artifacts, proof_corpus, and freeze_contract whenever they are needed for truthful execution.',
     'Do not invent fixed-SHA sibling validation just because the PRD mentions sibling repos, freezes, or SHAs. Emit freeze_contract.sha_source only when the PRD explicitly requires commit pinning or exact revision capture.',
     'If the PRD mixes sibling SHA/freeze language with an evolving external system or current-compatible mounted-system contract, treat that as ambiguous until resolved. Create an explicit contract-decision ticket first, mark it with contract_decision: true, and make downstream tickets depend on it.',
     'Parity-style port work must preserve full mirrored proof obligations, not only a benchmark slice.',
     'Resolve analyst disagreements explicitly in favor of the most truthful runnable plan.',
+    'The working repository is read-only for this phase. Write only the two requested artifacts.',
     'Return <promise>REFINEMENT_COMPLETE</promise> when both files are written.',
     'Stop immediately after writing the files and the promise token. Do not continue with extra analysis, follow-up turns.',
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 export interface TicketPhasePromptInput {

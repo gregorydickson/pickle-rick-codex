@@ -142,3 +142,31 @@ test('codex runner treats EPIPE from a closed child stdin as a process outcome',
   assert.equal(result.exitCode, 0);
   assert.equal(result.timedOut, false);
 });
+
+test('codex runner terminates the spawned process when ownership persistence rejects onSpawn', async () => {
+  let childPid = 0;
+  await assert.rejects(
+    () => runCommand({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      timeoutMs: 10_000,
+      onSpawn: (child) => {
+        childPid = Number(child.pid);
+        throw new Error('ownership persistence failed');
+      },
+    }),
+    /ownership persistence failed/,
+  );
+  assert.ok(childPid > 0);
+  const deadline = Date.now() + 2_000;
+  let alive = true;
+  while (alive && Date.now() < deadline) {
+    try {
+      process.kill(childPid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch {
+      alive = false;
+    }
+  }
+  assert.equal(alive, false, `child ${childPid} survived rejected ownership persistence`);
+});

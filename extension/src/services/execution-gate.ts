@@ -267,7 +267,7 @@ export async function runQualityCommand(
   timeoutMs: number,
   options: QualityRunOptions = {},
 ): Promise<QualityCommandResult> {
-  return await new Promise((resolve) => {
+  return await new Promise((resolve, reject) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let timedOut = false;
@@ -279,7 +279,6 @@ export async function runQualityCommand(
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     });
-    options.onSpawn?.(child.pid, command);
     const signalProcessGroup = (signal: NodeJS.Signals): void => {
       try {
         if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
@@ -292,6 +291,13 @@ export async function runQualityCommand(
       signalProcessGroup('SIGTERM');
       killTimer = setTimeout(() => signalProcessGroup('SIGKILL'), 1_000);
     };
+    try {
+      options.onSpawn?.(child.pid, command);
+    } catch (error) {
+      terminate();
+      reject(error);
+      return;
+    }
     const timer = setTimeout(() => {
       timedOut = true;
       terminate();
@@ -426,7 +432,8 @@ function fileIdentity(absolutePath: string): string {
     const stat = fs.lstatSync(absolutePath);
     if (stat.isSymbolicLink()) return `link:${fs.readlinkSync(absolutePath)}`;
     if (!stat.isFile()) return `other:${stat.mode}`;
-    return crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex');
+    const digest = crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex');
+    return `file:${stat.mode & 0o777}:${digest}`;
   } catch {
     return '<absent>';
   }
@@ -459,6 +466,32 @@ function stringList(value: unknown): string[] {
     : [];
 }
 
+/**
+ * Normalize a literal repository-relative ticket scope.
+ *
+ * Scope matching is exact/prefix based; it never expands shell globs. Square
+ * brackets are therefore ordinary filename characters (and are required by
+ * frameworks such as Next.js). Actual wildcard syntax remains unsupported so
+ * generated plans cannot imply a broader scope than the runtime enforces.
+ */
+export function normalizeTicketScopePath(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim().replaceAll('\\', '/');
+  if (!trimmed || trimmed.startsWith('/') || trimmed.startsWith('$')) return '';
+  if (trimmed.split('/').includes('..')) return '';
+  const normalized = path.posix.normalize(trimmed.replace(/^\.\//, '')).replace(/\/$/, '');
+  if (
+    !normalized
+    || normalized === '.'
+    || path.posix.isAbsolute(normalized)
+    || normalized === '..'
+    || normalized.startsWith('../')
+    || normalized.includes('/../')
+    || /[*?{}]/.test(normalized)
+  ) return '';
+  return normalized;
+}
+
 export function resolveTicketScope(ticket: Ticket): { allowedPaths: string[]; error?: string } {
   const raw = [
     ...stringList(ticket.allowed_paths),
@@ -470,8 +503,8 @@ export function resolveTicketScope(ticket: Ticket): { allowedPaths: string[]; er
   ];
   const allowedPaths: string[] = [];
   for (const candidate of raw) {
-    const normalized = candidate.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
-    if (!normalized || normalized === '.' || path.posix.isAbsolute(normalized) || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../') || /[*?[\]{}]/.test(normalized)) {
+    const normalized = normalizeTicketScopePath(candidate);
+    if (!normalized) {
       return { allowedPaths: [], error: `invalid ticket scope path: ${candidate}` };
     }
     if (!allowedPaths.includes(normalized)) allowedPaths.push(normalized);

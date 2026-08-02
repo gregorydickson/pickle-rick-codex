@@ -11,6 +11,7 @@ import { StateManager } from './state-manager.js';
 import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from './tmux.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { recordCodexManagerRelaunch } from './manager-relaunch-integrity.js';
+import { assertSessionOperationAvailable } from './session-operation.js';
 
 interface LoopConfig {
   mode: string;
@@ -315,6 +316,7 @@ export async function launchDetachedLoop({
   sessionCwd = null,
   sessionMapCwd = null,
 }: LaunchDetachedLoopOptions): Promise<string> {
+  const launchStartedAtMs = Date.now();
   ensureTmuxAvailable();
   const launcherCwd = fs.realpathSync(process.cwd());
   const effectiveSessionCwd = fs.realpathSync(sessionCwd || launcherCwd);
@@ -351,6 +353,7 @@ export async function launchDetachedLoop({
       state.working_dir,
     ]);
     releaseLock ??= acquireLaunchLock(sessionDir);
+    assertSessionOperationAvailable(sessionDir);
     const previousSessionDir = getSessionForCwd(effectiveSessionMapCwd);
     const runtimeRoot = getRuntimeRoot();
     const existingConfig = readJsonFile<ExistingLoopConfig>(path.join(sessionDir, 'loop_config.json'), {}) || {};
@@ -389,9 +392,12 @@ export async function launchDetachedLoop({
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
 
-      const runnerArgs = runnerDescriptor.mode === 'pickle'
-        ? `${shellQuote(sessionDir)} --on-failure=${onFailure}`
-        : `${shellQuote(sessionDir)}`;
+      const runnerArgs = [
+        shellQuote(sessionDir),
+        ...(runnerDescriptor.mode === 'pickle' ? [`--on-failure=${onFailure}`] : []),
+        `--launch-owner=${process.pid}`,
+        `--run-started-at=${launchStartedAtMs}`,
+      ].join(' ');
       const runnerCommand = [
         'node',
         shellQuote(path.join(runtimeRoot, 'bin', runnerDescriptor.runnerBin)),

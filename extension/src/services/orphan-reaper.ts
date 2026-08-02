@@ -112,6 +112,14 @@ function matchesPersistedIdentity(expected: PersistedProcessIdentity, current: P
   );
 }
 
+export function inspectRecordedLiveProcessIdentity(
+  persisted: PersistedProcessIdentity,
+): 'not-running' | 'matched' | 'ambiguous' {
+  const current = inspectProcess(persisted.pid);
+  if (!current) return 'not-running';
+  return matchesPersistedIdentity(persisted, current) ? 'matched' : 'ambiguous';
+}
+
 function ownsSession(identity: ProcessIdentity, sessionDir: string): boolean {
   if (identity.pgid !== identity.pid) return false;
   const exactSessions = new Set([path.resolve(sessionDir), fs.realpathSync(sessionDir)]);
@@ -249,6 +257,28 @@ export function reapRecordedLiveProcessGroup(
 export function recoverSessionOrphanState(sessionDir: string, state: Record<string, unknown>): OrphanReapResult | null {
   const pid = Number(state.orphan_child_pid || state.active_child_pid);
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  const rawIdentity = state.active_child_identity;
+  if (rawIdentity && typeof rawIdentity === 'object') {
+    const identity = rawIdentity as Partial<PersistedProcessIdentity>;
+    if (
+      identity.pid === pid
+      && Number.isInteger(identity.pgid)
+      && Number(identity.pgid) > 0
+      && typeof identity.start_time === 'string'
+      && typeof identity.fingerprint === 'string'
+    ) {
+      return reapRecordedLiveProcessGroup(identity as PersistedProcessIdentity);
+    }
+    return {
+      status: 'ambiguous',
+      pid,
+      pgid: null,
+      reason: 'persisted child identity is invalid or does not match the orphan pid',
+      signals: [],
+    };
+  }
+  // Legacy sessions predate immutable spawn identities. Keep their narrower
+  // argv-based ownership proof as the only fallback.
   return reapOwnedOrphanProcessGroup(path.resolve(sessionDir), pid);
 }
 
@@ -273,6 +303,58 @@ export function assertSessionOrphanRecovered(
     current.active_child_pid = null;
     current.active_child_kind = null;
     current.active_child_command = null;
+    current.orphan_child_pid = null;
+    current.recovery_required = false;
+    current.recovery_reason = null;
+    current.orphan_recovery = result;
+    return current;
+  });
+  return result;
+}
+
+export function assertRecordedActiveChildRecovered(
+  sessionDir: string,
+  stateManager: StateManager = new StateManager(),
+): OrphanReapResult | null {
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = stateManager.read(statePath);
+  const pid = Number(state.active_child_pid);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const rawIdentity = state.active_child_identity;
+  const identity = rawIdentity && typeof rawIdentity === 'object'
+    ? rawIdentity as Partial<PersistedProcessIdentity>
+    : null;
+  let result: OrphanReapResult;
+  if (
+    identity
+    && identity.pid === pid
+    && Number.isInteger(identity.pgid)
+    && Number(identity.pgid) > 0
+    && typeof identity.start_time === 'string'
+    && typeof identity.fingerprint === 'string'
+  ) {
+    result = reapRecordedLiveProcessGroup(identity as PersistedProcessIdentity);
+  } else if (!inspectProcess(pid)) {
+    result = { status: 'not-running', pid, pgid: null, reason: 'recorded child is no longer running', signals: [] };
+  } else {
+    result = { status: 'ambiguous', pid, pgid: null, reason: 'live child has no valid immutable spawn identity', signals: [] };
+  }
+  if (result.status !== 'reaped' && result.status !== 'not-running') {
+    stateManager.update(statePath, (current) => {
+      current.recovery_required = true;
+      current.recovery_reason = result.reason;
+      current.orphan_child_pid = pid;
+      current.orphan_recovery = result;
+      return current;
+    });
+    throw new Error(`Session recovery required: ${result.reason}`);
+  }
+  stateManager.update(statePath, (current) => {
+    current.active_child_pid = null;
+    current.active_child_kind = null;
+    current.active_child_command = null;
+    current.active_child_identity = null;
+    current.active_child_controller_pid = null;
     current.orphan_child_pid = null;
     current.recovery_required = false;
     current.recovery_reason = null;

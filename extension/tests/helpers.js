@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 
 // repoRoot resolves to the extension/ package root (parent of extension/tests/).
 // runNode/runBash bin invocations therefore target the COMPILED extension/bin/*.js.
@@ -60,6 +61,14 @@ export function writeJson(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
 }
 
+export function acceptTestRefinement(sessionDir, workingDir) {
+  const prdPath = path.join(sessionDir, 'prd.md');
+  const refinedPath = path.join(sessionDir, 'prd_refined.md');
+  if (!fs.existsSync(prdPath)) fs.writeFileSync(prdPath, '# Test PRD\n');
+  if (!fs.existsSync(refinedPath)) fs.writeFileSync(refinedPath, '# Test refined PRD\n');
+  return writeRefinementAcceptance(sessionDir, { workingDir });
+}
+
 export function writeExecutable(filePath, content) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, content, { mode: 0o755 });
@@ -110,6 +119,13 @@ import path from 'node:path';
 
 const args = process.argv.slice(2);
 const prompt = fs.readFileSync(0, 'utf8');
+
+if (process.env.FAKE_CODEX_INVOCATION_LOG) {
+  fs.appendFileSync(
+    process.env.FAKE_CODEX_INVOCATION_LOG,
+    JSON.stringify({ cwd: process.cwd(), args, prompt }) + '\\n',
+  );
+}
 
 if (args[0] === '--version') {
   console.log('codex 9.9.9-test');
@@ -449,7 +465,7 @@ function simulateRunnerStart(mode) {
   if (fs.existsSync(statePath)) {
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     state.active = true;
-    state.tmux_runner_pid = Number(process.env.FAKE_TMUX_RUNNER_PID || 4242);
+    state.tmux_runner_pid = Number(process.env.FAKE_TMUX_RUNNER_PID || process.ppid);
     state.last_exit_reason = null;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   }

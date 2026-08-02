@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readFrontmatterField, parseTicketFile } from '../services/pickle-utils.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable, fakeLifecycleArtifactWriterSource } from './helpers.js';
+import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeCodex, writeExecutable, fakeLifecycleArtifactWriterSource } from './helpers.js';
 
 function runGit(dir, args) {
   return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -47,6 +47,7 @@ function setupSession(projectDir, env, task, tickets) {
   state.active = true;
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), { tickets });
+  acceptTestRefinement(sessionDir, projectDir);
   return sessionDir;
 }
 

@@ -9,6 +9,7 @@ import { pipelineExitFailed } from '../bin/pipeline-runner.js';
 import {
   createFakeCodex,
   createFakeTmux,
+  acceptTestRefinement,
   makeTempRoot,
   prependPath,
   repoRoot,
@@ -118,6 +119,7 @@ test('pipeline-runner executes the configured phases to completion', () => {
     bootstrap_source: 'task',
     task: 'pipeline runner task',
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
     env,
@@ -326,6 +328,7 @@ test('pipeline-runner treats verification-contract failures as blocked and exits
     bootstrap_source: 'task',
     task: 'pipeline verification contract failure',
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {

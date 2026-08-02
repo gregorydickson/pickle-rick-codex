@@ -7,10 +7,15 @@ import {
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
+import { sessionOperationOwnerPid } from '../services/session-operation.js';
 
 function runtimePids(state: PersistedState): number[] {
+  const refinementPids = Array.isArray(state?.refinement_child_identities)
+    ? state.refinement_child_identities.map((entry) => Number((entry as Record<string, unknown> | null)?.pid))
+    : [];
   return [...new Set([
     Number(state?.active_child_pid),
+    ...refinementPids,
   ].filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid))];
 }
 
@@ -26,7 +31,10 @@ function processAlive(pid: unknown): boolean {
 }
 
 function persistedChildIdentity(state: PersistedState, pid: number): PersistedProcessIdentity | null {
-  const value = state.active_child_identity;
+  const refinementIdentity = Array.isArray(state.refinement_child_identities)
+    ? state.refinement_child_identities.find((entry) => Number((entry as Record<string, unknown> | null)?.pid) === pid)
+    : null;
+  const value = refinementIdentity || state.active_child_identity;
   if (!value || typeof value !== 'object') return null;
   const identity = value as Record<string, unknown>;
   if (
@@ -75,9 +83,9 @@ async function main(argv: string[]): Promise<void> {
 
   const stateBeforeCancel = loadSessionState(resolved);
   const pidsToSignal = runtimePids(stateBeforeCancel);
-  const liveController = hasLiveController(stateBeforeCancel);
-  const hasRecordedLiveChild = liveController && pidsToSignal.some((pid) => persistedChildIdentity(stateBeforeCancel, pid));
-  if (hasRecordedLiveChild) {
+  const liveController = hasLiveController(stateBeforeCancel) || Boolean(sessionOperationOwnerPid(resolved));
+  const hasRecordedChild = pidsToSignal.some((pid) => persistedChildIdentity(stateBeforeCancel, pid));
+  if (liveController || hasRecordedChild) {
     new StateManager().update(getStatePath(resolved), (current) => {
       current.active = false;
       current.last_exit_reason = 'cancelled';
@@ -87,7 +95,7 @@ async function main(argv: string[]): Promise<void> {
   }
   const recoveries = pidsToSignal.map((pid) => {
     const identity = persistedChildIdentity(stateBeforeCancel, pid);
-    return liveController && identity
+    return identity
       ? reapRecordedLiveProcessGroup(identity)
       : reapOwnedOrphanProcessGroup(resolved, pid);
   });

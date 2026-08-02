@@ -117,7 +117,7 @@ test('waitForTmuxRunnerStart accepts matching persisted runner identity', async 
   fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({
     active: true,
     tmux_session_name: 'pipeline-deadbeef',
-    tmux_runner_pid: 4242,
+    tmux_runner_pid: process.pid,
   }));
 
   await assert.doesNotReject(
@@ -125,7 +125,7 @@ test('waitForTmuxRunnerStart accepts matching persisted runner identity', async 
   );
 });
 
-test('waitForTmuxRunnerStart only accepts a fresh runner log marker and fails closed otherwise', async (t) => {
+test('waitForTmuxRunnerStart accepts a live persisted starting owner and rejects log-only startup', async (t) => {
   const dir = makeTempDir(t);
   const logPath = path.join(dir, 'loop-runner.log');
   const stalePrefix = 'loop-runner started in a prior launch\n';
@@ -136,17 +136,22 @@ test('waitForTmuxRunnerStart only accepts a fresh runner log marker and fails cl
   }));
   fs.writeFileSync(logPath, `${stalePrefix}loop-runner started\n`);
 
-  await assert.doesNotReject(waitForTmuxRunnerStart(dir, 'loop-deadbeef', 'loop', {
+  await assert.rejects(waitForTmuxRunnerStart(dir, 'loop-deadbeef', 'loop', {
     timeoutMs: 100,
     intervalMs: 1,
     existingLogSizeBytes: Buffer.byteLength(stalePrefix),
+  }), /tmux runner did not start for loop-deadbeef/);
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({
+    active: false,
+    runner_starting: true,
+    tmux_session_name: 'loop-deadbeef',
+    tmux_runner_pid: process.pid,
   }));
-  await assert.rejects(
+  await assert.doesNotReject(
     waitForTmuxRunnerStart(dir, 'loop-deadbeef', 'loop', {
-      timeoutMs: 5,
+      timeoutMs: 100,
       intervalMs: 1,
       existingLogSizeBytes: fs.statSync(logPath).size,
     }),
-    /tmux runner did not start for loop-deadbeef/,
   );
 });

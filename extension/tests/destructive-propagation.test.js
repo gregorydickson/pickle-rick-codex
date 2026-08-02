@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
-import { createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
+import { acceptTestRefinement, createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -31,7 +31,7 @@ function setupSession(projectDir, env, task) {
   return sessionDir;
 }
 
-test('worker archive-cap abort preserves attempted tree and records a blocked recovery failure', () => {
+test('worker archive-cap abort preserves attempted tree and records durable repository recovery ownership', () => {
   const projectDir = cleanRepo('pickle-worker-archive-cap-');
   const baseline = git(projectDir, ['rev-parse', 'HEAD']);
   const fakeBin = makeTempRoot('pickle-worker-archive-bin-');
@@ -55,6 +55,7 @@ test('worker archive-cap abort preserves attempted tree and records a blocked re
       status: 'Todo',
     }],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir }),
@@ -64,8 +65,13 @@ test('worker archive-cap abort preserves attempted tree and records a blocked re
   assert.match(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), /attempted worker mutation/);
   assert.equal(git(projectDir, ['status', '--porcelain']), 'M tracked.txt');
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
-  assert.equal(ticket.status, 'Blocked');
-  assert.match(String(ticket.frontmatter.failure_reason), /destructive-archive-cap-exceeded/);
+  assert.equal(ticket.status, 'In Progress');
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.recovery_required, true);
+  assert.equal(state.recovery_kind, 'ticket_repository');
+  assert.equal(state.last_exit_reason, 'recovery_required');
+  assert.match(String(state.recovery_reason), /destructive-archive-cap-exceeded/);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), true);
 });
 
 test('Citadel archive-cap abort preserves reviewer mutation and cannot approve', () => {

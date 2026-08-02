@@ -4,11 +4,16 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { canExecute, loadCircuitState } from './circuit-breaker.js';
 import { deriveCitadelAcceptanceCriteria, validateCitadelReport } from './citadel.js';
-import { assertQualityBaselineFresh, resolveTicketScope } from './execution-gate.js';
+import { assertQualityBaselineFresh, QualityBaselineError, resolveTicketScope } from './execution-gate.js';
 import { normalizeMetricTargetContract, normalizeMetricTolerance } from './metric-convergence.js';
 import { captureProtectedPathManifest } from './microverse-protection.js';
 import { atomicWriteJson, listTicketFiles, parseTicketFile, readJsonFile } from './pickle-utils.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
+import { inspectRecordedLiveProcessIdentity, type PersistedProcessIdentity } from './orphan-reaper.js';
+import {
+  inspectRefinementRepositoryAdvance,
+  validateRefinementAcceptance,
+} from './refinement-artifacts.js';
 import { assertSchemaVersionDeployParity, RUNTIME_STATE_SCHEMA_VERSION } from './state-manager.js';
 import { normalizeTicketId, validateRefinementManifest } from './tickets.js';
 import { assertTicketVerificationReady } from './verification-env.js';
@@ -60,6 +65,16 @@ function commandAvailable(command: string, env: NodeJS.ProcessEnv): boolean {
   const versionArgs = command === 'tmux' ? ['-V'] : ['--version'];
   const result = spawnSync(command, versionArgs, { encoding: 'utf8', timeout: 10_000, env });
   return !result.error && result.status === 0;
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const ADVANCED_LOOP_MODES = new Set(['microverse', 'anatomy-park', 'szechuan-sauce']);
@@ -232,7 +247,20 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   }
 
   const workingDir = typeof state?.working_dir === 'string' ? state.working_dir : '';
-  if (workingDir) findings.push(...checkGitTree(workingDir));
+  const preflightAcceptance = workingDir
+    ? validateRefinementAcceptance(resolvedSessionDir, { workingDir, verifyRepository: true })
+    : null;
+  const recoverableAdvance = workingDir
+    && preflightAcceptance?.reason === 'repository identity does not match the accepted refinement'
+    ? inspectRefinementRepositoryAdvance(resolvedSessionDir, workingDir)
+    : null;
+  if (workingDir) {
+    findings.push(...checkGitTree(workingDir).map((entry) => (
+      recoverableAdvance?.recoverable && entry.code === 'git-tree-dirty'
+        ? { ...entry, severity: 'warning' as const, code: 'git-tree-recoverable' }
+        : entry
+    )));
+  }
   else findings.push(finding('error', 'working-dir-missing', 'Session state has no working_dir.'));
 
   let manifest: RefinementManifest = { tickets: [] };
@@ -252,6 +280,15 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
     );
   } else {
     const manifestPath = path.join(resolvedSessionDir, 'refinement_manifest.json');
+    const acceptance = preflightAcceptance || validateRefinementAcceptance(resolvedSessionDir, {
+      workingDir,
+      verifyRepository: true,
+    });
+    findings.push(acceptance.ok
+      ? finding('info', 'refinement-acceptance-valid', 'Refinement artifacts match their acceptance receipt.')
+      : recoverableAdvance?.recoverable
+        ? finding('warning', 'refinement-repository-advance-recoverable', recoverableAdvance.reason)
+        : finding('error', 'refinement-acceptance-invalid', acceptance.reason || 'Refinement acceptance failed.'));
     try {
       manifest = readJsonStrict<RefinementManifest>(manifestPath);
       const issues = validateRefinementManifest(structuredClone(manifest));
@@ -296,7 +333,13 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
       assertQualityBaselineFresh(state?.quality_baseline, workingDir);
       findings.push(finding('info', 'quality-baseline-fresh', 'Persisted quality baseline matches HEAD and the current command contract.'));
     } catch (error) {
-      findings.push(finding('error', 'quality-baseline-not-ready', error instanceof Error ? error.message : String(error)));
+      findings.push(
+        recoverableAdvance?.recoverable
+        && error instanceof QualityBaselineError
+        && error.kind === 'quality-baseline-stale'
+          ? finding('warning', 'quality-baseline-recoverable', error.message)
+          : finding('error', 'quality-baseline-not-ready', error instanceof Error ? error.message : String(error)),
+      );
     }
   }
 
@@ -312,7 +355,39 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   if (state?.recovery_required === true || state?.orphan_child_pid) {
     findings.push(finding('error', 'recovery-required', String(state.recovery_reason || `orphan child ${state.orphan_child_pid} requires recovery`)));
   }
-  if (state?.active === true) findings.push(finding('error', 'session-active', 'Session is already active; readiness must be checked before a new launch.'));
+  if (state?.active === true) {
+    const runnerPid = Number(state.tmux_runner_pid);
+    const controllerPid = Number(state.active_child_controller_pid);
+    const childPid = Number(state.active_child_pid);
+    const rawChildIdentity = state.active_child_identity;
+    const childIdentity = rawChildIdentity && typeof rawChildIdentity === 'object'
+      ? rawChildIdentity as Partial<PersistedProcessIdentity>
+      : null;
+    const childRecoverable = processAlive(childPid)
+      && childIdentity?.pid === childPid
+      && Number.isInteger(childIdentity.pgid)
+      && Number(childIdentity.pgid) > 0
+      && typeof childIdentity.start_time === 'string'
+      && typeof childIdentity.fingerprint === 'string'
+      && inspectRecordedLiveProcessIdentity(childIdentity as PersistedProcessIdentity) === 'matched';
+    if (
+      processAlive(runnerPid)
+      || processAlive(controllerPid)
+      || (processAlive(childPid) && !childRecoverable)
+    ) {
+      findings.push(finding('error', 'session-active', 'Session has a live runner, controller, or child process.'));
+    } else if (Number.isInteger(runnerPid) && runnerPid > 0) {
+      findings.push(finding(
+        'warning',
+        'session-runner-lost',
+        childRecoverable
+          ? `Recorded runner ${runnerPid} is dead; its identity-matched child ${childPid} can be safely reaped on resume.`
+          : `Recorded runner ${runnerPid} is no longer alive and can be reconciled on resume.`,
+      ));
+    } else {
+      findings.push(finding('error', 'session-active', 'Session is active without a provable runner owner.'));
+    }
+  }
 
   if (advancedProfile.advanced) {
     findings.push(finding('info', 'lifecycle-evidence-not-applicable', 'Advanced-loop iterations use loop-specific evidence rather than ticket worker lifecycle artifacts.'));

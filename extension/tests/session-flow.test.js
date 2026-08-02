@@ -13,7 +13,7 @@ import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 import { updateSessionMap } from '../services/session-map.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
-import { makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
+import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
 function runGit(repoDir, args) {
@@ -94,6 +94,7 @@ function createPipelineSession({
       },
     ],
   });
+  acceptTestRefinement(sessionDir, realProjectDir);
   writeJson(path.join(sessionDir, 'pipeline.json'), {
     schema_version: 1,
     working_dir: realProjectDir,
@@ -162,7 +163,7 @@ function simulateRunnerStart(mode) {
   if (fs.existsSync(statePath)) {
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     state.active = true;
-    state.tmux_runner_pid = 4242;
+    state.tmux_runner_pid = process.ppid;
     state.last_exit_reason = null;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   }
@@ -629,6 +630,7 @@ setInterval(() => {}, 1000);
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   const runner = spawn('node', [path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
     cwd: projectDir,
@@ -976,6 +978,7 @@ test('pickle-tmux honors an explicit --resume session when --resume-ready-only i
         description: 'Keep this session runnable but unused.',
         acceptance_criteria: ['It stays out of the way.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -989,11 +992,14 @@ test('pickle-tmux honors an explicit --resume session when --resume-ready-only i
         description: 'This is the session that should launch.',
         acceptance_criteria: ['It is chosen explicitly.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptTestRefinement(mappedSession, projectDir);
+  acceptTestRefinement(explicitSession, projectDir);
   const previousRoot = process.env.PICKLE_DATA_ROOT;
   process.env.PICKLE_DATA_ROOT = dataRoot;
   try {
@@ -1152,11 +1158,13 @@ test('pickle-tmux replaces a stale tmux session before relaunching', () => {
         description: 'Relaunch without manual cleanup.',
         acceptance_criteria: ['The stale tmux session is replaced automatically.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
     env,
@@ -1195,11 +1203,13 @@ test('pickle-tmux ignores stale runner artifacts when resuming a session', () =>
         description: 'Only a fresh runner start should satisfy launch readiness.',
         acceptance_criteria: ['Resuming should fail if the new runner never starts.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
   writeJson(path.join(sessionDir, 'state.json'), {
     ...readJsonFile(path.join(sessionDir, 'state.json')),
     active: false,
@@ -1464,6 +1474,7 @@ test('mux-runner refreshes the run timer instead of inheriting stale session sta
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   writeJson(path.join(sessionDir, 'state.json'), {
     ...readJsonFile(path.join(sessionDir, 'state.json')),
@@ -1553,6 +1564,7 @@ test('mux-runner auto-commits completed tmux tickets and leaves a clean tree', (
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
     env,
@@ -1611,6 +1623,7 @@ test('mux-runner refuses pre-existing untracked files before worker execution', 
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
@@ -1680,6 +1693,7 @@ process.exit(1);
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   writeJson(path.join(sessionDir, 'state.json'), {
     ...readJsonFile(path.join(sessionDir, 'state.json')),
@@ -1749,6 +1763,7 @@ test('mux-runner does not retry verification-contract failures and leaves the ti
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   try {
     runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
@@ -3869,7 +3884,8 @@ test('pickle-pipeline marks abrupt runner loss before resume', () => {
   const launchedState = readJsonFile(statePath);
 
   assert.equal(launchedState.active, true);
-  assert.equal(launchedState.tmux_runner_pid, 4242);
+  assert.ok(Number.isInteger(launchedState.tmux_runner_pid) && launchedState.tmux_runner_pid > 0);
+  assert.throws(() => process.kill(launchedState.tmux_runner_pid, 0));
   assert.equal(launchedState.last_exit_reason, null);
 
   const resumeOutput = runNode([
@@ -3916,7 +3932,8 @@ test('pickle-tmux marks abrupt runner loss before resume', () => {
   const launchedState = readJsonFile(statePath);
 
   assert.equal(launchedState.active, true);
-  assert.equal(launchedState.tmux_runner_pid, 4242);
+  assert.ok(Number.isInteger(launchedState.tmux_runner_pid) && launchedState.tmux_runner_pid > 0);
+  assert.throws(() => process.kill(launchedState.tmux_runner_pid, 0));
   assert.equal(launchedState.last_exit_reason, null);
 
   const resumeOutput = runNode([
@@ -4645,6 +4662,7 @@ test('cancel stops live verification work without blocking the ticket', async ()
       },
     ],
   });
+  acceptTestRefinement(sessionDir, projectDir);
 
   const child = spawn('node', [path.join(repoRoot, 'bin/mux-runner.js'), sessionDir], {
     cwd: projectDir,

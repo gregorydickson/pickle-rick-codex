@@ -6,6 +6,7 @@ import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { readJsonFile } from '../services/pickle-utils.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import {
   assertPipelineResumeCompatible,
   createPipelineContract,
@@ -42,6 +43,11 @@ function writeSessionState(sessionDir, workingDir) {
     tmux_mode: true,
     last_exit_reason: null,
   });
+}
+
+function acceptRefinementFixture(sessionDir) {
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Accepted pipeline fixture PRD\n');
+  writeRefinementAcceptance(sessionDir);
 }
 
 test('validatePipelineContract normalizes aliases and resolveNextPipelinePhase returns the first incomplete phase', () => {
@@ -306,6 +312,7 @@ test('baseline green', () => {});
         description: 'Persist the structured failing baseline.',
         acceptance_criteria: ['Baseline failures are persisted.'],
         verification: ['node --test tests/baseline-red.test.js'],
+        allowed_paths: ['tests/baseline-red.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -315,11 +322,13 @@ test('baseline green', () => {});
         description: 'Persist the structured passing baseline.',
         acceptance_criteria: ['Passing baselines are persisted.'],
         verification: ['node --test tests/baseline-green.test.js'],
+        allowed_paths: ['tests/baseline-green.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptRefinementFixture(sessionDir);
 
   await ensureBootstrapSessionReady(sessionDir);
 
@@ -375,11 +384,13 @@ test('baseline blue', () => {
         description: 'Persist the first structured failing baseline.',
         acceptance_criteria: ['First baseline failures are persisted.'],
         verification: ['node --test tests/baseline-red.test.js'],
+        allowed_paths: ['tests/baseline-red.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptRefinementFixture(sessionDir);
 
   await ensureBootstrapSessionReady(sessionDir);
 
@@ -391,6 +402,7 @@ test('baseline blue', () => {
         description: 'Persist the first structured failing baseline.',
         acceptance_criteria: ['First baseline failures are persisted.'],
         verification: ['node --test tests/baseline-red.test.js'],
+        allowed_paths: ['tests/baseline-red.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
@@ -400,11 +412,13 @@ test('baseline blue', () => {
         description: 'Persist the later-added structured failing baseline.',
         acceptance_criteria: ['Later-added baseline failures are persisted.'],
         verification: ['node --test tests/baseline-blue.test.js'],
+        allowed_paths: ['tests/baseline-blue.test.js'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  writeRefinementAcceptance(sessionDir);
 
   await ensureBootstrapSessionReady(sessionDir);
 
@@ -446,6 +460,7 @@ test('ensureBootstrapSessionReady does not rerun verification for terminal ticke
         description: 'Completed ticket baselines must not re-execute verification.',
         acceptance_criteria: ['Done tickets are ignored during baseline capture.'],
         verification: [`node -e "require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')" `],
+        allowed_paths: ['done-ticket-ran.txt'],
         priority: 'P1',
         status: 'Done',
       },
@@ -455,11 +470,13 @@ test('ensureBootstrapSessionReady does not rerun verification for terminal ticke
         description: 'Keeps the session runnable.',
         acceptance_criteria: ['Runnable baselines are still captured.'],
         verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptRefinementFixture(sessionDir);
 
   await ensureBootstrapSessionReady(sessionDir);
 

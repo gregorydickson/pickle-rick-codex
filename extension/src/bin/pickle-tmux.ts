@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireLaunchLock } from '../services/detached-launch.js';
+import {
+  acquireCwdReservationLocks,
+  acquireLaunchLock,
+  assertNoTmuxReservationForCwds,
+} from '../services/detached-launch.js';
 import { appendHistory } from '../services/session.js';
 import { getSessionForCwd, removeSessionMapEntry, updateSessionMap } from '../services/session-map.js';
 import {
@@ -16,8 +20,10 @@ import {
 } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
+import { assertSessionOperationAvailable } from '../services/session-operation.js';
 import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
 import { recordCodexManagerRelaunch } from '../services/manager-relaunch-integrity.js';
+import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
 import { isPreflightError, type PreflightError } from '../services/verification-env.js';
 import type { TicketSummary } from '../services/tickets.js';
 
@@ -107,6 +113,7 @@ function markAbruptRunnerLossBeforeResume(sessionDir: string | null, manager: St
     return;
   }
 
+  assertRecordedActiveChildRecovered(sessionDir, manager);
   manager.update(statePath, (current) => {
     current.active = false;
     current.tmux_runner_pid = null;
@@ -115,6 +122,8 @@ function markAbruptRunnerLossBeforeResume(sessionDir: string | null, manager: St
     current.active_child_pid = null;
     current.active_child_kind = null;
     current.active_child_command = null;
+    current.active_child_identity = null;
+    current.active_child_controller_pid = null;
     current.last_exit_reason = 'runner_lost';
     current.step = 'paused';
     appendHistory(current, 'runner_lost', current.current_ticket || undefined);
@@ -131,6 +140,7 @@ async function main(argv: string[]): Promise<void> {
   ensureTmuxAvailable();
   const onFailure = parseFailureMode(argv);
   const parsed = parseArgs(argv);
+  const launchStartedAtMs = Date.now();
   const resumeSessionDir = resolveBootstrapResumeSessionDir(parsed.resume);
   if (parsed.resume) {
     if (!resumeSessionDir) {
@@ -139,6 +149,16 @@ async function main(argv: string[]): Promise<void> {
     markAbruptRunnerLossBeforeResume(resumeSessionDir);
   }
   assertBootstrapSessionNotRunning(resumeSessionDir);
+  const reservationCwd = resumeSessionDir
+    ? String(new StateManager().read(path.join(resumeSessionDir, 'state.json')).working_dir || process.cwd())
+    : process.cwd();
+  const reservedCwds = [fs.realpathSync(reservationCwd)];
+  const releaseCwdReservation = acquireCwdReservationLocks(reservedCwds);
+  try {
+  assertNoTmuxReservationForCwds(
+    reservedCwds,
+    resumeSessionDir ? { excludeSessionDir: resumeSessionDir } : {},
+  );
   const sessionDir = await materializeBootstrapSession({
     prdPath: parsed.prdPath,
     resume: parsed.resume ?? undefined,
@@ -149,10 +169,14 @@ async function main(argv: string[]): Promise<void> {
   const runtimeRoot = getRuntimeRoot();
   let previousSessionDir: string | null;
   try {
+    assertSessionOperationAvailable(sessionDir);
     let state: PersistedState;
     let summary: TicketSummary;
     try {
-      ({ state, summary } = await ensureBootstrapSessionReady(sessionDir, { resumeReadyOnly: parsed.resumeReadyOnly }));
+      ({ state, summary } = await ensureBootstrapSessionReady(sessionDir, {
+        resumeReadyOnly: parsed.resumeReadyOnly,
+        runStartedAtMs: launchStartedAtMs,
+      }));
     } catch (error) {
       if (isPreflightError(error)) {
         recordBootstrapPreflightBlocked(sessionDir, error as PreflightError);
@@ -200,6 +224,8 @@ async function main(argv: string[]): Promise<void> {
         shellQuote(path.join(runtimeRoot, 'bin', runnerDescriptor.runnerBin)),
         shellQuote(sessionDir),
         `--on-failure=${onFailure}`,
+        `--launch-owner=${process.pid}`,
+        `--run-started-at=${launchStartedAtMs}`,
         ';',
         'status=$?',
         ';',
@@ -274,6 +300,9 @@ async function main(argv: string[]): Promise<void> {
     ].join('\n'));
   } finally {
     releaseLock();
+  }
+  } finally {
+    releaseCwdReservation();
   }
 }
 

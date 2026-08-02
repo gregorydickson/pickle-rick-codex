@@ -15,6 +15,10 @@ import {
   writeManifest,
   writeTicketFiles,
 } from '../services/tickets.js';
+import { promoteRefinementArtifacts } from '../bin/spawn-refinement-team.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
+import { StateManager } from '../services/state-manager.js';
+import { prepareTicketTransaction } from '../services/ticket-transaction.js';
 import { makeTempRoot } from './helpers.js';
 
 test('fallbackRefinePrd builds tickets from the PRD task breakdown table', () => {
@@ -358,6 +362,28 @@ test('enrichRefinementManifest preserves ambiguous evolving external freeze cont
   });
 });
 
+test('validateRefinementManifest rejects malformed freeze aliases instead of weakening them', () => {
+  const issues = validateRefinementManifest({
+    tickets: [{
+      id: 'unsafe-freeze',
+      title: 'Reject unsafe freeze path',
+      description: 'Malformed alias contracts must fail before normalization.',
+      acceptance_criteria: ['Parent traversal cannot disappear from a freeze contract.'],
+      verification: ['npm test'],
+      allowed_paths: ['README.md'],
+      freezeContract: {
+        path: '../escape',
+        env: 'ATTRACTOR_ROOT',
+        authority: 'git:HEAD',
+      },
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  }, { fresh: true });
+
+  assert.ok(issues.some((issue) => issue.includes('freeze_contract.artifact_path must be a literal repo-relative path')));
+});
+
 test('validateRefinementManifest rejects fallback parser output with placeholder contracts', () => {
   const issues = validateRefinementManifest(fallbackRefinePrd([
     '# PRD',
@@ -408,7 +434,6 @@ test('validateRefinementManifest rejects formatter ownership drift, opaque wrapp
   });
 
   assert.ok(issues.some((issue) => issue.includes('formatter ownership requires explicit formatter work')));
-  assert.ok(issues.some((issue) => issue.includes('opaque verification wrapper commands require explicit')));
   assert.ok(issues.some((issue) => issue.includes('wrapper verification requires explicit output_artifacts')));
   assert.ok(issues.some((issue) => issue.includes('must declare proof_corpus coverage')));
   assert.ok(issues.some((issue) => issue.includes('verification references artifact "research/external-contract-freeze.md" but no ticket owns it')));
@@ -432,6 +457,156 @@ test('validateRefinementManifest accepts explicit scope and normalizes allowedPa
   });
   assert.deepEqual(enriched.manifest.tickets[0].allowed_paths, ['src/owned.ts']);
   assert.equal(validateRefinementManifest(enriched.manifest).some((issue) => issue.includes('allowed_paths')), false);
+});
+
+test('validateRefinementManifest accepts literal Next.js dynamic route scopes and local package scripts', () => {
+  for (const verification of ['npm run lint', 'pnpm test', 'yarn test', 'bun run typecheck']) {
+    const issues = validateRefinementManifest({
+      source: 'fake-codex-synthesis',
+      tickets: [{
+        id: `local-${verification.replace(/\W+/g, '-')}`,
+        title: 'Validate local package script',
+        description: 'Run a repository-owned quality command without inventing an external contract.',
+        acceptance_criteria: ['The local package command completes successfully.'],
+        verification: [verification],
+        allowed_paths: ['packages/app/src/app/(app)/admin/rule-explorer/[lenderId]/page.tsx'],
+        priority: 'P1',
+        status: 'Todo',
+      }],
+    }, { fresh: true });
+    assert.deepEqual(issues, [], `${verification}: ${issues.join('; ')}`);
+  }
+});
+
+test('validateRefinementManifest rejects invalid path entries even when a valid sibling path exists', () => {
+  const issues = validateRefinementManifest({
+    tickets: [{
+      id: 'mixed-scope',
+      title: 'Reject mixed scope',
+      description: 'Invalid paths cannot disappear during normalization.',
+      acceptance_criteria: ['Every declared path is a literal repository-relative path.'],
+      verification: ['npm run test'],
+      allowed_paths: ['src', '../outside'],
+      output_artifacts: ['artifacts/report.json', 'artifacts/../secrets.json'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  });
+
+  assert.ok(issues.some((issue) => issue.includes('allowed_paths[1] must be a literal repo-relative path')));
+  assert.ok(issues.some((issue) => issue.includes('output_artifacts[1] must be a literal repo-relative path')));
+});
+
+test('validateRefinementManifest rejects malformed ticket contracts and terminal fresh work', () => {
+  const issues = validateRefinementManifest({
+    source: 'fake-codex-synthesis',
+    tickets: [{
+      id: 'weak',
+      title: '',
+      description: '',
+      acceptance_criteria: [{}],
+      verification: [42],
+      allowed_paths: [],
+      priority: '',
+      status: 'Done',
+    }],
+  }, { fresh: true });
+
+  assert.ok(issues.some((issue) => issue.includes('title must be a non-empty string')));
+  assert.ok(issues.some((issue) => issue.includes('description must be a non-empty string')));
+  assert.ok(issues.some((issue) => issue.includes('priority must be a non-empty string')));
+  assert.ok(issues.some((issue) => issue.includes('acceptance criteria must be non-empty strings')));
+  assert.ok(issues.some((issue) => issue.includes('verification must contain at least one executable command')));
+  assert.ok(issues.some((issue) => issue.includes('allowed_paths must contain at least one')));
+  assert.ok(issues.some((issue) => issue.includes('fresh refinement tickets must start in Todo')));
+});
+
+test('validateRefinementManifest rejects dangling, self-referential, and cyclic dependency graphs', () => {
+  const ticket = (id, depends_on = []) => ({
+    id,
+    title: `Ticket ${id}`,
+    description: `Implement ${id}.`,
+    acceptance_criteria: [`${id} is complete.`],
+    verification: [`test -f src/${id}.ts`],
+    allowed_paths: [`src/${id}.ts`],
+    priority: 'P1',
+    status: 'Todo',
+    depends_on,
+  });
+
+  const dangling = validateRefinementManifest({ tickets: [ticket('a', ['missing'])] }, { fresh: true });
+  assert.ok(dangling.some((issue) => issue.includes('dependency "missing" does not exist')));
+
+  const self = validateRefinementManifest({ tickets: [ticket('a', ['a'])] }, { fresh: true });
+  assert.ok(self.some((issue) => issue.includes('cannot depend on itself')));
+
+  const cycle = validateRefinementManifest({ tickets: [ticket('a', ['b']), ticket('b', ['a'])] }, { fresh: true });
+  assert.ok(cycle.some((issue) => issue.includes('dependency cycle detected')));
+
+  assert.deepEqual(validateRefinementManifest({
+    tickets: [ticket('dependent', ['root']), ticket('root')],
+  }, { fresh: true }), []);
+});
+
+test('summarizeTickets preserves manifest contracts and honors dependencies after materialization', () => {
+  const sessionDir = makeTempRoot();
+  writeManifest(sessionDir, {
+    tickets: [
+      {
+        id: 'dependent',
+        title: 'Dependent',
+        description: 'Runs after the root.',
+        acceptance_criteria: ['The root completes first.'],
+        verification: ['test -f dependent.txt'],
+        verification_env: { required: [{ name: 'DEPENDENCY_ROOT', source: 'ambient' }] },
+        allowed_paths: ['dependent.txt'],
+        priority: 'P1',
+        status: 'Todo',
+        depends_on: ['root'],
+      },
+      {
+        id: 'root',
+        title: 'Root',
+        description: 'Runs first.',
+        acceptance_criteria: ['The root artifact exists.'],
+        verification: ['test -f root.txt'],
+        allowed_paths: ['root.txt'],
+        priority: 'P0',
+        status: 'Todo',
+      },
+    ],
+  });
+
+  const summary = summarizeTickets(sessionDir);
+  const dependent = summary.tickets.find((ticket) => ticket.id === 'dependent');
+  assert.deepEqual(dependent.depends_on, ['root']);
+  assert.deepEqual(dependent.verification_env.required.map((entry) => entry.name), ['DEPENDENCY_ROOT']);
+  assert.deepEqual(summary.runnable.map((ticket) => ticket.id), ['root']);
+});
+
+test('readManifest fails closed on corrupt JSON without pruning materialized tickets', () => {
+  const sessionDir = makeTempRoot();
+  const manifest = {
+    tickets: [{
+      id: 'ticket-a',
+      title: 'Preserve ticket',
+      description: 'Do not destroy recoverable state after a corrupt manifest read.',
+      acceptance_criteria: ['The ticket file remains intact.'],
+      verification: ['test -f README.md'],
+      allowed_paths: ['README.md'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  };
+  writeManifest(sessionDir, manifest);
+  writeTicketFiles(sessionDir, manifest);
+  const ticketPath = path.join(sessionDir, 'ticket-a', 'linear_ticket_ticket-a.md');
+  const ticketBefore = fs.readFileSync(ticketPath, 'utf8');
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), '{broken');
+
+  assert.throws(() => summarizeTickets(sessionDir), /Invalid refinement manifest JSON/);
+  assert.equal(fs.readFileSync(ticketPath, 'utf8'), ticketBefore);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), '{broken');
 });
 
 test('validateRefinementManifest rejects universal repository-root ownership', () => {
@@ -538,7 +713,7 @@ test('validateRefinementManifest rejects conflicting freeze authorities and cons
   assert.ok(issues.some((issue) => issue.includes('freeze_contract disagrees with authoritative producer')));
 });
 
-test('validateRefinementManifest rejects opaque wrapper verification without declared contracts', () => {
+test('validateRefinementManifest rejects known external sync wrappers without their artifact contracts', () => {
   const issues = validateRefinementManifest({
     source: 'fake-codex-synthesis',
     tickets: [
@@ -547,15 +722,16 @@ test('validateRefinementManifest rejects opaque wrapper verification without dec
         title: 'Run wrapper without proof',
         description: 'This should fail because the wrapper hides the real contract.',
         acceptance_criteria: ['Wrapper execution is backed by explicit artifacts and env contracts.'],
-        verification: ['bun run check:env'],
+        verification: ['bun run fixtures:sync'],
+        allowed_paths: ['fixtures'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
 
-  assert.ok(issues.some((issue) => issue.includes('opaque verification wrapper commands require explicit')));
-  assert.ok(issues.some((issue) => issue.includes('wrapper verification requires explicit contracts instead of opaque shell assumptions')));
+  assert.ok(issues.some((issue) => issue.includes('wrapper verification requires explicit output_artifacts')));
+  assert.ok(issues.some((issue) => issue.includes('wrapper verification requires mirrored proof_corpus coverage')));
 });
 
 test('validateRefinementManifest rejects freeze consumers when no authoritative producer exists', () => {
@@ -869,4 +1045,78 @@ test('summarizeTickets does not block runnable tickets with case-insensitive non
   const summary = summarizeTickets(sessionDir);
   assert.equal(summary.runnable.length, 1);
   assert.equal(summary.runnable[0].id, 'ticket-a');
+});
+
+test('refinement promotion rolls back canonical artifacts when cancellation lands during publication', () => {
+  const sessionDir = makeTempRoot('refinement-promotion-cancel-');
+  const workingDir = makeTempRoot('refinement-promotion-working-');
+  const statePath = path.join(sessionDir, 'state.json');
+  const priorManifest = {
+    source: 'prior-plan',
+    tickets: [{
+      id: 'prior-ticket',
+      title: 'Preserve prior plan',
+      description: 'The last accepted plan remains canonical when replacement is cancelled.',
+      acceptance_criteria: ['Cancellation restores every prior canonical artifact.'],
+      verification: ['npm test'],
+      allowed_paths: ['README.md'],
+      priority: 'P1',
+      status: 'Todo',
+    }],
+  };
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Source PRD\n');
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Prior refined PRD\n');
+  writeTicketFiles(sessionDir, priorManifest);
+  writeRefinementAcceptance(sessionDir, { workingDir });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    schema_version: 1,
+    step: 'refine:materialize',
+    history: [],
+    last_exit_reason: null,
+    cancel_requested_at: null,
+    active_child_controller_pid: process.pid,
+    working_dir: workingDir,
+  }, null, 2)}\n`);
+  const priorRefined = fs.readFileSync(path.join(sessionDir, 'prd_refined.md'), 'utf8');
+  const priorManifestBytes = fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8');
+  const priorReceipt = fs.readFileSync(path.join(sessionDir, 'refinement-acceptance.json'), 'utf8');
+  const priorTicketPath = path.join(sessionDir, 'prior-ticket', 'linear_ticket_prior-ticket.md');
+  prepareTicketTransaction(sessionDir, 'interrupted-prior-update', [priorTicketPath]);
+  fs.rmSync(priorTicketPath);
+  const manager = new StateManager();
+
+  assert.throws(() => promoteRefinementArtifacts({
+    sessionDir,
+    statePath,
+    manager,
+    refinedPrd: '# Replacement refined PRD\n',
+    manifest: {
+      source: 'replacement-plan',
+      tickets: [{
+        id: 'replacement-ticket',
+        title: 'Replacement plan',
+        description: 'This replacement must not survive cancellation.',
+        acceptance_criteria: ['The replacement is published only on commit.'],
+        verification: ['npm test'],
+        allowed_paths: ['README.md'],
+        priority: 'P1',
+        status: 'Todo',
+      }],
+    },
+    beforeCommit: () => manager.update(statePath, (state) => {
+      state.last_exit_reason = 'cancelled';
+      state.cancel_requested_at = '2026-08-01T00:00:00.000Z';
+      return state;
+    }),
+  }), /PRD refinement cancelled/);
+
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'prd_refined.md'), 'utf8'), priorRefined);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), priorManifestBytes);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'refinement-acceptance.json'), 'utf8'), priorReceipt);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'replacement-ticket', 'linear_ticket_replacement-ticket.md')), false);
+  assert.ok(fs.existsSync(priorTicketPath));
+  const cancelledState = manager.read(statePath);
+  assert.equal(cancelledState.step, 'refine:materialize');
+  assert.equal(cancelledState.last_exit_reason, 'cancelled');
+  assert.ok(cancelledState.cancel_requested_at);
 });

@@ -20,7 +20,7 @@ export const DEFAULT_CONFIG: Config = {
     max_iterations: 25,
     max_time_minutes: 480,
     worker_timeout_seconds: 900,
-    refinement_timeout_seconds: 600,
+    refinement_timeout_seconds: 900,
     max_retry_attempts: 2,
     activity_logging: true,
     hook_timeout_seconds: 10,

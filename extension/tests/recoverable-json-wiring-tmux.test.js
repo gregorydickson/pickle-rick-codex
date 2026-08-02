@@ -40,7 +40,7 @@ test('VAL-CROSS-002: waitForTmuxRunnerStart recovers a newer valid dead-PID orph
 
     // Stale base has NOT started the runner; the orphan tmp holds the started payload.
     writeJson(statePath, { active: false });
-    writeJson(tmp, { active: true, tmux_session_name: sessionName, tmux_runner_pid: 4242 });
+    writeJson(tmp, { active: true, tmux_session_name: sessionName, tmux_runner_pid: process.pid });
     setMtime(statePath, BASE_TIME);
     setMtime(tmp, BASE_TIME + 1_000);
 
@@ -51,7 +51,7 @@ test('VAL-CROSS-002: waitForTmuxRunnerStart recovers a newer valid dead-PID orph
     // The orphan tmp was promoted to the base file and removed.
     assert.deepEqual(
       JSON.parse(fs.readFileSync(statePath, 'utf8')),
-      { active: true, tmux_session_name: sessionName, tmux_runner_pid: 4242 },
+      { active: true, tmux_session_name: sessionName, tmux_runner_pid: process.pid },
     );
     assert.equal(fs.existsSync(tmp), false);
   });

@@ -1,10 +1,12 @@
 // @tier: fast
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { checkReadiness } from '../services/readiness.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
+import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { makeTempRoot, projectRoot, writeJson } from './helpers.js';
 
 function git(cwd, args) {
@@ -60,6 +62,9 @@ function createReadyFixture() {
       status: 'Todo',
     }],
   });
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Source PRD\n');
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Refined PRD\n');
+  writeRefinementAcceptance(sessionDir);
   fs.mkdirSync(path.join(sessionDir, 'r1'));
   fs.writeFileSync(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'), [
     '---',
@@ -129,6 +134,47 @@ test('checkReadiness approves a prepared session and bounds readiness cycle hist
     assert.equal(fs.readFileSync(path.join(fixture.sessionDir, 'state.json'), 'utf8'), stateBefore);
     assert.equal(fs.readFileSync(path.join(fixture.sessionDir, 'refinement_manifest.json'), 'utf8'), manifestBefore);
   } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('checkReadiness reports a dead runner with an identity-matched child as recoverable without mutating session or repository state', () => {
+  const fixture = createReadyFixture();
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const identity = captureSpawnedProcessIdentity(Number(child.pid));
+  assert.ok(identity);
+  const statePath = path.join(fixture.sessionDir, 'state.json');
+  writeJson(statePath, {
+    ...JSON.parse(fs.readFileSync(statePath, 'utf8')),
+    active: true,
+    tmux_runner_pid: 999_999_999,
+    active_child_pid: child.pid,
+    active_child_kind: 'codex',
+    active_child_identity: identity,
+  });
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = fixture.dataRoot;
+  const stateBefore = fs.readFileSync(statePath, 'utf8');
+  const manifestBefore = fs.readFileSync(path.join(fixture.sessionDir, 'refinement_manifest.json'), 'utf8');
+  const acceptanceBefore = fs.readFileSync(path.join(fixture.sessionDir, 'refinement-acceptance.json'), 'utf8');
+  const headBefore = git(fixture.workingDir, ['rev-parse', 'HEAD']);
+  const statusBefore = git(fixture.workingDir, ['status', '--porcelain']);
+  try {
+    const report = checkReadiness(fixture.sessionDir, { runtimeRoot: projectRoot });
+    assert.equal(report.ready, true, JSON.stringify(report.findings));
+    assert.ok(report.findings.some((entry) => entry.code === 'session-runner-lost' && entry.severity === 'warning'));
+    assert.equal(fs.readFileSync(statePath, 'utf8'), stateBefore);
+    assert.equal(fs.readFileSync(path.join(fixture.sessionDir, 'refinement_manifest.json'), 'utf8'), manifestBefore);
+    assert.equal(fs.readFileSync(path.join(fixture.sessionDir, 'refinement-acceptance.json'), 'utf8'), acceptanceBefore);
+    assert.equal(git(fixture.workingDir, ['rev-parse', 'HEAD']), headBefore);
+    assert.equal(git(fixture.workingDir, ['status', '--porcelain']), statusBefore);
+  } finally {
+    try { process.kill(-Number(child.pid), 'SIGKILL'); } catch {}
     if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
     else process.env.PICKLE_DATA_ROOT = previousRoot;
   }

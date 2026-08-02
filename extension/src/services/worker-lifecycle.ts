@@ -64,6 +64,11 @@ export function readAndValidateWorkerLifecycleArtifact(
     throw new Error(`worker-lifecycle-missing-artifact: ${phase} did not write ${filePath}`);
   }
 
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_048_576) {
+    throw new Error(`worker-lifecycle-invalid-artifact: ${phase} artifact must be a regular file no larger than 1 MiB`);
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));

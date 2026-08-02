@@ -195,7 +195,7 @@ test('ensureConfigFile migrates untouched legacy managed max-time defaults to ei
       max_iterations: 25,
       max_time_minutes: 120,
       worker_timeout_seconds: 900,
-      refinement_timeout_seconds: 600,
+      refinement_timeout_seconds: 900,
       max_retry_attempts: 2,
       activity_logging: true,
       hook_timeout_seconds: 10,

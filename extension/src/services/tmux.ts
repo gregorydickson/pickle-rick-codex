@@ -1,7 +1,5 @@
-import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { getRunnerDescriptor, type NormalizedRunnerDescriptor } from './runner-descriptors.js';
 import { readJsonFile } from './pickle-utils.js';
 
 export interface TmuxCallOptions {
@@ -105,16 +103,28 @@ export function runTmux(args: string[], options: TmuxCallOptions = {}): string {
 
 interface RunnerStartedState {
   active?: boolean;
+  runner_starting?: boolean;
   tmux_session_name?: string;
   tmux_runner_pid?: number;
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function runnerStarted(state: RunnerStartedState | null, sessionName: string): boolean {
+  const runnerPid = Number(state?.tmux_runner_pid);
   return Boolean(
-    state?.active === true
+    (state?.active === true || state?.runner_starting === true)
       && state?.tmux_session_name === sessionName
-      && Number.isInteger(state?.tmux_runner_pid)
-      && (state?.tmux_runner_pid ?? 0) > 0,
+      && Number.isInteger(runnerPid)
+      && runnerPid > 0
+      && processAlive(runnerPid),
   );
 }
 
@@ -127,27 +137,17 @@ export interface WaitForTmuxRunnerStartOptions {
 export async function waitForTmuxRunnerStart(
   sessionDir: string,
   sessionName: string,
-  mode: string,
+  _mode: string,
   options: WaitForTmuxRunnerStartOptions = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 5_000;
   const intervalMs = options.intervalMs ?? 100;
-  const existingLogSizeBytes = options.existingLogSizeBytes ?? 0;
-  const descriptor: NormalizedRunnerDescriptor = getRunnerDescriptor(mode);
   const statePath = path.join(sessionDir, 'state.json');
-  const runnerLogPath = path.join(sessionDir, descriptor.runnerLog);
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     if (runnerStarted(readJsonFile<RunnerStartedState>(statePath), sessionName)) {
       return;
-    }
-    if (fs.existsSync(runnerLogPath)) {
-      const runnerLog = fs.readFileSync(runnerLogPath);
-      const freshRunnerLog = runnerLog.subarray(Math.min(existingLogSizeBytes, runnerLog.length)).toString('utf8');
-      if (freshRunnerLog.includes(descriptor.runnerStartMarker)) {
-        return;
-      }
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }

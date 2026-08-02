@@ -10,7 +10,17 @@ import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { writePipelineContract } from '../services/pipeline.js';
 import { buildVerificationCommandScope, buildVerificationFailureSet, ensurePipelineState, writeVerificationBaselines } from '../services/pipeline-state.js';
 import { normalizeVerificationCommands, resolveTicketVerificationContract } from '../services/verification-env.js';
-import { createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode, writeExecutable, writeJson, fakeLifecycleArtifactWriterSource } from './helpers.js';
+import { acceptTestRefinement, createFakeCodex, createFakeTmux, makeTempRoot, prependPath, repoRoot, runNode as runNodeFixture, writeExecutable, writeJson, fakeLifecycleArtifactWriterSource } from './helpers.js';
+
+function acceptPreparedRefinement(sessionDir) {
+  const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+  acceptTestRefinement(sessionDir, state.working_dir);
+}
+
+function runNode(args, options = {}) {
+  if (path.basename(args[0] || '') === 'spawn-morty.js') acceptPreparedRefinement(args[1]);
+  return runNodeFixture(args, options);
+}
 
 function runGit(repoDir, args) {
   return execFileSync('git', args, {
@@ -55,6 +65,7 @@ function writePreflightManifest(sessionDir, verificationEnv, verification = ['no
       },
     ],
   });
+  acceptPreparedRefinement(sessionDir);
 }
 
 function buildVerificationWriteCommand(targetPath, contents) {
@@ -72,6 +83,7 @@ async function runTicketWithEnv(sessionDir, ticketId, envPatch) {
     process.env[key] = value;
   }
   try {
+    acceptPreparedRefinement(sessionDir);
     return await runTicket(sessionDir, ticketId);
   } finally {
     for (const [key, value] of previous.entries()) {
@@ -110,7 +122,7 @@ test('pickle-tmux resume fails fast on missing GITHUB_PACKAGES_TOKEN and recover
   });
 
   assert.throws(
-    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
       env: baseEnv,
       cwd: projectDir,
     }),
@@ -281,6 +293,7 @@ test('spawn-morty refuses pre-existing dirt before starting a worker', () => {
       },
     ],
   });
+  acceptPreparedRefinement(sessionDir);
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
@@ -2217,14 +2230,16 @@ test('pickle-tmux infers required env vars from verification commands before lau
         description: 'Verification references a custom env var without an explicit contract.',
         acceptance_criteria: ['Missing env is caught before tmux launch.'],
         verification: ['test -f "$EXTERNAL_FIXTURE_ROOT/fixture.dot"'],
+        allowed_paths: ['README.md'],
         priority: 'P1',
         status: 'Todo',
       },
     ],
   });
+  acceptPreparedRefinement(sessionDir);
 
   assert.throws(
-    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
       env,
       cwd: projectDir,
     }),

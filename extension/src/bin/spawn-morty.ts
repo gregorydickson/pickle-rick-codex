@@ -50,8 +50,17 @@ import {
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
+import { atomicWriteJson } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
+import {
+  beginRefinementRepositoryAdvance,
+  clearRefinementRepositoryAdvance,
+  markRefinementRepositoryAdvanceVerified,
+  refinementAcceptancePath,
+  refinementRepositoryAdvancePath,
+  refreshAcceptedRefinementRepositoryIdentity,
+} from '../services/refinement-artifacts.js';
 import {
   evaluateCompletionEvidence,
   type CompletionDecision,
@@ -410,9 +419,18 @@ function isSessionCancelled(manager: StateManager, statePath: string): boolean {
 function updateActiveChild(statePath: string, manager: StateManager, fields: Record<string, unknown>): void {
   if (Object.hasOwn(fields, 'active_child_pid')) {
     const pid = Number(fields.active_child_pid);
-    fields.active_child_identity = Number.isInteger(pid) && pid > 0
-      ? captureSpawnedProcessIdentity(pid)
-      : null;
+    const identity = Number.isInteger(pid) && pid > 0 ? captureSpawnedProcessIdentity(pid) : null;
+    if (Number.isInteger(pid) && pid > 0 && !identity) {
+      let alive = false;
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        // A short-lived deterministic command may finish before identity capture.
+      }
+      if (alive) throw new Error(`Could not persist a safe process identity for worker child ${pid}.`);
+    }
+    fields.active_child_identity = identity;
     fields.active_child_controller_pid = Number.isInteger(pid) && pid > 0 ? process.pid : null;
   }
   manager.update(statePath, (current) => {
@@ -470,11 +488,18 @@ async function runVerificationCommand({
       detached: process.platform !== 'win32',
     });
 
-    updateActiveChild(statePath, manager, {
-      active_child_pid: child.pid,
-      active_child_kind: 'verification',
-      active_child_command: command,
-    });
+    try {
+      updateActiveChild(statePath, manager, {
+        active_child_pid: child.pid,
+        active_child_kind: 'verification',
+        active_child_command: command,
+      });
+    } catch (error) {
+      terminateChild(child, 'SIGTERM');
+      setTimeout(() => terminateChild(child, 'SIGKILL'), 1_000).unref?.();
+      reject(error);
+      return;
+    }
 
     const cleanup = (): void => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
@@ -596,6 +621,14 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   let mutationBoundary: WorkerMutationBoundary | null = null;
   const lifecycleArtifacts: WorkerLifecycleArtifact[] = [];
 
+  function updateTicketAndClearAdvance(updates: Record<string, unknown>): void {
+    const advancePath = refinementRepositoryAdvancePath(sessionDir);
+    updateTicketStatus(sessionDir, normalizedTicketId, updates, {
+      transactionPaths: [advancePath],
+      afterWrite: () => clearRefinementRepositoryAdvance(sessionDir),
+    });
+  }
+
   function finalizeSuccess(applied: boolean): RunTicketResult {
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Done',
@@ -603,18 +636,32 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       failure_reason: null,
       failure_kind: null,
       failed_at: null,
+    }, {
+      transactionPaths: [
+        refinementAcceptancePath(sessionDir),
+        refinementRepositoryAdvancePath(sessionDir),
+        statePath,
+      ],
+      afterWrite: () => {
+        refreshAcceptedRefinementRepositoryIdentity(sessionDir, workingDir);
+        clearRefinementRepositoryAdvance(sessionDir);
+        manager.update(statePath, (current) => {
+          current.step = 'done';
+          appendHistory(current, 'done', normalizedTicketId);
+          return current;
+        });
+      },
     });
-    manager.update(statePath, (current) => {
-      current.step = 'done';
-      appendHistory(current, 'done', normalizedTicketId);
-      return current;
-    });
-    logActivity({
-      event: 'ticket_completed',
-      source: 'pickle',
-      session: path.basename(sessionDir),
-      ticket: normalizedTicketId,
-    }, { enabled: config.defaults.activity_logging });
+    try {
+      logActivity({
+        event: 'ticket_completed',
+        source: 'pickle',
+        session: path.basename(sessionDir),
+        ticket: normalizedTicketId,
+      }, { enabled: config.defaults.activity_logging });
+    } catch {
+      // Durable completion already committed; activity telemetry is best effort.
+    }
 
     return applied
       ? { status: 'done', applied: true }
@@ -632,7 +679,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     // Park the ticket with its verdict so an `on-failure=abort` run does not leave it
     // stuck at the start-of-try `In Progress` write (which resume treats as runnable
     // and summaries misreport). Mirrors the preflight-Todo path in the catch block.
-    updateTicketStatus(sessionDir, normalizedTicketId, {
+    updateTicketAndClearAdvance({
       status: 'Todo',
       failed_at: new Date().toISOString(),
       failure_reason: `completion refused by oracle: ${decision.reason}`,
@@ -665,6 +712,21 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     }
     workspaceBaseline = captureWorkspaceSnapshot(workingDir);
     persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+    updateTicketStatus(sessionDir, normalizedTicketId, {
+      status: 'In Progress',
+      started_at: new Date().toISOString(),
+      failure_reason: null,
+      failure_kind: null,
+      failed_at: null,
+    }, {
+      transactionPaths: [refinementRepositoryAdvancePath(sessionDir)],
+      afterWrite: () => beginRefinementRepositoryAdvance({
+        sessionDir,
+        workingDir,
+        ticketId: normalizedTicketId,
+        requiresCleanCommit: tmuxMode,
+      }),
+    });
     const persistedQualityBaseline = manager.read(statePath).quality_baseline;
     try {
       qualityBaseline = assertQualityBaselineFresh(persistedQualityBaseline, workingDir);
@@ -706,13 +768,6 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         () => manager.read(statePath).quality_baseline,
       );
     }
-    updateTicketStatus(sessionDir, normalizedTicketId, {
-      status: 'In Progress',
-      started_at: new Date().toISOString(),
-      failure_reason: null,
-      failure_kind: null,
-      failed_at: null,
-    });
     updateActiveChild(statePath, manager, {
       worker_pid: process.pid,
       active_child_pid: null,
@@ -733,65 +788,79 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       });
 
       const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
-      prepareWorkerLifecycleArtifact(artifactPath);
+      const candidateParent = path.join(sessionDir, 'worker-lifecycle-candidates');
+      fs.mkdirSync(candidateParent, { recursive: true, mode: 0o700 });
+      const candidateRoot = fs.mkdtempSync(path.join(candidateParent, `${normalizedTicketId}-${phase}-`));
+      const candidateArtifactPath = path.join(candidateRoot, normalizedTicketId, `${phase}.json`);
+      prepareWorkerLifecycleArtifact(candidateArtifactPath);
       const readOnlyPhase = ['research', 'research_review', 'plan', 'plan_review', 'review', 'conformance'].includes(phase);
       const phaseRepositoryBoundary = readOnlyPhase ? repositoryMutationFingerprint(workingDir) : null;
-      const result = await runCodexExecMonitored({
-        cwd: workingDir,
-        prompt: buildTicketPhasePrompt({
-          phase,
-          ticket: {
-            ...normalizedTicket,
-            verificationContract: verificationReady.contract,
+      try {
+        const result = await runCodexExecMonitored({
+          // Lifecycle artifacts authorize repository advancement. Pin the sandbox
+          // contract instead of inheriting operator-configured escape hatches.
+          execArgs: ['--full-auto'],
+          cwd: workingDir,
+          prompt: buildTicketPhasePrompt({
+            phase,
+            ticket: {
+              ...normalizedTicket,
+              verificationContract: verificationReady.contract,
+            },
+            sessionDir,
+            workingDir,
+            artifactPath: candidateArtifactPath,
+            priorArtifacts: lifecycleArtifacts,
+            tmuxMode,
+          }),
+          timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
+          outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
+          progressArtifactPaths: [candidateArtifactPath],
+          addDirs: [candidateRoot],
+          inheritConfiguredAddDirs: false,
+          successCheck: phaseSuccessCheck(phase, path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`)),
+          successSignalGraceMs: 150,
+          successPollMs: 50,
+          onSpawn: (child) => {
+            updateActiveChild(statePath, manager, {
+              active_child_pid: child.pid,
+              active_child_kind: 'codex',
+              active_child_command: phase,
+            });
           },
-          sessionDir,
-          workingDir,
-          artifactPath,
-          priorArtifacts: lifecycleArtifacts,
-          tmuxMode,
-        }),
-        timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
-        outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
-        progressArtifactPaths: [artifactPath],
-        addDirs: [sessionDir],
-        successCheck: phaseSuccessCheck(phase, path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`)),
-        successSignalGraceMs: 150,
-        successPollMs: 50,
-        onSpawn: (child) => {
-          updateActiveChild(statePath, manager, {
-            active_child_pid: child.pid,
-            active_child_kind: 'codex',
-            active_child_command: phase,
-          });
-        },
-        cancelCheck: () => isSessionCancelled(manager, statePath),
-      });
-      updateActiveChild(statePath, manager, {
-        active_child_pid: null,
-        active_child_kind: null,
-        active_child_command: null,
-      });
-      if (result.cancelled || isSessionCancelled(manager, statePath)) {
-        throw new CancellationError();
+          cancelCheck: () => isSessionCancelled(manager, statePath),
+        });
+        updateActiveChild(statePath, manager, {
+          active_child_pid: null,
+          active_child_kind: null,
+          active_child_command: null,
+        });
+        if (result.cancelled || isSessionCancelled(manager, statePath)) {
+          throw new CancellationError();
+        }
+        assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
+        const artifact = readAndValidateWorkerLifecycleArtifact(
+          candidateArtifactPath,
+          phase,
+          normalizedTicketId,
+          normalizedTicket.acceptance_criteria || [],
+        );
+        assertAcPhaseBoundary(
+          phase,
+          artifact,
+          lifecycleArtifacts,
+          normalizedTicket.acceptance_criteria || [],
+        );
+        if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
+          throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
+        }
+        atomicWriteJson(artifactPath, artifact);
+        lifecycleArtifacts.push(artifact);
+        recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
+      } finally {
+        fs.rmSync(candidateRoot, { recursive: true, force: true });
+        try { fs.rmdirSync(candidateParent); } catch { /* another phase candidate still exists */ }
       }
-      assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
-      const artifact = readAndValidateWorkerLifecycleArtifact(
-        artifactPath,
-        phase,
-        normalizedTicketId,
-        normalizedTicket.acceptance_criteria || [],
-      );
-      assertAcPhaseBoundary(
-        phase,
-        artifact,
-        lifecycleArtifacts,
-        normalizedTicket.acceptance_criteria || [],
-      );
-      if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
-        throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
-      }
-      lifecycleArtifacts.push(artifact);
-      recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
     }
 
     for (const command of verificationCommands) {
@@ -894,6 +963,13 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       throw new Error(`worker-quality-gate-${workerGate.verdict}: ${detail}`);
     }
 
+    markRefinementRepositoryAdvanceVerified({
+      sessionDir,
+      workingDir,
+      ticketId: normalizedTicketId,
+      changedPaths: postGateChangedPaths,
+    });
+
     const autoCommitSha = autoCommitDetachedTicketChanges({
       sessionDir,
       runnerMode,
@@ -955,6 +1031,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     return finalizeRefusal(false, decision);
   } catch (error) {
     let handledError: unknown = error;
+    let rollbackFailed = false;
     if (mutationBoundary) {
       try {
         restoreRejectedWorkerMutation(
@@ -965,21 +1042,36 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           runnerMode,
         );
       } catch (rollbackError) {
+        rollbackFailed = true;
         handledError = new AggregateError(
           [error, rollbackError],
           `worker transaction failed and recovery did not restore the original boundary: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
         );
       }
     }
+    if (rollbackFailed) {
+      try {
+        manager.update(statePath, (current) => {
+          current.recovery_required = true;
+          current.recovery_kind = 'ticket_repository';
+          current.recovery_reason = handledError instanceof Error ? handledError.message : String(handledError);
+          current.last_exit_reason = 'recovery_required';
+          return current;
+        });
+      } catch {
+        // Preserve the original rollback failure and its durable repository journal.
+      }
+      throw handledError;
+    }
     if (handledError instanceof CancellationError) {
-      updateTicketStatus(sessionDir, normalizedTicketId, {
+      updateTicketAndClearAdvance({
         status: 'Todo',
         cancelled_at: new Date().toISOString(),
       });
       throw error;
     }
     if (isPreflightError(handledError)) {
-      updateTicketStatus(sessionDir, normalizedTicketId, {
+      updateTicketAndClearAdvance({
         status: 'Todo',
         failed_at: new Date().toISOString(),
         failure_reason: (handledError as Error).message,
@@ -991,7 +1083,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       throw handledError;
     }
     if (isVerificationContractError(handledError)) {
-      updateTicketStatus(sessionDir, normalizedTicketId, {
+      updateTicketAndClearAdvance({
         status: 'Blocked',
         failed_at: new Date().toISOString(),
         failure_reason: (handledError as Error).message,
@@ -1002,7 +1094,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       });
       throw handledError;
     }
-    updateTicketStatus(sessionDir, normalizedTicketId, {
+    updateTicketAndClearAdvance({
       status: 'Blocked',
       failed_at: new Date().toISOString(),
       failure_reason: handledError instanceof Error ? handledError.message : String(handledError),
