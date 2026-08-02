@@ -549,6 +549,22 @@ function rewriteScopedVerificationCommands(commands: string[], cwd: string | und
   return commands.map((command) => rewriteScopedVitestCommand(command, cwd));
 }
 
+/**
+ * Jest and Vitest treat these flag values as regular expressions, but an
+ * unquoted `*`, `?`, or `[` is a shell glob before either runner sees it.
+ * Refinement artifacts are generated input, so canonicalize this known-safe
+ * argument form instead of turning a correct test intent into a terminal loop
+ * failure. Deliberate filesystem globs remain rejected by preflight.
+ */
+function quoteTestPatternArguments(command: string): string {
+  return command.replace(
+    /(^|\s)(--(?:testPathPattern|testNamePattern)=)([^\s'"`;&|]+)/g,
+    (match, prefix: string, flag: string, value: string) => (
+      /[*?[]/.test(value) ? `${prefix}${shellQuote(`${flag}${value}`)}` : match
+    ),
+  );
+}
+
 interface NormalizeVerificationCommandsOptions {
   cwd?: string;
   verify?: unknown;
@@ -556,9 +572,12 @@ interface NormalizeVerificationCommandsOptions {
 
 export function normalizeVerificationCommands(value: unknown, options: NormalizeVerificationCommandsOptions = {}): string[] {
   const commands = normalizeVerificationValue(value);
-  if (commands.length > 0) return rewriteScopedVerificationCommands(commands, options.cwd);
+  if (commands.length > 0) {
+    return rewriteScopedVerificationCommands(commands, options.cwd).map(quoteTestPatternArguments);
+  }
   if ('verify' in options) {
-    return rewriteScopedVerificationCommands(normalizeVerificationValue(options.verify), options.cwd);
+    return rewriteScopedVerificationCommands(normalizeVerificationValue(options.verify), options.cwd)
+      .map(quoteTestPatternArguments);
   }
   return [];
 }
