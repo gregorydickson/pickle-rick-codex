@@ -2319,7 +2319,7 @@ test('microverse retries a candidate-induced metric failure and accepts the corr
   assert.match(log, /microverse metric improved: 0 -> \d+/);
 });
 
-test('microverse rolls back iteration changes when post-worker metric measurement times out', () => {
+test('microverse rolls back a timed-out candidate metric and keeps retrying below target', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -2339,11 +2339,14 @@ test('microverse rolls back iteration changes when post-worker metric measuremen
     env,
     cwd: projectDir,
   }).trim();
+  const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse',
     task: 'attempt a slow metric change',
-    metric: 'if test -f slow-metric; then sleep 2; printf 2; else printf 1; fi',
+    metric: `if test -f slow-metric && test "$(cat '${counterPath}')" = 1; then sleep 2; printf 2; elif test -f slow-metric; then wc -c < slow-metric; else printf 1; fi`,
     direction: 'higher',
+    target: 2,
+    target_relation: 'gte',
     metric_timeout_seconds: 0.5,
     stall_limit: 2,
     worker_failure_limit: 2,
@@ -2354,12 +2357,13 @@ test('microverse rolls back iteration changes when post-worker metric measuremen
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
   const ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
-  assert.equal(state.last_exit_reason, 'worker_failure_limit');
-  assert.equal(state.iteration, 0);
-  assert.equal(ledger.worker_failure_count, 2);
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.iteration, 1);
+  assert.equal(ledger.worker_failure_count, 0);
   assert.equal(ledger.experiment_stall_count, 0);
-  assert.equal(ledger.experiments[0].classification, 'worker_incomplete');
-  assert.equal(fs.existsSync(path.join(projectDir, 'slow-metric')), false);
+  assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'worker_incomplete');
+  assert.equal(ledger.experiments[0].classification, 'improved');
+  assert.equal(fs.existsSync(path.join(projectDir, 'slow-metric')), true);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   assert.match(log, /Post-worker metric validation failed while the restored checkpoint remained valid at 1/);
 });
@@ -2576,7 +2580,7 @@ process.exit(1);
   assert.equal(state.active_child_pid, null);
 });
 
-test('measured microverse retries worker failures separately and cleans state at the failure limit', () => {
+test('measured microverse crosses worker recovery thresholds without stopping below target', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -2593,10 +2597,30 @@ if (args[0] === '--version') {
   console.log('codex 9.9.9-test');
   process.exit(0);
 }
-fs.writeFileSync('tracked.txt', 'worker mutation\\n');
-fs.writeFileSync('iteration-artifact.txt', 'remove me\\n');
-console.error('loop failure');
-process.exit(1);
+const prompt = fs.readFileSync(0, 'utf8');
+const counterPath = ${JSON.stringify(path.join(dataRoot, 'worker-attempt-count.txt'))};
+const attempt = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) + 1 : 1;
+fs.writeFileSync(counterPath, String(attempt));
+if (attempt <= 2) {
+  fs.writeFileSync('tracked.txt', 'worker mutation\\n');
+  fs.writeFileSync('iteration-artifact.txt', 'remove me\\n');
+  console.error('loop failure');
+  process.exit(1);
+}
+const experimentPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)[1].trim();
+const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)[1];
+fs.writeFileSync(experimentPath, JSON.stringify({
+  experiment_id: experimentId,
+  hypothesis: 'Complete after transport recovery',
+  hypothesis_family: 'transport recovery',
+  differentiator: 'healthy worker after two failed transports',
+  rationale: 'Prove the live runner continues after its recovery threshold.',
+  target_paths: ['tracked.txt'],
+  insight: 'The third worker completed without a manual relaunch.',
+  verification: ['wc -c < tracked.txt => 10'],
+}));
+fs.writeFileSync('tracked.txt', 'recovered\\n');
+fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
 `,
   );
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
@@ -2607,9 +2631,12 @@ process.exit(1);
 
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse',
-    task: 'fail immediately',
-    metric: 'printf 1',
+    task: 'recover without stopping',
+    metric: 'wc -c < tracked.txt',
     direction: 'higher',
+    target: 10,
+    target_relation: 'gte',
+    worker_failure_limit: 2,
     stall_limit: 5,
   });
 
@@ -2621,24 +2648,82 @@ process.exit(1);
   assert.equal(state.active, false);
   assert.equal(state.tmux_runner_pid, null);
   assert.equal(state.active_child_pid, null);
-  assert.equal(state.last_exit_reason, 'worker_failure_limit');
-  assert.equal(state.worker_failure_count, 3);
-  assert.equal(state.iteration, 0);
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.worker_failure_count, 0);
+  assert.equal(state.iteration, 1);
   assert.equal(ledger.experiments.length, 1);
   assert.equal(ledger.experiments[0].id, 'exp-0001');
-  assert.equal(ledger.experiments[0].attempt, 4);
-  assert.equal(ledger.experiments[0].retry_count, 3);
+  assert.equal(ledger.experiments[0].attempt, 3);
+  assert.equal(ledger.experiments[0].retry_count, 2);
   assert.equal(ledger.experiments[0].worker_attempts.length, 3);
-  assert.equal(ledger.experiments[0].status, 'invalid');
-  assert.equal(state.step, 'paused');
-  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(ledger.experiments[0].status, 'accepted');
+  assert.equal(state.step, 'complete');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'recovered\n');
   assert.equal(fs.existsSync(path.join(projectDir, 'iteration-artifact.txt')), false);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   assert.match(log, /microverse worker_error/);
-  assert.match(log, /loop-runner finished: worker_failure_limit/);
+  assert.match(log, /microverse recovery threshold reached after 2 worker failures: retrying exp-0001/);
+  assert.match(log, /loop-runner finished: success/);
 });
 
-test('measured microverse relaunches the same scientific iteration after exhausting a worker', () => {
+test('measured microverse doubles a saturated worker timeout and retries in the same runner', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-worker-timeout-recovery-');
+  const fakeBin = makeTempRoot('pickle-rick-worker-timeout-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  runGit(projectDir, ['add', 'score.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+await new Promise((resolve) => setTimeout(resolve, 1500));
+const experimentPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)[1].trim();
+const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)[1];
+fs.writeFileSync(experimentPath, JSON.stringify({
+  experiment_id: experimentId,
+  hypothesis: 'Finish after adaptive worker timeout growth',
+  hypothesis_family: 'adaptive timeout',
+  differentiator: 'same bounded work with sufficient runtime budget',
+  rationale: 'A saturated worker timeout is recoverable and should increase before retry.',
+  target_paths: ['score.txt'],
+  insight: 'The retry completed after the runtime doubled its worker timeout.',
+  verification: ['wc -c < score.txt => 2'],
+}));
+fs.writeFileSync('score.txt', 'aa');
+fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
+`);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'adapt worker timeout'], {
+    env, cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'adapt worker timeout', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte', worker_failure_limit: 3,
+  });
+  const statePath = path.join(sessionDir, 'state.json');
+  const initial = readJsonFile(statePath);
+  initial.worker_timeout_seconds = 1;
+  writeJson(statePath, initial);
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const state = readJsonFile(statePath);
+  const ledger = readExperimentLedger(sessionDir);
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.worker_timeout_seconds, 2);
+  assert.equal(state.iteration, 1);
+  assert.equal(ledger.experiments[0].attempt, 2);
+  assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'worker_timeout');
+  assert.equal(ledger.experiments[0].status, 'accepted');
+  assert.match(log, /microverse worker timeout increased: 1s -> 2s/);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+});
+
+test('measured microverse recovers a repaired worker transport without a runner relaunch', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-relaunch-project-');
   const fakeBin = makeTempRoot('pickle-rick-relaunch-bin-');
@@ -2653,6 +2738,7 @@ const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
 const prompt = fs.readFileSync(0, 'utf8');
 if (!fs.existsSync(${JSON.stringify(recoveryPath)})) {
+  fs.writeFileSync(${JSON.stringify(recoveryPath)}, 'ready');
   console.error('injected pre-repair transport failure');
   process.exit(1);
 }
@@ -2663,7 +2749,7 @@ fs.writeFileSync(experimentPath, JSON.stringify({
   hypothesis: 'Apply the repaired worker transport',
   hypothesis_family: 'transport-recovery',
   differentiator: 'first healthy attempt after relaunch',
-  rationale: 'Prove the same scientific iteration can continue after a terminal worker failure.',
+  rationale: 'Prove the same scientific iteration can continue after crossing a worker recovery threshold.',
   target_paths: ['score.txt'],
   insight: 'The relaunched worker completed with a fresh placeholder identity.',
   verification: ['wc -c < score.txt => 2'],
@@ -2688,27 +2774,17 @@ fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONT
   });
 
   runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
-  let state = readJsonFile(path.join(sessionDir, 'state.json'));
-  let ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
-  assert.equal(state.last_exit_reason, 'worker_failure_limit');
-  assert.equal(state.iteration, 0);
-  assert.equal(ledger.worker_failure_count, 1);
-  assert.equal(ledger.experiments[0].status, 'invalid');
-
-  fs.writeFileSync(recoveryPath, 'ready');
-  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
-
-  state = readJsonFile(path.join(sessionDir, 'state.json'));
-  ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
   const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
   assert.equal(state.last_exit_reason, 'success');
   assert.equal(state.iteration, 1);
   assert.equal(state.worker_failure_count, 0);
   assert.equal(ledger.worker_failure_count, 0);
-  assert.equal(ledger.experiments.length, 2);
-  assert.deepEqual(ledger.experiments.map((entry) => entry.status), ['invalid', 'accepted']);
-  assert.notEqual(ledger.experiments[0].hypothesis_key, ledger.experiments[1].hypothesis_key);
-  assert.match(log, /microverse reset 1 prior-run worker failures on relaunch/);
+  assert.equal(ledger.experiments.length, 1);
+  assert.equal(ledger.experiments[0].status, 'accepted');
+  assert.equal(ledger.experiments[0].attempt, 2);
+  assert.match(log, /microverse recovery threshold reached after 1 worker failures: retrying exp-0001/);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
@@ -2725,16 +2801,21 @@ import fs from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
 const prompt = fs.readFileSync(0, 'utf8');
+const counterPath = ${JSON.stringify(path.join(dataRoot, 'verification-attempt-count.txt'))};
+const attempt = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) + 1 : 1;
+fs.writeFileSync(counterPath, String(attempt));
 const experimentPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)[1].trim();
 const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)[1];
 fs.writeFileSync(experimentPath, JSON.stringify({
   experiment_id: experimentId,
-  hypothesis: 'exercise invalid verification shape',
+  hypothesis: attempt === 1 ? 'exercise invalid verification shape' : 'recover with valid verification shape',
+  hypothesis_family: attempt === 1 ? 'invalid verification' : 'valid verification recovery',
   rationale: 'prove retries explain the exact artifact contract',
   target_paths: ['score.txt'],
   insight: 'the worker used structured command records',
-  verification: [{ command: 'printf 1', result: 'passed' }],
+  verification: attempt === 1 ? [{ command: 'printf 1', result: 'passed' }] : ['wc -c < score.txt => 2'],
 }));
+if (attempt > 1) fs.writeFileSync('score.txt', 'aa');
 fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
 `);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
@@ -2747,6 +2828,8 @@ fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONT
     task: 'diagnose verification shape',
     metric: 'wc -c < score.txt',
     direction: 'higher',
+    target: 2,
+    target_relation: 'gte',
     worker_failure_limit: 1,
     stall_limit: 5,
   });
@@ -2755,12 +2838,16 @@ fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONT
 
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   const ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
-  assert.equal(state.last_exit_reason, 'worker_failure_limit');
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(ledger.experiments.length, 2);
   assert.equal(ledger.experiments[0].classification, 'worker_incomplete');
   assert.match(
     ledger.experiments[0].insight,
-    /verification must be a non-empty string array when present; object entries are invalid/,
+    /verification must be a non-empty string array when present; object entries are invalid.*rotating to a new experiment/,
   );
+  assert.equal(ledger.experiments[1].status, 'accepted');
+  assert.match(log, /archived exp-0001 and will plan a different experiment/);
 });
 
 test('measured microverse retries the same experiment without consuming max iterations', () => {
@@ -2835,13 +2922,30 @@ const counterPath = ${JSON.stringify(attemptCounter)};
 const attempt = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) + 1 : 1;
 fs.writeFileSync(counterPath, String(attempt));
 if (attempt === 1) fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
+if (attempt >= 3) {
+  const prompt = fs.readFileSync(0, 'utf8');
+  const experimentPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)[1].trim();
+  const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)[1];
+  fs.writeFileSync(experimentPath, JSON.stringify({
+    experiment_id: experimentId,
+    hypothesis: 'Complete with fresh final-message evidence',
+    hypothesis_family: 'fresh evidence recovery',
+    rationale: 'Prove stale final-message evidence cannot stop continuous recovery.',
+    target_paths: ['score.txt'],
+    insight: 'The new experiment supplied fresh completion evidence.',
+    verification: ['wc -c < score.txt => 2'],
+  }));
+  fs.writeFileSync('score.txt', 'aa');
+  fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
+}
 `);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', '--max-iterations', '1', 'fresh retry evidence'], {
     env, cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'loop_config.json'), {
-    mode: 'microverse', task: 'require fresh evidence', metric: 'printf 1', direction: 'higher',
+    mode: 'microverse', task: 'require fresh evidence', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte',
     worker_failure_limit: 2,
   });
 
@@ -2849,12 +2953,14 @@ if (attempt === 1) fs.writeFileSync(args[args.indexOf('--output-last-message') +
 
   const first = readJsonFile(path.join(sessionDir, 'microverse.1.attempt-1.worker-diagnostics.json'));
   const second = readJsonFile(path.join(sessionDir, 'microverse.1.attempt-2.worker-diagnostics.json'));
+  const third = readJsonFile(path.join(sessionDir, 'microverse.1.attempt-3.worker-diagnostics.json'));
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(first.completion_token, 'CONTINUE');
   assert.equal(second.completion_token, null);
   assert.equal(second.last_message_present, false);
-  assert.equal(state.iteration, 0);
-  assert.equal(state.last_exit_reason, 'worker_failure_limit');
+  assert.equal(third.completion_token, 'CONTINUE');
+  assert.equal(state.iteration, 1);
+  assert.equal(state.last_exit_reason, 'success');
 });
 
 test('measured microverse freezes a concrete experiment plan across worker retries', () => {
@@ -2864,7 +2970,8 @@ test('measured microverse freezes a concrete experiment plan across worker retri
   const attemptCounter = path.join(makeTempRoot('pickle-rick-plan-counter-'), 'count.txt');
   initGitRepo(projectDir);
   fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
-  runGit(projectDir, ['add', 'score.txt']);
+  fs.writeFileSync(path.join(projectDir, 'protected.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'score.txt', 'protected.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -2886,7 +2993,8 @@ fs.writeFileSync(artifactPath, JSON.stringify({
   insight: 'Exercise frozen-plan tamper rejection.',
   verification: ['frozen-plan retry probe completed'],
 }));
-if (attempt === 1) fs.appendFileSync('score.txt', 'tamper');
+if (attempt === 1) fs.appendFileSync('protected.txt', 'tamper');
+if (attempt >= 3) fs.writeFileSync('score.txt', 'aa');
 fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONTINUE</promise>');
 `);
   const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
@@ -2895,17 +3003,19 @@ fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>CONT
   }).trim();
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse', task: 'freeze plan', metric: 'wc -c < score.txt', direction: 'higher',
-    protected_paths: ['score.txt'], worker_failure_limit: 2,
+    target: 2, target_relation: 'gte', protected_paths: ['protected.txt'], worker_failure_limit: 2,
   });
 
   runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
 
   const ledger = readExperimentLedger(sessionDir);
-  assert.equal(ledger.experiments.length, 1);
+  assert.equal(ledger.experiments.length, 2);
   assert.equal(ledger.experiments[0].hypothesis, 'Frozen original plan');
   assert.equal(ledger.experiments[0].hypothesis_family, 'original family');
   assert.match(ledger.experiments[0].worker_attempts[1].insight, /must preserve its frozen hypothesis/);
-  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'a');
+  assert.equal(ledger.experiments[1].status, 'accepted');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'aa');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'protected.txt'), 'utf8'), 'baseline\n');
 });
 
 test('measured microverse preseeds a frozen retry plan so the worker need not reconstruct ledger prose', () => {
@@ -3166,7 +3276,7 @@ test('measured microverse preserves a terminal outcome across a same-process pos
   assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-attempt.json')), false);
 });
 
-test('measured microverse does not create a ninth experiment when resumed already stalled', () => {
+test('measured microverse forces a ninth hypothesis family when resumed below target after a stall threshold', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-resume-stalled-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -3175,16 +3285,21 @@ test('measured microverse does not create a ninth experiment when resumed alread
   runGit(projectDir, ['add', 'score.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   createFakeCodex(fakeBin);
-  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_MUTATE_FILE: 'score.txt',
+    FAKE_LOOP_APPEND_TEXT: 'b',
+  });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'resume stalled research'], {
     env, cwd: projectDir,
   }).trim();
   writeJson(path.join(sessionDir, 'loop_config.json'), {
-    mode: 'microverse', task: 'respect convergence', metric: 'printf 1', direction: 'higher',
-    target: 100, target_relation: 'gte',
+    mode: 'microverse', task: 'continue through convergence', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte',
   });
-  const baseline = { command: 'printf 1', score: 1, raw: '1', measured_at: '2026-07-18T00:00:00.000Z' };
-  writeMetricConvergenceState(sessionDir, createMetricConvergenceState(baseline, 'higher', 0, 100, 'gte'));
+  const baseline = { command: 'wc -c < score.txt', score: 1, raw: '1', measured_at: '2026-07-18T00:00:00.000Z' };
+  writeMetricConvergenceState(sessionDir, createMetricConvergenceState(baseline, 'higher', 0, 2, 'gte'));
   for (let index = 1; index <= 8; index += 1) {
     const experiment = planExperiment(sessionDir, {
       hypothesis: `Rejected hypothesis ${index}`,
@@ -3203,10 +3318,59 @@ test('measured microverse does not create a ninth experiment when resumed alread
 
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   const ledger = readExperimentLedger(sessionDir);
-  assert.equal(state.last_exit_reason, 'stalled');
-  assert.equal(state.iteration, 0);
-  assert.equal(ledger.experiments.length, 8);
-  assert.equal(fs.existsSync(path.join(sessionDir, 'fake-loop-count.txt')), false);
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.iteration, 1);
+  assert.equal(ledger.experiments.length, 9);
+  assert.equal(ledger.experiments[8].status, 'accepted');
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'fake-loop-count.txt'), 'utf8'), '1');
+  assert.match(log, /research stall threshold reached; continuing with a mandatory non-exhausted hypothesis family/);
+});
+
+test('measured microverse resets an open no-progress circuit and continues below target', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-open-circuit-recovery-');
+  const fakeBin = makeTempRoot('pickle-rick-open-circuit-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  runGit(projectDir, ['add', 'score.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_MUTATE_FILE: 'score.txt',
+    FAKE_LOOP_APPEND_TEXT: 'b',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'recover open microverse circuit'], {
+    env, cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'continue below target', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte',
+  });
+  writeJson(path.join(sessionDir, 'circuit_breaker.json'), {
+    state: 'OPEN',
+    last_change: '2026-08-01T00:00:00.000Z',
+    consecutive_no_progress: 3,
+    consecutive_same_error: 0,
+    last_error_signature: null,
+    last_snapshot: null,
+    total_opens: 1,
+    reason: 'no progress',
+    opened_at: '2026-08-01T00:00:00.000Z',
+    history: [],
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const circuit = readJsonFile(path.join(sessionDir, 'circuit_breaker.json'));
+  const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(state.iteration, 1);
+  assert.equal(circuit.state, 'CLOSED');
+  assert.match(log, /microverse reset an OPEN no-progress circuit and continued below target/);
 });
 
 test('loop-runner honors the stored worker timeout when config changes after session setup', () => {

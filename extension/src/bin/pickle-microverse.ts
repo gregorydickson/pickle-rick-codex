@@ -175,10 +175,10 @@ function parseArgs(argv: string[]): MicroverseArgs {
 
 async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv);
-  // Microverse convergence owns its scientific stop conditions (target,
-  // iterations, stalls, and worker failures). A wall-clock default can stop a
-  // healthy experiment before the metric converges, so microverse sessions are
-  // deliberately unbounded in time, including when an older session resumes.
+  // Microverse owns target completion and recovery. A wall-clock default can
+  // stop a healthy experiment before the metric converges, so sessions are
+  // deliberately unbounded in time; stalls and ordinary worker failures are
+  // recovery signals rather than terminal conditions.
   const setupArgs = [
     '--tmux',
     '--command-template',

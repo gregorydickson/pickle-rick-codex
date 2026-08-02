@@ -221,7 +221,7 @@ Detached advanced loops currently present in the repo:
   <img src="images/microverse.png" alt="Pickle Rick Microverse" width="100%" />
 </p>
 
-`pickle-microverse` is the evidence-driven metric-convergence loop. Command metrics must print exactly one finite number. The runtime owns numeric target evaluation, requires authoritative final-message and experiment evidence, accepts only improvements, archives and reverts held/regressed work, separates worker failures from scientific stalls, and escalates convergence at 3/5/8 valid stalls. Optional protected paths keep workers from changing evaluation inputs.
+`pickle-microverse` is the evidence-driven metric-convergence loop. Command metrics must print exactly one finite number. The runtime owns numeric target evaluation, requires authoritative final-message and experiment evidence, accepts only improvements, archives and reverts held/regressed work, separates worker failures from scientific stalls, and turns worker-failure, 3/5/8 stall, and no-progress circuit thresholds into recovery escalations while it remains below target. Optional protected paths keep workers from changing evaluation inputs; verified control-plane or protected-input tampering still fails closed.
 
 ### Recoverable destructive operations
 
