@@ -136,3 +136,21 @@ test('Szechuan prompt carries doctrine and the immutable precommit scope check',
   assert.match(prompt, /Immutable mutation scope: \["src"\]/);
   assert.match(prompt, /runtime will archive, roll back, and block/);
 });
+
+test('Microverse prompt makes the experiment target paths an exclusive write contract', () => {
+  const prompt = buildLoopPrompt({
+    mode: 'microverse',
+    sessionDir: '/tmp/session',
+    workerArtifactDir: '/tmp/artifacts',
+    workingDir: '/tmp/repo',
+    state: { iteration: 1, original_prompt: 'improve safely' },
+    loopConfig: {
+      experiment_id: 'exp-0001',
+      experiment_artifact_path: '/tmp/artifacts/microverse-experiment.json',
+      experiment_context_path: '/tmp/artifacts/microverse-handoff.json',
+    },
+  });
+  assert.match(prompt, /target_paths are an immutable write contract/);
+  assert.match(prompt, /preserve unrelated existing content verbatim/);
+  assert.match(prompt, /archives and rolls back out-of-scope changes/);
+});

@@ -61,7 +61,7 @@ import {
   type ProtectedPathManifest,
 } from '../services/microverse-protection.js';
 import { recoverableHardReset } from '../services/recoverable-git.js';
-import { enforceLoopMutationScope } from '../services/pipeline-scope.js';
+import { enforceLoopMutationScope, PipelineScopeError } from '../services/pipeline-scope.js';
 import { captureProgressSnapshot, diffProgressSnapshot } from '../services/progress-snapshot.js';
 import { buildLoopPrompt, type LoopPromptConfig, type LoopPromptState } from '../services/prompts.js';
 import { appendHistory, getRunStartEpoch } from '../services/session.js';
@@ -997,6 +997,33 @@ function enforceAdvancedLoopScope(
   });
 }
 
+/**
+ * A Microverse experiment owns only the repository paths declared in its
+ * experiment artifact.  This is deliberately file- and campaign-agnostic:
+ * the experiment contract, rather than a particular scorer or artifact
+ * format, defines the writable surface.
+ */
+function enforceMicroverseExperimentScope(
+  sessionDir: string,
+  loopConfig: LoopConfig,
+  workingDir: string,
+  beforeSnapshot: ProgressSnapshot,
+  beforeUntrackedFiles: string[],
+  experiment: WorkerExperimentArtifact,
+): void {
+  if (!isMeasuredMicroverse(loopConfig) || loopConfig.dry_run) return;
+  const targetPaths = experiment.target_paths ?? [];
+  enforceLoopMutationScope({
+    sessionDir,
+    workingDir,
+    mode: loopConfig.mode,
+    beforeHead: String(beforeSnapshot.head_sha || ''),
+    allowedPaths: targetPaths,
+    preserveUntracked: beforeUntrackedFiles,
+    log: (message) => appendRunnerLog(sessionDir, message),
+  });
+}
+
 function stopSummaryFromState(state: PersistedState, loopConfig: LoopConfig, exitReason: string, sessionDir: string) {
   const paths = summaryPaths(sessionDir, loopConfig.mode);
   const persistedSummary = readJsonFile<Record<string, unknown>>(paths.json, {}) ?? {};
@@ -1351,6 +1378,59 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         iteration,
         beforeUntrackedFiles,
       );
+
+      if (metricCheckpoint && experiment && experimentArtifact) {
+        try {
+          enforceMicroverseExperimentScope(
+            sessionDir,
+            loopConfig,
+            state.working_dir as string,
+            beforeSnapshot,
+            beforeUntrackedFiles,
+            experimentArtifact,
+          );
+        } catch (error) {
+          if (!(error instanceof PipelineScopeError)) throw error;
+          const workerFailureDetail = safeErrorMessage(error);
+          pendingMetricIteration = null;
+          recordWorkerAttemptFailure(sessionDir, experiment.id, {
+            classification: 'worker_incomplete',
+            insight: workerFailureDetail,
+          });
+          const failures = readExperimentLedger(sessionDir)?.worker_failure_count || 0;
+          manager.update(statePath, (current) => {
+            current.worker_failure_count = failures;
+            current.last_loop_message = workerFailureDetail;
+            return current;
+          });
+          appendRunnerLog(
+            sessionDir,
+            `microverse worker_incomplete: ${workerFailureDetail} (${failures} consecutive worker failures)`,
+          );
+          const recovered = recoverMicroverseWorkerFailure(
+            sessionDir,
+            statePath,
+            manager,
+            config,
+            loopConfig,
+            experiment,
+            'worker_incomplete',
+            workerFailureDetail,
+            failures,
+          );
+          if (!recovered) {
+            abandonPlannedExperiment(sessionDir, experiment.id, {
+              classification: 'worker_incomplete',
+              insight: `${workerFailureDetail}; unsafe worker failure limit reached.`,
+            });
+            clearMicroverseAttemptTransaction(sessionDir);
+            exitReason = 'worker_failure_limit';
+            break;
+          }
+          clearMicroverseAttemptTransaction(sessionDir);
+          continue;
+        }
+      }
 
       let metricResult: ReturnType<typeof processMetricIteration> | null = null;
       if (metricCheckpoint && experiment && currentMetricState) {
