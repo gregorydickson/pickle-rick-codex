@@ -22,6 +22,29 @@ export interface WorkerLifecycleArtifact {
   [key: string]: unknown;
 }
 
+export class WorkerLifecycleRefusalError extends Error {
+  readonly kind = 'worker-lifecycle-refusal';
+  readonly phase: WorkerLifecyclePhase;
+  readonly artifactPath: string;
+  readonly artifact: WorkerLifecycleArtifact;
+
+  constructor(
+    phase: WorkerLifecyclePhase,
+    artifactPath: string,
+    artifact: WorkerLifecycleArtifact,
+  ) {
+    super(`worker-lifecycle-refusal: ${phase} requested changes; evidence persisted at ${artifactPath}`);
+    this.name = 'WorkerLifecycleRefusalError';
+    this.phase = phase;
+    this.artifactPath = artifactPath;
+    this.artifact = artifact;
+  }
+}
+
+export function isWorkerLifecycleRefusalError(error: unknown): error is WorkerLifecycleRefusalError {
+  return error instanceof WorkerLifecycleRefusalError;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -32,12 +55,15 @@ function nonEmptyStrings(value: unknown): value is string[] {
     && value.every((item) => typeof item === 'string' && item.trim().length > 0);
 }
 
-function assertApprovedReview(artifact: Record<string, unknown>, phase: WorkerLifecyclePhase): void {
-  if (artifact.verdict !== 'approved') {
-    throw new Error(`worker-lifecycle-invalid-artifact: ${phase} must record verdict "approved"`);
+function assertReviewVerdict(artifact: Record<string, unknown>, phase: WorkerLifecyclePhase): void {
+  if (artifact.verdict !== 'approved' && artifact.verdict !== 'changes_requested') {
+    throw new Error(`worker-lifecycle-invalid-artifact: ${phase} must record verdict "approved" or "changes_requested"`);
   }
   if (!nonEmptyStrings(artifact.evidence)) {
     throw new Error(`worker-lifecycle-invalid-artifact: ${phase} must include non-empty evidence`);
+  }
+  if (artifact.verdict === 'changes_requested' && !nonEmptyStrings(artifact.findings)) {
+    throw new Error(`worker-lifecycle-invalid-artifact: changes_requested ${phase} must include non-empty findings`);
   }
 }
 
@@ -93,7 +119,7 @@ export function readAndValidateWorkerLifecycleArtifact(
       break;
     case 'research_review':
     case 'plan_review':
-      assertApprovedReview(parsed, phase);
+      assertReviewVerdict(parsed, phase);
       break;
     case 'plan':
       if (!nonEmptyStrings(parsed.steps)) {
@@ -106,7 +132,7 @@ export function readAndValidateWorkerLifecycleArtifact(
       }
       break;
     case 'review':
-      assertApprovedReview(parsed, phase);
+      assertReviewVerdict(parsed, phase);
       if (parsed.implementation_reviewed !== true) {
         throw new Error('worker-lifecycle-invalid-artifact: review must confirm implementation_reviewed');
       }
@@ -117,8 +143,8 @@ export function readAndValidateWorkerLifecycleArtifact(
       }
       break;
     case 'conformance': {
-      if (parsed.verdict !== 'all_pass' || parsed.implementation_reviewed !== true) {
-        throw new Error('worker-lifecycle-invalid-artifact: conformance must review the implementation and record all_pass');
+      if ((parsed.verdict !== 'all_pass' && parsed.verdict !== 'changes_requested') || parsed.implementation_reviewed !== true) {
+        throw new Error('worker-lifecycle-invalid-artifact: conformance must review the implementation and record all_pass or changes_requested');
       }
       const checks = Array.isArray(parsed.acceptance_criteria) ? parsed.acceptance_criteria : [];
       const actual = new Map<string, Record<string, unknown>>();
@@ -128,12 +154,24 @@ export function readAndValidateWorkerLifecycleArtifact(
       const exactCoverage = checks.length === acceptanceCriteria.length
         && acceptanceCriteria.every((criterion) => {
           const check = actual.get(criterion);
-          return check?.status === 'pass'
+          return (check?.status === 'pass' || check?.status === 'fail')
             && typeof check.evidence === 'string'
             && check.evidence.trim().length > 0;
         });
       if (!exactCoverage) {
-        throw new Error('worker-lifecycle-invalid-artifact: conformance must pass every exact acceptance criterion with evidence');
+        throw new Error('worker-lifecycle-invalid-artifact: conformance must cover every exact acceptance criterion with pass/fail evidence');
+      }
+      const failedChecks = checks.filter((check) => isRecord(check) && check.status === 'fail');
+      if (parsed.verdict === 'all_pass' && failedChecks.length > 0) {
+        throw new Error('worker-lifecycle-invalid-artifact: all_pass conformance must pass every acceptance criterion');
+      }
+      if (parsed.verdict === 'changes_requested') {
+        if (failedChecks.length === 0) {
+          throw new Error('worker-lifecycle-invalid-artifact: changes_requested conformance must fail at least one acceptance criterion');
+        }
+        if (!nonEmptyStrings(parsed.findings)) {
+          throw new Error('worker-lifecycle-invalid-artifact: changes_requested conformance must include non-empty findings');
+        }
       }
       break;
     }

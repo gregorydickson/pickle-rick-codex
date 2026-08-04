@@ -29,8 +29,10 @@ import {
   prepareWorkerLifecycleArtifact,
   readAndValidateWorkerLifecycleArtifact,
   workerLifecycleArtifactPath,
+  WorkerLifecycleRefusalError,
   WORKER_LIFECYCLE_PHASES,
   type WorkerLifecycleArtifact,
+  type WorkerLifecyclePhase,
 } from '../services/worker-lifecycle.js';
 import { recoverableHardReset } from '../services/recoverable-git.js';
 import { assertAcPhaseBoundary } from '../services/ac-phase-gate.js';
@@ -620,6 +622,22 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   let qualityBaseline: QualityBaseline;
   let mutationBoundary: WorkerMutationBoundary | null = null;
   const lifecycleArtifacts: WorkerLifecycleArtifact[] = [];
+  const refusalPhases: WorkerLifecyclePhase[] = ['research_review', 'plan_review', 'review', 'conformance'];
+  const remediationFeedback = refusalPhases
+    .flatMap((phase) => {
+      const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
+      if (!fs.existsSync(artifactPath)) return [];
+      const artifact = readAndValidateWorkerLifecycleArtifact(
+        artifactPath,
+        phase,
+        normalizedTicketId,
+        normalizedTicket.acceptance_criteria || [],
+      );
+      return artifact.verdict === 'changes_requested'
+        ? [{ artifact, mtimeMs: fs.statSync(artifactPath).mtimeMs }]
+        : [];
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.artifact ?? null;
 
   function updateTicketAndClearAdvance(updates: Record<string, unknown>): void {
     const advancePath = refinementRepositoryAdvancePath(sessionDir);
@@ -811,6 +829,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
             workingDir,
             artifactPath: candidateArtifactPath,
             priorArtifacts: lifecycleArtifacts,
+            remediationFeedback,
             tmuxMode,
           }),
           timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
@@ -855,6 +874,9 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
         }
         atomicWriteJson(artifactPath, artifact);
+        if (artifact.verdict === 'changes_requested') {
+          throw new WorkerLifecycleRefusalError(phase, artifactPath, artifact);
+        }
         lifecycleArtifacts.push(artifact);
         recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
       } finally {

@@ -32,4 +32,12 @@ test('AC phase gate requires exact conformance evidence for every criterion', ()
   assert.doesNotThrow(() => assertAcPhaseBoundary('conformance', artifact('conformance', {
     acceptance_criteria: criteria.map((criterion) => ({ criterion, status: 'pass', evidence: `verified ${criterion}` })),
   }), prior, criteria));
+  assert.doesNotThrow(() => assertAcPhaseBoundary('conformance', artifact('conformance', {
+    verdict: 'changes_requested',
+    acceptance_criteria: criteria.map((criterion, index) => ({
+      criterion,
+      status: index === 0 ? 'fail' : 'pass',
+      evidence: `reviewed ${criterion}`,
+    })),
+  }), prior, criteria));
 });

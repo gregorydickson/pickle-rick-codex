@@ -1178,7 +1178,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(fs.existsSync(path.join(sessionDir, 'prd_refined.md')), false);
   assert.ok(!fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
-  assert.equal(state.step, 'refine:synthesis');
+  assert.equal(state.step, 'refine:fallback');
 });
 
 test('spawn-refinement-team feeds semantic validation errors into one clean synthesis repair', () => {

@@ -17,9 +17,12 @@ export function assertAcPhaseBoundary(
   if (missing.length) throw new Error(`ac-phase-gate-failed: ${phase} missing lifecycle evidence: ${missing.join(', ')}`);
   if (phase !== 'conformance') return;
   const checks = Array.isArray(artifact.acceptance_criteria) ? artifact.acceptance_criteria : [];
+  const allowedStatuses = artifact.verdict === 'changes_requested'
+    ? new Set(['pass', 'fail'])
+    : new Set(['pass']);
   const exact = new Set(checks
     .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry))
-    .filter((entry) => entry.status === 'pass' && typeof entry.evidence === 'string' && entry.evidence.trim())
+    .filter((entry) => allowedStatuses.has(String(entry.status)) && typeof entry.evidence === 'string' && entry.evidence.trim())
     .map((entry) => entry.criterion));
   if (checks.length !== acceptanceCriteria.length || acceptanceCriteria.some((criterion) => !exact.has(criterion))) {
     throw new Error('ac-phase-gate-failed: conformance lacks exact acceptance-criterion evidence');

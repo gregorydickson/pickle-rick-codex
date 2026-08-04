@@ -179,6 +179,7 @@ function extractTicketPhase() {
 function writeLifecycleArtifact(phase) {
   const artifactPath = extractPathAfter('Lifecycle artifact path: ');
   const missingPhase = process.env.FAKE_LIFECYCLE_MISSING_PHASE || '';
+  const refusalPhase = process.env.FAKE_LIFECYCLE_REFUSAL_PHASE || '';
   if (!artifactPath || phase === missingPhase) return;
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
   const ticketId = path.basename(path.dirname(artifactPath));
@@ -188,16 +189,34 @@ function writeLifecycleArtifact(phase) {
   const artifact = phase === 'research'
     ? { ...base, evidence: ['approved research marker'] }
     : phase === 'research_review' || phase === 'plan_review'
-      ? { ...base, verdict: 'approved', evidence: ['approved ' + phase + ' evidence'] }
+      ? phase === refusalPhase
+        ? { ...base, verdict: 'changes_requested', evidence: ['reviewed ' + phase], findings: ['retry dispatch is not repository-bound'] }
+        : { ...base, verdict: 'approved', evidence: ['approved ' + phase + ' evidence'] }
       : phase === 'plan'
         ? { ...base, steps: ['approved plan marker'] }
         : phase === 'implement'
           ? { ...base, files_changed: process.env.FAKE_CODEX_MUTATE_FILE ? [process.env.FAKE_CODEX_MUTATE_FILE] : [], verification: ['fake implementation verification'] }
           : phase === 'review'
-            ? { ...base, verdict: 'approved', implementation_reviewed: true, evidence: ['reviewed implementation diff'] }
+            ? phase === refusalPhase
+              ? {
+                  ...base,
+                  verdict: 'changes_requested',
+                  implementation_reviewed: true,
+                  evidence: ['reviewed implementation diff'],
+                  findings: ['retry dispatch is not repository-bound'],
+                }
+              : { ...base, verdict: 'approved', implementation_reviewed: true, evidence: ['reviewed implementation diff'] }
             : phase === 'simplify'
               ? { ...base, verification: ['fake simplification verification'] }
-              : { ...base, verdict: 'all_pass', implementation_reviewed: true, acceptance_criteria: criteria.map((criterion) => ({ criterion, status: 'pass', evidence: 'fake conformance evidence' })) };
+              : phase === refusalPhase
+                ? {
+                    ...base,
+                    verdict: 'changes_requested',
+                    implementation_reviewed: true,
+                    acceptance_criteria: criteria.map((criterion, index) => ({ criterion, status: index === 0 ? 'fail' : 'pass', evidence: 'fake conformance evidence' })),
+                    findings: ['retry dispatch is not repository-bound'],
+                  }
+                : { ...base, verdict: 'all_pass', implementation_reviewed: true, acceptance_criteria: criteria.map((criterion) => ({ criterion, status: 'pass', evidence: 'fake conformance evidence' })) };
   if (phase === (process.env.FAKE_LIFECYCLE_INVALID_PHASE || '')) artifact.summary = '';
   fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
   const promptLog = process.env.FAKE_LIFECYCLE_PROMPT_LOG || '';

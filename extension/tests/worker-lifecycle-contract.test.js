@@ -159,13 +159,19 @@ test('phase validation rejects incomplete research, planning, implementation, an
   }
 });
 
-test('review validation requires approval, evidence, and implementation inspection', (t) => {
+test('review validation requires a supported verdict, evidence, findings for refusal, and implementation inspection', (t) => {
   const cases = [
-    artifact('review', { verdict: 'changes_requested', evidence: ['finding'], implementation_reviewed: true }),
+    artifact('review', { verdict: 'rejected', evidence: ['finding'], implementation_reviewed: true }),
+    artifact('review', { verdict: 'changes_requested', evidence: ['finding'], findings: [], implementation_reviewed: true }),
     artifact('review', { verdict: 'approved', evidence: [], implementation_reviewed: true }),
     artifact('review', { verdict: 'approved', evidence: ['reviewed'], implementation_reviewed: false }),
   ];
-  const expected = [/verdict "approved"/, /non-empty evidence/, /confirm implementation_reviewed/];
+  const expected = [
+    /verdict "approved" or "changes_requested"/,
+    /changes_requested review must include non-empty findings/,
+    /non-empty evidence/,
+    /confirm implementation_reviewed/,
+  ];
 
   cases.forEach((value, index) => {
     const filePath = writeArtifact(t, 'review', value);
@@ -176,20 +182,34 @@ test('review validation requires approval, evidence, and implementation inspecti
   });
 });
 
-test('research and plan reviews share the approved-review contract', (t) => {
+test('research and plan reviews preserve truthful changes-requested findings', (t) => {
   for (const phase of ['research_review', 'plan_review']) {
-    const filePath = writeArtifact(t, phase, artifact(phase, {
-      verdict: 'approved',
-      evidence: [''],
-    }));
-    assert.throws(
-      () => readAndValidateWorkerLifecycleArtifact(filePath, phase, ticketId, acceptanceCriteria),
-      new RegExp(`${phase} must include non-empty evidence`),
+    const refusal = artifact(phase, {
+      verdict: 'changes_requested',
+      evidence: ['reviewed inputs'],
+      findings: ['inputs are incomplete'],
+    });
+    const filePath = writeArtifact(t, phase, refusal);
+    assert.deepEqual(
+      readAndValidateWorkerLifecycleArtifact(filePath, phase, ticketId, acceptanceCriteria),
+      refusal,
     );
+
+    for (const [value, expected] of [
+      [artifact(phase, { verdict: 'rejected', evidence: ['reviewed inputs'] }), /verdict "approved" or "changes_requested"/],
+      [artifact(phase, { verdict: 'approved', evidence: [''] }), /non-empty evidence/],
+      [artifact(phase, { verdict: 'changes_requested', evidence: ['reviewed inputs'], findings: [] }), /non-empty findings/],
+    ]) {
+      const invalidPath = writeArtifact(t, phase, value);
+      assert.throws(
+        () => readAndValidateWorkerLifecycleArtifact(invalidPath, phase, ticketId, acceptanceCriteria),
+        expected,
+      );
+    }
   }
 });
 
-test('conformance validation requires implementation review and exact evidenced criteria', (t) => {
+test('conformance validation supports exact evidenced pass and refusal verdicts', (t) => {
   const base = {
     verdict: 'all_pass',
     implementation_reviewed: true,
@@ -199,22 +219,38 @@ test('conformance validation requires implementation review and exact evidenced 
       evidence: 'verified',
     })),
   };
+  const refusal = artifact('conformance', {
+    ...base,
+    verdict: 'changes_requested',
+    findings: ['The first acceptance criterion is not satisfied.'],
+    acceptance_criteria: base.acceptance_criteria.map((check, index) => (
+      index === 0 ? { ...check, status: 'fail' } : check
+    )),
+  });
+  const refusalPath = writeArtifact(t, 'conformance', refusal);
+  assert.deepEqual(
+    readAndValidateWorkerLifecycleArtifact(refusalPath, 'conformance', ticketId, acceptanceCriteria),
+    refusal,
+  );
+
   const cases = [
-    [artifact('conformance', { ...base, verdict: 'failed' }), /record all_pass/],
-    [artifact('conformance', { ...base, implementation_reviewed: false }), /record all_pass/],
-    [artifact('conformance', { ...base, acceptance_criteria: base.acceptance_criteria.slice(0, 1) }), /pass every exact/],
+    [artifact('conformance', { ...base, verdict: 'failed' }), /record all_pass or changes_requested/],
+    [artifact('conformance', { ...base, implementation_reviewed: false }), /record all_pass or changes_requested/],
+    [artifact('conformance', { ...base, acceptance_criteria: base.acceptance_criteria.slice(0, 1) }), /cover every exact/],
     [artifact('conformance', {
       ...base,
       acceptance_criteria: base.acceptance_criteria.map((check, index) => (
         index === 0 ? { ...check, status: 'fail' } : check
       )),
-    }), /pass every exact/],
+    }), /all_pass conformance must pass every/],
     [artifact('conformance', {
       ...base,
       acceptance_criteria: base.acceptance_criteria.map((check, index) => (
         index === 0 ? { ...check, evidence: ' ' } : check
       )),
-    }), /pass every exact/],
+    }), /cover every exact/],
+    [artifact('conformance', { ...base, verdict: 'changes_requested', findings: ['finding'] }), /fail at least one/],
+    [artifact('conformance', { ...refusal, findings: [] }), /non-empty findings/],
   ];
 
   for (const [value, expected] of cases) {

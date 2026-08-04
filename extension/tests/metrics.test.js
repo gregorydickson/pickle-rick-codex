@@ -56,8 +56,8 @@ test('buildMetricsReport aggregates rows by ISO week when --weekly is set', () =
   mondayThisWeek.setUTCDate(mondayThisWeek.getUTCDate() - (weekday - 1));
   const mondayLastWeek = new Date(mondayThisWeek.getTime() - (7 * 86_400_000));
 
-  const thisWeekEvent = new Date(mondayThisWeek.getTime() + (2 * 86_400_000) + (12 * 60 * 60 * 1000));
-  const lastWeekEvent = new Date(mondayLastWeek.getTime() + (4 * 86_400_000) + (9 * 60 * 60 * 1000));
+  const thisWeekEvent = new Date(now.getTime() - (60 * 60 * 1000));
+  const lastWeekEvent = new Date(mondayLastWeek.getTime() + (12 * 60 * 60 * 1000));
 
   writeActivityLog(dataRoot, thisWeekEvent, [
     { ts: thisWeekEvent.toISOString(), event: 'session_start', input_tokens: 7, output_tokens: 11 },

@@ -5,13 +5,13 @@ import { buildTicketPhasePrompt } from '../services/prompts.js';
 
 const phaseContracts = {
   research: 'evidence: non-empty string[]',
-  research_review: 'verdict: "approved"; evidence: non-empty string[]',
+  research_review: 'verdict: "approved" | "changes_requested"; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
   plan: 'steps: non-empty string[]',
-  plan_review: 'verdict: "approved"; evidence: non-empty string[]',
+  plan_review: 'verdict: "approved" | "changes_requested"; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
   implement: 'files_changed: string[]; verification: non-empty string[]',
-  review: 'verdict: "approved"; implementation_reviewed: true; evidence: non-empty string[]',
+  review: 'verdict: "approved" | "changes_requested"; implementation_reviewed: true; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
   simplify: 'verification: non-empty string[]',
-  conformance: 'verdict: "all_pass"; implementation_reviewed: true; acceptance_criteria:',
+  conformance: 'verdict: "all_pass" | "changes_requested"; implementation_reviewed: true; acceptance_criteria: [{criterion: exact ticket criterion, status: "pass" | "fail", evidence: non-empty string}]; findings: non-empty string[] when verdict is "changes_requested"',
 };
 
 const readOnlyPhases = new Set([
@@ -61,6 +61,12 @@ for (const [phase, contract] of Object.entries(phaseContracts)) {
     } else {
       assert.doesNotMatch(prompt, /Inspect the actual implementation diff and verification evidence/);
     }
+    if (['research_review', 'plan_review', 'review'].includes(phase)) {
+      assert.match(prompt, /Persist a truthful "changes_requested" verdict with non-empty findings/);
+    }
+    if (phase === 'conformance') {
+      assert.match(prompt, /at least one failed criterion, and non-empty findings/);
+    }
   });
 }
 
@@ -88,6 +94,16 @@ test('buildTicketPhasePrompt serializes rich implement inputs and a custom artif
       verdict: 'approved',
       evidence: ['Plan is executable.'],
     }],
+    remediationFeedback: {
+      schema_version: 1,
+      phase: 'review',
+      ticket_id: 'T-18',
+      summary: 'Implementation needs remediation.',
+      verdict: 'changes_requested',
+      implementation_reviewed: true,
+      evidence: ['Implementation diff inspected.'],
+      findings: ['Retry dispatch is not repository-bound.'],
+    },
     tmuxMode: true,
   });
 
@@ -99,6 +115,8 @@ test('buildTicketPhasePrompt serializes rich implement inputs and a custom artif
   assert.match(prompt, /MODE/);
   assert.match(prompt, /Approved plan_review artifact:/);
   assert.match(prompt, /"verdict": "approved"/);
+  assert.match(prompt, /Prior rejected lifecycle feedback \(remediation input, not approved causal context\):/);
+  assert.match(prompt, /Retry dispatch is not repository-bound/);
   assert.match(prompt, /leave verified ticket changes in the working tree/);
   assert.match(prompt, /do not run git add or git commit/);
   assert.match(prompt, /runtime owns scoped staging, commit attribution/);

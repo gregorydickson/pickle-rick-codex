@@ -144,19 +144,20 @@ export interface TicketPhasePromptInput {
   workingDir: string;
   artifactPath?: string;
   priorArtifacts?: WorkerLifecycleArtifact[];
+  remediationFeedback?: WorkerLifecycleArtifact | null;
   tmuxMode?: boolean;
 }
 
 function lifecycleArtifactContract(phase: WorkerLifecyclePhase, ticketId: string): string {
   const fields: Record<WorkerLifecyclePhase, string> = {
     research: 'evidence: non-empty string[]',
-    research_review: 'verdict: "approved"; evidence: non-empty string[]',
+    research_review: 'verdict: "approved" | "changes_requested"; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
     plan: 'steps: non-empty string[]',
-    plan_review: 'verdict: "approved"; evidence: non-empty string[]',
+    plan_review: 'verdict: "approved" | "changes_requested"; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
     implement: 'files_changed: string[]; verification: non-empty string[]',
-    review: 'verdict: "approved"; implementation_reviewed: true; evidence: non-empty string[]',
+    review: 'verdict: "approved" | "changes_requested"; implementation_reviewed: true; evidence: non-empty string[]; findings: non-empty string[] when verdict is "changes_requested"',
     simplify: 'verification: non-empty string[]',
-    conformance: 'verdict: "all_pass"; implementation_reviewed: true; acceptance_criteria: [{criterion: exact ticket criterion, status: "pass", evidence: non-empty string}]',
+    conformance: 'verdict: "all_pass" | "changes_requested"; implementation_reviewed: true; acceptance_criteria: [{criterion: exact ticket criterion, status: "pass" | "fail", evidence: non-empty string}]; findings: non-empty string[] when verdict is "changes_requested"',
   };
   return `Required JSON fields: schema_version: 1; phase: "${phase}"; ticket_id: "${ticketId}"; summary: non-empty string; ${fields[phase]}.`;
 }
@@ -168,6 +169,7 @@ export function buildTicketPhasePrompt({
   workingDir,
   artifactPath = `${sessionDir}/worker-lifecycle/${ticket.id}/${phase}.json`,
   priorArtifacts = [],
+  remediationFeedback = null,
   tmuxMode = false,
 }: TicketPhasePromptInput): string {
   const verificationCommands = normalizeVerificationCommands(ticket?.verification, {
@@ -196,6 +198,12 @@ export function buildTicketPhasePrompt({
     validatesImplementation
       ? 'Inspect the actual implementation diff and verification evidence. Approval is forbidden unless the implementation satisfies the ticket and the persisted prior artifacts.'
       : null,
+    ['research_review', 'plan_review', 'review'].includes(phase)
+      ? 'Persist a truthful "changes_requested" verdict with non-empty findings when approval is not warranted.'
+      : null,
+    phase === 'conformance'
+      ? 'Persist "changes_requested" with exact pass/fail acceptance-criterion evidence, at least one failed criterion, and non-empty findings when all_pass is not warranted.'
+      : null,
     isReadOnly
       ? 'The listed verification commands are downstream evidence contracts only. Do not execute them or perform the ticket deliverable in this read-only phase; persist only the lifecycle JSON artifact outside the repository.'
       : 'Use the repository tests and the listed verification commands for this phase; do not widen them back to package-wide wrappers.',
@@ -212,6 +220,9 @@ export function buildTicketPhasePrompt({
       ? `Verification env contract:\n${describeVerificationContract(verificationContract)}`
       : null,
     `Approved causal context from earlier phases (read this forward; do not replace it with fresh assumptions):\n${serializeApprovedWorkerContext(priorArtifacts)}`,
+    remediationFeedback
+      ? `Prior rejected lifecycle feedback (remediation input, not approved causal context):\n${JSON.stringify(remediationFeedback, null, 2)}`
+      : null,
     `Return <promise>${phase.toUpperCase()}_COMPLETE</promise> when this phase is finished.`,
     'Stop immediately after writing any phase-result artifacts and the promise token.',
     'Do not continue with extra analysis, follow-up, or additional work after the promise token has been emitted.',
