@@ -47,8 +47,13 @@ for (const [phase, contract] of Object.entries(phaseContracts)) {
 
     if (readOnlyPhases.has(phase)) {
       assert.match(prompt, /read-only repository phase/);
+      assert.match(prompt, /inspection context only/);
+      assert.match(prompt, /Do not create, modify, stage, or commit them/);
+      assert.match(prompt, /downstream evidence contracts only/);
+      assert.doesNotMatch(prompt, /You may modify only these ticket-owned paths/);
     } else {
       assert.match(prompt, /Work directly in the repository working tree/);
+      assert.match(prompt, /You may modify only these ticket-owned paths/);
     }
 
     if (phase === 'review' || phase === 'conformance') {
@@ -95,6 +100,31 @@ test('buildTicketPhasePrompt serializes rich implement inputs and a custom artif
   assert.match(prompt, /Approved plan_review artifact:/);
   assert.match(prompt, /"verdict": "approved"/);
   assert.match(prompt, /finish with committed changes/);
+});
+
+test('contract-decision research defers its repository deliverable to implementation', () => {
+  const prompt = buildTicketPhasePrompt({
+    phase: 'research',
+    ticket: {
+      id: 'P1-001',
+      title: 'Record runtime decisions',
+      description: 'Create the normative decision record.',
+      contract_decision: true,
+      acceptance_criteria: ['The decision record defines startup_accepted.'],
+      verification: ['test -f docs/runtime-decisions.md'],
+      allowed_paths: ['docs/runtime-decisions.md'],
+      output_artifacts: ['docs/runtime-decisions.md'],
+    },
+    sessionDir: '/sessions/pickle-contract',
+    workingDir: '/repos/pickle',
+    tmuxMode: true,
+  });
+
+  assert.match(prompt, /Do not execute them or perform the ticket deliverable/);
+  assert.match(prompt, /persist only the lifecycle JSON artifact outside the repository/);
+  assert.match(prompt, /do not create ticket deliverables or commits/);
+  assert.doesNotMatch(prompt, /finish with committed changes/);
+  assert.doesNotMatch(prompt, /You may modify only these ticket-owned paths/);
 });
 
 test('buildTicketPhasePrompt uses safe defaults for sparse tickets', () => {

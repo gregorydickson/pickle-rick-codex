@@ -54,7 +54,7 @@ function commitBase(dir, files) {
 }
 
 function refExists(dir, ref) {
-  const out = git(dir, ['for-each-ref', '--format=%(refname)', 'refs/pickle/salvage']).trim();
+  const out = git(dir, ['for-each-ref', '--format=%(refname)', 'refs/pickle']).trim();
   return out.split('\n').filter(Boolean).includes(ref);
 }
 
@@ -93,7 +93,8 @@ test('stashUnattributableRemainder anchors tracked mods + untracked without muta
   const result = stashUnattributableRemainder(dir, sessionDirFor(session), noop);
 
   assert.ok(result, 'returns a truthy ref name');
-  assert.equal(result, ref);
+  assert.match(result, new RegExp(`^refs/pickle/salvage-history/${session}/[0-9a-f]{40}$`));
+  assert.ok(refExists(dir, result), 'immutable salvage ref exists');
   assert.ok(refExists(dir, ref), 'salvage ref exists');
 
   const tree = git(dir, ['ls-tree', '-r', '--name-only', ref])
@@ -132,11 +133,47 @@ test('salvageDirtyTree anchors + returns owned only when foreign paths exist', (
   });
 
   assert.deepEqual(plan.stagePaths, owned, 'stagePaths deep-equals owned');
-  assert.equal(plan.salvageRef, ref, 'salvageRef points at the created ref');
+  assert.match(plan.salvageRef, new RegExp(`^refs/pickle/salvage-history/${session}/[0-9a-f]{40}$`));
+  assert.ok(refExists(dir, plan.salvageRef), 'salvageRef points at the immutable created ref');
   assert.ok(refExists(dir, ref), 'salvage ref created');
 
   const recovered = git(dir, ['show', `${ref}:foreign.txt`]);
   assert.equal(recovered, 'foreign work\n', 'foreign path recoverable from ref');
+});
+
+test('repeated salvage keeps every attempt on a distinct immutable ref', () => {
+  const dir = initRepo('pickle-salvage-history-');
+  commitBase(dir, { 'tracked.txt': 'base\n' });
+  const session = 'sess-history';
+
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'attempt one\n');
+  const first = stashUnattributableRemainder(dir, sessionDirFor(session), noop);
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'attempt two\n');
+  const second = stashUnattributableRemainder(dir, sessionDirFor(session), noop);
+
+  assert.ok(first);
+  assert.ok(second);
+  assert.notEqual(first, second);
+  assert.equal(git(dir, ['show', `${first}:tracked.txt`]), 'attempt one\n');
+  assert.equal(git(dir, ['show', `${second}:tracked.txt`]), 'attempt two\n');
+  assert.equal(git(dir, ['rev-parse', `refs/pickle/salvage/${session}`]).trim(), git(dir, ['rev-parse', second]).trim());
+});
+
+test('re-anchoring an identical salvage snapshot is idempotent', () => {
+  const dir = initRepo('pickle-salvage-idempotent-');
+  commitBase(dir, { 'tracked.txt': 'base\n' });
+  const session = 'sess-idempotent';
+
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'same snapshot\n');
+  const first = stashUnattributableRemainder(dir, sessionDirFor(session), noop);
+  const second = stashUnattributableRemainder(dir, sessionDirFor(session), noop);
+
+  assert.ok(first);
+  assert.ok(second);
+  assert.ok(refExists(dir, first));
+  assert.ok(refExists(dir, second));
+  assert.equal(git(dir, ['show', `${first}:tracked.txt`]), 'same snapshot\n');
+  assert.equal(git(dir, ['show', `${second}:tracked.txt`]), 'same snapshot\n');
 });
 
 test('salvageDirtyTree passes owned through with no ref when foreign is empty', () => {

@@ -24,9 +24,10 @@ import { safeErrorMessage } from './pickle-utils.js';
  * mutated (the caller can still stage and commit only the positively-owned paths
  * afterward). `git stash create` is unsuitable because it cannot include untracked
  * files and would miss a sibling's brand-new artifacts. We then anchor the snapshot
- * under `refs/pickle/salvage/<session>` so an operator can recover the remainder via
- * `git show refs/pickle/salvage/<session>`. The ref lives entirely in git's
- * object/ref store — no `state.json` write.
+ * under an immutable `refs/pickle/salvage-history/<session>/<commit>` ref so
+ * repeated recovery attempts cannot overwrite earlier evidence. The legacy
+ * `refs/pickle/salvage/<session>` ref remains a latest pointer for operators.
+ * The refs live entirely in git's object/ref store — no `state.json` write.
  *
  * Returns the ref name on success, or null when the tree had nothing to snapshot or
  * any git step failed (best-effort: losing the breadcrumb must never crash exit).
@@ -39,7 +40,7 @@ export function stashUnattributableRemainder(
   let tmpIndex: string | null = null;
   try {
     const session = path.basename(sessionDir);
-    const ref = `refs/pickle/salvage/${session}`;
+    const latestRef = `refs/pickle/salvage/${session}`;
     // Throwaway index so `git add` does not touch the real index/worktree.
     tmpIndex = path.join(os.tmpdir(), `pickle-salvage-index-${process.pid}-${Date.now()}`);
     const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
@@ -56,12 +57,20 @@ export function stashUnattributableRemainder(
     if (git(['rev-parse', 'HEAD^{tree}'], false) === tree) return null; // no diff from HEAD — nothing to anchor
     const sha = git(['commit-tree', tree, '-p', 'HEAD', '-m', `pickle exit-path bystander salvage (${session})`], true);
     if (!sha) return null;
-    if (git(['update-ref', ref, sha], false) === null) {
-      log(`[exit-commit] failed to anchor bystander stash at ${ref}`);
+    const immutableRef = `refs/pickle/salvage-history/${session}/${sha}`;
+    const existingImmutableSha = git(['rev-parse', '--verify', immutableRef], false);
+    if (existingImmutableSha !== sha && (
+      existingImmutableSha !== null
+      || git(['update-ref', immutableRef, sha, '0000000000000000000000000000000000000000'], false) === null
+    )) {
+      log(`[exit-commit] failed to anchor immutable bystander stash at ${immutableRef}`);
       return null;
     }
-    log(`[exit-commit] stashed un-attributable remainder to ${ref} (${sha.slice(0, 12)})`);
-    return ref;
+    if (git(['update-ref', latestRef, sha], false) === null) {
+      log(`[exit-commit] immutable stash is safe at ${immutableRef}, but latest pointer ${latestRef} could not be updated`);
+    }
+    log(`[exit-commit] stashed un-attributable remainder to ${immutableRef} (${sha.slice(0, 12)}; latest ${latestRef})`);
+    return immutableRef;
   } catch (err) {
     log(`[exit-commit] bystander stash threw (ignored): ${safeErrorMessage(err)}`);
     return null;
@@ -89,9 +98,9 @@ export interface SalvageDirtyTreePlan {
 
 /**
  * The invariant enforcer: when the partitioned dirty tree carries ANY foreign
- * paths, the whole dirty tree is snapshotted to `refs/pickle/salvage/<session>`
- * (recoverable, worktree/index untouched) and ONLY the owned set is returned
- * as stageable. A foreign-free tree passes through untouched (no ref).
+ * paths, the whole dirty tree is snapshotted to an immutable salvage-history
+ * ref (recoverable, worktree/index untouched) and ONLY the owned set is
+ * returned as stageable. A foreign-free tree passes through untouched (no ref).
  */
 export function salvageDirtyTree(input: SalvageDirtyTreeInput): SalvageDirtyTreePlan {
   const { workingDir, sessionDir, owned, foreign, log } = input;

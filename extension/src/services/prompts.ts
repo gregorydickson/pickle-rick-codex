@@ -177,6 +177,7 @@ export function buildTicketPhasePrompt({
   const verificationContract = (ticket?.verificationContract ?? null) as VerificationContract | null | undefined;
   const artifactTicketId = artifactPath.split(/[\\/]/).at(-2) || String(ticket.id);
   const isReadOnly = ['research', 'research_review', 'plan', 'plan_review', 'review', 'conformance'].includes(phase);
+  const ticketOwnedPaths = ticket.allowed_paths ?? ticket.allowedPaths ?? ticket.files ?? ticket.output_artifacts ?? [];
   const validatesImplementation = phase === 'review' || phase === 'conformance';
   return [
     `You are executing the "${phase}" phase for ticket ${ticket.id}: ${ticket.title}.`,
@@ -185,7 +186,9 @@ export function buildTicketPhasePrompt({
     isReadOnly
       ? 'This is a read-only repository phase. Inspect the working tree, but do not modify repository files, the index, commits, or HEAD.'
       : 'Work directly in the repository working tree for this ticket. Do not create isolated worktrees or sandbox copies.',
-    `You may modify only these ticket-owned paths: ${JSON.stringify(ticket.allowed_paths ?? ticket.allowedPaths ?? ticket.files ?? ticket.output_artifacts ?? [])}`,
+    isReadOnly
+      ? `Ticket-owned paths are inspection context only in this phase: ${JSON.stringify(ticketOwnedPaths)}. Do not create, modify, stage, or commit them until a writable implementation phase.`
+      : `You may modify only these ticket-owned paths: ${JSON.stringify(ticketOwnedPaths)}`,
     'Follow the guaranteed sequential path. Do not assume undocumented native agent controls.',
     `Lifecycle artifact path: ${artifactPath}`,
     lifecycleArtifactContract(phase, artifactTicketId),
@@ -193,9 +196,13 @@ export function buildTicketPhasePrompt({
     validatesImplementation
       ? 'Inspect the actual implementation diff and verification evidence. Approval is forbidden unless the implementation satisfies the ticket and the persisted prior artifacts.'
       : null,
-    'Use the repository tests and the listed verification commands for this phase; do not widen them back to package-wide wrappers.',
+    isReadOnly
+      ? 'The listed verification commands are downstream evidence contracts only. Do not execute them or perform the ticket deliverable in this read-only phase; persist only the lifecycle JSON artifact outside the repository.'
+      : 'Use the repository tests and the listed verification commands for this phase; do not widen them back to package-wide wrappers.',
     tmuxMode
-      ? 'Detached tmux ticket boundary: if this ticket changes files in a git repository, finish with committed changes and do not leave the working tree dirty for the next ticket.'
+      ? isReadOnly
+        ? 'Detached tmux read-only boundary: do not create ticket deliverables or commits. The runtime, not this phase, owns repository advancement.'
+        : 'Detached tmux ticket boundary: if this ticket changes files in a git repository, finish with committed changes and do not leave the working tree dirty for the next ticket.'
       : null,
     `Ticket description:\n${ticket.description || 'No description provided.'}`,
     `Acceptance criteria:\n${(ticket.acceptance_criteria || []).map((item) => `- ${item}`).join('\n')}`,
