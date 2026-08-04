@@ -10,10 +10,11 @@ The requirement and acceptance-criterion text in those three source PRDs is immu
 
 ## Execution-base repository condition
 
-- Resumed audit and implementation `HEAD`: `9bb9a8d08dfd2bf7f0e495c63c3583c77cf2a70e`.
-- `main`, `origin/main`, and `origin/HEAD` all resolved to that same revision at implementation start; the repository was synchronized.
-- The index and worktree were clean before `p1r-001`; `git status --short --branch` produced only `## main...origin/main`. The later documentation diff is attributable solely to this ticket's two owned paths.
-- Resume history: `9c792b0` created this ledger from the older `c75ea543318b1af0618630f3e2859e6a0249d78f` audit base. The intervening `9bb9a8d` commit changed only runtime-owned repository advancement and changed-path caller scanning; it added no frozen AR, QD, or BS coverage.
+- Observed execution-start `HEAD`: `82bbe93f432a95bad9735bf6a5b2d88421a6c17a`.
+- `HEAD`, local `main`, `origin/main`, and `origin/HEAD` all resolved to that revision at execution start, and `git rev-list --left-right --count origin/main...HEAD` returned `0 0`; the repository was synchronized.
+- The index and worktree were clean before `p1r-001`: `git status --short --branch` produced only `## main...origin/main`, and tracked, staged, and final porcelain inspections were empty.
+- This revision is observed audit evidence for this execution, not a fixed or prescribed manifest SHA. Future executions must record their actual clean, synchronized starting revision rather than require this value.
+- Current main includes the lifecycle-refusal work in `82bbe93` (`fix: preserve lifecycle refusal feedback`): validated and persisted `changes_requested` artifacts, typed refusal propagation, and forwarding of the newest refusal evidence into later worker prompts. That is partial recovery coverage because a retry still restarts the ordered lifecycle at research instead of resuming only the affected implementation-side phases.
 
 Coverage states below describe the actual execution base: **partial** means correct behavior exists but the frozen contract is incomplete; **uncovered** means the required contract/proof is not yet present; **preserve + gap** means relevant archive/rollback behavior exists but the receipt-grounded remediation contract does not.
 
@@ -45,12 +46,12 @@ Every matrix proof key expands to these exact commands. Typecheck and lint in `P
 | --- | --- | --- | --- |
 | `AR-R1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-R2` | `p1r-002`, `p1r-005` | uncovered | `P02` + `P05` + composed `P13` |
-| `AR-R3` | `p1r-011` | uncovered | `P11` + composed `P13` |
+| `AR-R3` | `p1r-011` | partial | `P11` + composed `P13` |
 | `AR-R4` | `p1r-002`, `p1r-004`, `p1r-005`, `p1r-011` | uncovered | `P02` + `P04` + `P05` + `P11` + composed `P13` |
 | `AR-AC1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-AC2` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-AC3` | `p1r-002`, `p1r-005` | uncovered | `P02` + `P05` + composed `P13` |
-| `AR-AC4` | `p1r-011` | uncovered | `P11` + composed `P13` |
+| `AR-AC4` | `p1r-011` | partial | `P11` + composed `P13` |
 
 ### Quality delta and grounded conformance (`QD`)
 
@@ -94,7 +95,7 @@ Every row names composed end-to-end parity proof under `P13`, owned by `p1r-013`
 
 ## Resolved cross-ticket contracts
 
-### Manifest recovery budget
+### Absolute four-candidate manifest recovery budget
 
 Each synthesis/fallback lane gets exactly one initial candidate plus at most one diagnostic repair. The primary synthesis lane runs first. Only if it remains invalid may an independent fallback lane run in a fresh process and fresh context using the approved original inputs and validator diagnostics; it also gets one initial candidate plus at most one repair. Four generated candidates is the absolute combined maximum. Every candidate passes through the same production validator. Rejected output and diagnostics remain evidence and may not be silently rewritten. Exhaustion persists typed, resumable `refinement_exhausted`; retry requires changed remediation input or operator retry authority. `p1r-004` implements this on the `p1r-002` recovery model after `p1r-003` path-contract hardening.
 
@@ -118,6 +119,7 @@ These are correct starting seams, not blank-slate implementation invitations:
 - `extension/src/services/prompts.ts` already directs synthesis to quote regex/glob runner values, use literal repository-relative paths, reject globs and repository-root `.`, distinguish exclusive artifacts from shared paths, and remain read-only. `p1r-003` must complete parser and mirrored-consumer parity without discarding that guidance.
 - `extension/src/services/execution-gate.ts` already emits typed non-green `absent` when no quality commands exist, while failure identity still depends on normalized raw transcript lines. `p1r-006` preserves the absent state and `p1r-007` hardens diagnostic identity.
 - Rejected-mutation archival and rollback already exist. `p1r-010` and `p1r-011` must preserve that machinery while binding it to authenticated receipts and evidence-carrying refusal remediation.
+- Worker lifecycle refusal handling already validates and persists evidence-bearing `changes_requested` artifacts, raises a typed `WorkerLifecycleRefusalError`, and forwards the newest refusal artifact as remediation feedback. `p1r-011` must preserve that plumbing while adding checkpointed recovery and attempt accounting so a refusal re-enters the affected implementation-side phases instead of consuming another identical full research-to-conformance attempt.
 
 ## Closure guard
 
