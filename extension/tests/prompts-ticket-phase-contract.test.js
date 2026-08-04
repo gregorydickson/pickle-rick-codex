@@ -99,7 +99,10 @@ test('buildTicketPhasePrompt serializes rich implement inputs and a custom artif
   assert.match(prompt, /MODE/);
   assert.match(prompt, /Approved plan_review artifact:/);
   assert.match(prompt, /"verdict": "approved"/);
-  assert.match(prompt, /finish with committed changes/);
+  assert.match(prompt, /leave verified ticket changes in the working tree/);
+  assert.match(prompt, /do not run git add or git commit/);
+  assert.match(prompt, /runtime owns scoped staging, commit attribution/);
+  assert.doesNotMatch(prompt, /finish with committed changes/);
 });
 
 test('contract-decision research defers its repository deliverable to implementation', () => {

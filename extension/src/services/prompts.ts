@@ -202,7 +202,7 @@ export function buildTicketPhasePrompt({
     tmuxMode
       ? isReadOnly
         ? 'Detached tmux read-only boundary: do not create ticket deliverables or commits. The runtime, not this phase, owns repository advancement.'
-        : 'Detached tmux ticket boundary: if this ticket changes files in a git repository, finish with committed changes and do not leave the working tree dirty for the next ticket.'
+        : 'Detached tmux writable boundary: leave verified ticket changes in the working tree and do not run git add or git commit. The runtime owns scoped staging, commit attribution, and repository advancement after all lifecycle gates pass.'
       : null,
     `Ticket description:\n${ticket.description || 'No description provided.'}`,
     `Acceptance criteria:\n${(ticket.acceptance_criteria || []).map((item) => `- ${item}`).join('\n')}`,

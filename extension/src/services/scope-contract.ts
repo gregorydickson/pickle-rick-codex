@@ -107,6 +107,7 @@ export function detectSignatureCallerGaps(
   }
   if (symbols.size === 0) return { expansions: [], gaps: [] };
   const candidates = runGit(workingDir, ['ls-files']).split('\n')
+    .filter((entry) => changedPaths.includes(entry))
     .filter((entry) => /\.(?:[cm]?[jt]sx?)$/.test(entry))
     .slice(0, CALLER_SCAN_MAX);
   const bySymbol = new Map<string, string[]>();

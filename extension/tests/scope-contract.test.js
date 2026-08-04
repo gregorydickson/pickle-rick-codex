@@ -60,10 +60,28 @@ test('signature caller gaps beyond the bounded one-hop cap block execution', () 
   const { workingDir, sessionDir, base } = repoFixture(SCOPE_ONE_HOP_MAX + 1);
   persistTicketScope(sessionDir, ticket, 'r1', base);
   fs.writeFileSync(path.join(workingDir, 'src/api.ts'), 'export function calculate(value: number, scale = 1): number { return value * scale; }\n');
-  const verdict = evaluatePersistedTicketScope(sessionDir, ticket, 'r1', base, workingDir, ['src/api.ts']);
+  const changedPaths = ['src/api.ts'];
+  for (let index = 0; index <= SCOPE_ONE_HOP_MAX; index += 1) {
+    const caller = `src/caller-${index}.ts`;
+    fs.writeFileSync(path.join(workingDir, caller), `import { calculate } from './api.js';\nexport const v${index} = calculate(${index}, 2);\n`);
+    changedPaths.push(caller);
+  }
+  const verdict = evaluatePersistedTicketScope(sessionDir, ticket, 'r1', base, workingDir, changedPaths);
   assert.equal(verdict.ok, false);
   assert.match(verdict.reason, /signature-caller-gap/);
   assert.equal(verdict.violations.length, SCOPE_ONE_HOP_MAX + 1);
+});
+
+test('unchanged callers do not create a signature scope gap', () => {
+  const { workingDir, sessionDir, base } = repoFixture(SCOPE_ONE_HOP_MAX + 1);
+  persistTicketScope(sessionDir, ticket, 'r1', base);
+  fs.writeFileSync(path.join(workingDir, 'src/api.ts'), 'export function calculate(value: number, scale = 1): number { return value * scale; }\n');
+
+  const verdict = evaluatePersistedTicketScope(sessionDir, ticket, 'r1', base, workingDir, ['src/api.ts']);
+
+  assert.equal(verdict.ok, true);
+  assert.deepEqual(verdict.violations, []);
+  assert.deepEqual(readFreshTicketScope(sessionDir, ticket, 'r1', base).expanded_paths, []);
 });
 
 test('Citadel audits persisted scope identity and reachable shared review base', () => {
