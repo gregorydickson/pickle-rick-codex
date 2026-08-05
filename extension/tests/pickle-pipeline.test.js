@@ -76,6 +76,7 @@ test('pickle-pipeline bootstraps from task and launches detached tmux', () => {
   assert.equal(state.pipeline_phase, 'pickle');
   assert.match(state.tmux_session_name, /^pickle-/);
   assert.ok(tmuxLines.some((args) => args[0] === 'new-session'));
+  assert.ok(tmuxLines.some((args) => /--on-failure=retry(?:\s|$)/.test(args.join(' '))));
 });
 
 test('pipeline-runner executes the configured phases to completion', () => {

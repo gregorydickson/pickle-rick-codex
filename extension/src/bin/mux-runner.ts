@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
-import { canExecute, loadCircuitState } from '../services/circuit-breaker.js';
+import { canExecute, loadCircuitState, openCircuitBreaker, recordCircuitProgress } from '../services/circuit-breaker.js';
 import { getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
@@ -18,7 +18,13 @@ import {
 } from '../services/tickets.js';
 import { isPreflightError, isVerificationContractError } from '../services/verification-env.js';
 import { scrubTicketWorkerMessages } from '../services/worker-output.js';
-import { decideTicketRecovery } from '../services/recovery-controller.js';
+import {
+  buildTicketRecoveryFailureIdentity,
+  decideTicketRecovery,
+  recordTicketRecoveryFailure,
+  type TicketFailureKind,
+} from '../services/recovery-controller.js';
+import { isWorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
 import { runTicket } from './spawn-morty.js';
 
@@ -43,7 +49,7 @@ function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
   if (!modeArg) return 'abort';
   const mode = modeArg.split('=')[1] ?? '';
-  if (!['abort', 'skip', 'retry-once'].includes(mode)) {
+  if (!['abort', 'skip', 'retry-once', 'retry'].includes(mode)) {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
@@ -140,7 +146,85 @@ async function runSequentialWithLease(
     }
 
     let attempts = 0;
-    const maxAttempts = failureMode === 'retry-once' ? 2 : 1;
+    const maxAttempts = failureMode === 'retry'
+      ? Number.POSITIVE_INFINITY
+      : failureMode === 'retry-once' ? 2 : 1;
+
+    const decideRecovery = (
+      failureKind: TicketFailureKind,
+      message: string,
+      error: unknown = null,
+    ) => {
+      let adaptiveExhausted = false;
+      if (failureMode === 'retry') {
+        const refusal = isWorkerLifecycleRefusalError(error) ? error : null;
+        const identity = buildTicketRecoveryFailureIdentity({
+          failureKind,
+          message,
+          phase: refusal?.phase || null,
+          artifact: refusal?.artifact || null,
+          evidencePath: refusal?.artifactPath || null,
+          remediationIdentity: refusal?.remediationIdentity || null,
+        });
+        let event;
+        try {
+          event = recordTicketRecoveryFailure({
+            sessionDir,
+            ticketId: ticket.id,
+            failureKind,
+            identity,
+          });
+        } catch (historyError) {
+          const reason = historyError instanceof Error ? historyError.message : String(historyError);
+          manager.update(statePath, (current) => {
+            current.recovery_required = true;
+            current.recovery_kind = 'ticket_recovery_history';
+            current.recovery_reason = reason;
+            return current;
+          });
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} recovery history failed closed: ${reason}`);
+          return { action: 'abort' as const, exitReason: 'recovery_required', reason };
+        }
+        const unchangedLimit = Math.max(
+          1,
+          config.defaults.max_retry_attempts + 1,
+          config.defaults.circuit_breaker.same_error_threshold,
+        );
+        adaptiveExhausted = !event.changed_lineage && event.consecutive_same_lineage >= unchangedLimit;
+        if (event.changed_lineage) {
+          recordCircuitProgress(sessionDir, `changed recovery lineage for ${ticket.id}`);
+        } else if (adaptiveExhausted) {
+          openCircuitBreaker(
+            sessionDir,
+            `ticket ${ticket.id} repeated an unchanged recovery lineage ${event.consecutive_same_lineage} times`,
+            identity.signature,
+          );
+        }
+        appendRunnerLog(
+          sessionDir,
+          runnerMode,
+          `ticket ${ticket.id} recovery event ${event.sequence}: ${event.changed_lineage ? 'changed' : 'unchanged'} lineage, consecutive=${event.consecutive_same_lineage}/${unchangedLimit}`,
+        );
+      }
+      const latestState = manager.read(statePath);
+      if (latestState.recovery_required) {
+        return {
+          action: 'abort' as const,
+          exitReason: 'recovery_required',
+          reason: String(latestState.recovery_reason || 'verified unsafe repository recovery state'),
+        };
+      }
+      return decideTicketRecovery({
+        failureKind,
+        failureMode,
+        attempt: attempts,
+        maxAttempts,
+        stopReason: shouldStop(latestState),
+        circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
+        failureExitReason: 'error',
+        adaptiveExhausted,
+      });
+    };
 
     while (attempts < maxAttempts) {
       const latestState = manager.read(statePath);
@@ -159,7 +243,11 @@ async function runSequentialWithLease(
 
       attempts += 1;
       try {
-        appendRunnerLog(sessionDir, runnerMode, `starting ticket ${ticket.id} attempt ${attempts}/${maxAttempts}`);
+        appendRunnerLog(
+          sessionDir,
+          runnerMode,
+          `starting ticket ${ticket.id} attempt ${attempts}${Number.isFinite(maxAttempts) ? `/${maxAttempts}` : ' (adaptive)'}`,
+        );
         const result = await runTicketFn(sessionDir, ticket.id, {
           ...options,
           runnerMode,
@@ -174,14 +262,8 @@ async function runSequentialWithLease(
         // Done. Route it through the same failure-mode handling as a genuine failure so a
         // ticket is only ever marked Done when the oracle accepted it.
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} not completed: oracle refusal ${result.reason ?? result.status}`);
-        const recovery = decideTicketRecovery({
-          failureKind: 'oracle_refusal',
-          failureMode,
-          attempt: attempts,
-          maxAttempts,
-          stopReason: shouldStop(manager.read(statePath)),
-          circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
-        });
+        const refusalMessage = `oracle refusal ${result.reason ?? result.status}`;
+        const recovery = decideRecovery('oracle_refusal', refusalMessage);
         if (recovery.action === 'retry') {
           continue;
         }
@@ -217,14 +299,8 @@ async function runSequentialWithLease(
           break;
         }
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} failed on attempt ${attempts}: ${error instanceof Error ? error.message : String(error)}`);
-        const recovery = decideTicketRecovery({
-          failureKind: 'worker_failure',
-          failureMode,
-          attempt: attempts,
-          maxAttempts,
-          stopReason: shouldStop(manager.read(statePath)),
-          circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
-        });
+        const failureMessage = error instanceof Error ? error.message : String(error);
+        const recovery = decideRecovery('worker_failure', failureMessage, error);
         if (recovery.action === 'retry') {
           continue;
         }
@@ -293,7 +369,7 @@ export async function runSequential(
 async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
-    throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
+    throw new Error('Usage: node bin/mux-runner.js <session-dir> [--on-failure=abort|skip|retry-once|retry]');
   }
   const exitReason = await runSequential(sessionDir, {
     onFailure: parseFailureMode(argv),

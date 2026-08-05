@@ -26,6 +26,7 @@ import {
 } from '../services/git-utils.js';
 import { buildTicketPhasePrompt } from '../services/prompts.js';
 import {
+  archiveWorkerLifecycleRefusal,
   prepareWorkerLifecycleArtifact,
   readAndValidateWorkerLifecycleArtifact,
   workerLifecycleArtifactPath,
@@ -347,6 +348,13 @@ function repositoryMutationFingerprint(workingDir: string): string {
   });
 }
 
+function repositoryRemediationIdentity(workingDir: string): string {
+  return JSON.stringify({
+    status: isGitRepo(workingDir) ? getWorkingTreeStatus(workingDir) : null,
+    files: getWorkingTreeFingerprint(workingDir),
+  });
+}
+
 function workerGateFailureKind(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (message.startsWith('scope-violation:')) return 'scope_violation';
@@ -373,8 +381,9 @@ function restoreRejectedWorkerMutation(
   ticketId: string,
   boundary: WorkerMutationBoundary,
   runnerMode: string | null,
-): void {
-  if (!isGitRepo(workingDir) || repositoryMutationFingerprint(workingDir) === boundary.fingerprint) return;
+): string | null {
+  if (!isGitRepo(workingDir) || repositoryMutationFingerprint(workingDir) === boundary.fingerprint) return null;
+  const remediationIdentity = repositoryRemediationIdentity(workingDir);
   recoverableHardReset({
     workingDir,
     sessionDir,
@@ -387,6 +396,7 @@ function restoreRejectedWorkerMutation(
   if (repositoryMutationFingerprint(workingDir) !== boundary.fingerprint) {
     throw new Error('worker-rollback-failed: rejected worker changes were anchored, but the original repository boundary was not restored');
   }
+  return remediationIdentity;
 }
 
 interface AutoCommitDetachedTicketChangesInput {
@@ -963,7 +973,13 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       }
       atomicWriteJson(artifactPath, acceptedArtifact);
       if (acceptedArtifact.verdict === 'changes_requested') {
-        throw new WorkerLifecycleRefusalError(phase, artifactPath, acceptedArtifact);
+        const refusalPath = archiveWorkerLifecycleRefusal(
+          sessionDir,
+          normalizedTicketId,
+          phase,
+          acceptedArtifact,
+        );
+        throw new WorkerLifecycleRefusalError(phase, refusalPath, acceptedArtifact);
       }
       lifecycleArtifacts.push(acceptedArtifact);
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
@@ -1140,13 +1156,16 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     let rollbackFailed = false;
     if (mutationBoundary) {
       try {
-        restoreRejectedWorkerMutation(
+        const remediationIdentity = restoreRejectedWorkerMutation(
           workingDir,
           sessionDir,
           normalizedTicketId,
           mutationBoundary,
           runnerMode,
         );
+        if (handledError instanceof WorkerLifecycleRefusalError) {
+          handledError.remediationIdentity = remediationIdentity;
+        }
       } catch (rollbackError) {
         rollbackFailed = true;
         handledError = new AggregateError(

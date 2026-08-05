@@ -10,6 +10,7 @@ import { runSequential } from '../bin/mux-runner.js';
 import { StateManager } from '../services/state-manager.js';
 import { updateTicketStatus } from '../services/tickets.js';
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
+import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 
 function createSessionWithTodoTicket(taskLabel) {
   const dataRoot = makeTempRoot();
@@ -139,6 +140,79 @@ test('mux-runner retries an oracle-refused ticket once then aborts under on-fail
   assert.equal(finalReason, 'error');
   assert.doesNotMatch(log, /completed ticket r1/);
   assert.notEqual(ticket.status, 'Done');
+});
+
+test('mux-runner adaptive recovery continues when review findings or remediation content change', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive changed-lineage task');
+  let calls = 0;
+  const attempts = [
+    { finding: 'first blocker', remediation: 'tree-a' },
+    { finding: 'second blocker', remediation: 'tree-a' },
+    { finding: 'second blocker', remediation: 'tree-b' },
+  ];
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        if (calls <= attempts.length) {
+          const artifact = {
+            schema_version: 1,
+            phase: 'review',
+            ticket_id: 'r1',
+            summary: 'Review requested changes.',
+            verdict: 'changes_requested',
+            findings: [attempts[calls - 1].finding],
+          };
+          const refusal = new WorkerLifecycleRefusalError('review', `/evidence/${calls}.json`, artifact);
+          refusal.remediationIdentity = attempts[calls - 1].remediation;
+          throw refusal;
+        }
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 4);
+  const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
+  assert.deepEqual(history.events.map((event) => event.changed_lineage), [true, true, true]);
+});
+
+test('mux-runner adaptive recovery opens the circuit only after repeated unchanged findings', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive unchanged-lineage task');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: { circuit_breaker: { same_error_threshold: 3 } },
+  });
+  let calls = 0;
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        const artifact = {
+          schema_version: 1,
+          phase: 'review',
+          ticket_id: 'r1',
+          summary: 'Review requested changes.',
+          verdict: 'changes_requested',
+          findings: ['unchanged blocker'],
+        };
+        throw new WorkerLifecycleRefusalError('review', `/evidence/${calls}.json`, artifact);
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'circuit_open');
+  assert.equal(calls, 3);
+  const circuit = JSON.parse(fs.readFileSync(path.join(sessionDir, 'circuit_breaker.json'), 'utf8'));
+  assert.equal(circuit.state, 'OPEN');
+  const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
+  assert.deepEqual(history.events.map((event) => event.consecutive_same_lineage), [1, 2, 3]);
 });
 
 test('mux-runner refuses ticket execution while the circuit is OPEN', async () => {

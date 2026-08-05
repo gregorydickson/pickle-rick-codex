@@ -250,8 +250,10 @@ node ~/.codex/pickle-rick/extension/bin/anatomy-park.js <target>
 node ~/.codex/pickle-rick/extension/bin/setup.js "<task>"
 node ~/.codex/pickle-rick/extension/bin/draft-prd.js <session-dir> "<task>"
 node ~/.codex/pickle-rick/extension/bin/spawn-refinement-team.js <session-dir>
-node ~/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry-once
+node ~/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry
 ```
+
+Detached Pickle runs use adaptive recovery by default. Review refusals are archived append-only, changed finding lineages receive a fresh bounded remediation window, and identical lineages stop only when the persisted stagnation/circuit safeguard is exhausted. Cancellation, global time/iteration limits, verification-contract failures, and verified unsafe or corrupt recovery state still fail closed.
 
 Support commands:
 

@@ -98,6 +98,24 @@ export function resetCircuitBreaker(sessionDir: string, reason = 'manual reset')
   return circuitState;
 }
 
+export function recordCircuitProgress(sessionDir: string, reason: string): CircuitState {
+  const circuitState = loadCircuitState(sessionDir);
+  circuitState.consecutive_no_progress = 0;
+  circuitState.consecutive_same_error = 0;
+  circuitState.last_error_signature = null;
+  recordTransition(circuitState, 'CLOSED', reason);
+  saveCircuitState(sessionDir, circuitState);
+  return circuitState;
+}
+
+export function openCircuitBreaker(sessionDir: string, reason: string, errorSignature: string | null = null): CircuitState {
+  const circuitState = loadCircuitState(sessionDir);
+  circuitState.last_error_signature = errorSignature;
+  recordTransition(circuitState, 'OPEN', reason);
+  saveCircuitState(sessionDir, circuitState);
+  return circuitState;
+}
+
 export function recordIteration(
   sessionDir: string,
   state: CircuitIterationState,

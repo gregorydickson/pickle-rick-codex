@@ -31,7 +31,7 @@ function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
   if (!modeArg) return 'abort';
   const mode = modeArg.split('=')[1] ?? '';
-  if (!['abort', 'skip', 'retry-once'].includes(mode)) {
+  if (!['abort', 'skip', 'retry-once', 'retry'].includes(mode)) {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
@@ -241,7 +241,7 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
 async function main(argv: string[]): Promise<void> {
   const sessionDir = argv.find((arg) => !arg.startsWith('--'));
   if (!sessionDir) {
-    throw new Error('Usage: node bin/pipeline-runner.js <session-dir> [--on-failure=abort|skip|retry-once]');
+    throw new Error('Usage: node bin/pipeline-runner.js <session-dir> [--on-failure=abort|skip|retry-once|retry]');
   }
   const exitReason = await runPipeline(sessionDir, {
     onFailure: parseFailureMode(argv),

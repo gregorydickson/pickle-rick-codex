@@ -9,7 +9,7 @@ metadata:
 
 Run:
 
-`node $HOME/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry-once`
+`node $HOME/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir> --on-failure=retry`
 
 ## Loop Engine
 
@@ -24,3 +24,4 @@ For each ticket in manifest order:
 - `--on-failure=abort` stops at the first failed ticket
 - `--on-failure=skip` marks the ticket skipped and continues
 - `--on-failure=retry-once` retries the ticket once, then aborts on repeat failure
+- `--on-failure=retry` keeps recovering while failure lineage changes and stops only at a global or verified stagnation safeguard

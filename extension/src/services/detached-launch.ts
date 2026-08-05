@@ -311,7 +311,7 @@ function uniqueCwds(values: unknown[]): string[] {
 export async function launchDetachedLoop({
   setupArgs,
   loopConfig,
-  onFailure = 'retry-once',
+  onFailure = 'retry',
   banner = 'Detached loop launched.',
   sessionCwd = null,
   sessionMapCwd = null,

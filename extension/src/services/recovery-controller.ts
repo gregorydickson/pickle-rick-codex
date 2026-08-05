@@ -1,3 +1,10 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { normalizeErrorSignature } from './circuit-breaker.js';
+import { atomicWriteJson } from './pickle-utils.js';
+import type { WorkerLifecycleArtifact, WorkerLifecyclePhase } from './worker-lifecycle.js';
+
 export type TicketFailureKind =
   | 'oracle_refusal'
   | 'worker_failure'
@@ -14,6 +21,7 @@ export interface TicketRecoveryInput {
   stopReason?: string | null;
   circuitOpen?: boolean;
   failureExitReason?: string;
+  adaptiveExhausted?: boolean;
 }
 
 export interface TicketRecoveryDecision {
@@ -22,10 +30,186 @@ export interface TicketRecoveryDecision {
   reason: string;
 }
 
+export interface TicketRecoveryFailureIdentity {
+  signature: string;
+  phase: WorkerLifecyclePhase | null;
+  evidencePath: string | null;
+  remediationIdentity: string | null;
+}
+
+export interface TicketRecoveryEvent {
+  sequence: number;
+  ticket_id: string;
+  failure_kind: TicketFailureKind;
+  signature: string;
+  phase: WorkerLifecyclePhase | null;
+  evidence_path: string | null;
+  remediation_identity: string | null;
+  changed_lineage: boolean;
+  consecutive_same_lineage: number;
+  recorded_at: string;
+}
+
+interface TicketRecoveryHistory {
+  schema_version: 1;
+  events: TicketRecoveryEvent[];
+}
+
+const TICKET_RECOVERY_HISTORY_FILE = 'ticket-recovery-history.json';
+
+function normalizedStrings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+      .filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
+      .map(normalizeFindingIdentity)
+      .sort()
+    : [];
+}
+
+function normalizeFindingIdentity(value: unknown): string {
+  return String(value || '')
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g, '<TIME>')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<UUID>')
+    .replace(/:\d+(?:-\d+)?/g, ':<LOC>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+export function buildTicketRecoveryFailureIdentity(input: {
+  failureKind: TicketFailureKind;
+  message: string;
+  phase?: WorkerLifecyclePhase | null;
+  artifact?: WorkerLifecycleArtifact | null;
+  evidencePath?: string | null;
+  remediationIdentity?: string | null;
+}): TicketRecoveryFailureIdentity {
+  const failedCriteria = Array.isArray(input.artifact?.acceptance_criteria)
+    ? input.artifact.acceptance_criteria
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry))
+      .filter((entry) => entry.status === 'fail')
+      .map((entry) => normalizeFindingIdentity(entry.criterion))
+      .sort()
+    : [];
+  const findings = normalizedStrings(input.artifact?.findings);
+  const payload = {
+    failure_kind: input.failureKind,
+    phase: input.phase || null,
+    verdict: typeof input.artifact?.verdict === 'string' ? input.artifact.verdict : null,
+    findings,
+    failed_criteria: failedCriteria,
+    remediation_identity: input.remediationIdentity || null,
+    fallback: findings.length === 0 && failedCriteria.length === 0
+      ? normalizeErrorSignature(input.message)
+      : null,
+  };
+  return {
+    signature: crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex'),
+    phase: input.phase || null,
+    evidencePath: input.evidencePath || null,
+    remediationIdentity: input.remediationIdentity || null,
+  };
+}
+
+function recoveryHistoryPath(sessionDir: string): string {
+  return path.join(sessionDir, TICKET_RECOVERY_HISTORY_FILE);
+}
+
+function validateRecoveryHistory(value: unknown): TicketRecoveryHistory {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('ticket-recovery-corrupt: history must be an object');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.schema_version !== 1 || !Array.isArray(candidate.events)) {
+    throw new Error('ticket-recovery-corrupt: unsupported history schema');
+  }
+  const failureKinds = new Set<TicketFailureKind>(['oracle_refusal', 'worker_failure', 'preflight', 'verification_contract']);
+  const lifecyclePhases = new Set<WorkerLifecyclePhase>([
+    'research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'simplify', 'conformance',
+  ]);
+  const latestByTicket = new Map<string, TicketRecoveryEvent>();
+  for (let index = 0; index < candidate.events.length; index += 1) {
+    const event = candidate.events[index] as Record<string, unknown> | null;
+    if (
+      !event
+      || event.sequence !== index + 1
+      || typeof event.ticket_id !== 'string' || !event.ticket_id.trim()
+      || !failureKinds.has(event.failure_kind as TicketFailureKind)
+      || !/^[0-9a-f]{64}$/.test(String(event.signature || ''))
+      || (event.phase !== null && !lifecyclePhases.has(event.phase as WorkerLifecyclePhase))
+      || (event.evidence_path !== null && typeof event.evidence_path !== 'string')
+      || (event.remediation_identity !== null && typeof event.remediation_identity !== 'string')
+      || typeof event.changed_lineage !== 'boolean'
+      || !Number.isInteger(event.consecutive_same_lineage)
+      || Number(event.consecutive_same_lineage) < 1
+      || typeof event.recorded_at !== 'string' || !Number.isFinite(Date.parse(event.recorded_at))
+    ) {
+      throw new Error(`ticket-recovery-corrupt: invalid event at index ${index}`);
+    }
+    const typedEvent = event as unknown as TicketRecoveryEvent;
+    const previous = latestByTicket.get(typedEvent.ticket_id) || null;
+    const expectedChanged = previous === null || previous.signature !== typedEvent.signature;
+    const expectedConsecutive = expectedChanged ? 1 : previous.consecutive_same_lineage + 1;
+    if (
+      typedEvent.changed_lineage !== expectedChanged
+      || typedEvent.consecutive_same_lineage !== expectedConsecutive
+    ) {
+      throw new Error(`ticket-recovery-corrupt: lineage counters regress at index ${index}`);
+    }
+    latestByTicket.set(typedEvent.ticket_id, typedEvent);
+  }
+  return candidate as unknown as TicketRecoveryHistory;
+}
+
+function readRecoveryHistory(sessionDir: string): TicketRecoveryHistory {
+  const filePath = recoveryHistoryPath(sessionDir);
+  if (!fs.existsSync(filePath)) return { schema_version: 1, events: [] };
+  try {
+    return validateRecoveryHistory(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('ticket-recovery-corrupt:')) throw error;
+    throw new Error(
+      `ticket-recovery-corrupt: history is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+export function recordTicketRecoveryFailure(input: {
+  sessionDir: string;
+  ticketId: string;
+  failureKind: TicketFailureKind;
+  identity: TicketRecoveryFailureIdentity;
+}): TicketRecoveryEvent {
+  const history = readRecoveryHistory(input.sessionDir);
+  const previous = [...history.events].reverse().find((event) => event.ticket_id === input.ticketId) || null;
+  const changedLineage = previous === null || previous.signature !== input.identity.signature;
+  const event: TicketRecoveryEvent = {
+    sequence: history.events.length + 1,
+    ticket_id: input.ticketId,
+    failure_kind: input.failureKind,
+    signature: input.identity.signature,
+    phase: input.identity.phase,
+    evidence_path: input.identity.evidencePath,
+    remediation_identity: input.identity.remediationIdentity,
+    changed_lineage: changedLineage,
+    consecutive_same_lineage: changedLineage ? 1 : previous.consecutive_same_lineage + 1,
+    recorded_at: new Date().toISOString(),
+  };
+  const next: TicketRecoveryHistory = { schema_version: 1, events: [...history.events, event] };
+  atomicWriteJson(recoveryHistoryPath(input.sessionDir), next);
+  const persisted = readRecoveryHistory(input.sessionDir);
+  const persistedEvent = persisted.events.at(-1);
+  if (!persistedEvent || JSON.stringify(persistedEvent) !== JSON.stringify(event)) {
+    throw new Error('ticket-recovery-corrupt: appended event failed read-back validation');
+  }
+  return event;
+}
+
 /**
- * A deliberately small, bounded recovery ladder. Safety/contract failures are
- * terminal, an open circuit refuses more work, and retry-once can schedule at
- * most the caller-provided attempt bound. Budgets always win over retry.
+ * Safety/contract failures are terminal and global safeguards always win.
+ * Explicit retry-once remains bounded for compatibility; adaptive retry is
+ * bounded by its durable unchanged-lineage circuit rather than an attempt count.
  */
 export function decideTicketRecovery(input: TicketRecoveryInput): TicketRecoveryDecision {
   const failureExitReason = input.failureExitReason || 'error';
@@ -37,6 +221,11 @@ export function decideTicketRecovery(input: TicketRecoveryInput): TicketRecovery
   }
   if (input.stopReason === 'max_time' || input.stopReason === 'max_iterations') {
     return { action: 'abort', exitReason: failureExitReason, reason: `${input.stopReason} prevents recovery` };
+  }
+  if (input.failureMode === 'retry') {
+    return input.adaptiveExhausted
+      ? { action: 'abort', exitReason: 'circuit_open', reason: 'unchanged recovery lineage exhausted the circuit safeguard' }
+      : { action: 'retry', exitReason: null, reason: 'adaptive recovery remains safe' };
   }
   if (input.failureMode === 'retry-once' && input.attempt < input.maxAttempts) {
     return { action: 'retry', exitReason: null, reason: 'bounded retry available' };

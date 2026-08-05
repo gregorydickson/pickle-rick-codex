@@ -900,6 +900,7 @@ test('pickle-tmux bootstraps from --prd, refines, and launches detached tmux', (
   assert.equal(logLines[0][0], '-V');
   assert.ok(logLines.some((args) => args[0] === 'new-session'));
   assert.ok(logLines.some((args) => args[0] === 'send-keys'));
+  assert.ok(logLines.some((args) => /--on-failure=retry(?:\s|$)/.test(args.join(' '))));
   assert.ok(logLines.some((args) => args[0] === 'select-window'));
 });
 

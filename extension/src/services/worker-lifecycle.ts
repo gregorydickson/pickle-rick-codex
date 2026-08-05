@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { atomicWriteJson } from './pickle-utils.js';
 
 export const WORKER_LIFECYCLE_PHASES = [
   'research',
@@ -27,6 +28,7 @@ export class WorkerLifecycleRefusalError extends Error {
   readonly phase: WorkerLifecyclePhase;
   readonly artifactPath: string;
   readonly artifact: WorkerLifecycleArtifact;
+  remediationIdentity: string | null = null;
 
   constructor(
     phase: WorkerLifecyclePhase,
@@ -73,6 +75,23 @@ export function workerLifecycleArtifactPath(
   phase: WorkerLifecyclePhase,
 ): string {
   return path.join(sessionDir, 'worker-lifecycle', ticketId, `${phase}.json`);
+}
+
+export function archiveWorkerLifecycleRefusal(
+  sessionDir: string,
+  ticketId: string,
+  phase: WorkerLifecyclePhase,
+  artifact: WorkerLifecycleArtifact,
+): string {
+  const archiveDir = path.join(sessionDir, 'worker-lifecycle-refusals', ticketId);
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  const priorSequences = fs.readdirSync(archiveDir)
+    .map((name) => Number.parseInt(name.match(/^(\d+)-/)?.[1] || '', 10))
+    .filter(Number.isSafeInteger);
+  const sequence = (priorSequences.length > 0 ? Math.max(...priorSequences) : 0) + 1;
+  const archivePath = path.join(archiveDir, `${String(sequence).padStart(4, '0')}-${phase}.json`);
+  atomicWriteJson(archivePath, artifact);
+  return archivePath;
 }
 
 export function prepareWorkerLifecycleArtifact(filePath: string): void {

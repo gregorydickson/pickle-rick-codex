@@ -37,9 +37,9 @@ interface PickleTmuxArgs {
 
 function parseFailureMode(argv: string[]): string {
   const modeArg = argv.find((arg) => arg.startsWith('--on-failure='));
-  if (!modeArg) return 'retry-once';
+  if (!modeArg) return 'retry';
   const [, mode] = modeArg.split('=');
-  if (!['abort', 'skip', 'retry-once'].includes(mode)) {
+  if (!['abort', 'skip', 'retry-once', 'retry'].includes(mode)) {
     throw new Error(`Invalid on-failure mode: ${mode}`);
   }
   return mode;
@@ -96,9 +96,9 @@ function parseArgs(argv: string[]): PickleTmuxArgs {
 function usage(): string {
   return [
     'Usage:',
-    '  node bin/pickle-tmux.js --prd path/to/prd.md [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
-    '  node bin/pickle-tmux.js --bootstrap-from path/to/prd.md [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
-    '  node bin/pickle-tmux.js --resume [SESSION_DIR] [--resume-ready-only] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once]',
+    '  node bin/pickle-tmux.js --prd path/to/prd.md [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once|retry]',
+    '  node bin/pickle-tmux.js --bootstrap-from path/to/prd.md [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once|retry]',
+    '  node bin/pickle-tmux.js --resume [SESSION_DIR] [--resume-ready-only] [--worker-timeout S] [--max-time M] [--on-failure=abort|skip|retry-once|retry]',
   ].join('\n');
 }
 

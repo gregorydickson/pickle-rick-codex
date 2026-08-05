@@ -213,6 +213,13 @@ test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings i
   const refusedArtifact = JSON.parse(fs.readFileSync(refusalPath, 'utf8'));
   assert.equal(refusedArtifact.verdict, 'changes_requested');
   assert.deepEqual(refusedArtifact.findings, ['retry dispatch is not repository-bound']);
+  const refusalArchiveDir = path.join(sessionDir, 'worker-lifecycle-refusals', 'r1');
+  const archivedRefusals = fs.readdirSync(refusalArchiveDir);
+  assert.deepEqual(archivedRefusals, [`0001-${refusalPhase}.json`]);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(refusalArchiveDir, archivedRefusals[0]), 'utf8')),
+    refusedArtifact,
+  );
   assert.equal(git(projectDir, ['rev-parse', 'HEAD']), baseline);
   assert.equal(git(projectDir, ['status', '--porcelain']), '');
 
