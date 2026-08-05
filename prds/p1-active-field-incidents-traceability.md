@@ -6,17 +6,17 @@ This document freezes the implementation contract for the P1 drain before runtim
 - `prds/p1-quality-delta-and-grounded-conformance-field-incident.md` (`QD`)
 - `prds/p1-field-run-bootstrap-contract-gaps.md` (`BS`)
 
-The requirement and acceptance-criterion text in those three source PRDs is immutable during implementation. Ticket `p1r-014` may change only status and completion-evidence sections after proof is complete.
+The exact Requirements and Acceptance Criteria text in those three source PRDs is immutable during implementation. This audit records current-source observations; revisions in older reports are observations, not pins. Only after composed `P13` proof passes may ticket `p1r-014` change source-PRD status and completion-evidence sections, while preserving that normative text verbatim.
 
 ## Execution-base repository condition
 
-- Observed execution-start `HEAD`: `82bbe93f432a95bad9735bf6a5b2d88421a6c17a`.
-- `HEAD`, local `main`, `origin/main`, and `origin/HEAD` all resolved to that revision at execution start, and `git rev-list --left-right --count origin/main...HEAD` returned `0 0`; the repository was synchronized.
-- The index and worktree were clean before `p1r-001`: `git status --short --branch` produced only `## main...origin/main`, and tracked, staged, and final porcelain inspections were empty.
-- This revision is observed audit evidence for this execution, not a fixed or prescribed manifest SHA. Future executions must record their actual clean, synchronized starting revision rather than require this value.
-- Current main includes the lifecycle-refusal work in `82bbe93` (`fix: preserve lifecycle refusal feedback`): validated and persisted `changes_requested` artifacts, typed refusal propagation, and forwarding of the newest refusal evidence into later worker prompts. That is partial recovery coverage because a retry still restarts the ordered lifecycle at research instead of resuming only the affected implementation-side phases.
+- Actual execution-start `HEAD`: `536aecbbff83733fddc212b7e4a6576db3ae455a`.
+- At execution start, `HEAD`, local `main`, `origin/main`, `origin/HEAD`, and configured upstream `@{upstream}` all resolved to that revision. Branch `main` tracked `origin/main`, and `git rev-list --left-right --count origin/main...HEAD` returned `0 0` (zero behind, zero ahead).
+- Before mutation, the index and worktree were clean: `git status --porcelain=v1`, `git diff --name-only`, and `git diff --cached --name-only` were empty, and both worktree and index diff checks returned zero. `git status --short --branch` produced only `## main...origin/main`.
+- This SHA is execution evidence, not a fixed or prescribed historical base. The previously recorded `82bbe93f432a95bad9735bf6a5b2d88421a6c17a` ledger revision and `9bb9a8d08dfd2bf7f0e495c63c3583c77cf2a70e` report revision were valid observations of older executions, not pins that this execution was required to use.
+- Coverage below comes from inspection of current source and regression tests, not from commit subjects. Current main retains validated and persisted `changes_requested` artifacts, typed refusal propagation, and forwarding of the newest refusal evidence into later worker prompts. That supplies partial refusal-remediation coverage, but retry still lacks the complete checkpointed implementation-side recovery contract.
 
-Coverage states below describe the actual execution base: **partial** means correct behavior exists but the frozen contract is incomplete; **uncovered** means the required contract/proof is not yet present; **preserve + gap** means relevant archive/rollback behavior exists but the receipt-grounded remediation contract does not.
+Coverage states below describe the actual execution base: **preserve** means an already-correct seam must survive downstream work although adjacent obligations remain; **partial** means correct behavior exists but the frozen contract is incomplete; **uncovered** means the required contract/proof is not yet present. Notes such as contradictory or final-parity obligation explain a gap without creating another classification.
 
 ## Deterministic proof catalog
 
@@ -47,7 +47,7 @@ Every matrix proof key expands to these exact commands. Typecheck and lint in `P
 | `AR-R1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-R2` | `p1r-002`, `p1r-005` | uncovered | `P02` + `P05` + composed `P13` |
 | `AR-R3` | `p1r-011` | partial | `P11` + composed `P13` |
-| `AR-R4` | `p1r-002`, `p1r-004`, `p1r-005`, `p1r-011` | uncovered | `P02` + `P04` + `P05` + `P11` + composed `P13` |
+| `AR-R4` | `p1r-002`, `p1r-004`, `p1r-005`, `p1r-011` | partial | `P02` + `P04` + `P05` + `P11` + composed `P13` |
 | `AR-AC1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-AC2` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `AR-AC3` | `p1r-002`, `p1r-005` | uncovered | `P02` + `P05` + composed `P13` |
@@ -63,7 +63,7 @@ Every matrix proof key expands to these exact commands. Typecheck and lint in `P
 | `QD-R4` | `p1r-009` | uncovered | `P09` + composed `P13` |
 | `QD-R5` | `p1r-010` | uncovered | `P10` + composed `P13` |
 | `QD-R6` | `p1r-010` | uncovered | `P10` + composed `P13` |
-| `QD-R7` | `p1r-010`, `p1r-011` | preserve + gap | `P10` + `P11` + composed `P13` |
+| `QD-R7` | `p1r-010`, `p1r-011` | preserve | `P10` + `P11` + composed `P13` |
 | `QD-AC1` | `p1r-007` | uncovered | `P07` + composed `P13` |
 | `QD-AC2` | `p1r-007` | uncovered | `P07` + composed `P13` |
 | `QD-AC3` | `p1r-008` | uncovered | `P08` + composed `P13` |
@@ -72,7 +72,7 @@ Every matrix proof key expands to these exact commands. Typecheck and lint in `P
 | `QD-AC6` | `p1r-010` | uncovered | `P10` + composed `P13` |
 | `QD-AC7` | `p1r-010` | uncovered | `P10` + composed `P13` |
 | `QD-AC8` | `p1r-010` | uncovered | `P10` + composed `P13` |
-| `QD-AC9` | `p1r-013` | uncovered final-parity obligation | `P13` |
+| `QD-AC9` | `p1r-013` | uncovered (final-parity obligation) | targeted `P13` + composed `P13` |
 
 ### Bootstrap and detached startup (`BS`)
 
@@ -80,16 +80,16 @@ Every matrix proof key expands to these exact commands. Typecheck and lint in `P
 | --- | --- | --- | --- |
 | `BS-R1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `BS-R2` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
-| `BS-R3` | `p1r-006` | uncovered/contradictory | `P06` + composed `P13` |
-| `BS-R4` | `p1r-006` | uncovered/contradictory | `P06` + composed `P13` |
+| `BS-R3` | `p1r-006` | uncovered (current source is contradictory) | `P06` + composed `P13` |
+| `BS-R4` | `p1r-006` | uncovered (current source is contradictory) | `P06` + composed `P13` |
 | `BS-R5` | `p1r-012` | uncovered | `P12` + composed `P13` |
 | `BS-AC1` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
 | `BS-AC2` | `p1r-003`, `p1r-004` | partial | `P03` + `P04` + composed `P13` |
-| `BS-AC3` | `p1r-006` | uncovered/contradictory | `P06` + composed `P13` |
+| `BS-AC3` | `p1r-006` | uncovered (current source is contradictory) | `P06` + composed `P13` |
 | `BS-AC4` | `p1r-012` | uncovered | `P12` + composed `P13` |
-| `BS-AC5` | `p1r-013` | uncovered final-parity obligation | `P13` |
-| `BS-AC6` | `p1r-013` | uncovered final-parity obligation | `P13` |
-| `BS-AC7` | `p1r-013` | uncovered final-parity obligation | `P13` |
+| `BS-AC5` | `p1r-013` | uncovered (final-parity obligation) | targeted `P13` + composed `P13` |
+| `BS-AC6` | `p1r-013` | uncovered (final-parity obligation) | targeted `P13` + composed `P13` |
+| `BS-AC7` | `p1r-013` | uncovered (final-parity obligation) | targeted `P13` + composed `P13` |
 
 Every row names composed end-to-end parity proof under `P13`, owned by `p1r-013`. After that proof passes, `p1r-014` owns `P14` status/evidence closure. The refinement dependency graph makes every `p1r-002` through `p1r-014` ticket depend directly or transitively on this `p1r-001` decision record.
 
@@ -120,7 +120,9 @@ These are correct starting seams, not blank-slate implementation invitations:
 - `extension/src/services/execution-gate.ts` already emits typed non-green `absent` when no quality commands exist, while failure identity still depends on normalized raw transcript lines. `p1r-006` preserves the absent state and `p1r-007` hardens diagnostic identity.
 - Rejected-mutation archival and rollback already exist. `p1r-010` and `p1r-011` must preserve that machinery while binding it to authenticated receipts and evidence-carrying refusal remediation.
 - Worker lifecycle refusal handling already validates and persists evidence-bearing `changes_requested` artifacts, raises a typed `WorkerLifecycleRefusalError`, and forwards the newest refusal artifact as remediation feedback. `p1r-011` must preserve that plumbing while adding checkpointed recovery and attempt accounting so a refusal re-enters the affected implementation-side phases instead of consuming another identical full research-to-conformance attempt.
+- `extension/src/bin/spawn-morty.ts` now gives missing or invalid read-only lifecycle artifacts one bounded same-phase recovery attempt only when the repository-mutation fingerprint is unchanged. It archives the candidate artifact, last message, and metadata beneath `worker-lifecycle-failures` and feeds the validator diagnostic back to the retry; writable phases remain single-attempt. `extension/tests/worker-lifecycle.test.js` proves the malformed-conformance case, the one extra invocation, archival, retained implementation, and correction feedback. This source-inspected behavior advances `AR-R4` to partial and is part of the `QD-R7` preserve seam, but it does not provide full typed recovery history, receipt-grounded refusal, structured quality comparison, action/next-checkpoint history, or the required terminal-stop policy.
+- `extension/src/services/verification-env.ts` masks quotes, comments, and escapes; recognizes only structurally complete simple shell `for` loops; and suppresses the bound variable only inside the loop body, failing closed when syntax is ambiguous. `extension/tests/verification-preflight.test.js` proves that a loop-local `id` is not inferred as required while `TRACEABILITY_FILE` is, and that word-list/post-loop, non-loop, subshell-external, quoted, and Unicode-prefixed lookalikes remain required. This is an already-landed verification-preflight preserve seam; it does not reclassify `QD-R4`, bootstrap path grammar, receipt, or composed-proof obligations.
 
 ## Closure guard
 
-This ticket creates only this audit. It does not alter the three normative source PRDs. Final closure remains blocked until `P13` and `P14` pass and the final diff proves their normative requirement and acceptance-criterion text unchanged.
+This ticket changes only this ledger and `reports/p1r-001-execution-base-audit.md`. It does not alter the three normative source PRDs. Their exact Requirements and Acceptance Criteria text remains verbatim; any later source-PRD edit is limited to status and completion evidence after composed `P13` proof. Final closure remains blocked until `P13` and `P14` pass and the final diff proves that normative text unchanged.
