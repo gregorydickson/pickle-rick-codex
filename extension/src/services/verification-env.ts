@@ -614,6 +614,76 @@ function inferLocallyAssignedEnvNames(command: string): Set<string> {
   return assigned;
 }
 
+interface ShellForLoopBinding {
+  name: string;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
+function maskQuotedShellSyntax(command: string): string {
+  const masked = command.split('');
+  let quote: "'" | '"' | null = null;
+  let comment = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (comment) {
+      if (character === '\n') {
+        comment = false;
+      } else {
+        masked[index] = ' ';
+      }
+      continue;
+    }
+    if (quote) {
+      masked[index] = ' ';
+      if (character === '\\' && quote === '"' && index + 1 < command.length) {
+        masked[index + 1] = ' ';
+        index += 1;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      masked[index] = ' ';
+      continue;
+    }
+    if (character === '\\' && index + 1 < command.length) {
+      masked[index] = ' ';
+      masked[index + 1] = ' ';
+      index += 1;
+      continue;
+    }
+    if (character === '#' && (index === 0 || /\s|[;&|()]/.test(command[index - 1]))) {
+      comment = true;
+      masked[index] = ' ';
+    }
+  }
+  return masked.join('');
+}
+
+function inferShellForLoopBindings(command: string): ShellForLoopBinding[] {
+  const bindings: ShellForLoopBinding[] = [];
+  const syntax = maskQuotedShellSyntax(command);
+  // Deliberately recognize only a simple, structurally complete shell loop. If
+  // parsing is ambiguous, fail closed and leave the variable externally required.
+  const openingPattern = /(?:^|[;&|()]\s*)for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b[^;\n]*(?:;|\n)\s*do(?:\s|$)/g;
+  let opening: RegExpExecArray | null;
+  while ((opening = openingPattern.exec(syntax)) !== null) {
+    const bodyStart = opening.index + opening[0].length;
+    const closing = /(?:;|\n)\s*done(?=\s*(?:[;&|)]|$))/.exec(syntax.slice(bodyStart));
+    if (!closing) continue;
+    bindings.push({
+      name: opening[1],
+      bodyStart,
+      bodyEnd: bodyStart + closing.index,
+    });
+    openingPattern.lastIndex = bodyStart + closing.index + closing[0].length;
+  }
+  return bindings;
+}
+
 function inferWrapperRequiredEnv(command: string): Set<string> {
   const inferred = new Set<string>();
   for (const rule of REPO_WRAPPER_ENV_RULES) {
@@ -636,6 +706,7 @@ function inferRequiredEnvFromVerificationCommands(
 
   for (const command of commands) {
     const locallyAssigned = inferLocallyAssignedEnvNames(command);
+    const loopBindings = inferShellForLoopBindings(command);
     for (const name of inferWrapperRequiredEnv(command)) {
       if (INFERRED_ENV_IGNORE_KEYS.has(name) || contractVars.has(name) || locallyAssigned.has(name)) {
         continue;
@@ -652,7 +723,10 @@ function inferRequiredEnvFromVerificationCommands(
       const expansionRest = match[2] || '';
       if (!name) continue;
       if (/^:?[-=?]/.test(expansionRest)) continue;
-      if (INFERRED_ENV_IGNORE_KEYS.has(name) || contractVars.has(name) || locallyAssigned.has(name)) {
+      const isLoopLocal = loopBindings.some((binding) => (
+        binding.name === name && match!.index >= binding.bodyStart && match!.index < binding.bodyEnd
+      ));
+      if (INFERRED_ENV_IGNORE_KEYS.has(name) || contractVars.has(name) || locallyAssigned.has(name) || isLoopLocal) {
         continue;
       }
       inferred.set(name, {

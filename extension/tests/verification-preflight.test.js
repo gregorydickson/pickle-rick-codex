@@ -2276,6 +2276,41 @@ test('resolveTicketVerificationContract ignores shell-default expansions when in
   assert.ok(!required.includes('CACHE_DIR'), `CACHE_DIR should not be required, got: ${required.join(', ')}`);
 });
 
+test('resolveTicketVerificationContract ignores shell for-loop bindings while retaining real external vars', () => {
+  const contract = resolveTicketVerificationContract({
+    ticket: {
+      verification: [
+        'for id in AR-R1 AR-R2; do rg -q "$id" "$TRACEABILITY_FILE" || exit 1; done',
+      ],
+    },
+    config: null,
+  });
+  const required = (contract?.required || []).map((entry) => entry.name);
+  assert.ok(!required.includes('id'), `loop-local id should not be required, got: ${required.join(', ')}`);
+  assert.ok(required.includes('TRACEABILITY_FILE'), `TRACEABILITY_FILE should be required, got: ${required.join(', ')}`);
+});
+
+test('resolveTicketVerificationContract retains loop-name references outside the loop body', () => {
+  const contract = resolveTicketVerificationContract({
+    ticket: {
+      verification: [
+        'for id in "$id"; do echo "$id"; done; test -n "$id"',
+        'printf "%s\\n" for item in docs; test -n "$item"',
+        '(for nested in one; do echo "$nested"; done); test -n "$nested"',
+        'echo ";for quoted in one; do $quoted; done"',
+        'echo 🥒 ";for unicode_quoted in one; do $unicode_quoted; done"',
+      ],
+    },
+    config: null,
+  });
+  const required = (contract?.required || []).map((entry) => entry.name);
+  assert.ok(required.includes('id'), `word-list and post-loop id should remain required, got: ${required.join(', ')}`);
+  assert.ok(required.includes('item'), `non-loop item should remain required, got: ${required.join(', ')}`);
+  assert.ok(required.includes('nested'), `subshell-local nested should remain required outside its loop, got: ${required.join(', ')}`);
+  assert.ok(required.includes('quoted'), `quoted loop-shaped text should not bind quoted, got: ${required.join(', ')}`);
+  assert.ok(required.includes('unicode_quoted'), `Unicode prefixes must not shift quote masking, got: ${required.join(', ')}`);
+});
+
 test('resolveTicketVerificationContract still infers real unbound variables without defaults', () => {
   const contract = resolveTicketVerificationContract({
     ticket: {
