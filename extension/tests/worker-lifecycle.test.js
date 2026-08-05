@@ -146,6 +146,47 @@ test('worker lifecycle persists eight validated phases and reads approved resear
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
 });
 
+test('worker lifecycle retries malformed read-only conformance output without discarding reviewed implementation', () => {
+  const fakeBin = makeTempRoot('pickle-worker-lifecycle-artifact-retry-bin-');
+  createFakeCodex(fakeBin);
+  const dataRoot = makeTempRoot();
+  const invocationLog = path.join(dataRoot, 'codex-invocations.jsonl');
+  const promptLog = makeTempRoot('pickle-worker-lifecycle-artifact-retry-prompts-');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'implemented\n',
+    FAKE_LIFECYCLE_INVALID_ONCE_PHASE: 'conformance',
+    FAKE_LIFECYCLE_PROMPT_LOG: promptLog,
+  });
+  const { projectDir, sessionDir, baseline } = setupLifecycleRun(env);
+
+  runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+
+  assert.notEqual(git(projectDir, ['rev-parse', 'HEAD']), baseline);
+  assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.args[0] === 'exec');
+  assert.equal(invocations.length, WORKER_LIFECYCLE_PHASES.length + 1);
+  const failureDir = path.join(sessionDir, 'worker-lifecycle-failures', 'r1');
+  const failureFiles = fs.readdirSync(failureDir);
+  const rawArtifact = failureFiles.find((file) => file.startsWith('conformance.') && file.endsWith('.artifact'));
+  const metadata = failureFiles.find((file) => file.startsWith('conformance.') && file.endsWith('.json'));
+  assert.ok(rawArtifact);
+  assert.ok(metadata);
+  assert.equal(fs.readFileSync(path.join(failureDir, rawArtifact), 'utf8'), '{invalid json');
+  assert.match(
+    JSON.parse(fs.readFileSync(path.join(failureDir, metadata), 'utf8')).error,
+    /conformance wrote invalid JSON/,
+  );
+  const retriedPrompt = fs.readFileSync(path.join(promptLog, 'conformance.prompt.txt'), 'utf8');
+  assert.match(retriedPrompt, /Prior artifact-contract attempt failed and must be corrected in this retry/);
+  assert.match(retriedPrompt, /conformance wrote invalid JSON/);
+});
+
 for (const refusalPhase of ['review', 'conformance']) {
 test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings into bounded remediation`, () => {
   const fakeBin = makeTempRoot('pickle-worker-lifecycle-refusal-bin-');

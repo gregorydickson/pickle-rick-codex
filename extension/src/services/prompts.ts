@@ -145,6 +145,7 @@ export interface TicketPhasePromptInput {
   artifactPath?: string;
   priorArtifacts?: WorkerLifecycleArtifact[];
   remediationFeedback?: WorkerLifecycleArtifact | null;
+  artifactRecoveryFeedback?: string | null;
   tmuxMode?: boolean;
 }
 
@@ -170,6 +171,7 @@ export function buildTicketPhasePrompt({
   artifactPath = `${sessionDir}/worker-lifecycle/${ticket.id}/${phase}.json`,
   priorArtifacts = [],
   remediationFeedback = null,
+  artifactRecoveryFeedback = null,
   tmuxMode = false,
 }: TicketPhasePromptInput): string {
   const verificationCommands = normalizeVerificationCommands(ticket?.verification, {
@@ -222,6 +224,9 @@ export function buildTicketPhasePrompt({
     `Approved causal context from earlier phases (read this forward; do not replace it with fresh assumptions):\n${serializeApprovedWorkerContext(priorArtifacts)}`,
     remediationFeedback
       ? `Prior rejected lifecycle feedback (remediation input, not approved causal context):\n${JSON.stringify(remediationFeedback, null, 2)}`
+      : null,
+    artifactRecoveryFeedback
+      ? `Prior artifact-contract attempt failed and must be corrected in this retry: ${artifactRecoveryFeedback}`
       : null,
     `Return <promise>${phase.toUpperCase()}_COMPLETE</promise> when this phase is finished.`,
     'Stop immediately after writing any phase-result artifacts and the promise token.',

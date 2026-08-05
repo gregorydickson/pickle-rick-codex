@@ -180,8 +180,18 @@ function writeLifecycleArtifact(phase) {
   const artifactPath = extractPathAfter('Lifecycle artifact path: ');
   const missingPhase = process.env.FAKE_LIFECYCLE_MISSING_PHASE || '';
   const refusalPhase = process.env.FAKE_LIFECYCLE_REFUSAL_PHASE || '';
+  const invalidOncePhase = process.env.FAKE_LIFECYCLE_INVALID_ONCE_PHASE || '';
   if (!artifactPath || phase === missingPhase) return;
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  const controlSessionDir = extractPathAfter('Session dir: ');
+  const invalidOnceMarker = controlSessionDir
+    ? path.join(controlSessionDir, '.fake-' + phase + '-invalid-once')
+    : '';
+  if (phase === invalidOncePhase && invalidOnceMarker && !fs.existsSync(invalidOnceMarker)) {
+    fs.writeFileSync(invalidOnceMarker, 'consumed\\n');
+    fs.writeFileSync(artifactPath, '{invalid json');
+    return;
+  }
   const ticketId = path.basename(path.dirname(artifactPath));
   const criteriaLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Required acceptance criteria JSON: '));
   const criteria = criteriaLine ? JSON.parse(criteriaLine.slice('Required acceptance criteria JSON: '.length)) : [];

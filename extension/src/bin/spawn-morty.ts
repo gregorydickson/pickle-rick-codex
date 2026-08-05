@@ -199,6 +199,51 @@ function appendRunnerLog(sessionDir: string, runnerMode: string | null, message:
   );
 }
 
+const MAX_READ_ONLY_LIFECYCLE_ARTIFACT_ATTEMPTS = 2;
+
+function isLifecycleArtifactContractError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('worker-lifecycle-missing-artifact:')
+    || message.startsWith('worker-lifecycle-invalid-artifact:');
+}
+
+function archiveLifecycleArtifactFailure(input: {
+  sessionDir: string;
+  ticketId: string;
+  phase: WorkerLifecyclePhase;
+  iteration: number;
+  attempt: number;
+  candidateArtifactPath: string;
+  lastMessagePath: string;
+  error: unknown;
+}): void {
+  const archiveDir = path.join(input.sessionDir, 'worker-lifecycle-failures', input.ticketId);
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  const prefix = `${input.phase}.iteration-${input.iteration}.attempt-${input.attempt}`;
+  for (const [source, suffix] of [
+    [input.candidateArtifactPath, 'artifact'],
+    [input.lastMessagePath, 'last-message.txt'],
+  ] as const) {
+    try {
+      const stat = fs.lstatSync(source);
+      if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1_048_576) {
+        fs.copyFileSync(source, path.join(archiveDir, `${prefix}.${suffix}`));
+      }
+    } catch {
+      // Missing or unsafe diagnostic evidence is described by the metadata below.
+    }
+  }
+  atomicWriteJson(path.join(archiveDir, `${prefix}.json`), {
+    schema_version: 1,
+    ticket_id: input.ticketId,
+    phase: input.phase,
+    iteration: input.iteration,
+    phase_attempt: input.attempt,
+    error: input.error instanceof Error ? input.error.message : String(input.error),
+    archived_at: new Date().toISOString(),
+  });
+}
+
 function normalizeCommitSubject(value: unknown, fallback: string): string {
   const normalized = String(value || '')
     .replace(/\s+/g, ' ')
@@ -797,92 +842,131 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }
-      manager.update(statePath, (current) => {
-        current.current_ticket = normalizedTicketId;
-        current.step = phase;
-        current.iteration = (current.iteration as number) + 1;
-        appendHistory(current, phase, normalizedTicketId);
-        return current;
-      });
-
       const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
       const candidateParent = path.join(sessionDir, 'worker-lifecycle-candidates');
-      fs.mkdirSync(candidateParent, { recursive: true, mode: 0o700 });
-      const candidateRoot = fs.mkdtempSync(path.join(candidateParent, `${normalizedTicketId}-${phase}-`));
-      const candidateArtifactPath = path.join(candidateRoot, normalizedTicketId, `${phase}.json`);
-      prepareWorkerLifecycleArtifact(candidateArtifactPath);
       const readOnlyPhase = ['research', 'research_review', 'plan', 'plan_review', 'review', 'conformance'].includes(phase);
       const phaseRepositoryBoundary = readOnlyPhase ? repositoryMutationFingerprint(workingDir) : null;
-      try {
-        const result = await runCodexExecMonitored({
-          // Lifecycle artifacts authorize repository advancement. Pin the sandbox
-          // contract instead of inheriting operator-configured escape hatches.
-          execArgs: ['--full-auto'],
-          cwd: workingDir,
-          prompt: buildTicketPhasePrompt({
-            phase,
-            ticket: {
-              ...normalizedTicket,
-              verificationContract: verificationReady.contract,
+      const maxPhaseAttempts = readOnlyPhase ? MAX_READ_ONLY_LIFECYCLE_ARTIFACT_ATTEMPTS : 1;
+      let acceptedArtifact: WorkerLifecycleArtifact | null = null;
+      let artifactRecoveryFeedback: string | null = null;
+
+      for (let phaseAttempt = 1; phaseAttempt <= maxPhaseAttempts; phaseAttempt += 1) {
+        const phaseState = manager.update(statePath, (current) => {
+          current.current_ticket = normalizedTicketId;
+          current.step = phase;
+          current.iteration = (current.iteration as number) + 1;
+          appendHistory(current, phase, normalizedTicketId);
+          return current;
+        });
+        const phaseIteration = Number(phaseState.iteration);
+        fs.mkdirSync(candidateParent, { recursive: true, mode: 0o700 });
+        const candidateRoot = fs.mkdtempSync(path.join(candidateParent, `${normalizedTicketId}-${phase}-`));
+        const candidateArtifactPath = path.join(candidateRoot, normalizedTicketId, `${phase}.json`);
+        const lastMessagePath = path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`);
+        prepareWorkerLifecycleArtifact(candidateArtifactPath);
+        try {
+          const result = await runCodexExecMonitored({
+            // Lifecycle artifacts authorize repository advancement. Pin the sandbox
+            // contract instead of inheriting operator-configured escape hatches.
+            execArgs: ['--full-auto'],
+            cwd: workingDir,
+            prompt: buildTicketPhasePrompt({
+              phase,
+              ticket: {
+                ...normalizedTicket,
+                verificationContract: verificationReady.contract,
+              },
+              sessionDir,
+              workingDir,
+              artifactPath: candidateArtifactPath,
+              priorArtifacts: lifecycleArtifacts,
+              remediationFeedback,
+              artifactRecoveryFeedback,
+              tmuxMode,
+            }),
+            timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
+            outputLastMessagePath: lastMessagePath,
+            progressArtifactPaths: [candidateArtifactPath],
+            addDirs: [candidateRoot],
+            inheritConfiguredAddDirs: false,
+            successCheck: phaseSuccessCheck(phase, lastMessagePath),
+            successSignalGraceMs: 150,
+            successPollMs: 50,
+            onSpawn: (child) => {
+              updateActiveChild(statePath, manager, {
+                active_child_pid: child.pid,
+                active_child_kind: 'codex',
+                active_child_command: phase,
+              });
             },
-            sessionDir,
-            workingDir,
-            artifactPath: candidateArtifactPath,
-            priorArtifacts: lifecycleArtifacts,
-            remediationFeedback,
-            tmuxMode,
-          }),
-          timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
-          outputLastMessagePath: path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`),
-          progressArtifactPaths: [candidateArtifactPath],
-          addDirs: [candidateRoot],
-          inheritConfiguredAddDirs: false,
-          successCheck: phaseSuccessCheck(phase, path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`)),
-          successSignalGraceMs: 150,
-          successPollMs: 50,
-          onSpawn: (child) => {
-            updateActiveChild(statePath, manager, {
-              active_child_pid: child.pid,
-              active_child_kind: 'codex',
-              active_child_command: phase,
+            cancelCheck: () => isSessionCancelled(manager, statePath),
+          });
+          if (result.cancelled || isSessionCancelled(manager, statePath)) {
+            throw new CancellationError();
+          }
+          assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
+          acceptedArtifact = readAndValidateWorkerLifecycleArtifact(
+            candidateArtifactPath,
+            phase,
+            normalizedTicketId,
+            normalizedTicket.acceptance_criteria || [],
+          );
+          assertAcPhaseBoundary(
+            phase,
+            acceptedArtifact,
+            lifecycleArtifacts,
+            normalizedTicket.acceptance_criteria || [],
+          );
+          if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
+            throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
+          }
+        } catch (error) {
+          const artifactContractFailure = readOnlyPhase
+            && isLifecycleArtifactContractError(error)
+            && repositoryMutationFingerprint(workingDir) === phaseRepositoryBoundary;
+          if (artifactContractFailure) {
+            archiveLifecycleArtifactFailure({
+              sessionDir,
+              ticketId: normalizedTicketId,
+              phase,
+              iteration: phaseIteration,
+              attempt: phaseAttempt,
+              candidateArtifactPath,
+              lastMessagePath,
+              error,
             });
-          },
-          cancelCheck: () => isSessionCancelled(manager, statePath),
-        });
-        updateActiveChild(statePath, manager, {
-          active_child_pid: null,
-          active_child_kind: null,
-          active_child_command: null,
-        });
-        if (result.cancelled || isSessionCancelled(manager, statePath)) {
-          throw new CancellationError();
+          }
+          const mayRetryArtifact = artifactContractFailure && phaseAttempt < maxPhaseAttempts;
+          if (!mayRetryArtifact) throw error;
+          appendRunnerLog(
+            sessionDir,
+            runnerMode,
+            `retrying read-only ${phase} artifact in place after attempt ${phaseAttempt}/${maxPhaseAttempts}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          artifactRecoveryFeedback = error instanceof Error ? error.message : String(error);
+          acceptedArtifact = null;
+          continue;
+        } finally {
+          updateActiveChild(statePath, manager, {
+            active_child_pid: null,
+            active_child_kind: null,
+            active_child_command: null,
+          });
+          fs.rmSync(candidateRoot, { recursive: true, force: true });
+          try { fs.rmdirSync(candidateParent); } catch { /* another phase candidate still exists */ }
         }
-        assertCodexSucceeded(result, `Ticket ${normalizedTicketId} failed in ${phase}`);
-        const artifact = readAndValidateWorkerLifecycleArtifact(
-          candidateArtifactPath,
-          phase,
-          normalizedTicketId,
-          normalizedTicket.acceptance_criteria || [],
-        );
-        assertAcPhaseBoundary(
-          phase,
-          artifact,
-          lifecycleArtifacts,
-          normalizedTicket.acceptance_criteria || [],
-        );
-        if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
-          throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
-        }
-        atomicWriteJson(artifactPath, artifact);
-        if (artifact.verdict === 'changes_requested') {
-          throw new WorkerLifecycleRefusalError(phase, artifactPath, artifact);
-        }
-        lifecycleArtifacts.push(artifact);
-        recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
-      } finally {
-        fs.rmSync(candidateRoot, { recursive: true, force: true });
-        try { fs.rmdirSync(candidateParent); } catch { /* another phase candidate still exists */ }
+        break;
       }
+
+      if (!acceptedArtifact) {
+        throw new Error(`worker-lifecycle-invalid-artifact: ${phase} exhausted bounded artifact recovery`);
+      }
+      atomicWriteJson(artifactPath, acceptedArtifact);
+      if (acceptedArtifact.verdict === 'changes_requested') {
+        throw new WorkerLifecycleRefusalError(phase, artifactPath, acceptedArtifact);
+      }
+      lifecycleArtifacts.push(acceptedArtifact);
+      recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
     }
 
     for (const command of verificationCommands) {
