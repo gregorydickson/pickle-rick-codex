@@ -12,6 +12,7 @@ import { completeExperiment, planExperiment, readExperimentLedger, startExperime
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 import { updateSessionMap } from '../services/session-map.js';
+import { acquireSessionOperation } from '../services/session-operation.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
@@ -847,8 +848,21 @@ test('retry-ticket reactivates the session and resets the ticket state', () => {
     last_exit_reason: 'error',
   });
 
+  const releaseOperation = acquireSessionOperation(sessionDir);
+  try {
+    assert.throws(
+      () => runNode(
+        [path.join(repoRoot, 'bin/retry-ticket.js'), '--session-dir', sessionDir, '--ticket', 'TICKET-A'],
+        { env, cwd: projectDir },
+      ),
+      /Cannot authorize retry while another session operation is running/,
+    );
+  } finally {
+    releaseOperation();
+  }
+
   const output = runNode(
-    [path.join(repoRoot, 'bin/retry-ticket.js'), '--session-dir', sessionDir, '--ticket', 'ticket-a'],
+    [path.join(repoRoot, 'bin/retry-ticket.js'), '--session-dir', sessionDir, '--ticket', 'TICKET-A'],
     { env, cwd: projectDir },
   ).trim();
 
@@ -859,6 +873,15 @@ test('retry-ticket reactivates the session and resets the ticket state', () => {
   assert.equal(state.step, 'research');
   assert.equal(state.last_exit_reason, null);
   assert.equal(state.history.at(-1).step, 'retry');
+  const authorization = readJsonFile(path.join(sessionDir, 'ticket-recovery-authorizations.json'));
+  assert.equal(authorization.authorizations.at(-1).ticket_id, 'ticket-a');
+  assert.throws(
+    () => runNode(
+      [path.join(repoRoot, 'bin/retry-ticket.js'), '--session-dir', sessionDir, '--ticket', 'ticket-a'],
+      { env, cwd: projectDir },
+    ),
+    /Cannot authorize retry while the session is active/,
+  );
 
   const ticket = parseTicketFile(path.join(ticketDir, 'linear_ticket_ticket-a.md'));
   assert.equal(ticket.status, 'Todo');

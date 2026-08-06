@@ -22,6 +22,7 @@ export interface TicketRecoveryInput {
   circuitOpen?: boolean;
   failureExitReason?: string;
   adaptiveExhausted?: boolean;
+  adaptiveExitReason?: 'circuit_open' | 'recovery_exhausted';
 }
 
 export interface TicketRecoveryDecision {
@@ -47,7 +48,16 @@ export interface TicketRecoveryEvent {
   remediation_identity: string | null;
   changed_lineage: boolean;
   consecutive_same_lineage: number;
+  /** History-wide occurrence count for this ticket and failure signature. */
+  lineage_occurrences?: number;
+  /** Monotonic recovery failures consumed by this ticket. */
+  ticket_failure_count?: number;
   recorded_at: string;
+}
+
+export interface TicketRecoveryUsage {
+  ticketFailureCount: number;
+  maxLineageOccurrences: number;
 }
 
 interface TicketRecoveryHistory {
@@ -55,7 +65,21 @@ interface TicketRecoveryHistory {
   events: TicketRecoveryEvent[];
 }
 
+interface TicketRecoveryAuthorization {
+  sequence: number;
+  ticket_id: string;
+  start_after_event: number;
+  authorized_at: string;
+}
+
+interface TicketRecoveryAuthorizations {
+  schema_version: 1;
+  authorizations: TicketRecoveryAuthorization[];
+}
+
 const TICKET_RECOVERY_HISTORY_FILE = 'ticket-recovery-history.json';
+const TICKET_RECOVERY_AUTHORIZATIONS_FILE = 'ticket-recovery-authorizations.json';
+export const MAX_ADAPTIVE_TICKET_FAILURES = 25;
 
 function normalizedStrings(value: unknown): string[] {
   return Array.isArray(value)
@@ -128,6 +152,8 @@ function validateRecoveryHistory(value: unknown): TicketRecoveryHistory {
     'research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'simplify', 'conformance',
   ]);
   const latestByTicket = new Map<string, TicketRecoveryEvent>();
+  const failuresByTicket = new Map<string, number>();
+  const occurrencesByTicketLineage = new Map<string, number>();
   for (let index = 0; index < candidate.events.length; index += 1) {
     const event = candidate.events[index] as Record<string, unknown> | null;
     if (
@@ -150,13 +176,20 @@ function validateRecoveryHistory(value: unknown): TicketRecoveryHistory {
     const previous = latestByTicket.get(typedEvent.ticket_id) || null;
     const expectedChanged = previous === null || previous.signature !== typedEvent.signature;
     const expectedConsecutive = expectedChanged ? 1 : previous.consecutive_same_lineage + 1;
+    const ticketFailureCount = (failuresByTicket.get(typedEvent.ticket_id) || 0) + 1;
+    const lineageKey = `${typedEvent.ticket_id}\0${typedEvent.signature}`;
+    const lineageOccurrences = (occurrencesByTicketLineage.get(lineageKey) || 0) + 1;
     if (
       typedEvent.changed_lineage !== expectedChanged
       || typedEvent.consecutive_same_lineage !== expectedConsecutive
+      || (typedEvent.ticket_failure_count !== undefined && typedEvent.ticket_failure_count !== ticketFailureCount)
+      || (typedEvent.lineage_occurrences !== undefined && typedEvent.lineage_occurrences !== lineageOccurrences)
     ) {
-      throw new Error(`ticket-recovery-corrupt: lineage counters regress at index ${index}`);
+      throw new Error(`ticket-recovery-corrupt: recovery counters regress at index ${index}`);
     }
     latestByTicket.set(typedEvent.ticket_id, typedEvent);
+    failuresByTicket.set(typedEvent.ticket_id, ticketFailureCount);
+    occurrencesByTicketLineage.set(lineageKey, lineageOccurrences);
   }
   return candidate as unknown as TicketRecoveryHistory;
 }
@@ -175,6 +208,41 @@ function readRecoveryHistory(sessionDir: string): TicketRecoveryHistory {
   }
 }
 
+function readRecoveryAuthorizations(sessionDir: string, historyLength: number): TicketRecoveryAuthorizations {
+  const filePath = path.join(sessionDir, TICKET_RECOVERY_AUTHORIZATIONS_FILE);
+  if (!fs.existsSync(filePath)) return { schema_version: 1, authorizations: [] };
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    if (value.schema_version !== 1 || !Array.isArray(value.authorizations)) {
+      throw new Error('ticket-recovery-corrupt: unsupported authorization schema');
+    }
+    let priorBoundary = -1;
+    for (let index = 0; index < value.authorizations.length; index += 1) {
+      const authorization = value.authorizations[index] as Record<string, unknown> | null;
+      if (
+        !authorization
+        || authorization.sequence !== index + 1
+        || typeof authorization.ticket_id !== 'string' || !authorization.ticket_id.trim()
+        || !Number.isInteger(authorization.start_after_event)
+        || Number(authorization.start_after_event) < priorBoundary
+        || Number(authorization.start_after_event) > historyLength
+        || typeof authorization.authorized_at !== 'string'
+        || !Number.isFinite(Date.parse(authorization.authorized_at))
+      ) {
+        throw new Error(`ticket-recovery-corrupt: invalid authorization at index ${index}`);
+      }
+      priorBoundary = Number(authorization.start_after_event);
+    }
+    return value as unknown as TicketRecoveryAuthorizations;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('ticket-recovery-corrupt:')) throw error;
+    throw new Error(
+      `ticket-recovery-corrupt: authorizations are not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
 export function recordTicketRecoveryFailure(input: {
   sessionDir: string;
   ticketId: string;
@@ -183,6 +251,8 @@ export function recordTicketRecoveryFailure(input: {
 }): TicketRecoveryEvent {
   const history = readRecoveryHistory(input.sessionDir);
   const previous = [...history.events].reverse().find((event) => event.ticket_id === input.ticketId) || null;
+  const priorTicketEvents = history.events.filter((event) => event.ticket_id === input.ticketId);
+  const lineageOccurrences = priorTicketEvents.filter((event) => event.signature === input.identity.signature).length + 1;
   const changedLineage = previous === null || previous.signature !== input.identity.signature;
   const event: TicketRecoveryEvent = {
     sequence: history.events.length + 1,
@@ -194,6 +264,8 @@ export function recordTicketRecoveryFailure(input: {
     remediation_identity: input.identity.remediationIdentity,
     changed_lineage: changedLineage,
     consecutive_same_lineage: changedLineage ? 1 : previous.consecutive_same_lineage + 1,
+    lineage_occurrences: lineageOccurrences,
+    ticket_failure_count: priorTicketEvents.length + 1,
     recorded_at: new Date().toISOString(),
   };
   const next: TicketRecoveryHistory = { schema_version: 1, events: [...history.events, event] };
@@ -204,6 +276,67 @@ export function recordTicketRecoveryFailure(input: {
     throw new Error('ticket-recovery-corrupt: appended event failed read-back validation');
   }
   return event;
+}
+
+/**
+ * Derive durable budget consumption from the append-only journal. Legacy v1
+ * events without explicit counters remain fully accounted for on resume.
+ */
+export function getTicketRecoveryUsage(sessionDir: string, ticketId: string): TicketRecoveryUsage {
+  const history = readRecoveryHistory(sessionDir);
+  const authorizations = readRecoveryAuthorizations(sessionDir, history.events.length);
+  const boundary = [...authorizations.authorizations]
+    .reverse()
+    .find((authorization) => authorization.ticket_id === ticketId)?.start_after_event ?? 0;
+  const events = history.events.filter((event) => event.ticket_id === ticketId && event.sequence > boundary);
+  const lineageCounts = new Map<string, number>();
+  for (const event of events) {
+    lineageCounts.set(event.signature, (lineageCounts.get(event.signature) || 0) + 1);
+  }
+  return {
+    ticketFailureCount: events.length,
+    maxLineageOccurrences: Math.max(0, ...lineageCounts.values()),
+  };
+}
+
+export function getTicketRecoveryLineageOccurrences(
+  sessionDir: string,
+  ticketId: string,
+  signature: string,
+): number {
+  const history = readRecoveryHistory(sessionDir);
+  const authorizations = readRecoveryAuthorizations(sessionDir, history.events.length);
+  const boundary = [...authorizations.authorizations]
+    .reverse()
+    .find((authorization) => authorization.ticket_id === ticketId)?.start_after_event ?? 0;
+  return history.events.filter((event) => (
+    event.ticket_id === ticketId
+    && event.sequence > boundary
+    && event.signature === signature
+  )).length;
+}
+
+/** Start a new bounded recovery epoch only after an explicit operator retry. */
+export function authorizeTicketRecoveryEpoch(sessionDir: string, ticketId: string): TicketRecoveryAuthorization {
+  const history = readRecoveryHistory(sessionDir);
+  const authorizations = readRecoveryAuthorizations(sessionDir, history.events.length);
+  const authorization: TicketRecoveryAuthorization = {
+    sequence: authorizations.authorizations.length + 1,
+    ticket_id: ticketId,
+    start_after_event: history.events.length,
+    authorized_at: new Date().toISOString(),
+  };
+  const next: TicketRecoveryAuthorizations = {
+    schema_version: 1,
+    authorizations: [...authorizations.authorizations, authorization],
+  };
+  const filePath = path.join(sessionDir, TICKET_RECOVERY_AUTHORIZATIONS_FILE);
+  atomicWriteJson(filePath, next);
+  const persisted = readRecoveryAuthorizations(sessionDir, history.events.length).authorizations.at(-1);
+  if (!persisted || JSON.stringify(persisted) !== JSON.stringify(authorization)) {
+    throw new Error('ticket-recovery-corrupt: authorization failed read-back validation');
+  }
+  return authorization;
 }
 
 /**
@@ -224,7 +357,13 @@ export function decideTicketRecovery(input: TicketRecoveryInput): TicketRecovery
   }
   if (input.failureMode === 'retry') {
     return input.adaptiveExhausted
-      ? { action: 'abort', exitReason: 'circuit_open', reason: 'unchanged recovery lineage exhausted the circuit safeguard' }
+      ? {
+        action: 'abort',
+        exitReason: input.adaptiveExitReason || 'circuit_open',
+        reason: input.adaptiveExitReason === 'recovery_exhausted'
+          ? 'durable ticket recovery budget exhausted'
+          : 'recovery lineage exhausted the circuit safeguard',
+      }
       : { action: 'retry', exitReason: null, reason: 'adaptive recovery remains safe' };
   }
   if (input.failureMode === 'retry-once' && input.attempt < input.maxAttempts) {

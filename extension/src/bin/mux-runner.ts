@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
-import { canExecute, loadCircuitState, openCircuitBreaker, recordCircuitProgress } from '../services/circuit-breaker.js';
+import { canExecute, loadCircuitState, openCircuitBreaker } from '../services/circuit-breaker.js';
 import { getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
@@ -21,6 +21,9 @@ import { scrubTicketWorkerMessages } from '../services/worker-output.js';
 import {
   buildTicketRecoveryFailureIdentity,
   decideTicketRecovery,
+  getTicketRecoveryLineageOccurrences,
+  getTicketRecoveryUsage,
+  MAX_ADAPTIVE_TICKET_FAILURES,
   recordTicketRecoveryFailure,
   type TicketFailureKind,
 } from '../services/recovery-controller.js';
@@ -149,6 +152,12 @@ async function runSequentialWithLease(
     const maxAttempts = failureMode === 'retry'
       ? Number.POSITIVE_INFINITY
       : failureMode === 'retry-once' ? 2 : 1;
+    const unchangedLimit = Math.max(
+      1,
+      config.defaults.max_retry_attempts + 1,
+      config.defaults.circuit_breaker.same_error_threshold,
+    );
+    const ticketFailureLimit = MAX_ADAPTIVE_TICKET_FAILURES;
 
     const decideRecovery = (
       failureKind: TicketFailureKind,
@@ -156,6 +165,7 @@ async function runSequentialWithLease(
       error: unknown = null,
     ) => {
       let adaptiveExhausted = false;
+      let adaptiveExitReason: 'circuit_open' | 'recovery_exhausted' = 'circuit_open';
       if (failureMode === 'retry') {
         const refusal = isWorkerLifecycleRefusalError(error) ? error : null;
         const identity = buildTicketRecoveryFailureIdentity({
@@ -185,25 +195,30 @@ async function runSequentialWithLease(
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} recovery history failed closed: ${reason}`);
           return { action: 'abort' as const, exitReason: 'recovery_required', reason };
         }
-        const unchangedLimit = Math.max(
-          1,
-          config.defaults.max_retry_attempts + 1,
-          config.defaults.circuit_breaker.same_error_threshold,
+        const lineageOccurrences = getTicketRecoveryLineageOccurrences(
+          sessionDir,
+          ticket.id,
+          identity.signature,
         );
-        adaptiveExhausted = !event.changed_lineage && event.consecutive_same_lineage >= unchangedLimit;
-        if (event.changed_lineage) {
-          recordCircuitProgress(sessionDir, `changed recovery lineage for ${ticket.id}`);
-        } else if (adaptiveExhausted) {
-          openCircuitBreaker(
-            sessionDir,
-            `ticket ${ticket.id} repeated an unchanged recovery lineage ${event.consecutive_same_lineage} times`,
-            identity.signature,
-          );
+        const ticketFailureCount = getTicketRecoveryUsage(sessionDir, ticket.id).ticketFailureCount;
+        const lineageExhausted = config.defaults.circuit_breaker.enabled
+          && lineageOccurrences >= unchangedLimit;
+        adaptiveExhausted = lineageExhausted || ticketFailureCount >= ticketFailureLimit;
+        if (adaptiveExhausted) {
+          if (ticketFailureCount >= ticketFailureLimit) {
+            adaptiveExitReason = 'recovery_exhausted';
+          } else if (lineageExhausted) {
+            openCircuitBreaker(
+              sessionDir,
+              `ticket ${ticket.id} repeated recovery lineage ${identity.signature} ${lineageOccurrences} times`,
+              identity.signature,
+            );
+          }
         }
         appendRunnerLog(
           sessionDir,
           runnerMode,
-          `ticket ${ticket.id} recovery event ${event.sequence}: ${event.changed_lineage ? 'changed' : 'unchanged'} lineage, consecutive=${event.consecutive_same_lineage}/${unchangedLimit}`,
+          `ticket ${ticket.id} recovery event ${event.sequence}: ${event.changed_lineage ? 'changed' : 'unchanged'} lineage, consecutive=${event.consecutive_same_lineage}/${unchangedLimit}, occurrences=${lineageOccurrences}/${unchangedLimit}, ticket=${ticketFailureCount}/${ticketFailureLimit}`,
         );
       }
       const latestState = manager.read(statePath);
@@ -223,6 +238,7 @@ async function runSequentialWithLease(
         circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
         failureExitReason: 'error',
         adaptiveExhausted,
+        adaptiveExitReason,
       });
     };
 
@@ -239,6 +255,36 @@ async function runSequentialWithLease(
         exitReason = 'circuit_open';
         appendRunnerLog(sessionDir, runnerMode, `refusing ticket ${ticket.id}: circuit breaker is OPEN`);
         break;
+      }
+      if (failureMode === 'retry') {
+        try {
+          const usage = getTicketRecoveryUsage(sessionDir, ticket.id);
+          const lineageExhausted = config.defaults.circuit_breaker.enabled
+            && usage.maxLineageOccurrences >= unchangedLimit;
+          if (usage.ticketFailureCount >= ticketFailureLimit || lineageExhausted) {
+            failedTicketId = ticket.id;
+            const ticketBudgetExhausted = usage.ticketFailureCount >= ticketFailureLimit;
+            exitReason = ticketBudgetExhausted ? 'recovery_exhausted' : 'circuit_open';
+            const reason = ticketBudgetExhausted
+              ? `ticket ${ticket.id} already exhausted its durable recovery budget ${usage.ticketFailureCount}/${ticketFailureLimit}`
+              : `ticket ${ticket.id} already exhausted a durable recovery lineage ${usage.maxLineageOccurrences}/${unchangedLimit}`;
+            if (!ticketBudgetExhausted) openCircuitBreaker(sessionDir, reason);
+            appendRunnerLog(sessionDir, runnerMode, reason);
+            break;
+          }
+        } catch (historyError) {
+          failedTicketId = ticket.id;
+          exitReason = 'recovery_required';
+          const reason = historyError instanceof Error ? historyError.message : String(historyError);
+          manager.update(statePath, (current) => {
+            current.recovery_required = true;
+            current.recovery_kind = 'ticket_recovery_history';
+            current.recovery_reason = reason;
+            return current;
+          });
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} recovery history failed closed before dispatch: ${reason}`);
+          break;
+        }
       }
 
       attempts += 1;
@@ -376,16 +422,22 @@ async function main(argv: string[]): Promise<void> {
     launchOwnerPid: parseLaunchOwnerPid(argv),
     runStartedAtMs: parseRunStartedAtMs(argv),
   });
-  if (
+  if (muxRunnerExitFailed(exitReason)) {
+    process.exitCode = 1;
+  }
+}
+
+export function muxRunnerExitFailed(exitReason: string): boolean {
+  return (
     exitReason === 'error'
     || exitReason === 'no_tickets'
     || exitReason === 'invalid_session'
     || exitReason === 'verification-contract-failed'
     || exitReason === 'circuit_open'
+    || exitReason === 'recovery_exhausted'
+    || exitReason === 'recovery_required'
     || String(exitReason).startsWith('preflight-')
-  ) {
-    process.exitCode = 1;
-  }
+  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

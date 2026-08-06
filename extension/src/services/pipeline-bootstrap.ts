@@ -568,8 +568,11 @@ export function exitMuxRunnerPhase(
       current.step = 'complete';
       appendHistory(current, 'complete');
     } else {
-      const blocked = finalReason === 'verification-contract-failed' || String(finalReason).startsWith('preflight-');
-      current.current_ticket = finalReason === 'error' || blocked
+      const blocked = finalReason === 'verification-contract-failed'
+        || finalReason === 'recovery_exhausted'
+        || finalReason === 'recovery_required'
+        || String(finalReason).startsWith('preflight-');
+      current.current_ticket = finalReason === 'error' || finalReason === 'circuit_open' || blocked
         ? failedTicketId || current.current_ticket || null
         : null;
       current.step = blocked ? 'blocked' : 'paused';
