@@ -304,10 +304,20 @@ function hasUnquotedGlob(command: string): boolean {
 }
 
 const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'printf', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
+const SHELL_RESERVED_WITHOUT_COMMAND = new Set(['for', 'select', 'case', 'done', 'fi', 'esac', 'in', 'function', '{', '}']);
+const SHELL_RESERVED_COMMAND_PREFIXES = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', 'time']);
 
 function commandExecutable(segment: string): string | null {
   const tokens = tokenizeShellWords(segment);
   let index = 0;
+  if (SHELL_RESERVED_WITHOUT_COMMAND.has(tokens[index])) return null;
+  while (SHELL_RESERVED_COMMAND_PREFIXES.has(tokens[index])) {
+    const keyword = tokens[index];
+    index += 1;
+    if (keyword === 'time') {
+      while (index < tokens.length && tokens[index].startsWith('-')) index += 1;
+    }
+  }
   while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
   while (['command', 'env', 'exec'].includes(tokens[index])) {
     index += 1;

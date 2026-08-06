@@ -79,6 +79,49 @@ test('verification preflight checks every executable in a compound command', () 
   );
 });
 
+test('verification preflight understands shell loop keywords and still checks the loop body executable', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-command-loop-'));
+  assert.doesNotThrow(() => assertTicketVerificationReady({
+    ticket: {
+      id: 'R1',
+      verification: ['for id in AR-R1 AR-R2; do /usr/bin/true "$id" || exit 1; done'],
+    },
+    config: null,
+    cwd,
+    ambientEnv: { PATH: cwd },
+  }));
+
+  assert.throws(
+    () => assertTicketVerificationReady({
+      ticket: {
+        id: 'R1',
+        verification: ['for id in AR-R1 AR-R2; do missing-inside-pickle-loop "$id" || exit 1; done'],
+      },
+      config: null,
+      cwd,
+      ambientEnv: { PATH: cwd },
+    }),
+    (error) => error instanceof PreflightError
+      && error.kind === 'preflight-missing-executable'
+      && error.prerequisite === 'missing-inside-pickle-loop',
+  );
+});
+
+test('verification preflight does not exempt a reserved word passed through command', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-command-reserved-wrapper-'));
+  assert.throws(
+    () => assertTicketVerificationReady({
+      ticket: { id: 'R1', verification: ['command for --version'] },
+      config: null,
+      cwd,
+      ambientEnv: { PATH: cwd },
+    }),
+    (error) => error instanceof PreflightError
+      && error.kind === 'preflight-missing-executable'
+      && error.prerequisite === 'for',
+  );
+});
+
 test('scoped Vitest commands normalize package-manager execution without running it', () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-scoped-vitest-'));
   const packageDir = path.join(cwd, "package's app");
