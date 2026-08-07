@@ -70,6 +70,8 @@ interface TicketRecoveryAuthorization {
   ticket_id: string;
   start_after_event: number;
   authorized_at: string;
+  authorized_by?: 'operator' | 'runner';
+  reason?: string;
 }
 
 interface TicketRecoveryAuthorizations {
@@ -228,6 +230,8 @@ function readRecoveryAuthorizations(sessionDir: string, historyLength: number): 
         || Number(authorization.start_after_event) > historyLength
         || typeof authorization.authorized_at !== 'string'
         || !Number.isFinite(Date.parse(authorization.authorized_at))
+        || (authorization.authorized_by !== undefined && !['operator', 'runner'].includes(String(authorization.authorized_by)))
+        || (authorization.reason !== undefined && (typeof authorization.reason !== 'string' || !authorization.reason.trim()))
       ) {
         throw new Error(`ticket-recovery-corrupt: invalid authorization at index ${index}`);
       }
@@ -316,8 +320,12 @@ export function getTicketRecoveryLineageOccurrences(
   )).length;
 }
 
-/** Start a new bounded recovery epoch only after an explicit operator retry. */
-export function authorizeTicketRecoveryEpoch(sessionDir: string, ticketId: string): TicketRecoveryAuthorization {
+/** Start a new bounded recovery epoch without deleting prior failure evidence. */
+export function authorizeTicketRecoveryEpoch(
+  sessionDir: string,
+  ticketId: string,
+  options: { authorizedBy?: 'operator' | 'runner'; reason?: string } = {},
+): TicketRecoveryAuthorization {
   const history = readRecoveryHistory(sessionDir);
   const authorizations = readRecoveryAuthorizations(sessionDir, history.events.length);
   const authorization: TicketRecoveryAuthorization = {
@@ -325,6 +333,8 @@ export function authorizeTicketRecoveryEpoch(sessionDir: string, ticketId: strin
     ticket_id: ticketId,
     start_after_event: history.events.length,
     authorized_at: new Date().toISOString(),
+    authorized_by: options.authorizedBy || 'operator',
+    reason: options.reason || 'explicit ticket retry',
   };
   const next: TicketRecoveryAuthorizations = {
     schema_version: 1,
@@ -341,8 +351,9 @@ export function authorizeTicketRecoveryEpoch(sessionDir: string, ticketId: strin
 
 /**
  * Safety/contract failures are terminal and global safeguards always win.
- * Explicit retry-once remains bounded for compatibility; adaptive retry is
- * bounded by its durable unchanged-lineage circuit rather than an attempt count.
+ * Explicit retry-once remains bounded for compatibility. The mux runner turns
+ * safe adaptive exhaustion into a new durable strategy epoch before asking for
+ * this terminal decision; callers that do not authorize an epoch still fail closed.
  */
 export function decideTicketRecovery(input: TicketRecoveryInput): TicketRecoveryDecision {
   const failureExitReason = input.failureExitReason || 'error';

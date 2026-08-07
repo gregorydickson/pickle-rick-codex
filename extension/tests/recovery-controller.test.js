@@ -146,6 +146,8 @@ test('explicit retry starts a new bounded epoch without deleting recovery histor
 
   const authorization = authorizeTicketRecoveryEpoch(sessionDir, 'r1');
   assert.equal(authorization.start_after_event, 2);
+  assert.equal(authorization.authorized_by, 'operator');
+  assert.equal(authorization.reason, 'explicit ticket retry');
   assert.deepEqual(getTicketRecoveryUsage(sessionDir, 'r1'), {
     ticketFailureCount: 0,
     maxLineageOccurrences: 0,

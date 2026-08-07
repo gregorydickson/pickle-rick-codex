@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
-import { canExecute, loadCircuitState, openCircuitBreaker } from '../services/circuit-breaker.js';
+import { canExecute, loadCircuitState, openCircuitBreaker, resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
@@ -20,6 +20,7 @@ import { isPreflightError, isVerificationContractError } from '../services/verif
 import { scrubTicketWorkerMessages } from '../services/worker-output.js';
 import {
   buildTicketRecoveryFailureIdentity,
+  authorizeTicketRecoveryEpoch,
   decideTicketRecovery,
   getTicketRecoveryLineageOccurrences,
   getTicketRecoveryUsage,
@@ -159,6 +160,32 @@ async function runSequentialWithLease(
     );
     const ticketFailureLimit = MAX_ADAPTIVE_TICKET_FAILURES;
 
+    const startAutomaticRecoveryEpoch = (reason: string): boolean => {
+      try {
+        const authorization = authorizeTicketRecoveryEpoch(sessionDir, ticket.id, {
+          authorizedBy: 'runner',
+          reason,
+        });
+        resetCircuitBreaker(sessionDir, `automatic recovery epoch ${authorization.sequence} for ${ticket.id}`);
+        appendRunnerLog(
+          sessionDir,
+          runnerMode,
+          `ticket ${ticket.id} ${reason}; continuing in automatic recovery epoch ${authorization.sequence}`,
+        );
+        return true;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        manager.update(statePath, (current) => {
+          current.recovery_required = true;
+          current.recovery_kind = 'ticket_recovery_history';
+          current.recovery_reason = detail;
+          return current;
+        });
+        appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} could not start an automatic recovery epoch: ${detail}`);
+        return false;
+      }
+    };
+
     const decideRecovery = (
       failureKind: TicketFailureKind,
       message: string,
@@ -229,12 +256,26 @@ async function runSequentialWithLease(
           reason: String(latestState.recovery_reason || 'verified unsafe repository recovery state'),
         };
       }
+      const stopReason = shouldStop(latestState);
+      if (adaptiveExhausted && !stopReason) {
+        const reason = adaptiveExitReason === 'recovery_exhausted'
+          ? `exhausted durable recovery budget ${ticketFailureLimit}/${ticketFailureLimit}`
+          : `exhausted recovery lineage window ${unchangedLimit}/${unchangedLimit}`;
+        if (!startAutomaticRecoveryEpoch(reason)) {
+          return {
+            action: 'abort' as const,
+            exitReason: 'recovery_required',
+            reason: String(manager.read(statePath).recovery_reason || 'automatic recovery epoch failed'),
+          };
+        }
+        adaptiveExhausted = false;
+      }
       return decideTicketRecovery({
         failureKind,
         failureMode,
         attempt: attempts,
         maxAttempts,
-        stopReason: shouldStop(latestState),
+        stopReason,
         circuitOpen: config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir)),
         failureExitReason: 'error',
         adaptiveExhausted,
@@ -251,6 +292,9 @@ async function runSequentialWithLease(
         break;
       }
       if (config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
+        if (failureMode === 'retry' && startAutomaticRecoveryEpoch('reached an OPEN circuit strategy boundary')) {
+          continue;
+        }
         failedTicketId = ticket.id;
         exitReason = 'circuit_open';
         appendRunnerLog(sessionDir, runnerMode, `refusing ticket ${ticket.id}: circuit breaker is OPEN`);
@@ -262,14 +306,13 @@ async function runSequentialWithLease(
           const lineageExhausted = config.defaults.circuit_breaker.enabled
             && usage.maxLineageOccurrences >= unchangedLimit;
           if (usage.ticketFailureCount >= ticketFailureLimit || lineageExhausted) {
-            failedTicketId = ticket.id;
             const ticketBudgetExhausted = usage.ticketFailureCount >= ticketFailureLimit;
-            exitReason = ticketBudgetExhausted ? 'recovery_exhausted' : 'circuit_open';
             const reason = ticketBudgetExhausted
-              ? `ticket ${ticket.id} already exhausted its durable recovery budget ${usage.ticketFailureCount}/${ticketFailureLimit}`
-              : `ticket ${ticket.id} already exhausted a durable recovery lineage ${usage.maxLineageOccurrences}/${unchangedLimit}`;
-            if (!ticketBudgetExhausted) openCircuitBreaker(sessionDir, reason);
-            appendRunnerLog(sessionDir, runnerMode, reason);
+              ? `already exhausted durable recovery budget ${usage.ticketFailureCount}/${ticketFailureLimit}`
+              : `already exhausted recovery lineage ${usage.maxLineageOccurrences}/${unchangedLimit}`;
+            if (startAutomaticRecoveryEpoch(reason)) continue;
+            failedTicketId = ticket.id;
+            exitReason = 'recovery_required';
             break;
           }
         } catch (historyError) {

@@ -313,6 +313,7 @@ async function main(argv: string[]): Promise<void> {
       current.tmux_mode = true;
       current.active = false;
       current.max_iterations = 0;
+      if (parsed.maxTime === null) current.max_time_minutes = 0;
       current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;
       current.preserve_tmux_monitor = process.env.PICKLE_PRESERVE_TMUX_MONITOR === '1';

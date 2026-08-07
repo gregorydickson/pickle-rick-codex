@@ -7,12 +7,14 @@ import path from 'node:path';
 import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
-import { authorizeTicketRecoveryEpoch } from '../services/recovery-controller.js';
-import { resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { StateManager } from '../services/state-manager.js';
 import { updateTicketStatus } from '../services/tickets.js';
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
+import {
+  buildTicketRecoveryFailureIdentity,
+  recordTicketRecoveryFailure,
+} from '../services/recovery-controller.js';
 
 function createSessionWithTodoTicket(taskLabel) {
   const dataRoot = makeTempRoot();
@@ -183,7 +185,7 @@ test('mux-runner adaptive recovery continues when review findings or remediation
   assert.deepEqual(history.events.map((event) => event.changed_lineage), [true, true, true]);
 });
 
-test('mux-runner adaptive recovery opens the circuit only after repeated unchanged findings', async () => {
+test('mux-runner adaptive recovery rolls repeated unchanged findings into a new strategy epoch', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive unchanged-lineage task');
   writeJson(path.join(dataRoot, 'config.json'), {
     defaults: { circuit_breaker: { same_error_threshold: 3 } },
@@ -196,6 +198,7 @@ test('mux-runner adaptive recovery opens the circuit only after repeated unchang
     {
       runTicket: async () => {
         calls += 1;
+        if (calls === 4) return { status: 'done', applied: true };
         const artifact = {
           schema_version: 1,
           phase: 'review',
@@ -209,15 +212,17 @@ test('mux-runner adaptive recovery opens the circuit only after repeated unchang
     },
   ));
 
-  assert.equal(finalReason, 'circuit_open');
-  assert.equal(calls, 3);
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 4);
   const circuit = JSON.parse(fs.readFileSync(path.join(sessionDir, 'circuit_breaker.json'), 'utf8'));
-  assert.equal(circuit.state, 'OPEN');
+  assert.equal(circuit.state, 'CLOSED');
   const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
   assert.deepEqual(history.events.map((event) => event.consecutive_same_lineage), [1, 2, 3]);
+  const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
+  assert.equal(authorizations.authorizations.at(-1).authorized_by, 'runner');
 });
 
-test('mux-runner adaptive recovery exhausts interleaved recurring lineages', async () => {
+test('mux-runner adaptive recovery rolls interleaved recurring lineages into a new strategy epoch', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive interleaved-lineage task');
   writeJson(path.join(dataRoot, 'config.json'), {
     defaults: { circuit_breaker: { same_error_threshold: 3, no_progress_threshold: 5 } },
@@ -230,6 +235,7 @@ test('mux-runner adaptive recovery exhausts interleaved recurring lineages', asy
     {
       runTicket: async () => {
         calls += 1;
+        if (calls === 6) return { status: 'done', applied: true };
         const artifact = {
           schema_version: 1,
           phase: 'review',
@@ -243,24 +249,25 @@ test('mux-runner adaptive recovery exhausts interleaved recurring lineages', asy
     },
   ));
 
-  assert.equal(finalReason, 'circuit_open');
-  assert.equal(calls, 5);
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 6);
   const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
   assert.deepEqual(history.events.map((event) => event.lineage_occurrences), [1, 1, 2, 2, 3]);
 });
 
-test('mux-runner adaptive recovery applies a durable total ticket budget across resumes', async () => {
+test('mux-runner adaptive recovery converts the durable ticket budget into a strategy epoch', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive global-budget task');
   writeJson(path.join(dataRoot, 'config.json'), {
     defaults: { circuit_breaker: { same_error_threshold: 30, no_progress_threshold: 30 } },
   });
   let calls = 0;
-  const run = () => withDataRoot(dataRoot, () => runSequential(
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
     sessionDir,
     { onFailure: 'retry', runnerMode: 'pickle' },
     {
       runTicket: async () => {
         calls += 1;
+        if (calls === 26) return { status: 'done', applied: true };
         const artifact = {
           schema_version: 1,
           phase: 'review',
@@ -274,31 +281,49 @@ test('mux-runner adaptive recovery applies a durable total ticket budget across 
     },
   ));
 
-  assert.equal(await run(), 'recovery_exhausted');
-  assert.equal(calls, 25);
-
-  writeJson(path.join(sessionDir, 'circuit_breaker.json'), { state: 'CLOSED' });
-  const statePath = path.join(sessionDir, 'state.json');
-  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-  state.active = true;
-  state.last_exit_reason = null;
-  writeJson(statePath, state);
-  assert.equal(await run(), 'recovery_exhausted');
-  assert.equal(calls, 25, 'resume must refuse dispatch after the durable budget is exhausted');
-
-  authorizeTicketRecoveryEpoch(sessionDir, 'r1');
-  resetCircuitBreaker(sessionDir, 'test-authorized retry');
-  const retriedState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-  retriedState.active = true;
-  retriedState.last_exit_reason = null;
-  writeJson(statePath, retriedState);
-  assert.equal(await run(), 'recovery_exhausted');
-  assert.equal(calls, 50, 'authorized epoch receives a fresh bounded budget');
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 26);
   const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
-  assert.equal(history.events.length, 50, 'authorization preserves prior recovery evidence');
+  assert.equal(history.events.length, 25, 'automatic epoch preserves prior recovery evidence');
+  const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
+  assert.equal(authorizations.authorizations.length, 1);
+  assert.equal(authorizations.authorizations[0].authorized_by, 'runner');
 });
 
-test('disabled circuit ignores lineage thresholds but retains the absolute recovery budget', async () => {
+test('mux-runner resumes a previously exhausted ticket through an automatic strategy epoch', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive exhausted resume task');
+  const identity = buildTicketRecoveryFailureIdentity({
+    failureKind: 'worker_failure',
+    message: 'legacy unique failure',
+  });
+  for (let index = 0; index < 25; index += 1) {
+    recordTicketRecoveryFailure({
+      sessionDir,
+      ticketId: 'r1',
+      failureKind: 'worker_failure',
+      identity: { ...identity, signature: index.toString(16).padStart(64, '0') },
+    });
+  }
+  let calls = 0;
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 1);
+  const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
+  assert.equal(authorizations.authorizations.at(-1).authorized_by, 'runner');
+});
+
+test('disabled circuit ignores lineage thresholds and rolls the absolute recovery budget forward', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('disabled circuit budget task');
   writeJson(path.join(dataRoot, 'config.json'), {
     defaults: { circuit_breaker: { enabled: false, same_error_threshold: 2 } },
@@ -310,6 +335,7 @@ test('disabled circuit ignores lineage thresholds but retains the absolute recov
     {
       runTicket: async () => {
         calls += 1;
+        if (calls === 26) return { status: 'done', applied: true };
         const artifact = {
           schema_version: 1,
           phase: 'review',
@@ -323,8 +349,8 @@ test('disabled circuit ignores lineage thresholds but retains the absolute recov
     },
   ));
 
-  assert.equal(finalReason, 'recovery_exhausted');
-  assert.equal(calls, 25);
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 26);
   const circuitPath = path.join(sessionDir, 'circuit_breaker.json');
   const circuit = fs.existsSync(circuitPath)
     ? JSON.parse(fs.readFileSync(circuitPath, 'utf8'))

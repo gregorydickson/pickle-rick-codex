@@ -918,6 +918,7 @@ test('pickle-tmux bootstraps from --prd, refines, and launches detached tmux', (
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(state.max_iterations, 0);
+  assert.equal(state.max_time_minutes, 0);
   assert.match(state.tmux_session_name, /^pickle-/);
   const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(logLines[0][0], '-V');
@@ -945,7 +946,7 @@ test('pickle-tmux --resume refines an existing PRD-only session before launch', 
   }).trim();
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Existing PRD\n\n## Summary\nResume from this PRD.\n');
 
-  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir], {
+  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--max-time', '3'], {
     env,
     cwd: projectDir,
   }).trim();
@@ -953,6 +954,7 @@ test('pickle-tmux --resume refines an existing PRD-only session before launch', 
   assert.match(output, /Pickle Rick tmux mode launched/);
   assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
   assert.ok(fs.existsSync(path.join(sessionDir, 'ticket-001', 'linear_ticket_ticket-001.md')));
+  assert.equal(readJsonFile(path.join(sessionDir, 'state.json')).max_time_minutes, 3);
 });
 
 test('pickle-tmux --resume fails cleanly when no session can be resolved', () => {
