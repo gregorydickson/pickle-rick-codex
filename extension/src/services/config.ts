@@ -12,7 +12,7 @@ export const DEFAULT_CONFIG: Config = {
   runtime: {
     command: process.env.PICKLE_CODEX_BIN || 'codex',
     model: null,
-    exec_args: ['--full-auto'],
+    exec_args: ['--sandbox', 'workspace-write'],
     add_dirs: [],
     json_output: true,
   },
@@ -175,8 +175,13 @@ function shouldMigrateLegacyMaxTimeConfig(raw: unknown): raw is LegacyMaxTimeCon
   };
   const hooksAreManagedDefaults = JSON.stringify(normalized.hooks) === JSON.stringify(DEFAULT_CONFIG.hooks)
     || JSON.stringify(normalized.hooks) === JSON.stringify(legacyHooks);
+  const runtimeIsManagedDefault = JSON.stringify(normalized.runtime) === JSON.stringify(DEFAULT_CONFIG.runtime)
+    || JSON.stringify(normalized.runtime) === JSON.stringify({
+      ...DEFAULT_CONFIG.runtime,
+      exec_args: ['--full-auto'],
+    });
   return (
-    JSON.stringify(normalized.runtime) === JSON.stringify(DEFAULT_CONFIG.runtime)
+    runtimeIsManagedDefault
     && JSON.stringify(normalized.defaults) === JSON.stringify({
       ...DEFAULT_CONFIG.defaults,
       max_time_minutes: legacyDefaultMaxTime,
@@ -207,6 +212,17 @@ export function ensureConfigFile(configPath: string = getConfigPath()): Config {
             max_time_minutes: DEFAULT_CONFIG.defaults.max_time_minutes,
           },
           hooks: DEFAULT_CONFIG.hooks,
+        };
+        changed = true;
+      }
+      const migratedRuntime = isPlainObject(migrated.runtime) ? migrated.runtime : {};
+      if (JSON.stringify(migratedRuntime.exec_args) === JSON.stringify(['--full-auto'])) {
+        migrated = {
+          ...migrated,
+          runtime: {
+            ...migratedRuntime,
+            exec_args: DEFAULT_CONFIG.runtime.exec_args,
+          },
         };
         changed = true;
       }

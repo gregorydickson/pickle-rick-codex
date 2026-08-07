@@ -878,7 +878,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           const result = await runCodexExecMonitored({
             // Lifecycle artifacts authorize repository advancement. Pin the sandbox
             // contract instead of inheriting operator-configured escape hatches.
-            execArgs: ['--full-auto'],
+            execArgs: ['--sandbox', 'workspace-write'],
             cwd: workingDir,
             prompt: buildTicketPhasePrompt({
               phase,

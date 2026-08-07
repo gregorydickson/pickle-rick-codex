@@ -166,7 +166,7 @@ test('loadConfig falls back to safe defaults when nested config shapes are malfo
   const config = loadConfig(configPath);
 
   assert.equal(config.runtime.command, 'codex');
-  assert.deepEqual(config.runtime.exec_args, ['--full-auto']);
+  assert.deepEqual(config.runtime.exec_args, ['--sandbox', 'workspace-write']);
   assert.equal(config.defaults.max_iterations, 25);
   assert.equal(config.defaults.max_time_minutes, 480);
   assert.equal(config.defaults.activity_logging, true);
@@ -215,7 +215,9 @@ test('ensureConfigFile migrates untouched legacy managed max-time defaults to ei
   const config = ensureConfigFile(configPath);
 
   assert.equal(config.defaults.max_time_minutes, 480);
+  assert.deepEqual(config.runtime.exec_args, ['--sandbox', 'workspace-write']);
   assert.equal(loadConfig(configPath).defaults.max_time_minutes, 480);
+  assert.deepEqual(loadConfig(configPath).runtime.exec_args, ['--sandbox', 'workspace-write']);
   assert.equal(config.hooks.enabled, false);
   assert.deepEqual(config.hooks.validated_events, []);
 });

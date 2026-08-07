@@ -22,7 +22,7 @@ try {
   console.log(JSON.stringify({
     validation_date: new Date().toISOString(),
     codex_version: getCodexVersion(),
-    guaranteed_path: 'codex exec --full-auto',
+    guaranteed_path: 'codex exec --sandbox workspace-write',
     exec_capabilities: Object.fromEntries(REQUIRED_EXEC_FLAGS.map((flag) => [flag, true])),
   }, null, 2));
 } catch (error) {

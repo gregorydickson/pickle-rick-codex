@@ -18,7 +18,7 @@ test('validate-codex reports the configured codex version and guaranteed path', 
   const parsed = JSON.parse(output);
   assert.match(parsed.validation_date, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(parsed.codex_version, 'codex 9.9.9-test');
-  assert.equal(parsed.guaranteed_path, 'codex exec --full-auto');
+  assert.equal(parsed.guaranteed_path, 'codex exec --sandbox workspace-write');
   assert.deepEqual(parsed.exec_capabilities, {
     '--cd': true,
     '--json': true,
@@ -219,7 +219,8 @@ test('spawn-refinement-team writes the manifest and ticket files', () => {
   const workerRoot = fs.realpathSync(path.join(sessionDir, '.refinement-workers')) + path.sep;
   for (const invocation of invocations) {
     assert.ok(fs.realpathSync(invocation.cwd).startsWith(workerRoot));
-    assert.ok(invocation.args.includes('--full-auto'));
+    assert.ok(invocation.args.includes('--sandbox'));
+    assert.ok(invocation.args.includes('workspace-write'));
     assert.equal(invocation.args.includes('--dangerously-bypass-approvals-and-sandbox'), false);
     assert.equal(invocation.args.includes('--add-dir'), false);
     assert.match(invocation.prompt, /working repository is read-only/i);

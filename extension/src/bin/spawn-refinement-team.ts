@@ -64,7 +64,7 @@ export interface RefinePrdOptions {
 
 const REFINEMENT_LEAF_ENV = 'PICKLE_REFINEMENT_LEAF';
 const REFINEMENT_WORKER_ENV: NodeJS.ProcessEnv = { [REFINEMENT_LEAF_ENV]: '1' };
-const REFINEMENT_EXEC_ARGS = ['--full-auto'];
+const REFINEMENT_EXEC_ARGS = ['--sandbox', 'workspace-write'];
 const ANALYST_ATTEMPTS = 2;
 const FINAL_ARTIFACT_ATTEMPTS = 2;
 const MAX_REFINEMENT_ARTIFACT_BYTES = 2_000_000;

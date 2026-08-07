@@ -21,7 +21,7 @@ You are entering the Pickle Rick autonomous engineering lifecycle for a Codex wo
 
 ## Execution Contract
 
-- Guaranteed path: Node orchestration plus sequential `codex exec --full-auto`
+- Guaranteed path: Node orchestration plus sequential `codex exec --sandbox workspace-write`
 - Required signals: process exit code, `state.json`, `refinement_manifest.json`, ticket files, and repository working tree changes
 - Do not assume undocumented native-agent controls such as `list_agents`, `send_message`, or fork-context internals unless a future validation document adds them
 

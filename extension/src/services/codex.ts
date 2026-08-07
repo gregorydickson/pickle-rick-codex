@@ -372,7 +372,7 @@ export function getCodexVersion(): string {
 function buildCodexExecInvocation(options: CodexExecOptions): { command: string; args: string[] } {
   const config = loadConfig();
   const command = options.command || config.runtime.command;
-  const args = ['exec', ...(options.execArgs ?? config.runtime.exec_args ?? ['--full-auto'])];
+  const args = ['exec', ...(options.execArgs ?? config.runtime.exec_args ?? ['--sandbox', 'workspace-write'])];
 
   if (options.cwd) {
     args.push('--cd', options.cwd);

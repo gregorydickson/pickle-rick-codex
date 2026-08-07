@@ -12,7 +12,7 @@ No replacement authenticated run is claimed here. Before calling the current bui
 
 ## Guaranteed contract
 
-- Automation uses sequential `codex exec --full-auto` processes.
+- Automation uses sequential `codex exec --sandbox workspace-write` processes.
 - Runtime state lives under `~/.codex/pickle-rick/`, or `PICKLE_DATA_ROOT` when set.
 - `bash install.sh` installs global skills under `~/.agents/skills` and merges one managed block into `~/.codex/AGENTS.md`; it does not modify `CLAUDE.md`.
 - `bash install.sh --project <path>` adds a project-local override without deleting unrelated Codex state.

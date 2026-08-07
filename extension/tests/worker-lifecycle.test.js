@@ -134,7 +134,8 @@ test('worker lifecycle persists eight validated phases and reads approved resear
     .filter((entry) => entry.args[0] === 'exec');
   assert.equal(invocations.length, WORKER_LIFECYCLE_PHASES.length);
   for (const invocation of invocations) {
-    assert.ok(invocation.args.includes('--full-auto'));
+    assert.ok(invocation.args.includes('--sandbox'));
+    assert.ok(invocation.args.includes('workspace-write'));
     assert.ok(!invocation.args.includes('--dangerously-bypass-approvals-and-sandbox'));
     const addDirs = invocation.args.flatMap((arg, index) => arg === '--add-dir' ? [invocation.args[index + 1]] : []);
     assert.equal(addDirs.length, 1);
