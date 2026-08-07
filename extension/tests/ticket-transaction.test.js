@@ -1,5 +1,6 @@
 // @tier: fast
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,6 +11,15 @@ import {
 } from '../services/ticket-transaction.js';
 import { updateTicketStatus, writeTicketFiles } from '../services/tickets.js';
 import { makeTempRoot, writeJson } from './helpers.js';
+
+async function waitForFile(filePath, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${filePath}`);
+}
 
 function ticket(id, status = 'Todo') {
   return {
@@ -67,6 +77,39 @@ test('ticket transaction rolls back all touched files when a multi-file mutation
   assert.equal(fs.existsSync(second), false);
   const ledger = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-transaction-ledger.json'), 'utf8'));
   assert.equal(ledger.history.at(-1).status, 'rolled_back');
+});
+
+test('ticket transaction waits for a live foreign owner instead of failing the worker', async () => {
+  const sessionDir = makeTempRoot('pickle-ticket-live-contention-');
+  const lockFile = path.join(sessionDir, 'ticket-transaction-ledger.json.lock');
+  const child = spawn(process.execPath, [
+    '-e',
+    `const fs=require('node:fs');const p=process.argv[1];fs.writeFileSync(p,String(process.pid));setTimeout(()=>{fs.rmSync(p,{force:true});process.exit(0)},250)`,
+    lockFile,
+  ], { stdio: 'ignore' });
+  await waitForFile(lockFile);
+
+  const startedAt = Date.now();
+  assert.equal(recoverInterruptedTicketTransaction(sessionDir), false);
+  assert.ok(Date.now() - startedAt >= 150, 'transaction should wait for the live owner to release');
+  assert.equal(fs.existsSync(lockFile), false);
+  if (child.exitCode === null) {
+    await new Promise((resolve, reject) => {
+      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`lock holder exited ${code}`)));
+      child.once('error', reject);
+    });
+  } else {
+    assert.equal(child.exitCode, 0);
+  }
+});
+
+test('ticket transaction reclaims a dead-owner lock without consuming worker retries', () => {
+  const sessionDir = makeTempRoot('pickle-ticket-dead-contention-');
+  const lockFile = path.join(sessionDir, 'ticket-transaction-ledger.json.lock');
+  fs.writeFileSync(lockFile, '2147483647');
+
+  assert.equal(recoverInterruptedTicketTransaction(sessionDir), false);
+  assert.equal(fs.existsSync(lockFile), false);
 });
 
 test('ticket transaction treats nested state.json as an ordinary artifact', () => {

@@ -6,6 +6,24 @@ import { StateManager } from './state-manager.js';
 
 export const TICKET_TRANSACTION_SCHEMA_VERSION = 1;
 export const TICKET_TRANSACTION_HISTORY_LIMIT = 20;
+export const TICKET_TRANSACTION_LOCK_TIMEOUT_MS = 5_000;
+export const TICKET_TRANSACTION_LOCK_RETRY_MS = 50;
+
+const lockSleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(lockSleepBuffer, 0, 0, milliseconds);
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 interface ReverseEntry {
   relative_path: string;
@@ -68,25 +86,46 @@ function normalizeRelativePath(sessionDir: string, filePath: string): string {
 function acquireLock(sessionDir: string): number {
   ensureDir(sessionDir);
   const filePath = lockPath(sessionDir);
-  try {
-    const fd = fs.openSync(filePath, 'wx', 0o600);
-    fs.writeFileSync(fd, String(process.pid));
-    return fd;
-  } catch (error) {
-    let owner = 0;
-    try { owner = Number(fs.readFileSync(filePath, 'utf8')); } catch { /* stale malformed lock */ }
-    if (owner > 0) {
+  const deadline = Date.now() + TICKET_TRANSACTION_LOCK_TIMEOUT_MS;
+  while (true) {
+    try {
+      const fd = fs.openSync(filePath, 'wx', 0o600);
       try {
-        process.kill(owner, 0);
-        throw new Error(`Ticket transaction is already active under pid ${owner}.`, { cause: error });
-      } catch (ownerError) {
-        if (ownerError instanceof Error && ownerError.message.startsWith('Ticket transaction is already active')) throw ownerError;
+        fs.writeFileSync(fd, String(process.pid));
+        fs.fsyncSync(fd);
+        return fd;
+      } catch (error) {
+        try { fs.closeSync(fd); } catch { /* best effort */ }
+        fs.rmSync(filePath, { force: true });
+        throw error;
       }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
     }
-    fs.rmSync(filePath, { force: true });
-    const fd = fs.openSync(filePath, 'wx', 0o600);
-    fs.writeFileSync(fd, String(process.pid));
-    return fd;
+
+    let owner = 0;
+    let lockAgeMs = Number.POSITIVE_INFINITY;
+    try {
+      owner = Number(fs.readFileSync(filePath, 'utf8'));
+      lockAgeMs = Date.now() - fs.statSync(filePath).mtimeMs;
+    } catch { /* lock disappeared; retry creation */ }
+
+    if (owner === process.pid) {
+      throw new Error(`Ticket transaction attempted a nested lock under pid ${owner}.`);
+    }
+    if ((!Number.isInteger(owner) || owner <= 0) && lockAgeMs >= TICKET_TRANSACTION_LOCK_RETRY_MS) {
+      fs.rmSync(filePath, { force: true });
+      continue;
+    }
+    if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
+      fs.rmSync(filePath, { force: true });
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ticket transaction owned by pid ${owner || 'unknown'}.`);
+    }
+    sleepSync(TICKET_TRANSACTION_LOCK_RETRY_MS);
   }
 }
 
