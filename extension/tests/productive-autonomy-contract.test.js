@@ -64,6 +64,32 @@ test('every declared autonomous failure has a typed recovery policy', () => {
   );
 });
 
+test('explicit artifact failures outrank review and conformance phase fallbacks', () => {
+  const expectedInvalidate = ['implement', 'verify', 'review', 'conformance', 'quality', 'promote'];
+  for (const phase of ['review', 'conformance']) {
+    for (const input of [
+      { kind: 'artifact_invalid', phase },
+      { kind: 'worker_failure', phase, message: `worker-lifecycle-invalid-artifact: ${phase} exhausted bounded artifact recovery` },
+      { kind: 'worker_failure', phase, message: `worker-lifecycle-missing-artifact: ${phase} did not write its artifact` },
+    ]) {
+      assert.equal(classifyAutonomousFailure(input), 'artifact_invalid');
+      const route = resolveAutonomousRecovery(input);
+      assert.equal(route.failureType, 'artifact_invalid');
+      assert.equal(route.handler, 'repair_artifact');
+      assert.deepEqual(route.invalidate, expectedInvalidate);
+      assert.deepEqual(route.preserve, ['context', 'invalid_artifact_evidence']);
+    }
+  }
+});
+
+test('every explicit typed failure kind outranks lifecycle phase fallbacks', () => {
+  for (const failureType of AUTONOMOUS_FAILURE_TYPES) {
+    for (const phase of ['review', 'conformance']) {
+      assert.equal(classifyAutonomousFailure({ kind: failureType, phase }), failureType);
+    }
+  }
+});
+
 test('every injected recoverable failure remains autonomous after the PRD seal', () => {
   const recoverable = AUTONOMOUS_FAILURE_TYPES.filter((failureType) => (
     typedRecoveryRoute(failureType).schedulerState === 'repairing'

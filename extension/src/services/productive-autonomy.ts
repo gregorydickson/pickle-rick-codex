@@ -268,18 +268,22 @@ export function classifyAutonomousFailure(input: {
   const kind = String(input.kind || '').toLowerCase();
   const phase = String(input.phase || '').toLowerCase();
   const message = String(input.message || '').toLowerCase();
+  const explicitFailureType = AUTONOMOUS_FAILURE_TYPES.find((failureType) => kind === failureType);
+  if (explicitFailureType) return explicitFailureType;
   if (kind.includes('prd_contract_defect') || message.includes('contradictory prd')) return 'prd_contract_defect';
   if (kind.includes('workspace_unsafe') || message.includes('unsafe workspace')) return 'workspace_unsafe';
   if (kind.includes('completion_evidence') || kind.includes('oracle_refusal')
     || message.includes('completion evidence') || message.includes('oracle refusal')) return 'completion_evidence_refused';
   if (kind.includes('contract') || kind.includes('preflight') || message.includes('verification contract') || message.includes('preflight')) return 'contract_invalid';
-  if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review_refused';
-  if (phase === 'conformance' || kind.includes('conformance')) return 'conformance_refused';
+  if (kind.includes('artifact')
+    || message.includes('worker-lifecycle-missing-artifact')
+    || message.includes('worker-lifecycle-invalid-artifact')) return 'artifact_invalid';
+  if (kind.includes('implementation')) return 'implementation_invalid';
   if (kind.includes('quality') || message.includes('quality-gate') || message.includes('quality gate')) return 'quality_failed';
   if (kind.includes('test') || kind.includes('verification_failed') || message.includes('verification command failed') || message.includes('verification-command-failed')) return 'verification_failed';
-  if (kind.includes('artifact')) return 'artifact_invalid';
-  if (kind.includes('implementation')) return 'implementation_invalid';
   if (kind.includes('transport') || message.includes('worker transport')) return 'worker_transport';
+  if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review_refused';
+  if (phase === 'conformance' || kind.includes('conformance')) return 'conformance_refused';
   return 'infrastructure_transient';
 }
 

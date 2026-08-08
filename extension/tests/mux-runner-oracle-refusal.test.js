@@ -192,6 +192,40 @@ test('mux-runner adaptive recovery continues when review findings or remediation
   assert.deepEqual(history.events.map((event) => event.changed_lineage), [true, true, true]);
 });
 
+test('mux-runner production routing repairs exhausted review and conformance artifacts', async () => {
+  const expectedInvalidate = ['implement', 'verify', 'review', 'conformance', 'quality', 'promote'];
+  for (const phase of ['review', 'conformance']) {
+    const { dataRoot, sessionDir } = createSessionWithTodoTicket(`${phase} artifact recovery task`);
+    let calls = 0;
+    const finalReason = await withDataRoot(dataRoot, () => runSequential(
+      sessionDir,
+      { onFailure: 'retry', runnerMode: 'pickle' },
+      {
+        runTicket: async (_dir, _ticketId, options) => {
+          calls += 1;
+          if (calls === 1) {
+            new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+              state.step = phase;
+              return state;
+            });
+            throw new Error(`worker-lifecycle-invalid-artifact: ${phase} exhausted bounded artifact recovery`);
+          }
+          assert.equal(options.recoveryStrategy.handler, 'repair_artifact');
+          assert.equal(options.recoveryStrategy.checkpoint, 'implement');
+          return { status: 'done', applied: true };
+        },
+      },
+    ));
+
+    assert.equal(finalReason, 'success');
+    assert.equal(calls, 2);
+    const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
+    assert.equal(history.events[0].failure_domain, 'infrastructure');
+    assert.equal(history.events[0].recovery_handler, 'repair_artifact');
+    assert.deepEqual(history.events[0].invalidated_checkpoints, expectedInvalidate);
+  }
+});
+
 test('mux-runner adaptive recovery rolls repeated unchanged findings into a new strategy epoch', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('adaptive unchanged-lineage task');
   writeJson(path.join(dataRoot, 'config.json'), {
