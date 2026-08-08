@@ -38,10 +38,7 @@ function normalizedRuntimeContent(root: string, raw: Buffer): Buffer {
   if (text.includes(RUNTIME_ROOT_NORMALIZATION_TOKEN)) {
     throw new Error('Runtime descriptor refuses reserved runtime-root normalization token in runtime contents.');
   }
-  const aliases = [root, '$HOME/.codex/pickle-rick', '~/.codex/pickle-rick']
-    .sort((left, right) => right.length - left.length);
-  let normalized = text;
-  for (const alias of aliases) normalized = normalized.split(alias).join(RUNTIME_ROOT_NORMALIZATION_TOKEN);
+  const normalized = text.split(root).join(RUNTIME_ROOT_NORMALIZATION_TOKEN);
   return Buffer.from(normalized, 'utf8');
 }
 

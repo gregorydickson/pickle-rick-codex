@@ -59,6 +59,7 @@ export interface LegacyAdoptionRecord {
   resume_checkpoint: InstalledRuntimeMigration['resume_checkpoint'];
   legacy_owner: {
     runner: PersistedProcessIdentity;
+    supervisor: PersistedProcessIdentity;
     pane: PersistedProcessIdentity;
     tmux_session_name: string;
     operation_lock_pid: number;
@@ -79,6 +80,7 @@ interface LegacyAdoptionTransaction {
   source_runtime: InstalledRuntimeDescriptor;
   target_runtime: InstalledRuntimeDescriptor;
   runner: PersistedProcessIdentity;
+  supervisor: PersistedProcessIdentity;
   pane: PersistedProcessIdentity;
   tmux: LegacyTmuxBinding;
   operation_lock_pid: number;
@@ -195,6 +197,45 @@ function exactMuxCommand(command: string, sessionDir: string, runtimeRoot?: stri
   const expectedBin = runtimeRoot ? path.join(fs.realpathSync(runtimeRoot), 'extension', 'bin', 'mux-runner.js') : null;
   return tokens.some((token) => expectedBin ? path.resolve(token) === expectedBin : path.basename(token) === 'mux-runner.js')
     && tokens.some((token) => path.resolve(token) === fs.realpathSync(sessionDir));
+}
+
+function exactSupervisorCommand(command: string, sessionDir: string, runtimeRoot: string): boolean {
+  const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((token) => token.replace(/^["']|["']$/g, '')) || [];
+  const expectedBin = path.join(fs.realpathSync(runtimeRoot), 'extension', 'bin', 'supervised-runner.js');
+  return tokens.some((token) => path.resolve(token) === expectedBin)
+    && tokens.some((token) => path.resolve(token) === fs.realpathSync(sessionDir))
+    && tokens.some((token) => token === '--runner-bin=mux-runner.js');
+}
+
+function verifiedLegacyControllerTopology(
+  runnerPid: number,
+  tmux: LegacyTmuxBinding,
+  sessionDir: string,
+  runtimeRoot: string,
+  observe: (pid: number) => ObservedLegacyProcess | null,
+  inspect: (identity: PersistedProcessIdentity) => 'not-running' | 'matched' | 'reused',
+  expected?: { runner: PersistedProcessIdentity; supervisor: PersistedProcessIdentity; pane: PersistedProcessIdentity },
+): { runner: ObservedLegacyProcess; supervisor: ObservedLegacyProcess; pane: ObservedLegacyProcess } {
+  const runner = observe(runnerPid);
+  if (!runner || inspect(runner.identity) !== 'matched' || !exactMuxCommand(runner.command, sessionDir, runtimeRoot)) {
+    throw new Error('Legacy mux runner identity or exact argv does not match the active session.');
+  }
+  const supervisor = observe(runner.parent_pid);
+  if (!supervisor || inspect(supervisor.identity) !== 'matched'
+      || !exactSupervisorCommand(supervisor.command, sessionDir, runtimeRoot)
+      || supervisor.parent_pid !== tmux.pane_pid) {
+    throw new Error('Legacy mux runner is not owned by the exact tmux pane supervisor chain.');
+  }
+  const pane = observe(tmux.pane_pid);
+  if (!pane || inspect(pane.identity) !== 'matched') {
+    throw new Error('Legacy tmux pane process identity does not match its immutable binding.');
+  }
+  if (expected && (JSON.stringify(runner.identity) !== JSON.stringify(expected.runner)
+      || JSON.stringify(supervisor.identity) !== JSON.stringify(expected.supervisor)
+      || JSON.stringify(pane.identity) !== JSON.stringify(expected.pane))) {
+    throw new Error('Legacy tmux controller ancestry changed after it was recorded.');
+  }
+  return { runner, supervisor, pane };
 }
 
 function defaultTmuxBinding(sessionName: string): LegacyTmuxBinding | null {
@@ -345,18 +386,11 @@ export function adoptActiveLegacyMuxSession(
     assertOwnedTmuxSession(tmuxName, sessionDir);
     const lockPid = operationLockPid(sessionDir);
     if (lockPid !== runnerPid) throw new Error('Legacy runner and operation lock owners do not match.');
-    const runner = observe(runnerPid);
     const tmux = bindingFor(tmuxName);
-    const pane = tmux ? observe(tmux.pane_pid) : null;
-    if (!runner || !exactMuxCommand(runner.command, sessionDir, sourceRuntimeRoot) || inspect(runner.identity) !== 'matched') {
-      throw new Error('Legacy mux runner identity or exact argv does not match the active session.');
-    }
-    if (!tmux || !exists(tmuxName) || !pane || inspect(pane.identity) !== 'matched') {
+    if (!tmux || !exists(tmuxName)) {
       throw new Error('Legacy tmux session lacks an immutable live binding.');
     }
-    if (runner.parent_pid !== tmux.pane_pid) {
-      throw new Error('Legacy mux runner is not a direct child of the recorded tmux pane controller.');
-    }
+    const topology = verifiedLegacyControllerTopology(runnerPid, tmux, sessionDir, sourceRuntimeRoot, observe, inspect);
     const candidatePaths = attributableCandidatePaths(sessionDir, workingDir,
       typeof state.current_ticket === 'string' ? state.current_ticket : null);
     const candidateArchive = { paths: candidatePaths, staged_paths: [] as string[], ref: null };
@@ -366,7 +400,8 @@ export function adoptActiveLegacyMuxSession(
     transaction = {
       schema_version: 1, stage: 'fenced', session_id: path.basename(sessionDir),
       source_runtime_root: fs.realpathSync(sourceRuntimeRoot), target_runtime_root: fs.realpathSync(targetRuntimeRoot),
-      source_runtime: sourceRuntime, target_runtime: targetRuntime, runner: runner.identity, pane: pane.identity,
+      source_runtime: sourceRuntime, target_runtime: targetRuntime, runner: topology.runner.identity,
+      supervisor: topology.supervisor.identity, pane: topology.pane.identity,
       tmux, operation_lock_pid: lockPid, active_child: child, candidate_archive: candidateArchive,
       created_at: now.toISOString(), updated_at: now.toISOString(),
     };
@@ -382,21 +417,19 @@ export function adoptActiveLegacyMuxSession(
     const live = exists(transaction.tmux.session_name);
     const runnerStatus = inspect(transaction.runner);
     if (live) {
-      const runnerNow = observe(transaction.runner.pid);
       const bindingNow = bindingFor(transaction.tmux.session_name);
-      if (!runnerNow || JSON.stringify(runnerNow.identity) !== JSON.stringify(transaction.runner)
-        || runnerNow.parent_pid !== transaction.tmux.pane_pid
-        || !exactMuxCommand(runnerNow.command, sessionDir, sourceRuntimeRoot) || JSON.stringify(bindingNow) !== JSON.stringify(transaction.tmux)) {
+      if (JSON.stringify(bindingNow) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy runner or immutable tmux binding changed before controller fencing.');
       }
+      verifiedLegacyControllerTopology(transaction.runner.pid, transaction.tmux, sessionDir, sourceRuntimeRoot, observe, inspect,
+        { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane });
       (deps.stopController || ((identity) => process.kill(identity.pid, 'SIGSTOP')))(transaction.runner);
-      const stoppedRunner = observe(transaction.runner.pid);
       const stoppedBinding = bindingFor(transaction.tmux.session_name);
-      if (!stoppedRunner || JSON.stringify(stoppedRunner.identity) !== JSON.stringify(transaction.runner)
-        || stoppedRunner.parent_pid !== transaction.tmux.pane_pid
-        || JSON.stringify(stoppedBinding) !== JSON.stringify(transaction.tmux)) {
+      if (JSON.stringify(stoppedBinding) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy runner or immutable tmux binding changed after controller fencing.');
       }
+      verifiedLegacyControllerTopology(transaction.runner.pid, transaction.tmux, sessionDir, sourceRuntimeRoot, observe, inspect,
+        { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane });
       const fencedState = new StateManager().read(statePath);
       const child = validPersistedIdentity(fencedState.active_child_identity) ? fencedState.active_child_identity : null;
       if (fencedState.active_child_pid && !child) throw new Error('Legacy controller respawned a child without immutable identity.');
@@ -415,13 +448,11 @@ export function adoptActiveLegacyMuxSession(
         typeof fencedState.current_ticket === 'string' ? fencedState.current_ticket : null);
       atomicWriteJson(transactionPath, transaction);
       deps.checkpoint?.('candidate_archived');
-      const finalRunner = observe(transaction.runner.pid);
-      if (!finalRunner || JSON.stringify(finalRunner.identity) !== JSON.stringify(transaction.runner)
-        || finalRunner.parent_pid !== transaction.tmux.pane_pid
-        || !exactMuxCommand(finalRunner.command, sessionDir, sourceRuntimeRoot)
-        || JSON.stringify(bindingFor(transaction.tmux.session_name)) !== JSON.stringify(transaction.tmux)) {
+      if (JSON.stringify(bindingFor(transaction.tmux.session_name)) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy identities changed immediately before tmux shutdown.');
       }
+      verifiedLegacyControllerTopology(transaction.runner.pid, transaction.tmux, sessionDir, sourceRuntimeRoot, observe, inspect,
+        { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane });
       (deps.killTmux || killTmuxSessionById)(transaction.tmux.session_id);
       try { (deps.resumeController || ((identity) => process.kill(identity.pid, 'SIGCONT')))(transaction.runner); } catch { /* tmux already reaped it */ }
       if (!(deps.waitForRunnerExit || defaultWaitForExit)(transaction.runner) || exists(transaction.tmux.session_name)) {
@@ -465,7 +496,7 @@ export function adoptActiveLegacyMuxSession(
       source_runtime: transaction.source_runtime,
       target_runtime: transaction.target_runtime,
       resume_checkpoint: { ...migration.resume_checkpoint },
-      legacy_owner: { runner: transaction.runner, pane: transaction.pane, tmux: transaction.tmux,
+      legacy_owner: { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane, tmux: transaction.tmux,
         operation_lock_pid: transaction.operation_lock_pid, active_child: transaction.active_child },
     }, { nowMs: (deps.now?.() ?? new Date()).getTime() });
     deps.checkpoint?.('journaled');
@@ -479,7 +510,7 @@ export function adoptActiveLegacyMuxSession(
       target_runtime: transaction.target_runtime,
       migration_content_hash: migration.content_hash,
       resume_checkpoint: migration.resume_checkpoint,
-      legacy_owner: { runner: transaction.runner, pane: transaction.pane, tmux_session_name: transaction.tmux.session_name,
+      legacy_owner: { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane, tmux_session_name: transaction.tmux.session_name,
         operation_lock_pid: transaction.operation_lock_pid, active_child: transaction.active_child },
       adopted_at: (deps.now?.() ?? new Date()).toISOString(),
       candidate_archive: transaction.candidate_archive,
@@ -502,7 +533,10 @@ export function launchAdoptedLegacySession(
   deps: LegacyAdoptionDependencies = {},
 ): LegacyAdoptionRecord {
   const sessionDir = fs.realpathSync(sessionDirInput);
-  const launchLock = new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });
+  const launchLock = new StateManager({
+    acquireTimeoutMs: Number(process.env.PICKLE_ADOPTION_LAUNCH_LOCK_TIMEOUT_MS || 60_000),
+    staleLockThresholdMs: 0,
+  });
   launchLock.acquireLock(path.join(sessionDir, '.legacy-session-adoption'));
   try {
   const recordPath = path.join(sessionDir, LEGACY_ADOPTION_FILE);
