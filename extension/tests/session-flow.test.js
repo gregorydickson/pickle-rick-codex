@@ -216,8 +216,17 @@ if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-
   process.exit(0);
 }
 
+if (args[0] === 'display-message') {
+  const name = target.split(':')[0];
+  const commandPath = (logPath || '/tmp/fake-tmux-stale') + '.runner-command';
+  const command = fs.existsSync(commandPath) ? fs.readFileSync(commandPath, 'utf8') : '';
+  console.log([name, '$1', '1723147200', '%0', String(process.ppid), command].join('\\t'));
+  process.exit(0);
+}
+
 if (args[0] === 'respawn-pane') {
   const command = args.at(-1) || '';
+  fs.writeFileSync((logPath || '/tmp/fake-tmux-stale') + '.runner-command', command);
   const runnerMode = Object.entries(runnerDescriptors).find(([, descriptor]) => command.includes(descriptor.runnerBin))?.[0];
   if (runnerMode) {
     simulateRunnerStart(runnerMode);
@@ -1164,7 +1173,7 @@ test('pickle-tmux clears a fresh malformed launch lock before relaunching', () =
   assert.equal(fs.existsSync(path.join(sessionDir, '.tmux-launch.lock')), false);
 });
 
-test('pickle-tmux replaces a stale tmux session before relaunching', () => {
+test('pickle-tmux never destroys an unbound same-name tmux session before relaunching', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-runtime-bin-');
@@ -1196,15 +1205,16 @@ test('pickle-tmux replaces a stale tmux session before relaunching', () => {
   });
   acceptTestRefinement(sessionDir, projectDir);
 
-  const output = runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
-    env,
-    cwd: projectDir,
-  }).trim();
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/pickle-tmux.js'), '--resume', sessionDir, '--resume-ready-only'], {
+      env,
+      cwd: projectDir,
+    }),
+    /duplicate session/,
+  );
 
   const logLines = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.match(output, /Pickle Rick tmux mode launched/);
-  assert.ok(logLines.some((args) => args[0] === 'has-session' && args.includes(sessionName)));
-  assert.ok(logLines.some((args) => args[0] === 'kill-session' && args.includes(sessionName)));
+  assert.ok(!logLines.some((args) => args[0] === 'kill-session'));
   assert.ok(logLines.some((args) => args[0] === 'new-session' && args.includes(sessionName)));
 });
 

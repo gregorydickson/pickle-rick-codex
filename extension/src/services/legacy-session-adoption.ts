@@ -12,7 +12,7 @@ import {
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { ensureSessionPrdSeal } from './session-prd-seal.js';
 import { StateManager } from './state-manager.js';
-import { assertOwnedTmuxSession, killTmuxSession, runTmux, tmuxSessionExists } from './tmux.js';
+import { assertOwnedTmuxSession, killTmuxSessionById, runTmux, tmuxSessionExists } from './tmux.js';
 import {
   prepareLiveSessionMigration,
   verifyLiveSessionMigration,
@@ -46,6 +46,7 @@ export interface LegacyTmuxBinding {
 export interface ObservedLegacyProcess {
   identity: PersistedProcessIdentity;
   command: string;
+  parent_pid: number;
 }
 
 export interface LegacyAdoptionRecord {
@@ -65,6 +66,7 @@ export interface LegacyAdoptionRecord {
   };
   adopted_at: string;
   launched_at?: string;
+  launched_runtime_root?: string;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
 }
 
@@ -83,6 +85,7 @@ interface LegacyAdoptionTransaction {
   active_child: PersistedProcessIdentity | null;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
   migration_content_hash?: string;
+  launched_runtime_root?: string;
   created_at: string;
   updated_at: string;
 }
@@ -95,7 +98,7 @@ interface LegacyAdoptionDependencies {
   tmuxExists?: (name: string) => boolean;
   tmuxPanePid?: (name: string) => number | null;
   tmuxBinding?: (name: string) => LegacyTmuxBinding | null;
-  killTmux?: (name: string, sessionDir: string) => void;
+  killTmux?: (sessionId: string) => void;
   waitForRunnerExit?: (identity: PersistedProcessIdentity) => boolean;
   stopController?: (identity: PersistedProcessIdentity) => void;
   resumeController?: (identity: PersistedProcessIdentity) => void;
@@ -104,7 +107,44 @@ interface LegacyAdoptionDependencies {
   afterChildQuiesced?: () => void;
   sealSession?: (sessionDir: string) => unknown;
   launch?: (sessionDir: string, runtimeRoot: string) => void;
+  handoff?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
   now?: () => Date;
+}
+
+export function runtimeRootMatchesDescriptor(runtimeRoot: string, descriptor: InstalledRuntimeDescriptor): boolean {
+  try {
+    return JSON.stringify(describeInstalledRuntime(runtimeRoot)) === JSON.stringify(descriptor);
+  } catch {
+    return false;
+  }
+}
+
+function handoffLaunchedRuntime(
+  sessionDir: string,
+  sourceRuntimeRoot: string,
+  targetRuntimeRoot: string,
+  state: Record<string, unknown>,
+): void {
+  const logical = readLogicalPipeline(sessionDir);
+  if (!logical.lease) throw new Error('Fallback runtime has no active durable lease for canonical takeover.');
+  const tempDir = fs.mkdtempSync(path.join(path.dirname(sessionDir), '.legacy-runtime-handoff-'));
+  const specPath = path.join(tempDir, 'handoff.json');
+  try {
+    atomicWriteJson(specPath, {
+      session_dir: sessionDir,
+      source_owner_id: logical.lease.owner_id,
+      source_token: logical.lease.token,
+      source_runtime: describeInstalledRuntime(sourceRuntimeRoot),
+      target_runtime: describeInstalledRuntime(targetRuntimeRoot),
+      runner_bin: state.pipeline_mode === true ? 'pipeline-runner.js' : 'mux-runner.js',
+    });
+    const result = spawnSync(process.execPath, [
+      path.join(targetRuntimeRoot, 'extension', 'bin', 'runtime-handoff.js'), specPath,
+    ], { cwd: String(state.working_dir || process.cwd()), env: process.env, encoding: 'utf8', timeout: 30_000 });
+    if (result.status !== 0) throw new Error(result.stderr || result.stdout || 'Canonical runtime handoff failed.');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 function processCommand(pid: number): string | null {
@@ -115,13 +155,14 @@ function processCommand(pid: number): string | null {
 function observeProcess(pid: number): ObservedLegacyProcess | null {
   const command = processCommand(pid);
   if (!command) return null;
-  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'pgid=', '-o', 'state=', '-o', 'lstart='], {
+  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=', '-o', 'pgid=', '-o', 'state=', '-o', 'lstart='], {
     encoding: 'utf8', timeout: 5_000,
   });
-  const match = metadata.status === 0 ? metadata.stdout.trim().match(/^(\d+)\s+(\S+)\s+([\s\S]+)$/) : null;
-  if (!match || match[2].startsWith('Z')) return null;
-  const pgid = Number(match[1]);
-  const startTime = match[3].trim();
+  const match = metadata.status === 0 ? metadata.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]+)$/) : null;
+  if (!match || match[3].startsWith('Z')) return null;
+  const parentPid = Number(match[1]);
+  const pgid = Number(match[2]);
+  const startTime = match[4].trim();
   return {
     identity: {
       pid,
@@ -130,6 +171,7 @@ function observeProcess(pid: number): ObservedLegacyProcess | null {
       fingerprint: crypto.createHash('sha256').update(`${pid}\0${pgid}\0${startTime}`).digest('hex'),
     },
     command,
+    parent_pid: parentPid,
   };
 }
 
@@ -248,6 +290,7 @@ function clearQuiescedOwnership(sessionDir: string): void {
   new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
     state.tmux_runner_pid = null;
     state.tmux_session_name = null;
+    state.tmux_runner_binding = null;
     state.worker_pid = null;
     state.active_child_pid = null;
     state.active_child_kind = null;
@@ -311,6 +354,9 @@ export function adoptActiveLegacyMuxSession(
     if (!tmux || !exists(tmuxName) || !pane || inspect(pane.identity) !== 'matched') {
       throw new Error('Legacy tmux session lacks an immutable live binding.');
     }
+    if (runner.parent_pid !== tmux.pane_pid) {
+      throw new Error('Legacy mux runner is not a direct child of the recorded tmux pane controller.');
+    }
     const candidatePaths = attributableCandidatePaths(sessionDir, workingDir,
       typeof state.current_ticket === 'string' ? state.current_ticket : null);
     const candidateArchive = { paths: candidatePaths, staged_paths: [] as string[], ref: null };
@@ -339,6 +385,7 @@ export function adoptActiveLegacyMuxSession(
       const runnerNow = observe(transaction.runner.pid);
       const bindingNow = bindingFor(transaction.tmux.session_name);
       if (!runnerNow || JSON.stringify(runnerNow.identity) !== JSON.stringify(transaction.runner)
+        || runnerNow.parent_pid !== transaction.tmux.pane_pid
         || !exactMuxCommand(runnerNow.command, sessionDir, sourceRuntimeRoot) || JSON.stringify(bindingNow) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy runner or immutable tmux binding changed before controller fencing.');
       }
@@ -346,6 +393,7 @@ export function adoptActiveLegacyMuxSession(
       const stoppedRunner = observe(transaction.runner.pid);
       const stoppedBinding = bindingFor(transaction.tmux.session_name);
       if (!stoppedRunner || JSON.stringify(stoppedRunner.identity) !== JSON.stringify(transaction.runner)
+        || stoppedRunner.parent_pid !== transaction.tmux.pane_pid
         || JSON.stringify(stoppedBinding) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy runner or immutable tmux binding changed after controller fencing.');
       }
@@ -367,11 +415,14 @@ export function adoptActiveLegacyMuxSession(
         typeof fencedState.current_ticket === 'string' ? fencedState.current_ticket : null);
       atomicWriteJson(transactionPath, transaction);
       deps.checkpoint?.('candidate_archived');
-      if (JSON.stringify(observe(transaction.runner.pid)?.identity) !== JSON.stringify(transaction.runner)
+      const finalRunner = observe(transaction.runner.pid);
+      if (!finalRunner || JSON.stringify(finalRunner.identity) !== JSON.stringify(transaction.runner)
+        || finalRunner.parent_pid !== transaction.tmux.pane_pid
+        || !exactMuxCommand(finalRunner.command, sessionDir, sourceRuntimeRoot)
         || JSON.stringify(bindingFor(transaction.tmux.session_name)) !== JSON.stringify(transaction.tmux)) {
         throw new Error('Legacy identities changed immediately before tmux shutdown.');
       }
-      (deps.killTmux || killTmuxSession)(transaction.tmux.session_name, sessionDir);
+      (deps.killTmux || killTmuxSessionById)(transaction.tmux.session_id);
       try { (deps.resumeController || ((identity) => process.kill(identity.pid, 'SIGCONT')))(transaction.runner); } catch { /* tmux already reaped it */ }
       if (!(deps.waitForRunnerExit || defaultWaitForExit)(transaction.runner) || exists(transaction.tmux.session_name)) {
         throw new Error('Legacy mux owner did not stop after exact tmux shutdown.');
@@ -457,9 +508,29 @@ export function launchAdoptedLegacySession(
   const recordPath = path.join(sessionDir, LEGACY_ADOPTION_FILE);
   const record = readJsonFile<LegacyAdoptionRecord>(recordPath, null);
   if (!record || record.schema_version !== 1) throw new Error('Legacy adoption record is missing or invalid.');
-  if (record.status === 'launched') return record;
   const target = describeInstalledRuntime(runtimeRoot);
   if (JSON.stringify(target) !== JSON.stringify(record.target_runtime)) throw new Error('Installed target runtime hash does not match the adopted runtime.');
+  const resolvedRuntimeRoot = fs.realpathSync(runtimeRoot);
+  if (record.status === 'launched') {
+    if (!record.launched_runtime_root) throw new Error('Launched legacy adoption lacks its immutable runtime root.');
+    const launchedRoot = fs.realpathSync(record.launched_runtime_root);
+    if (launchedRoot === resolvedRuntimeRoot) return record;
+    if (!runtimeRootMatchesDescriptor(launchedRoot, record.target_runtime)) {
+      throw new Error('Fallback launched runtime hash no longer matches the adopted runtime.');
+    }
+    const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+    (deps.handoff || ((dir, sourceRoot, targetRoot) => (
+      handoffLaunchedRuntime(dir, sourceRoot, targetRoot, state)
+    )))(sessionDir, launchedRoot, resolvedRuntimeRoot);
+    const canonical = { ...record, launched_runtime_root: resolvedRuntimeRoot,
+      launched_at: (deps.now?.() ?? new Date()).toISOString() };
+    atomicWriteJson(recordPath, canonical);
+    const transactionPath = path.join(sessionDir, LEGACY_ADOPTION_TRANSACTION_FILE);
+    const transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
+    if (transaction) atomicWriteJson(transactionPath, { ...transaction, stage: 'launched',
+      launched_runtime_root: resolvedRuntimeRoot, updated_at: canonical.launched_at });
+    return canonical;
+  }
   const migration = readJsonFile<InstalledRuntimeMigration>(path.join(sessionDir, 'installed-runtime-migration.json'), null);
   if (!migration || migration.content_hash !== record.migration_content_hash) throw new Error('Legacy migration hash does not match its adoption record.');
   verifyLiveSessionMigration(sessionDir, migration);
@@ -478,9 +549,11 @@ export function launchAdoptedLegacySession(
     const exactTarget = runner && exactMuxCommand(runner.command, sessionDir)
       && runner.command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.some((token) => path.resolve(token.replace(/^["']|["']$/g, '')) === expectedBin);
     if (transaction.stage !== 'launching' || !exactTarget) throw new Error('Legacy adopted session regained an unverified owner before launch.');
-    const recovered = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString() };
+    const recovered = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString(),
+      launched_runtime_root: resolvedRuntimeRoot };
     atomicWriteJson(recordPath, recovered);
-    atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', updated_at: recovered.launched_at });
+    atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', launched_runtime_root: resolvedRuntimeRoot,
+      updated_at: recovered.launched_at });
     return recovered;
   }
 
@@ -492,10 +565,12 @@ export function launchAdoptedLegacySession(
   });
   atomicWriteJson(transactionPath, { ...transaction, stage: 'launching', updated_at: (deps.now?.() ?? new Date()).toISOString() });
   deps.checkpoint?.('launching');
-  launch(sessionDir, fs.realpathSync(runtimeRoot));
-  const launched = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString() };
+  launch(sessionDir, resolvedRuntimeRoot);
+  const launched = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString(),
+    launched_runtime_root: resolvedRuntimeRoot };
   atomicWriteJson(recordPath, launched);
-  atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', updated_at: launched.launched_at });
+  atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', launched_runtime_root: resolvedRuntimeRoot,
+    updated_at: launched.launched_at });
   return launched;
   } finally {
     launchLock.releaseLock(path.join(sessionDir, '.legacy-session-adoption'));

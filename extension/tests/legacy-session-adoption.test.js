@@ -15,6 +15,8 @@ import {
 import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recovery.js';
+import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
+import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -48,8 +50,9 @@ function fixture() {
   git(repo, ['commit', '-m', 'base']);
   const sessionDir = path.join(makeTempRoot('pickle-legacy-data-'), 'sessions', '2026-08-08-legacy');
   fs.mkdirSync(sessionDir, { recursive: true });
-  const runner = identity(4100);
-  const pane = identity(4200);
+  // Mirrors the installed inventory's tmux pane shell -> mux runner layout.
+  const runner = identity(51980);
+  const pane = identity(51956);
   const child = identity(4300);
   const tmuxName = `pickle-${path.basename(sessionDir)}`;
   writeJson(path.join(sessionDir, 'state.json'), {
@@ -94,8 +97,8 @@ function depsFor(value, actions = []) {
   let tmuxLive = true;
   const canonicalSession = fs.realpathSync(value.sessionDir);
   const observations = new Map([
-    [value.runner.pid, { identity: value.runner, command: `node ${path.join(fs.realpathSync(value.sourceRoot), 'extension', 'bin', 'mux-runner.js')} ${canonicalSession}` }],
-    [value.pane.pid, { identity: value.pane, command: `bash -lc node /runtime/bin/mux-runner.js ${canonicalSession}` }],
+    [value.runner.pid, { identity: value.runner, parent_pid: value.pane.pid, command: `node ${path.join(fs.realpathSync(value.sourceRoot), 'extension', 'bin', 'mux-runner.js')} ${canonicalSession}` }],
+    [value.pane.pid, { identity: value.pane, parent_pid: 1, command: `bash -lc node /runtime/bin/mux-runner.js ${canonicalSession}` }],
   ]);
   return {
     observeProcess: (pid) => observations.get(pid) || null,
@@ -114,7 +117,7 @@ function depsFor(value, actions = []) {
     stopController: () => { actions.push('fence'); },
     resumeController: () => { actions.push('resume'); },
     startWatchdog: () => { actions.push('watchdog'); },
-    killTmux: () => { actions.push('tmux'); tmuxLive = false; },
+    killTmux: (sessionId) => { actions.push(`tmux:${sessionId}`); tmuxLive = false; },
     waitForRunnerExit: () => true,
     sealSession: seal,
     now: () => new Date('2026-08-08T20:00:00.000Z'),
@@ -128,7 +131,7 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   const recovery = fs.readFileSync(path.join(value.sessionDir, 'ticket-recovery-history.json'), 'utf8');
   const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value, actions));
 
-  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7', 'resume']);
   assert.equal(record.status, 'adopted');
   assert.equal(record.resume_checkpoint.phase, 'verification_contract_repair');
   assert.deepEqual(record.resume_checkpoint.reuse_phases, ['research', 'research_review', 'plan', 'plan_review']);
@@ -148,9 +151,66 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
     launch: () => { launches += 1; }, now: () => new Date('2026-08-08T20:01:00.000Z'),
   });
   assert.equal(launched.status, 'launched');
+  assert.equal(launched.launched_runtime_root, fs.realpathSync(value.targetRoot));
   assert.equal(launches, 1);
   launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
   assert.equal(launches, 1);
+});
+
+test('watchdog prefers the canonical deployed runtime and records its owner root', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const canonicalRoot = runtime('target');
+  const selected = chooseLegacyLaunchRuntime(
+    canonicalRoot,
+    value.targetRoot,
+    describeInstalledRuntime(value.targetRoot),
+    { timeoutMs: 0 },
+  );
+  assert.deepEqual(selected, { runtimeRoot: canonicalRoot, fallback: false });
+  let launchedRoot = null;
+  const record = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot, {
+    launch: (_sessionDir, root) => { launchedRoot = root; },
+  });
+  assert.equal(launchedRoot, fs.realpathSync(canonicalRoot));
+  assert.equal(record.launched_runtime_root, fs.realpathSync(canonicalRoot));
+});
+
+test('installer death launches bounded checkout fallback and rerun hands it to canonical runtime', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  let clock = 0;
+  const selected = chooseLegacyLaunchRuntime(
+    value.sourceRoot,
+    value.targetRoot,
+    describeInstalledRuntime(value.targetRoot),
+    { timeoutMs: 100, intervalMs: 25, now: () => clock, wait: (milliseconds) => { clock += milliseconds; } },
+  );
+  assert.deepEqual(selected, { runtimeRoot: value.targetRoot, fallback: true });
+  const fallback = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot, { launch: () => undefined });
+  assert.equal(fallback.launched_runtime_root, fs.realpathSync(value.targetRoot));
+
+  const canonicalRoot = runtime('target');
+  let handoff = null;
+  const canonical = launchAdoptedLegacySession(value.sessionDir, canonicalRoot, {
+    handoff: (sessionDir, sourceRoot, targetRoot) => { handoff = { sessionDir, sourceRoot, targetRoot }; },
+  });
+  assert.deepEqual(handoff, {
+    sessionDir: fs.realpathSync(value.sessionDir),
+    sourceRoot: fs.realpathSync(value.targetRoot),
+    targetRoot: fs.realpathSync(canonicalRoot),
+  });
+  assert.equal(canonical.launched_runtime_root, fs.realpathSync(canonicalRoot));
+});
+
+test('runtime descriptor relocation aliases remain equal and reserved normalization bytes fail closed', () => {
+  const first = runtime('relocated');
+  const second = runtime('relocated');
+  fs.appendFileSync(path.join(first, 'extension', 'bin', 'mux-runner.js'), `const runtimeRoot = ${JSON.stringify(fs.realpathSync(first))};\n`);
+  fs.appendFileSync(path.join(second, 'extension', 'bin', 'mux-runner.js'), `const runtimeRoot = ${JSON.stringify(fs.realpathSync(second))};\n`);
+  assert.equal(runtimeBuildHash(first), runtimeBuildHash(second));
+  fs.writeFileSync(path.join(second, 'extension', 'bin', 'mux-runner.js'), 'const runtimeRoot = "<PICKLE_RUNTIME_ROOT>";\n');
+  assert.throws(() => runtimeBuildHash(second), /reserved runtime-root normalization token/);
 });
 
 test('legacy adoption fails closed before signaling on owner identity mismatch', () => {
@@ -161,6 +221,22 @@ test('legacy adoption fails closed before signaling on owner identity mismatch',
   assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps), /identity or exact argv/);
   assert.deepEqual(actions, []);
   assert.equal(fs.existsSync(path.join(value.sessionDir, LEGACY_ADOPTION_FILE)), false);
+});
+
+test('legacy adoption requires the real tmux pane shell to parent the mux runner', () => {
+  const value = fixture();
+  const actions = [];
+  const deps = depsFor(value, actions);
+  const observe = deps.observeProcess;
+  deps.observeProcess = (pid) => {
+    const observed = observe(pid);
+    return pid === value.runner.pid ? { ...observed, parent_pid: 41955 } : observed;
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /not a direct child of the recorded tmux pane controller/,
+  );
+  assert.deepEqual(actions, []);
 });
 
 test('legacy adoption rejects schema, artifact, ref, and installed runtime hash drift before launch', () => {
@@ -239,7 +315,7 @@ test('legacy adoption freezes the controller then rereads a respawned child befo
     return { status: 'reaped', pid: child.pid, pgid: child.pgid, reason: 'test', signals: ['SIGTERM'] };
   };
   adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
-  assert.deepEqual(actions, ['watchdog', 'fence', `child:${replacement.pid}`, 'tmux', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', `child:${replacement.pid}`, 'tmux:$7', 'resume']);
 });
 
 test('candidate snapshot is taken after child quiescence and captures the final attributable mutation', () => {
@@ -252,7 +328,7 @@ test('candidate snapshot is taken after child quiescence and captures the final 
   };
   const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
   assert.deepEqual(record.candidate_archive.paths, ['tracked.txt']);
-  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'final-mutation', 'tmux', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'final-mutation', 'tmux:$7', 'resume']);
   assert.equal(git(value.repo, ['status', '--porcelain']), '');
   restoreRejectedCandidateCheckpoint({ sessionDir: value.sessionDir, workingDir: value.repo, ticketId: 'r1',
     expectedBaseHead: git(value.repo, ['rev-parse', 'HEAD']), validateScope: () => undefined });

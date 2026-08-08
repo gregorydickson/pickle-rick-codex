@@ -28,7 +28,7 @@ import { ensurePipelineState } from '../services/pipeline-state.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { assertSessionOperationAvailable } from '../services/session-operation.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from '../services/tmux.js';
+import { captureOwnedTmuxRunnerBinding, ensureTmuxAvailable, getRuntimeRoot, killTmuxSessionById, respawnOwnedTmuxPane, runTmux, shellQuote, type TmuxRunnerBinding, waitForTmuxRunnerStart } from '../services/tmux.js';
 import { recordCodexManagerRelaunch } from '../services/manager-relaunch-integrity.js';
 import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
 import { isPreflightError, type PreflightError } from '../services/verification-env.js';
@@ -308,6 +308,7 @@ async function main(argv: string[]): Promise<void> {
     const runnerLogPath = path.join(sessionDir, runnerDescriptor.runnerLog);
     const existingLogSizeBytes = fs.existsSync(runnerLogPath) ? fs.statSync(runnerLogPath).size : 0;
     let launchStarted = false;
+    let launchBinding: TmuxRunnerBinding | null = null;
 
     manager.update(statePath, (current) => {
       current.tmux_mode = true;
@@ -316,6 +317,7 @@ async function main(argv: string[]): Promise<void> {
       if (parsed.maxTime === null) current.max_time_minutes = 0;
       current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;
+      current.tmux_runner_binding = null;
       current.preserve_tmux_monitor = process.env.PICKLE_PRESERVE_TMUX_MONITOR === '1';
       current.last_exit_reason = null;
       current.active_child_pid = null;
@@ -327,7 +329,6 @@ async function main(argv: string[]): Promise<void> {
     });
 
     try {
-      clearTmuxSession(sessionName, sessionDir);
       runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
@@ -361,6 +362,11 @@ async function main(argv: string[]): Promise<void> {
 
       runTmux(['set-option', '-w', '-t', `${sessionName}:0`, 'remain-on-exit', 'on']);
       respawnOwnedTmuxPane(sessionName, sessionDir, `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`);
+      launchBinding = captureOwnedTmuxRunnerBinding(sessionName, sessionDir);
+      manager.update(statePath, (current) => {
+        current.tmux_runner_binding = launchBinding;
+        return current;
+      });
       const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, runnerDescriptor.monitorMode], {
         encoding: 'utf8',
         timeout: 30_000,
@@ -373,7 +379,7 @@ async function main(argv: string[]): Promise<void> {
     } catch (error) {
       if (launchStarted) {
         try {
-          killTmuxSession(sessionName, sessionDir);
+          if (launchBinding) killTmuxSessionById(launchBinding.session_id);
         } catch {
           // Best-effort cleanup for partially created tmux sessions.
         }
@@ -382,6 +388,7 @@ async function main(argv: string[]): Promise<void> {
         current.active = false;
         current.tmux_runner_pid = null;
         current.tmux_session_name = null;
+        current.tmux_runner_binding = null;
         current.worker_pid = null;
         current.active_child_pid = null;
         current.active_child_kind = null;

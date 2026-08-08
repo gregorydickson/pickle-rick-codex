@@ -549,8 +549,18 @@ if ((args[0] === 'new-window' || args[0] === 'split-window') && args.includes('-
   process.exit(0);
 }
 
+if (args[0] === 'display-message') {
+  const target = args[args.indexOf('-t') + 1] || 'pickle-test:0';
+  const name = target.split(':')[0];
+  const commandPath = (logPath || '/tmp/fake-tmux') + '.runner-command';
+  const command = fs.existsSync(commandPath) ? fs.readFileSync(commandPath, 'utf8') : '';
+  console.log([name, '$1', '1723147200', '%0', String(process.ppid), command].join('\\t'));
+  process.exit(0);
+}
+
 if (args[0] === 'respawn-pane') {
   const command = args.at(-1) || '';
+  fs.writeFileSync((logPath || '/tmp/fake-tmux') + '.runner-command', command);
   const runnerMode = Object.entries(runnerDescriptors).find(([, descriptor]) => command.includes(descriptor.runnerBin))?.[0];
   if (runnerMode) {
     simulateRunnerStart(runnerMode);

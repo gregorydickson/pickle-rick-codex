@@ -8,7 +8,7 @@ import { getRunnerDescriptor } from './runner-descriptors.js';
 import { appendHistory } from './session.js';
 import { findLastSessionForCwd, getSessionForCwd, removeSessionMapEntry, sessionStateMatchesCwd, updateSessionMap } from './session-map.js';
 import { StateManager } from './state-manager.js';
-import { clearTmuxSession, ensureTmuxAvailable, getRuntimeRoot, killTmuxSession, respawnOwnedTmuxPane, runTmux, shellQuote, waitForTmuxRunnerStart } from './tmux.js';
+import { captureOwnedTmuxRunnerBinding, ensureTmuxAvailable, getRuntimeRoot, killTmuxSessionById, respawnOwnedTmuxPane, runTmux, shellQuote, type TmuxRunnerBinding, waitForTmuxRunnerStart } from './tmux.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { recordCodexManagerRelaunch } from './manager-relaunch-integrity.js';
 import { assertSessionOperationAvailable } from './session-operation.js';
@@ -371,6 +371,7 @@ export async function launchDetachedLoop({
     const runnerLogPath = path.join(sessionDir, runnerDescriptor.runnerLog);
     const manager = new StateManager();
     let launchStarted = false;
+    let launchBinding: TmuxRunnerBinding | null = null;
     const existingLogSizeBytes = fs.existsSync(runnerLogPath) ? fs.statSync(runnerLogPath).size : 0;
 
     try {
@@ -378,6 +379,7 @@ export async function launchDetachedLoop({
         current.active = false;
         current.tmux_runner_pid = null;
         current.tmux_session_name = sessionName;
+        current.tmux_runner_binding = null;
         current.preserve_tmux_monitor = process.env.PICKLE_PRESERVE_TMUX_MONITOR === '1';
         current.active_child_pid = null;
         current.active_child_kind = null;
@@ -387,7 +389,6 @@ export async function launchDetachedLoop({
         appendHistory(current, 'tmux_launch_requested', current.current_ticket || undefined);
         return current;
       });
-      clearTmuxSession(sessionName, sessionDir);
       runTmux(['new-session', '-d', '-s', sessionName, '-c', state.working_dir as string]);
       launchStarted = true;
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
@@ -422,6 +423,11 @@ export async function launchDetachedLoop({
       ].join(' ');
       runTmux(['set-option', '-w', '-t', `${sessionName}:0`, 'remain-on-exit', 'on']);
       respawnOwnedTmuxPane(sessionName, sessionDir, `${sessionName}:0`, `bash -lc ${shellQuote(runnerCommand)}`);
+      launchBinding = captureOwnedTmuxRunnerBinding(sessionName, sessionDir);
+      manager.update(statePath, (current) => {
+        current.tmux_runner_binding = launchBinding;
+        return current;
+      });
 
       const monitorResult = spawnSync('bash', [path.join(runtimeRoot, 'bin', 'tmux-monitor.sh'), sessionName, sessionDir, runnerDescriptor.monitorMode], {
         encoding: 'utf8',
@@ -435,7 +441,7 @@ export async function launchDetachedLoop({
     } catch (error) {
       if (launchStarted) {
         try {
-          killTmuxSession(sessionName, sessionDir);
+          if (launchBinding) killTmuxSessionById(launchBinding.session_id);
         } catch {
           // Best-effort cleanup for partially created tmux sessions.
         }
@@ -445,6 +451,7 @@ export async function launchDetachedLoop({
           current.active = false;
           current.tmux_runner_pid = null;
           current.tmux_session_name = null;
+          current.tmux_runner_binding = null;
           current.active_child_pid = null;
           current.active_child_kind = null;
           current.active_child_command = null;

@@ -501,6 +501,7 @@ export function recordBootstrapPreflightBlocked(sessionDir: string, error: Prefl
     current.active = false;
     current.tmux_runner_pid = null;
     current.tmux_session_name = null;
+    current.tmux_runner_binding = null;
     current.active_child_pid = null;
     current.active_child_kind = null;
     current.active_child_command = null;

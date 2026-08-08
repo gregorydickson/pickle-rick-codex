@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { readJsonFile } from './pickle-utils.js';
 
@@ -6,6 +7,54 @@ export interface TmuxCallOptions {
   timeoutMs?: number;
   cwd?: string;
   env?: Record<string, string | undefined>;
+}
+
+export interface TmuxRunnerBinding {
+  schema_version: 1;
+  session_name: string;
+  session_id: string;
+  session_created: string;
+  pane_id: string;
+  pane_pid: number;
+  pane_start_command: string;
+}
+
+export function runnerPaneCommandMatches(command: string, sessionDir: string): boolean {
+  const sessionAliases = [...new Set([path.resolve(sessionDir), fs.realpathSync(sessionDir)])];
+  return sessionAliases.some((candidate) => command.includes(candidate))
+    && /(?:supervised-runner|mux-runner|pipeline-runner|loop-runner)\.js(?:\s|['"]|$)/.test(command);
+}
+
+export function readTmuxRunnerBinding(target: string, options: TmuxCallOptions = {}): TmuxRunnerBinding | null {
+  try {
+    const raw = runTmux(['display-message', '-p', '-t', target,
+      '#{session_name}\t#{session_id}\t#{session_created}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}'], options);
+    const [sessionName, sessionId, created, paneId, rawPid, ...command] = raw.split('\t');
+    const panePid = Number(rawPid);
+    if (!sessionName || !sessionId || !created || !paneId || !Number.isInteger(panePid) || panePid <= 0) return null;
+    return { schema_version: 1, session_name: sessionName, session_id: sessionId, session_created: created,
+      pane_id: paneId, pane_pid: panePid, pane_start_command: command.join('\t') };
+  } catch {
+    return null;
+  }
+}
+
+export function captureOwnedTmuxRunnerBinding(
+  sessionName: string,
+  sessionDir: string,
+  options: TmuxCallOptions = {},
+): TmuxRunnerBinding {
+  assertOwnedTmuxSession(sessionName, sessionDir);
+  const binding = readTmuxRunnerBinding(`${sessionName}:0`, options);
+  if (!binding || binding.session_name !== sessionName || !runnerPaneCommandMatches(binding.pane_start_command, sessionDir)) {
+    throw new Error('tmux runner pane does not match the exact session controller command.');
+  }
+  return binding;
+}
+
+export function killTmuxSessionById(sessionId: string, options: TmuxCallOptions = {}): void {
+  if (!/^\$\d+$/.test(sessionId)) throw new Error('Refusing invalid immutable tmux session id.');
+  runTmux(['kill-session', '-t', sessionId], options);
 }
 
 export function shellQuote(value: unknown): string {

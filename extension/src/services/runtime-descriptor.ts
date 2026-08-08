@@ -17,6 +17,10 @@ const HASHED_RUNTIME_PATHS = [
   'extension/types',
 ] as const;
 
+// Construct this marker so the descriptor implementation itself does not
+// contain the reserved byte sequence it rejects in hashed runtime files.
+const RUNTIME_ROOT_NORMALIZATION_TOKEN = ['<PICKLE', 'RUNTIME', 'ROOT>'].join('_');
+
 function filesUnder(root: string, relative: string): string[] {
   const absolute = path.join(root, relative);
   const stat = fs.lstatSync(absolute);
@@ -31,10 +35,13 @@ function filesUnder(root: string, relative: string): string[] {
 function normalizedRuntimeContent(root: string, raw: Buffer): Buffer {
   const text = raw.toString('utf8');
   if (!Buffer.from(text, 'utf8').equals(raw)) return raw;
+  if (text.includes(RUNTIME_ROOT_NORMALIZATION_TOKEN)) {
+    throw new Error('Runtime descriptor refuses reserved runtime-root normalization token in runtime contents.');
+  }
   const aliases = [root, '$HOME/.codex/pickle-rick', '~/.codex/pickle-rick']
     .sort((left, right) => right.length - left.length);
   let normalized = text;
-  for (const alias of aliases) normalized = normalized.split(alias).join('<PICKLE_RUNTIME_ROOT>');
+  for (const alias of aliases) normalized = normalized.split(alias).join(RUNTIME_ROOT_NORMALIZATION_TOKEN);
   return Buffer.from(normalized, 'utf8');
 }
 
