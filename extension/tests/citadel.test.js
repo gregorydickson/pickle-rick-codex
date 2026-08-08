@@ -168,6 +168,27 @@ test('runCitadelChecks executes defined release scripts and skips absent ones', 
   assert.equal(checks[2].exit_code, 3);
 });
 
+test('runCitadelChecks discovers extension-scoped release scripts', () => {
+  const cwd = makeTempRoot('pickle-citadel-extension-scripts-');
+  fs.mkdirSync(path.join(cwd, 'extension'));
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }));
+  fs.writeFileSync(path.join(cwd, 'extension', 'package.json'), JSON.stringify({
+    scripts: {
+      typecheck: 'node -e "process.exit(0)"',
+      lint: 'node -e "process.exit(0)"',
+    },
+  }));
+
+  const checks = runCitadelChecks(cwd, 10_000);
+
+  assert.deepEqual(checks.map(({ status }) => status), ['passed', 'passed', 'passed']);
+  assert.deepEqual(checks.map(({ command }) => command), [
+    'npm --prefix extension run typecheck',
+    'npm --prefix extension run lint',
+    'npm run test',
+  ]);
+});
+
 test('runCitadelChecks deduplicates and records declared ticket verification commands', () => {
   const cwd = makeTempRoot('pickle-citadel-ticket-checks-');
   fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({ scripts: [] }));
@@ -332,7 +353,8 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     const checks = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'citadel-checks.json'), 'utf8')).checks;
     const approvedState = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'state.json'), 'utf8'));
     assert.equal(approvedReport.verdict, 'approve');
-    assert.deepEqual(checks.map(({ status }) => status), ['skipped', 'skipped', 'passed']);
+    assert.deepEqual(checks.map(({ status }) => status), ['skipped', 'skipped', 'passed', 'passed']);
+    assert.equal(checks[3].command, 'git diff --check');
     assert.equal(approvedState.active_child_pid, null);
     assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: approved.cwd, encoding: 'utf8' }), '');
 

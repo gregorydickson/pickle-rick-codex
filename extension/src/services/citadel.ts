@@ -276,32 +276,54 @@ function packageScripts(workingDir: string): Record<string, string> {
     .filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
 }
 
+function packageCheckDescriptor(workingDir: string, script: string): CitadelCheckDescriptor {
+  const rootScripts = packageScripts(workingDir);
+  if (rootScripts[script]) {
+    return { command: `npm run ${script}`, executable: 'npm', args: ['run', script] };
+  }
+  const extensionDir = path.join(workingDir, 'extension');
+  const extensionScripts = packageScripts(extensionDir);
+  if (extensionScripts[script]) {
+    return {
+      command: `npm --prefix extension run ${script}`,
+      executable: 'npm',
+      args: ['--prefix', 'extension', 'run', script],
+    };
+  }
+  return { command: `npm run ${script}`, executable: 'npm', args: ['run', script], skipped: true };
+}
+
+function runSynchronousCitadelCheck(
+  descriptor: CitadelCheckDescriptor,
+  workingDir: string,
+  timeoutMs: number,
+): CitadelCheckResult {
+  if (descriptor.skipped) {
+    return { command: descriptor.command, status: 'skipped', exit_code: null, output: 'script not defined' };
+  }
+  const result = spawnSync(descriptor.executable, descriptor.args, {
+    cwd: descriptor.cwd || workingDir,
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    maxBuffer: 16 * 1024 * 1024,
+    env: process.env,
+  });
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim().slice(-100_000);
+  return {
+    command: descriptor.command,
+    status: !result.error && result.status === 0 ? 'passed' : 'failed',
+    exit_code: result.status,
+    output: result.error ? `${result.error.message}\n${output}`.trim() : output,
+  };
+}
+
 export function runCitadelChecks(
   workingDir: string,
   timeoutMs = 900_000,
   ticketVerificationCommands: string[] = [],
 ): CitadelCheckResult[] {
-  const scripts = packageScripts(workingDir);
-  const packageChecks: CitadelCheckResult[] = ['typecheck', 'lint', 'test'].map((script) => {
-    if (!scripts[script]) {
-      return { command: `npm run ${script}`, status: 'skipped', exit_code: null, output: 'script not defined' };
-    }
-    const result = spawnSync('npm', ['run', script], {
-      cwd: workingDir,
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      maxBuffer: 16 * 1024 * 1024,
-      env: process.env,
-    });
-    const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim().slice(-100_000);
-    const status = !result.error && result.status === 0 ? 'passed' : 'failed';
-    return {
-      command: `npm run ${script}`,
-      status,
-      exit_code: result.status,
-      output: result.error ? `${result.error.message}\n${output}`.trim() : output,
-    };
-  });
+  const packageChecks = ['typecheck', 'lint', 'test']
+    .map((script) => runSynchronousCitadelCheck(packageCheckDescriptor(workingDir, script), workingDir, timeoutMs));
   const ticketChecks = uniqueStrings(ticketVerificationCommands).map((command) => {
     const result = spawnSync(process.env.SHELL || 'zsh', ['-lc', command], {
       cwd: workingDir,
@@ -330,13 +352,13 @@ interface CitadelCheckDescriptor {
 }
 
 function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: VerificationStep[]): CitadelCheckDescriptor[] {
-  const scripts = packageScripts(workingDir);
-  const packageChecks = ['typecheck', 'lint', 'test'].map((script): CitadelCheckDescriptor => ({
-    command: `npm run ${script}`,
-    executable: 'npm',
-    args: ['run', script],
-    skipped: !scripts[script],
-  }));
+  const packageChecks = ['typecheck', 'lint', 'test']
+    .map((script) => packageCheckDescriptor(workingDir, script));
+  const repositoryCheck: CitadelCheckDescriptor = {
+    command: 'git diff --check',
+    executable: 'git',
+    args: ['diff', '--check'],
+  };
   const ticketChecks = ticketVerificationSteps.map((step): CitadelCheckDescriptor => {
     const command = verificationStepCommand(step);
     return {
@@ -346,7 +368,7 @@ function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: Ve
       ...(step.cwd ? { cwd: path.resolve(workingDir, step.cwd) } : {}),
     };
   });
-  return [...packageChecks, ...ticketChecks];
+  return [...packageChecks, repositoryCheck, ...ticketChecks];
 }
 
 function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
