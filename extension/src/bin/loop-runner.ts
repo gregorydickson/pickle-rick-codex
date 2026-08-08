@@ -810,6 +810,7 @@ function promoteMicroverseCandidate(
   sessionDir: string,
   candidate: MicroverseCandidate,
   experimentId: string,
+  expectedCandidateHead: string,
 ): string[] {
   const changedPaths = listChangedPathsSince(candidate.worktreeDir, candidate.baseHead);
   if (changedPaths.length === 0) return [];
@@ -830,10 +831,15 @@ function promoteMicroverseCandidate(
   const patchPath = path.join(patchDir, `${experimentId}.patch`);
   createPatchFromWorktree(candidate.worktreeDir, candidate.baseHead, patchPath);
   const candidateHead = getHeadSha(candidate.worktreeDir);
-  if (!candidateHead || candidateHead === candidate.baseHead) {
+  if (!candidateHead || candidateHead === candidate.baseHead || candidateHead !== expectedCandidateHead) {
     throw new Error(`Accepted Microverse candidate ${experimentId} has no committed improvement.`);
   }
-  fastForwardFromIsolatedCandidate(candidate.liveWorkingDir, candidate.worktreeDir, candidate.baseHead);
+  fastForwardFromIsolatedCandidate(
+    candidate.liveWorkingDir,
+    candidate.worktreeDir,
+    candidate.baseHead,
+    expectedCandidateHead,
+  );
   return changedPaths;
 }
 
@@ -908,7 +914,7 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
           `Live workspace still differs from the ${transaction.experiment_id} promotion boundary; candidate remains pending.`,
         );
       }
-      promoteMicroverseCandidate(sessionDir, candidate, transaction.experiment_id);
+      promoteMicroverseCandidate(sessionDir, candidate, transaction.experiment_id, transaction.candidate_head);
       atomicWriteJson(microverseAttemptPath(sessionDir), { ...transaction, phase: 'promoted' });
     }
     if (experiment && experiment.status === 'running') {
@@ -1912,14 +1918,14 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
 
       if (metricResult && experiment) {
         if (metricResult.classification === 'improved' && candidate) {
-          normalizeIsolatedCandidateCommit(
+          const normalizedCandidateHead = normalizeIsolatedCandidateCommit(
             candidate.worktreeDir,
             candidate.baseHead,
             `microverse: accept metric improvement to ${metricResult.state.latest.score}`,
           );
           persistMicroversePromotion(sessionDir, 'promotion_pending', candidate, metricResult, experimentArtifact);
           try {
-            promoteMicroverseCandidate(sessionDir, candidate, experiment.id);
+            promoteMicroverseCandidate(sessionDir, candidate, experiment.id, normalizedCandidateHead);
             persistMicroversePromotion(sessionDir, 'promoted', candidate, metricResult, experimentArtifact);
             if (process.env.PICKLE_TEST_MODE === '1'
                 && process.env.PICKLE_TEST_MICROVERSE_THROW_AFTER_PROMOTION === '1') {

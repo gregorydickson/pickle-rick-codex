@@ -576,6 +576,7 @@ export function fastForwardFromIsolatedCandidate(
   liveWorkingDir: string,
   candidateWorkingDir: string,
   baseSha: string,
+  expectedCandidateSha: string,
 ): void {
   if (getWorkingTreeStatus(liveWorkingDir)) {
     throw new Error('Refusing candidate promotion into a dirty live workspace.');
@@ -583,12 +584,18 @@ export function fastForwardFromIsolatedCandidate(
   if (getHeadSha(liveWorkingDir) !== baseSha) {
     throw new Error('Refusing candidate promotion after the live HEAD changed.');
   }
+  if (getHeadSha(candidateWorkingDir) !== expectedCandidateSha) {
+    throw new Error('Refusing promotion after the isolated candidate HEAD changed.');
+  }
   const candidateParent = runGit(['rev-parse', 'HEAD^'], candidateWorkingDir);
   const candidateCommitCount = runGit(['rev-list', '--count', `${baseSha}..HEAD`], candidateWorkingDir);
   if (candidateParent !== baseSha || candidateCommitCount !== '1') {
     throw new Error('Refusing non-normalized candidate commit topology.');
   }
-  runGit(['fetch', '--quiet', '--no-tags', candidateWorkingDir, 'HEAD'], liveWorkingDir, { timeout: 120_000 });
+  runGit(['fetch', '--quiet', '--no-tags', candidateWorkingDir, expectedCandidateSha], liveWorkingDir, { timeout: 120_000 });
+  if (runGit(['rev-parse', 'FETCH_HEAD'], liveWorkingDir) !== expectedCandidateSha) {
+    throw new Error('Fetched candidate identity did not match the prepared promotion.');
+  }
   runGit(['merge', '--ff-only', 'FETCH_HEAD'], liveWorkingDir);
 }
 
