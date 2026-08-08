@@ -20,7 +20,7 @@ import {
   recoveryExecutionAction,
   typedRecoveryRoute,
 } from '../services/productive-autonomy.js';
-import { makeTempRoot } from './helpers.js';
+import { makeTempRoot, repoRoot } from './helpers.js';
 
 test('typed failures route to domain-specific handlers and minimal checkpoint invalidation', () => {
   assert.equal(classifyFailure({ kind: 'verification_contract' }), 'contract');
@@ -58,6 +58,30 @@ test('every declared autonomous failure has a typed recovery policy', () => {
     typedRecoveryRoute('verification_failed').invalidate,
     typedRecoveryRoute('worker_transport').invalidate,
   );
+});
+
+test('every injected recoverable failure remains autonomous after the PRD seal', () => {
+  const recoverable = AUTONOMOUS_FAILURE_TYPES.filter((failureType) => (
+    typedRecoveryRoute(failureType).schedulerState === 'repairing'
+  ));
+  assert.deepEqual(recoverable, AUTONOMOUS_FAILURE_TYPES.filter((failureType) => failureType !== 'prd_contract_defect'));
+
+  for (const failureType of recoverable) {
+    const sessionDir = makeTempRoot(`pickle-autonomy-${failureType}-`);
+    const injected = resolveAutonomousRecovery({ kind: failureType });
+    assert.equal(injected.failureType, failureType, `${failureType} classification drifted`);
+    assert.equal(injected.schedulerState, 'repairing', `${failureType} requested a human`);
+    recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: injected.invalidate.length });
+    const summary = executionTelemetrySummary(sessionDir);
+    assert.equal(summary.postSealHumanInterventions, 0, `${failureType} recorded a human intervention`);
+    assert.equal(summary.autonomyScore, 1, `${failureType} broke autonomous recovery`);
+  }
+
+  const sealSource = fs.readFileSync(path.join(repoRoot, 'src/services/session-prd-seal.ts'), 'utf8');
+  const increments = sealSource.match(/post_seal_human_interventions:\s*1/g) || [];
+  assert.equal(increments.length, 1, 'production may increment the counter only at the explicit approval boundary');
+  const approvalBoundary = sealSource.slice(sealSource.indexOf('export function approveSessionPrdRevision'));
+  assert.match(approvalBoundary, /recordExecutionControlTelemetry\(sessionDir, \{ post_seal_human_interventions: 1 \}\)/);
 });
 
 test('strategy epochs reject consecutive identity and produce three materially distinct approaches', () => {

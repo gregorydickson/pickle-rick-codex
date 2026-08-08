@@ -256,6 +256,29 @@ test('deterministic verification fails immediately after implement before review
     .map((entry) => entry.args[entry.args.indexOf('--output-last-message') + 1])
     .map((lastMessagePath) => path.basename(lastMessagePath).split('.')[1]);
   assert.deepEqual(phases, ['research', 'research_review', 'plan', 'plan_review', 'implement']);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'worker-lifecycle', 'r1', 'review.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'worker-lifecycle', 'r1', 'conformance.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), false);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.notEqual(ticket.status, 'Done');
+  assert.equal(ticket.frontmatter.completion_commit, undefined);
+});
+
+test('worker completion source encodes the literal implement<verify<review<conformance<quality<promote trace', () => {
+  const source = fs.readFileSync(path.join(repoRoot, 'src/bin/spawn-morty.ts'), 'utf8');
+  const verifyMarker = "if (phase === 'implement') await runDeterministicVerification();";
+  const qualityMarker = 'const workerGate = await evaluateWorkerQualityGate(';
+  const promoteMarker = 'const decision = evaluateCompletionEvidence(';
+  const lifecycleTail = WORKER_LIFECYCLE_PHASES.slice(WORKER_LIFECYCLE_PHASES.indexOf('implement'));
+  const trace = [
+    lifecycleTail[0],
+    source.includes(verifyMarker) ? 'verify' : null,
+    ...lifecycleTail.filter((phase) => phase === 'review' || phase === 'conformance'),
+    source.indexOf(qualityMarker) > source.indexOf(verifyMarker) ? 'quality' : null,
+    source.indexOf(promoteMarker) > source.indexOf(qualityMarker) ? 'promote' : null,
+  ];
+
+  assert.deepEqual(trace, ['implement', 'verify', 'review', 'conformance', 'quality', 'promote']);
 });
 
 for (const refusalPhase of ['review', 'conformance']) {

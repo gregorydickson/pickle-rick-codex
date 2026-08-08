@@ -7,10 +7,19 @@ import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import {
   LIVE_SESSION_MIGRATION_FILE,
+  finalizeLiveSessionMigrationAfterHandoff,
+  prepareLiveSessionHandoffCheckpoint,
   prepareLiveSessionMigration,
   verifyLiveSessionMigration,
 } from '../services/live-session-migration.js';
-import { beginAutonomousExecution, createLogicalPipeline } from '../services/durable-supervisor.js';
+import {
+  acceptRuntimeHandoff,
+  acquireSupervisorLease,
+  beginAutonomousExecution,
+  createLogicalPipeline,
+  releaseRuntimeHandoffLease,
+  requestRuntimeHandoff,
+} from '../services/durable-supervisor.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 
 const sourceRuntime = { runtime_id: 'installed-blue', version: '0.2.17', build_hash: '1'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
@@ -51,10 +60,28 @@ function fixture() {
     });
   }
   writeJson(path.join(sessionDir, 'worker-lifecycle-refusals.json'), { refusals: ['review', 'review'] });
+  const refusalDir = path.join(sessionDir, 'worker-lifecycle-refusals', 'r1');
+  fs.mkdirSync(refusalDir, { recursive: true });
+  writeJson(path.join(refusalDir, '0001-review.json'), {
+    schema_version: 1,
+    phase: 'review',
+    ticket_id: 'r1',
+    verdict: 'changes_requested',
+    findings: ['preserve this refusal across runtime ownership transfer'],
+  });
   writeJson(path.join(sessionDir, 'ticket-recovery-history.json'), { schema_version: 1, events: [{ strategy: 'repair' }] });
   writeJson(path.join(sessionDir, 'completion-evidence.json'), { commit: 'abc123' });
   const sha = git(repo, ['rev-parse', 'HEAD']);
   git(repo, ['update-ref', `refs/pickle/salvage/${path.basename(sessionDir)}`, sha]);
+  const recoveryRef = `refs/pickle/salvage-history/${path.basename(sessionDir)}/r1/0001`;
+  git(repo, ['update-ref', recoveryRef, sha]);
+  writeJson(path.join(sessionDir, 'rejected-candidates', 'r1.json'), {
+    schema_version: 1,
+    ticket_id: 'r1',
+    recovery_ref: recoveryRef,
+    rejected_at: '2026-08-08T17:59:00.000Z',
+    changed_paths: ['tracked.txt'],
+  });
   return { repo, sessionDir };
 }
 
@@ -69,8 +96,8 @@ test('active legacy session migrates in place to contract repair without losing 
   assert.equal(migration.resume_checkpoint.phase, 'verification_contract_repair');
   assert.deepEqual(migration.resume_checkpoint.reuse_phases, ['research', 'research_review', 'plan', 'plan_review']);
   assert.equal(migration.resume_checkpoint.history_length, 2);
-  assert.equal(migration.salvage_refs.length, 1);
-  assert.match(migration.salvage_refs[0], /^refs\/pickle\/salvage\/field-session-1:/);
+  assert.equal(migration.salvage_refs.length, 2);
+  assert.ok(migration.salvage_refs.some((ref) => /^refs\/pickle\/salvage\/field-session-1:/.test(ref)));
   assert.ok(fs.existsSync(path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE)));
   verifyLiveSessionMigration(sessionDir, migration);
 
@@ -110,4 +137,40 @@ test('migration inventory includes and validates the authoritative logical journ
   assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'logical-pipeline.json'));
   writeJson(path.join(sessionDir, 'logical-pipeline.json'), { schema_version: 1, events: [] });
   assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /logical pipeline|journal/i);
+});
+
+test('rejected candidate and refusal archive survive a real durable runtime handoff', () => {
+  const { repo, sessionDir } = fixture();
+  createLogicalPipeline(sessionDir, 'artifact-handoff');
+  writePrdSeal(sessionDir, {
+    prd: '# Approved handoff\n', repository: { identity: 'repo@base', working_directory: repo, execution_base_policy: 'sealed' },
+    acceptance_criteria: [{ id: 'AC-1', text: 'Preserve rejected work.' }], scope_and_ownership: {},
+    dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [], preservation_and_rollback: {},
+    completion_definition: {}, release_gates: [],
+  });
+  beginAutonomousExecution(sessionDir);
+  const candidatePath = path.join(sessionDir, 'rejected-candidates', 'r1.json');
+  const refusalPath = path.join(sessionDir, 'worker-lifecycle-refusals', 'r1', '0001-review.json');
+  const candidateBefore = fs.readFileSync(candidatePath, 'utf8');
+  const refusalBefore = fs.readFileSync(refusalPath, 'utf8');
+  const recoveryRef = JSON.parse(candidateBefore).recovery_ref;
+  const recoverySha = git(repo, ['rev-parse', recoveryRef]);
+
+  const blue = acquireSupervisorLease(sessionDir, { ownerId: 'installed-blue', ttlMs: 10_000, nowMs: 1_000 });
+  const checkpoint = prepareLiveSessionHandoffCheckpoint(sessionDir, sourceRuntime, targetRuntime);
+  const requestId = requestRuntimeHandoff(
+    sessionDir, blue.owner_id, blue.token, sourceRuntime, targetRuntime, checkpoint, { nowMs: 1_100 },
+  );
+  releaseRuntimeHandoffLease(sessionDir, blue.owner_id, blue.token, requestId, { nowMs: 1_200 });
+  const accepted = acceptRuntimeHandoff(sessionDir, requestId, 'candidate-green', 10_000, targetRuntime, { nowMs: 1_300 });
+  const migration = finalizeLiveSessionMigrationAfterHandoff(sessionDir, requestId, targetRuntime);
+
+  assert.deepEqual(accepted.resume_checkpoint, checkpoint);
+  assert.equal(fs.readFileSync(candidatePath, 'utf8'), candidateBefore);
+  assert.equal(fs.readFileSync(refusalPath, 'utf8'), refusalBefore);
+  assert.equal(git(repo, ['rev-parse', recoveryRef]), recoverySha);
+  assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'rejected-candidates/r1.json'));
+  assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'worker-lifecycle-refusals/r1/0001-review.json'));
+  assert.ok(migration.salvage_refs.some((entry) => entry.startsWith(`${recoveryRef}:`)));
+  verifyLiveSessionMigration(sessionDir, migration);
 });

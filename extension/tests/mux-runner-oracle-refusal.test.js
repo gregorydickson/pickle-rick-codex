@@ -13,6 +13,10 @@ import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 import { VerificationCommandError } from '../bin/spawn-morty.js';
 import {
+  executionTelemetrySummary,
+  readRecoveryStrategyEpochs,
+} from '../services/productive-autonomy.js';
+import {
   buildTicketRecoveryFailureIdentity,
   recordTicketRecoveryFailure,
 } from '../services/recovery-controller.js';
@@ -221,6 +225,45 @@ test('mux-runner adaptive recovery rolls repeated unchanged findings into a new 
   assert.deepEqual(history.events.map((event) => event.consecutive_same_lineage), [1, 2, 3]);
   const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
   assert.equal(authorizations.authorizations.at(-1).authorized_by, 'runner');
+});
+
+test('literal no-progress run selects three material strategies without human input or an intermediate terminal stop', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('three-strategy no-progress task');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: { circuit_breaker: { same_error_threshold: 3, no_progress_threshold: 3 } },
+  });
+  let calls = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        if (calls === 10) return { status: 'done', applied: true };
+        const artifact = {
+          schema_version: 1,
+          phase: 'review',
+          ticket_id: 'r1',
+          summary: 'The candidate made no progress.',
+          verdict: 'changes_requested',
+          findings: ['literal unchanged no-progress blocker'],
+        };
+        throw new WorkerLifecycleRefusalError('review', `/evidence/no-progress-${calls}.json`, artifact);
+      },
+    },
+  ));
+
+  const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'r1');
+  const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 10);
+  assert.ok(strategies.length >= 3);
+  assert.equal(new Set(strategies.slice(0, 3).map((epoch) => epoch.materialApproach)).size, 3);
+  assert.equal(new Set(strategies.slice(0, 3).map((epoch) => epoch.strategyHash)).size, 3);
+  assert.ok(authorizations.authorizations.length >= 3);
+  assert.ok(authorizations.authorizations.every((authorization) => authorization.authorized_by === 'runner'));
+  assert.equal(executionTelemetrySummary(sessionDir).postSealHumanInterventions, 0);
+  assert.doesNotMatch(readRunnerLog(sessionDir), /paused for explicit PRD revision approval|stopping during ticket|refusing ticket/);
 });
 
 test('mux-runner adaptive recovery rolls interleaved recurring lineages into a new strategy epoch', async () => {
