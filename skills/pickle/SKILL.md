@@ -16,7 +16,7 @@ You are entering the Pickle Rick autonomous engineering lifecycle for a Codex wo
 3. If no session exists, create one: `node $HOME/.codex/pickle-rick/extension/bin/setup.js "<task>"`
 4. Draft the PRD: `node $HOME/.codex/pickle-rick/extension/bin/draft-prd.js <session-dir> "<task>"`
 5. Refine the PRD into tickets: `node $HOME/.codex/pickle-rick/extension/bin/spawn-refinement-team.js <session-dir>`
-6. Execute tickets sequentially: `node $HOME/.codex/pickle-rick/extension/bin/mux-runner.js <session-dir>`
+6. Execute tickets through the durable restart supervisor: `node $HOME/.codex/pickle-rick/extension/bin/supervised-runner.js <session-dir> --runner-bin=mux-runner.js --on-failure=retry`
 7. Inspect or control the run with `status`, `metrics`, `cancel`, and `retry`
 
 ## Execution Contract

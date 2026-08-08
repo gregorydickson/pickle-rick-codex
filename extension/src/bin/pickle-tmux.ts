@@ -222,8 +222,9 @@ async function main(argv: string[]): Promise<void> {
 
       const runnerCommand = [
         'node',
-        shellQuote(path.join(runtimeRoot, 'bin', runnerDescriptor.runnerBin)),
+        shellQuote(path.join(runtimeRoot, 'bin', 'supervised-runner.js')),
         shellQuote(sessionDir),
+        `--runner-bin=${runnerDescriptor.runnerBin}`,
         `--on-failure=${onFailure}`,
         `--launch-owner=${process.pid}`,
         `--run-started-at=${launchStartedAtMs}`,
