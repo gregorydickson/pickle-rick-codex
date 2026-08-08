@@ -135,6 +135,8 @@ test('shell verification confines cd and pushd transitions while preserving in-r
     'cd ../outside && node --version',
     `cd ${outside} && node --version`,
     'pushd escape-link && node --version',
+    'builtin cd ../outside && node --version',
+    'builtin pushd escape-link && node --version',
   ]) {
     assert.throws(() => ready({
       id: 'unsafe-shell-cwd', verification: [{ kind: 'shell', script, justification: 'multi-command verification' }],
@@ -180,6 +182,10 @@ test('shell and package lifecycle policy unwraps command and env before destruct
     'command -p rm -rf build',
     'env rm -rf build',
     'command git reset --hard HEAD',
+    'builtin command rm -rf build',
+    'builtin command env git reset --hard HEAD',
+    'builtin exec command rm -rf build',
+    'builtin exec env git reset --hard HEAD',
     'if true; then command rm -rf build; fi',
     '{ command rm -rf build; }',
   ]) {
@@ -189,7 +195,13 @@ test('shell and package lifecycle policy unwraps command and env before destruct
   }
 
   const packagePath = path.join(repo, 'package.json');
-  for (const script of ['command rm -rf build', 'env git reset --hard HEAD', 'cd ../outside && node --version']) {
+  for (const script of [
+    'command rm -rf build',
+    'env git reset --hard HEAD',
+    'cd ../outside && node --version',
+    'builtin command rm -rf build',
+    'builtin cd ../outside && node --version',
+  ]) {
     fs.writeFileSync(packagePath, JSON.stringify({ scripts: { test: script } }));
     assert.throws(() => ready({
       id: 'unsafe-package-wrapper', verification: [{ kind: 'package_script', manager: 'npm', script: 'test' }],
@@ -200,6 +212,14 @@ test('shell and package lifecycle policy unwraps command and env before destruct
     id: 'safe-command-query',
     verification: [{ kind: 'shell', script: 'command -v node', justification: 'resolve verifier' }],
   }, repo));
+  assert.throws(() => assertVerificationStepSafe({
+    kind: 'shell',
+    script: `${'builtin '.repeat(17)}pwd`,
+    justification: 'legacy verification',
+  }, { cwd: repo }), /wrapper nesting exceeds verification policy limit/);
+  assert.throws(() => assertVerificationStepSafe({
+    kind: 'shell', script: 'builtin -s pwd', justification: 'legacy verification',
+  }, { cwd: repo }), /builtin wrapper options are forbidden/);
 });
 
 test('package verification validates script existence and lifecycle bodies before implementation and at runtime', () => {

@@ -313,14 +313,22 @@ function hasUnquotedGlob(command: string): boolean {
 const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'command', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'popd', 'printf', 'pushd', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
 const SHELL_RESERVED_WITHOUT_COMMAND = new Set(['for', 'select', 'case', 'done', 'fi', 'esac', 'in', 'function', '}']);
 const SHELL_RESERVED_COMMAND_PREFIXES = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', 'time', '{']);
+const MAX_SHELL_WRAPPER_DEPTH = 16;
+
+interface ShellCommandDescriptor {
+  executable: string;
+  args: string[];
+  policyViolation?: string;
+}
 
 function commandExecutable(segment: string): string | null {
   return shellCommandDescriptor(segment)?.executable || null;
 }
 
-function shellCommandDescriptor(segment: string): { executable: string; args: string[] } | null {
+function shellCommandDescriptor(segment: string): ShellCommandDescriptor | null {
   let tokens = tokenizeShellWords(segment);
   let index = 0;
+  let wrapperDepth = 0;
   if (SHELL_RESERVED_WITHOUT_COMMAND.has(tokens[index])) return null;
   while (SHELL_RESERVED_COMMAND_PREFIXES.has(tokens[index])) {
     const keyword = tokens[index];
@@ -330,9 +338,20 @@ function shellCommandDescriptor(segment: string): { executable: string; args: st
     }
   }
   while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
-  while (['command', 'env', 'exec'].includes(tokens[index])) {
+  while (['builtin', 'command', 'env', 'exec'].includes(tokens[index])) {
+    wrapperDepth += 1;
+    if (wrapperDepth > MAX_SHELL_WRAPPER_DEPTH) {
+      return { executable: '', args: [], policyViolation: 'shell wrapper nesting exceeds verification policy limit' };
+    }
     const wrapper = tokens[index];
     index += 1;
+    if (wrapper === 'builtin') {
+      while (tokens[index] === '--') index += 1;
+      if (tokens[index]?.startsWith('-')) {
+        return { executable: '', args: [], policyViolation: 'builtin wrapper options are forbidden by verification policy' };
+      }
+      continue;
+    }
     if (wrapper === 'command') {
       while (tokens[index]?.startsWith('-')) {
         if (/[vV]/.test(tokens[index])) return { executable: 'command', args: tokens.slice(index) };
@@ -902,6 +921,7 @@ function shellPolicyViolation(
   for (const segment of splitShellSegments(script)) {
     const descriptor = shellCommandDescriptor(segment);
     if (!descriptor) continue;
+    if (descriptor.policyViolation) return descriptor.policyViolation;
     const executable = executableBasename(descriptor.executable);
     if (['cd', 'pushd'].includes(executable)) {
       if (!containment) continue;
