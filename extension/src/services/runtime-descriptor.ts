@@ -38,7 +38,15 @@ function normalizedRuntimeContent(root: string, raw: Buffer): Buffer {
   if (text.includes(RUNTIME_ROOT_NORMALIZATION_TOKEN)) {
     throw new Error('Runtime descriptor refuses reserved runtime-root normalization token in runtime contents.');
   }
-  const normalized = text.split(root).join(RUNTIME_ROOT_NORMALIZATION_TOKEN);
+  // Authored source templates are the only context where shell aliases carry
+  // installer-defined runtime-root semantics. Installed runtimes are marked
+  // before their descriptor is written, so a later concrete -> literal alias
+  // edit remains meaningful bytes and cannot collide with the deployed root.
+  const aliases = fs.existsSync(path.join(root, '.pickle-rick-runtime'))
+    ? [root]
+    : [root, '$HOME/.codex/pickle-rick', '~/.codex/pickle-rick'];
+  let normalized = text;
+  for (const alias of aliases) normalized = normalized.split(alias).join(RUNTIME_ROOT_NORMALIZATION_TOKEN);
   return Buffer.from(normalized, 'utf8');
 }
 

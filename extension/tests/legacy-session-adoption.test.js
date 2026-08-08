@@ -247,6 +247,7 @@ test('runtime descriptor relocations remain equal while literal shell aliases an
   fs.appendFileSync(path.join(first, 'extension', 'bin', 'mux-runner.js'), `const runtimeRoot = ${JSON.stringify(fs.realpathSync(first))};\n`);
   fs.appendFileSync(path.join(second, 'extension', 'bin', 'mux-runner.js'), `const runtimeRoot = ${JSON.stringify(fs.realpathSync(second))};\n`);
   assert.equal(runtimeBuildHash(first), runtimeBuildHash(second));
+  fs.writeFileSync(path.join(second, '.pickle-rick-runtime'), 'installed\n');
   const relocatedHash = runtimeBuildHash(second);
   fs.writeFileSync(path.join(second, 'extension', 'bin', 'mux-runner.js'), 'const runtimeRoot = "$HOME/.codex/pickle-rick";\n');
   assert.notEqual(runtimeBuildHash(second), relocatedHash);
