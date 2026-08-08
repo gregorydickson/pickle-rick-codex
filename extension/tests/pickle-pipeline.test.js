@@ -35,6 +35,7 @@ function initGitRepo(repoDir) {
 
 test('pipeline-runner CLI treats every non-success terminal reason as failure', () => {
   assert.equal(pipelineExitFailed('success'), false);
+  assert.equal(pipelineExitFailed('dependency_repair_scheduled'), false, 'durable dependency wakeup is nonterminal');
   for (const reason of ['citadel-blocked', 'circuit_open', 'cancelled', 'no_tickets', 'future-failure']) {
     assert.equal(pipelineExitFailed(reason), true, reason);
   }

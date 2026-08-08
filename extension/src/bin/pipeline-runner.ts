@@ -89,7 +89,7 @@ function isBlockingExitReason(exitReason: string): boolean {
 }
 
 export function pipelineExitFailed(exitReason: string): boolean {
-  return exitReason !== 'success';
+  return exitReason !== 'success' && exitReason !== 'dependency_repair_scheduled';
 }
 
 function readSessionExitReason(sessionDir: string): string {
