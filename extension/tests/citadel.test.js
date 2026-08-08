@@ -11,6 +11,7 @@ import {
   runCitadelChecks,
   recoverCitadelStartCommit,
   persistCitadelReleaseApproval,
+  resolveCitadelCheckCwd,
   validateCitadelReport,
 } from '../services/citadel.js';
 import { writePrdSeal } from '../services/prd-seal.js';
@@ -62,6 +63,36 @@ function sealCitadelSession(sessionDir, cwd, id, text) {
     release_gates: [],
   });
 }
+
+test('Citadel verification cwd cannot escape its isolated worktree', () => {
+  const isolated = makeTempRoot('pickle-citadel-cwd-');
+  fs.mkdirSync(path.join(isolated, 'extension'));
+  assert.equal(resolveCitadelCheckCwd(isolated, 'extension'), fs.realpathSync(path.join(isolated, 'extension')));
+  assert.throws(
+    () => resolveCitadelCheckCwd(isolated, path.join(path.dirname(isolated), 'live-release-workspace')),
+    /escapes the isolated release worktree/,
+  );
+  assert.throws(() => resolveCitadelCheckCwd(isolated, '../outside'), /escapes the isolated release worktree/);
+});
+
+test('Citadel rejects an absolute verification cwd before it can mutate the release tree', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('Checks stay isolated.');
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{
+      acceptance_criteria: ['Checks stay isolated.'],
+      verification: [{
+        kind: 'process',
+        executable: process.execPath,
+        args: ['-e', "require('node:fs').writeFileSync('escaped.txt', 'must not run\\n')"],
+        cwd,
+      }],
+    }],
+  }));
+
+  await assert.rejects(() => runCitadel(sessionDir), /escapes the isolated release worktree/);
+  assert.equal(fs.existsSync(path.join(cwd, 'escaped.txt')), false);
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
+});
 
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({

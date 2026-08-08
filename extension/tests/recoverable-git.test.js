@@ -140,3 +140,33 @@ test('path-scoped recovery restores both sides of a committed rename with unusua
   assert.equal(fs.readFileSync(path.join(cwd, 'unrelated.txt'), 'utf8'), 'injected unrelated work\n');
   assert.equal(fs.readFileSync(path.join(cwd, unrelatedUntracked), 'utf8'), 'injected untracked work\n');
 });
+
+test('path-scoped recovery preserves mixed-commit topology while reverting only owned paths', () => {
+  const cwd = repo();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-recovery-mixed-'));
+  const baseline = git(cwd, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'owned attempt\n');
+  fs.writeFileSync(path.join(cwd, 'unrelated.txt'), 'preserved commit\n');
+  git(cwd, ['add', 'tracked.txt', 'unrelated.txt']);
+  git(cwd, ['commit', '-m', 'mixed owned and preserved changes']);
+  const mixedCommit = git(cwd, ['rev-parse', 'HEAD']);
+
+  recoverableHardReset({
+    workingDir: cwd,
+    sessionDir,
+    targetHead: baseline,
+    operation: 'mixed-ownership',
+    ownedPaths: ['tracked.txt'],
+    evidencePaths: ['tracked.txt', 'unrelated.txt'],
+  });
+
+  const restoredHead = git(cwd, ['rev-parse', 'HEAD']);
+  assert.notEqual(restoredHead, baseline);
+  assert.notEqual(restoredHead, mixedCommit);
+  assert.doesNotThrow(() => git(cwd, ['merge-base', '--is-ancestor', mixedCommit, restoredHead]));
+  assert.equal(fs.readFileSync(path.join(cwd, 'tracked.txt'), 'utf8'), 'base\n');
+  assert.equal(fs.readFileSync(path.join(cwd, 'unrelated.txt'), 'utf8'), 'preserved commit\n');
+  assert.equal(git(cwd, ['show', 'HEAD:tracked.txt']), 'base');
+  assert.equal(git(cwd, ['show', 'HEAD:unrelated.txt']), 'preserved commit');
+  assert.equal(git(cwd, ['status', '--porcelain']), '');
+});

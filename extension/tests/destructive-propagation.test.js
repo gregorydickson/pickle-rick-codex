@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
+import { CITADEL_ISOLATION_QUARANTINE_FILE } from '../services/citadel.js';
 import { acceptTestRefinement, createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 
 function git(cwd, args) {
@@ -74,7 +75,7 @@ test('worker archive-cap abort preserves attempted tree and records durable repo
   assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), true);
 });
 
-test('Citadel archive-cap abort preserves reviewer mutation and cannot approve', () => {
+test('Citadel archive-cap abort quarantines isolated mutation without touching the release tree', () => {
   const projectDir = cleanRepo('pickle-citadel-archive-cap-');
   fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
     scripts: {
@@ -98,10 +99,17 @@ test('Citadel archive-cap abort preserves reviewer mutation and cannot approve',
     /destructive-archive-cap-exceeded/,
   );
   assert.equal(git(projectDir, ['rev-parse', 'HEAD']), baseline);
-  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'attempted Citadel mutation\n');
-  assert.equal(git(projectDir, ['status', '--porcelain']), 'M tracked.txt');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(git(projectDir, ['status', '--porcelain']), '');
+  const quarantine = readJsonFile(path.join(sessionDir, CITADEL_ISOLATION_QUARANTINE_FILE));
+  assert.match(quarantine.reason, /destructive-archive-cap-exceeded/);
+  assert.equal(fs.readFileSync(path.join(quarantine.working_dir, 'tracked.txt'), 'utf8'), 'attempted Citadel mutation\n');
+  assert.equal(git(quarantine.working_dir, ['status', '--porcelain']), 'M tracked.txt');
   const reportPath = path.join(sessionDir, 'citadel-report.json');
   assert.ok(!fs.existsSync(reportPath) || readJsonFile(reportPath).verdict !== 'approve');
+
+  git(projectDir, ['worktree', 'remove', '--force', quarantine.working_dir]);
+  fs.rmSync(path.dirname(quarantine.working_dir), { recursive: true, force: true });
 });
 
 test('Microverse archive-cap abort preserves attempted iteration and exits non-success with recovery evidence', () => {

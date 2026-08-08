@@ -277,6 +277,7 @@ export function validateCitadelReport(
 }
 
 const CITADEL_RELEASE_APPROVAL_FILE = 'citadel-release-approval.json';
+export const CITADEL_ISOLATION_QUARANTINE_FILE = 'citadel-isolation-quarantine.json';
 
 function reportHash(report: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(report)).digest('hex');
@@ -398,6 +399,18 @@ interface CitadelCheckDescriptor {
   skipped?: boolean;
 }
 
+export function resolveCitadelCheckCwd(workingDir: string, requestedCwd: string): string {
+  const root = fs.realpathSync(workingDir);
+  const candidate = path.resolve(root, requestedCwd);
+  let resolved = candidate;
+  try { resolved = fs.realpathSync(candidate); } catch { /* spawn reports a missing cwd after containment is established */ }
+  const relative = path.relative(root, resolved);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Citadel verification cwd escapes the isolated release worktree: ${requestedCwd}`);
+  }
+  return candidate;
+}
+
 function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: VerificationStep[]): CitadelCheckDescriptor[] {
   const packageChecks = ['typecheck', 'lint', 'test']
     .map((script) => packageCheckDescriptor(workingDir, script));
@@ -412,7 +425,7 @@ function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: Ve
       command: command.display,
       executable: command.executable,
       args: command.args,
-      ...(step.cwd ? { cwd: path.resolve(workingDir, step.cwd) } : {}),
+      ...(step.cwd ? { cwd: resolveCitadelCheckCwd(workingDir, step.cwd) } : {}),
     };
   });
   return [...packageChecks, repositoryCheck, ...ticketChecks];
@@ -684,6 +697,24 @@ export async function runCitadel(
   const isolated = createCitadelWorktree(workingDir, checkpointHead);
   const citadelWorkingDir = isolated.workingDir;
   const checkpointFingerprint = getCitadelRepositoryFingerprint(citadelWorkingDir);
+  let preserveIsolatedEvidence = false;
+  const restoreIsolatedCheckpoint = (source: string): boolean => {
+    try {
+      return restoreMutatedCitadelCheckpoint(
+        citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, source,
+      );
+    } catch (error) {
+      preserveIsolatedEvidence = true;
+      atomicWriteJson(path.join(sessionDir, CITADEL_ISOLATION_QUARANTINE_FILE), {
+        schema_version: 1,
+        working_dir: citadelWorkingDir,
+        source,
+        reason: error instanceof Error ? error.message : String(error),
+        quarantined_at: new Date().toISOString(),
+      });
+      throw error;
+    }
+  };
   try {
   let checks: CitadelCheckResult[];
   try {
@@ -722,10 +753,10 @@ export async function runCitadel(
     assertReleaseWorkspaceUnchanged();
     if (error instanceof CitadelChecksCancelledError) {
       assertOwnership();
-      restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
+      restoreIsolatedCheckpoint('deterministic-check');
       return 'cancelled';
     }
-    const restored = restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
+    const restored = restoreIsolatedCheckpoint('deterministic-check');
     if (restored) {
       throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.', { cause: error });
     }
@@ -734,7 +765,7 @@ export async function runCitadel(
   const checksPath = path.join(sessionDir, 'citadel-checks.json');
   assertOwnership();
   atomicWriteJson(checksPath, { schema_version: 1, reviewed_range: reviewedRange, checks });
-  if (restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check')) {
+  if (restoreIsolatedCheckpoint('deterministic-check')) {
     assertReleaseWorkspaceUnchanged();
     throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.');
   }
@@ -816,7 +847,7 @@ export async function runCitadel(
       });
     }
   }
-  if (restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'reviewer')) {
+  if (restoreIsolatedCheckpoint('reviewer')) {
     assertReleaseWorkspaceUnchanged();
     throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);
   }
@@ -861,6 +892,6 @@ export async function runCitadel(
   assertReleaseWorkspaceUnchanged();
   return report.verdict === 'approve' ? 'success' : 'citadel-blocked';
   } finally {
-    isolated.cleanup();
+    if (!preserveIsolatedEvidence) isolated.cleanup();
   }
 }

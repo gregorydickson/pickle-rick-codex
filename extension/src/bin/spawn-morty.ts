@@ -410,9 +410,10 @@ function restoreRejectedWorkerMutation(
     sessionDir,
     targetHead: boundary.head,
     operation: `rejected-${ticketId}`,
-    ownedPaths: changedPaths.filter((candidate) => (
-      boundary.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`))
-    )),
+    // The worker starts behind a clean mutation boundary, so every subsequent
+    // changed path is operation-owned. allowedPaths is an acceptance policy,
+    // not an ownership signal; filtering here strands out-of-scope worker dirt.
+    ownedPaths: changedPaths,
     evidencePaths: changedPaths,
     headRecoveryRef: rejectedWorkerRef(sessionDir, ticketId),
     log: (message) => appendRunnerLog(sessionDir, runnerMode, message),

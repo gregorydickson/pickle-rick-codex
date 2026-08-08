@@ -205,6 +205,56 @@ function targetContainsPath(workingDir: string, targetHead: string, ownedPath: s
   return git(workingDir, ['ls-tree', '-z', targetHead, '--', ownedPath]).length > 0;
 }
 
+function committedPathsBetween(workingDir: string, targetHead: string, currentHead: string): string[] {
+  return execFileSync('git', ['diff', '--name-only', '-z', targetHead, currentHead], {
+    cwd: workingDir,
+    encoding: 'utf8',
+    timeout: 30_000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).split('\0').filter(Boolean);
+}
+
+/** Build an inverse, owned-path-only commit on top of the current topology.
+ * This is required when the attempted commit also contains paths the caller
+ * does not own: moving HEAD to the old checkpoint would silently demote those
+ * preserved changes from committed history into the index. */
+function commitOwnedPathRollback(
+  workingDir: string,
+  currentHead: string,
+  targetHead: string,
+  ownedPaths: string[],
+  operation: string,
+): string {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-owned-rollback-'));
+  const indexPath = path.join(temporaryDir, 'index');
+  const indexEnv = { GIT_INDEX_FILE: indexPath };
+  try {
+    git(workingDir, ['read-tree', currentHead], indexEnv);
+    for (const ownedPath of ownedPaths) {
+      if (targetContainsPath(workingDir, targetHead, ownedPath)) {
+        git(workingDir, ['restore', `--source=${targetHead}`, '--staged', '--', ownedPath], indexEnv);
+      } else {
+        git(workingDir, ['update-index', '--force-remove', '--', ownedPath], indexEnv);
+      }
+    }
+    const tree = git(workingDir, ['write-tree'], indexEnv);
+    const currentTree = git(workingDir, ['rev-parse', `${currentHead}^{tree}`]);
+    if (tree === currentTree) return currentHead;
+    const identityEnv = {
+      GIT_AUTHOR_NAME: 'Pickle Rick Recovery',
+      GIT_AUTHOR_EMAIL: 'pickle-recovery@localhost',
+      GIT_COMMITTER_NAME: 'Pickle Rick Recovery',
+      GIT_COMMITTER_EMAIL: 'pickle-recovery@localhost',
+    };
+    return git(workingDir, [
+      'commit-tree', tree, '-p', currentHead, '-m', `pickle recovery: rollback owned paths for ${operation}`,
+    ], identityEnv);
+  } finally {
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  }
+}
+
 /**
  * Restore only files explicitly owned by a failed operation. The historical name
  * remains API-compatible; this implementation never performs a repository reset.
@@ -219,12 +269,21 @@ export function recoverableHardReset(options: RecoverableHardResetOptions): Reco
   if (ownedPaths.length === 0) return archive;
   try {
     if (currentHead !== targetHead) {
-      git(options.workingDir, ['update-ref', 'HEAD', targetHead, currentHead]);
+      const owned = new Set(ownedPaths);
+      const hasPreservedCommittedPaths = committedPathsBetween(options.workingDir, targetHead, currentHead)
+        .some((candidate) => !owned.has(candidate));
+      const restoredHead = hasPreservedCommittedPaths
+        ? commitOwnedPathRollback(
+          options.workingDir, currentHead, targetHead, ownedPaths, options.operation,
+        )
+        : targetHead;
+      git(options.workingDir, ['update-ref', 'HEAD', restoredHead, currentHead]);
     }
+    const restoredHead = git(options.workingDir, ['rev-parse', 'HEAD']);
     const repoRoot = fs.realpathSync(git(options.workingDir, ['rev-parse', '--show-toplevel']));
     for (const ownedPath of ownedPaths) {
-      if (targetContainsPath(options.workingDir, targetHead, ownedPath)) {
-        git(options.workingDir, ['restore', `--source=${targetHead}`, '--staged', '--worktree', '--', ownedPath]);
+      if (targetContainsPath(options.workingDir, restoredHead, ownedPath)) {
+        git(options.workingDir, ['restore', `--source=${restoredHead}`, '--staged', '--worktree', '--', ownedPath]);
         continue;
       }
       git(options.workingDir, ['update-index', '--force-remove', '--', ownedPath]);

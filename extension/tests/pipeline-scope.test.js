@@ -84,7 +84,7 @@ test('pipeline scope is immutable on resume and resolved artifact drift fails cl
   );
 });
 
-test('out-of-scope optional-loop commit is archived and blocked without deleting unattributed paths', () => {
+test('out-of-scope optional-loop commit is archived without demoting preserved commit topology', () => {
   const repo = initRepo();
   const session = makeTempRoot('pickle-scope-session-');
   const beforeHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
@@ -92,6 +92,7 @@ test('out-of-scope optional-loop commit is archived and blocked without deleting
   fs.writeFileSync(path.join(repo, 'docs/outside.md'), 'violating edit\n');
   execFileSync('git', ['add', 'src/safe.ts', 'docs/outside.md'], { cwd: repo });
   execFileSync('git', ['commit', '-qm', 'bad optional loop commit'], { cwd: repo });
+  const mixedCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
 
   assert.throws(
     () => enforceLoopMutationScope({
@@ -103,9 +104,14 @@ test('out-of-scope optional-loop commit is archived and blocked without deleting
     }),
     (error) => error instanceof PipelineScopeError && error.code === 'PIPELINE_SCOPE_VIOLATION',
   );
-  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(), beforeHead);
+  const restoredHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  assert.notEqual(restoredHead, beforeHead);
+  assert.notEqual(restoredHead, mixedCommit);
+  execFileSync('git', ['merge-base', '--is-ancestor', mixedCommit, restoredHead], { cwd: repo });
   assert.equal(fs.readFileSync(path.join(repo, 'src/safe.ts'), 'utf8'), 'safe\n');
   assert.equal(fs.readFileSync(path.join(repo, 'docs/outside.md'), 'utf8'), 'violating edit\n');
+  assert.equal(execFileSync('git', ['show', 'HEAD:docs/outside.md'], { cwd: repo, encoding: 'utf8' }), 'violating edit\n');
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf8' }), '');
   const recoveryRef = `refs/pickle/optional-loop-recovery/${path.basename(session)}/szechuan-sauce`;
   assert.match(execFileSync('git', ['rev-parse', '--verify', recoveryRef], { cwd: repo, encoding: 'utf8' }), /^[0-9a-f]{40}\n$/);
 });
