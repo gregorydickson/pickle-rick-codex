@@ -15,6 +15,27 @@ export const WORKER_LIFECYCLE_PHASES = [
 
 export type WorkerLifecyclePhase = typeof WORKER_LIFECYCLE_PHASES[number];
 
+export interface SimplificationPolicyInput {
+  complexityTier?: unknown;
+  priority?: unknown;
+  explicitlyRequired?: unknown;
+  changedPathCount?: number;
+  reviewFindings?: unknown;
+}
+
+export function simplificationRequired(input: SimplificationPolicyInput): boolean {
+  if (input.explicitlyRequired === true) return true;
+  const tier = String(input.complexityTier || '').trim().toLowerCase();
+  const priority = String(input.priority || '').trim().toUpperCase();
+  if (tier === 'high' || tier === 'critical' || priority === 'P0') return true;
+  if (Number(input.changedPathCount || 0) >= 8) return true;
+  const findings = Array.isArray(input.reviewFindings) ? input.reviewFindings : [];
+  return findings.some((finding) => (
+    typeof finding === 'string'
+    && /\b(?:simplif(?:y|ication)|unnecessary complexity|duplication|dead code)\b/i.test(finding)
+  ));
+}
+
 export interface WorkerLifecycleArtifact {
   schema_version: 1;
   phase: WorkerLifecyclePhase;

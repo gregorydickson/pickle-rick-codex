@@ -78,7 +78,10 @@ function createAcceptedSession(status = 'Todo') {
     history: [],
   });
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Approved fixture PRD\n\nShip durable runtime ownership.\n');
-  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Refined fixture PRD\n');
+  fs.writeFileSync(
+    path.join(sessionDir, 'prd_refined.md'),
+    '# Refined fixture PRD\n\n### AC-RUNTIME-01: The launched runner renews exclusive durable ownership.\n',
+  );
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [{
       id: 'R1',
@@ -116,6 +119,10 @@ test('bootstrap readiness writes a validated seal and crosses the explicit auton
   await ensureBootstrapSessionReady(sessionDir, { resumeReadyOnly: true });
   const seal = readPrdSeal(sessionDir);
   assert.deepEqual(readPrdSeal(sessionDir), seal);
+  assert.deepEqual(seal.acceptance_criteria, [{
+    id: 'AC-RUNTIME-01',
+    text: 'The launched runner renews exclusive durable ownership.',
+  }]);
   const logical = readLogicalPipeline(sessionDir);
   assert.equal(logical.control_state, 'autonomous_execution');
   assert.equal(logical.prd_seal_hash, seal.semantic_hash);

@@ -18,6 +18,7 @@ import {
   readLogicalPipeline,
   requestPrdRevision,
 } from '../services/durable-supervisor.js';
+import { extractAuthoritativeAcceptanceCriteria } from '../services/session-prd-seal.js';
 
 function sealInput(prd = '# Approved PRD\n\nShip it.\n', criterionText = 'The engine ships.') {
   return {
@@ -38,6 +39,29 @@ function sealInput(prd = '# Approved PRD\n\nShip it.\n', criterionText = 'The en
     release_gates: ['typecheck', 'tests'],
   };
 }
+
+test('authoritative acceptance extraction preserves identifiers and exact section text', () => {
+  assert.deepEqual(extractAuthoritativeAcceptanceCriteria(`
+# Refined
+
+### AC-07: Preserve the approved identifier
+
+- Keep the exact evidence.
+- Do not synthesize a ticket index.
+
+### AC-LIVE-2 — Handoff stays live
+`), [
+    {
+      id: 'AC-07',
+      text: 'Preserve the approved identifier\n\n- Keep the exact evidence.\n- Do not synthesize a ticket index.',
+    },
+    { id: 'AC-LIVE-2', text: 'Handoff stays live' },
+  ]);
+  assert.throws(
+    () => extractAuthoritativeAcceptanceCriteria('### AC-01: One\n\n### AC-01: Two\n'),
+    /Duplicate authoritative acceptance criterion id/,
+  );
+});
 
 test('PRD seal binds exact PRD and semantic contract with validated durable read-back', () => {
   const sessionDir = makeTempRoot('prd-seal-');

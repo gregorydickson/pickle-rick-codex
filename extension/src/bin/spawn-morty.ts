@@ -30,6 +30,7 @@ import {
   archiveWorkerLifecycleRefusal,
   prepareWorkerLifecycleArtifact,
   readAndValidateWorkerLifecycleArtifact,
+  simplificationRequired,
   workerLifecycleArtifactPath,
   WorkerLifecycleRefusalError,
   WORKER_LIFECYCLE_PHASES,
@@ -1070,6 +1071,29 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     for (const phase of WORKER_LIFECYCLE_PHASES) {
       assertOwnership();
       if (lifecycleArtifacts.some((artifact) => artifact.phase === phase)) continue;
+      if (phase === 'simplify') {
+        const review = lifecycleArtifacts.find((artifact) => artifact.phase === 'review');
+        const required = simplificationRequired({
+          complexityTier: normalizedTicket.complexity_tier,
+          priority: normalizedTicket.priority,
+          explicitlyRequired: normalizedTicket.simplification_required,
+          changedPathCount: changedPathsSinceSnapshot(workingDir, workspaceBaseline).length,
+          reviewFindings: review?.findings,
+        });
+        if (!required) {
+          const skipped: WorkerLifecycleArtifact = {
+            schema_version: 1,
+            phase: 'simplify',
+            ticket_id: normalizedTicketId,
+            summary: 'Simplification skipped by the sealed risk, diff, and verified-finding policy.',
+            skipped: true,
+            verification: ['Policy evaluated after implementation review and required no simplification pass.'],
+          };
+          atomicWriteJson(workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase), skipped);
+          lifecycleArtifacts.push(skipped);
+          continue;
+        }
+      }
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }

@@ -8,6 +8,7 @@ import {
   WORKER_LIFECYCLE_PHASES,
   prepareWorkerLifecycleArtifact,
   readAndValidateWorkerLifecycleArtifact,
+  simplificationRequired,
   serializeApprovedWorkerContext,
   workerLifecycleArtifactPath,
 } from '../services/worker-lifecycle.js';
@@ -49,6 +50,21 @@ test('worker lifecycle exposes its ordered eight-phase contract', () => {
     'simplify',
     'conformance',
   ]);
+});
+
+test('simplification policy skips low and medium risk but runs for high risk and concrete triggers', () => {
+  assert.equal(simplificationRequired({ complexityTier: 'low', priority: 'P3', changedPathCount: 2 }), false);
+  assert.equal(simplificationRequired({ complexityTier: 'medium', priority: 'P2', changedPathCount: 3 }), false);
+  assert.equal(simplificationRequired({ complexityTier: 'medium', priority: 'P1', changedPathCount: 3 }), false);
+  assert.equal(simplificationRequired({ complexityTier: 'high', priority: 'P2', changedPathCount: 1 }), true);
+  assert.equal(simplificationRequired({ complexityTier: 'medium', priority: 'P0', changedPathCount: 1 }), true);
+  assert.equal(simplificationRequired({ complexityTier: 'low', priority: 'P3', explicitlyRequired: true }), true);
+  assert.equal(simplificationRequired({ complexityTier: 'medium', priority: 'P2', changedPathCount: 8 }), true);
+  assert.equal(simplificationRequired({
+    complexityTier: 'low',
+    priority: 'P3',
+    reviewFindings: ['Verified duplication requires simplification before conformance.'],
+  }), true);
 });
 
 test('workerLifecycleArtifactPath and prepareWorkerLifecycleArtifact create a clean destination', (t) => {

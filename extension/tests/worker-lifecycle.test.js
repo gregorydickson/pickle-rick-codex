@@ -18,7 +18,7 @@ function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-function setupLifecycleRun(env) {
+function setupLifecycleRun(env, ticketOverrides = {}) {
   const projectDir = makeTempRoot('pickle-worker-lifecycle-project-');
   git(projectDir, ['init']);
   git(projectDir, ['config', 'user.name', 'Lifecycle Tests']);
@@ -44,7 +44,9 @@ function setupLifecycleRun(env) {
       verification: ['node -e "process.exit(0)"'],
       allowed_paths: ['feature.txt'],
       priority: 'P1',
+      complexity_tier: 'high',
       status: 'Todo',
+      ...ticketOverrides,
     }],
   });
   acceptTestRefinement(sessionDir, projectDir);
@@ -149,6 +151,40 @@ test('worker lifecycle persists eight validated phases and reads approved resear
   }
   assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), false);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
+});
+
+test('low-risk lifecycle records a policy skip without invoking simplification', () => {
+  const fakeBin = makeTempRoot('pickle-worker-lifecycle-low-risk-bin-');
+  createFakeCodex(fakeBin);
+  const dataRoot = makeTempRoot();
+  const invocationLog = path.join(dataRoot, 'codex-invocations.jsonl');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    runtime: { add_dirs: [dataRoot], exec_args: ['--dangerously-bypass-approvals-and-sandbox'] },
+  });
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'implemented\n',
+  });
+  const { projectDir, sessionDir } = setupLifecycleRun(env, {
+    complexity_tier: 'low',
+    priority: 'P3',
+  });
+
+  runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
+
+  const phases = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.args[0] === 'exec')
+    .map((entry) => path.basename(entry.args[entry.args.indexOf('--output-last-message') + 1]).split('.')[1]);
+  assert.equal(phases.includes('simplify'), false);
+  assert.deepEqual(phases, ['research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'conformance']);
+  const skipped = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'worker-lifecycle', 'r1', 'simplify.json'), 'utf8',
+  ));
+  assert.equal(skipped.skipped, true);
 });
 
 test('worker lifecycle retries malformed read-only conformance output without discarding reviewed implementation', () => {

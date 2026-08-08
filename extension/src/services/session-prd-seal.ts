@@ -13,6 +13,7 @@ import {
   readPrdSeal,
   writePrdSeal,
   type CreatePrdSealInput,
+  type PrdAcceptanceCriterion,
   type PrdSeal,
 } from './prd-seal.js';
 import { readJsonFile } from './pickle-utils.js';
@@ -24,6 +25,35 @@ import { recordExecutionControlTelemetry } from './productive-autonomy.js';
 export function initializePrdDevelopmentPipeline(sessionDir: string): void {
   const journalPath = path.join(sessionDir, 'logical-pipeline.json');
   if (!fs.existsSync(journalPath)) createLogicalPipeline(sessionDir, path.basename(sessionDir));
+}
+
+export function extractAuthoritativeAcceptanceCriteria(markdown: string): PrdAcceptanceCriterion[] {
+  const lines = markdown.split(/\r?\n/);
+  const criteria: PrdAcceptanceCriterion[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const heading = lines[index].match(/^(#{1,6})\s+(AC-[A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*[:—-]\s*(.*))?\s*$/i);
+    if (!heading) continue;
+    const depth = heading[1].length;
+    const body: string[] = [];
+    let cursor = index + 1;
+    for (; cursor < lines.length; cursor += 1) {
+      const nextHeading = lines[cursor].match(/^(#{1,6})\s+/);
+      if (nextHeading && nextHeading[1].length <= depth) break;
+      body.push(lines[cursor]);
+    }
+    const title = String(heading[3] || '').trim();
+    const bodyText = body.join('\n').trim();
+    const text = [title, bodyText].filter(Boolean).join('\n\n');
+    if (!text) throw new Error(`Authoritative acceptance criterion ${heading[2]} has no text.`);
+    criteria.push({ id: heading[2], text });
+    index = cursor - 1;
+  }
+  const ids = new Set<string>();
+  for (const criterion of criteria) {
+    if (ids.has(criterion.id)) throw new Error(`Duplicate authoritative acceptance criterion id: ${criterion.id}.`);
+    ids.add(criterion.id);
+  }
+  return criteria;
 }
 
 function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): PrdSeal {
@@ -40,14 +70,22 @@ function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): Pr
   }
   const prdPath = path.join(sessionDir, 'prd.md');
   const prd = fs.readFileSync(prdPath, 'utf8');
+  const refinedPrdPath = path.join(sessionDir, 'prd_refined.md');
+  const refinedPrd = fs.existsSync(refinedPrdPath) ? fs.readFileSync(refinedPrdPath, 'utf8') : '';
   const manifest = readManifest(sessionDir);
   const executionBase = String(state.start_commit || 'unversioned');
-  const acceptanceCriteria = manifest.tickets.flatMap((ticket) => (
-    (ticket.acceptance_criteria || []).map((text, index) => ({
-      id: `${ticket.id}-AC-${index + 1}`,
-      text,
-    }))
-  ));
+  const authoritativeCriteria = extractAuthoritativeAcceptanceCriteria(refinedPrd);
+  const sourceCriteria = authoritativeCriteria.length > 0
+    ? authoritativeCriteria
+    : extractAuthoritativeAcceptanceCriteria(prd);
+  const acceptanceCriteria = sourceCriteria.length > 0
+    ? sourceCriteria
+    : manifest.tickets.flatMap((ticket) => (
+      (ticket.acceptance_criteria || []).map((text, index) => ({
+        id: `${ticket.id}-AC-${index + 1}`,
+        text,
+      }))
+    ));
   if (acceptanceCriteria.length === 0) {
     throw new Error('Cannot seal PRD because refinement produced no acceptance criteria.');
   }
@@ -86,7 +124,11 @@ function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): Pr
       terminal_state: 'completed',
     },
     release_gates: {
-      ticket_verification: manifest.tickets.map((ticket) => ({ ticket_id: ticket.id, verification: ticket.verification || [] })),
+      ticket_verification: manifest.tickets.map((ticket) => ({
+        ticket_id: ticket.id,
+        acceptance_criteria: ticket.acceptance_criteria || [],
+        verification: ticket.verification || [],
+      })),
       final_gate: 'citadel',
     },
   };
