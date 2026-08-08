@@ -7,6 +7,7 @@ import {
   countCommitsSince,
   commitTrackedChanges,
   getHeadSha,
+  getWorkingTreeContentFingerprint,
   getWorkingTreeFingerprint,
   getWorkingTreeStatus,
   isGitRepo,
@@ -160,7 +161,7 @@ function refinementRepositoryFilesFingerprint(workingDir: string, sessionDir: st
   const resolved = fs.realpathSync(workingDir);
   const exclusion = refinementSessionExclusion(resolved, sessionDir);
   if (exclusion.excludeAll) return '';
-  return getWorkingTreeFingerprint(resolved, exclusion.prefixes);
+  return getWorkingTreeContentFingerprint(resolved, exclusion.prefixes);
 }
 
 export interface RefinementInputIdentity {

@@ -37,6 +37,10 @@ export function getHeadSha(cwd: string): string {
   return runGit(['rev-parse', 'HEAD'], cwd, { allowFailure: true }) || '';
 }
 
+export function getSymbolicHead(cwd: string): string | null {
+  return runGit(['symbolic-ref', '-q', 'HEAD'], cwd, { allowFailure: true }) || null;
+}
+
 export function isPathTracked(cwd: string, relativePath: string): boolean {
   try {
     runGit(['ls-files', '--error-unmatch', '--', relativePath], cwd);
@@ -323,11 +327,11 @@ function getFilesystemFingerprint(cwd: string, excludePrefixes?: string[]): stri
   return hash.digest('hex');
 }
 
-export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[]): string {
-  if (!isGitRepo(cwd)) {
-    return getFilesystemFingerprint(cwd, excludePrefixes);
-  }
-
+function getGitWorkingTreeFingerprint(
+  cwd: string,
+  excludePrefixes: string[] | undefined,
+  includeIndex: boolean,
+): string {
   const args = ['ls-files', '--cached', '--others', '--exclude-standard', '-z'];
   const excluded = normalizeExcludePrefixes(excludePrefixes);
   if (excluded.length > 0) {
@@ -344,14 +348,13 @@ export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[
     .sort();
   const hash = crypto.createHash('sha256');
   // File bytes alone cannot distinguish staged content from the same worktree
-  // bytes backed by a different index entry. Bind the identity to HEAD, the
-  // symbolic branch, and the exact staged blob/mode/stage tuples as well.
-  hash.update(runGit(['rev-parse', 'HEAD'], cwd, { trim: false }));
-  hash.update('\0');
-  hash.update(runGit(['symbolic-ref', '-q', 'HEAD'], cwd, { allowFailure: true, trim: false }));
-  hash.update('\0');
-  hash.update(runGit(['ls-files', '--stage', '-z'], cwd, { trim: false }));
-  hash.update('\0');
+  // bytes backed by a different index entry. HEAD and branch identity are
+  // intentionally excluded: this shared fingerprint measures repository
+  // content, while callers that fence topology bind those fields separately.
+  if (includeIndex) {
+    hash.update(runGit(['ls-files', '--stage', '-z'], cwd, { trim: false }));
+    hash.update('\0');
+  }
 
   for (const relativePath of files) {
     const absolutePath = path.join(cwd, relativePath);
@@ -373,6 +376,17 @@ export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[
   }
 
   return hash.digest('hex');
+}
+
+export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[]): string {
+  if (!isGitRepo(cwd)) return getFilesystemFingerprint(cwd, excludePrefixes);
+  return getGitWorkingTreeFingerprint(cwd, excludePrefixes, true);
+}
+
+/** Content-only identity used when the same verified bytes cross an untracked/staged/committed boundary. */
+export function getWorkingTreeContentFingerprint(cwd: string, excludePrefixes?: string[]): string {
+  if (!isGitRepo(cwd)) return getFilesystemFingerprint(cwd, excludePrefixes);
+  return getGitWorkingTreeFingerprint(cwd, excludePrefixes, false);
 }
 
 function worktreeExists(worktreeDir: string): boolean {
@@ -577,12 +591,16 @@ export function fastForwardFromIsolatedCandidate(
   candidateWorkingDir: string,
   baseSha: string,
   expectedCandidateSha: string,
+  expectedLiveRef: string | null,
 ): void {
   if (getWorkingTreeStatus(liveWorkingDir)) {
     throw new Error('Refusing candidate promotion into a dirty live workspace.');
   }
   if (getHeadSha(liveWorkingDir) !== baseSha) {
     throw new Error('Refusing candidate promotion after the live HEAD changed.');
+  }
+  if (getSymbolicHead(liveWorkingDir) !== expectedLiveRef) {
+    throw new Error('Refusing candidate promotion after the live branch changed.');
   }
   if (getHeadSha(candidateWorkingDir) !== expectedCandidateSha) {
     throw new Error('Refusing promotion after the isolated candidate HEAD changed.');

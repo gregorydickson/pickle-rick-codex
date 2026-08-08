@@ -14,6 +14,7 @@ import {
   commitIsAncestorWithPathsUnchanged,
   fastForwardFromIsolatedCandidate,
   getHeadSha,
+  getSymbolicHead,
   getWorkingTreeFingerprint,
   getWorkingTreeStatus,
   isGitRepo,
@@ -121,6 +122,7 @@ interface MicroverseAttemptTransaction {
   candidate_ino?: number;
   live_working_dir?: string;
   live_head?: string;
+  live_ref?: string | null;
   live_fingerprint?: string;
   phase?: 'running' | 'promotion_pending' | 'promoted' | 'quarantined';
   quarantine_reason?: string;
@@ -148,6 +150,7 @@ interface MicroverseCandidate {
   device: number;
   inode: number;
   liveWorkingDir: string;
+  liveRef: string | null;
   baseHead: string;
   liveFingerprint: string;
 }
@@ -669,6 +672,7 @@ function writeMicroverseAttemptTransaction(
     candidate_ino: candidate?.inode,
     live_working_dir: candidate?.liveWorkingDir,
     live_head: candidate?.baseHead,
+    live_ref: candidate?.liveRef,
     live_fingerprint: candidate?.liveFingerprint,
     phase: candidate ? 'running' : undefined,
     created_at: new Date().toISOString(),
@@ -708,6 +712,7 @@ function createMicroverseCandidate(
   checkpoint: MetricIterationCheckpoint,
 ): MicroverseCandidate {
   const liveFingerprint = getWorkingTreeFingerprint(liveWorkingDir);
+  const liveRef = getSymbolicHead(liveWorkingDir);
   const candidate = createIsolatedTicketWorktree({
     repoDir: liveWorkingDir,
     sessionDir: path.join(sessionDir, 'microverse-candidates'),
@@ -721,6 +726,7 @@ function createMicroverseCandidate(
     device: candidateStat.dev,
     inode: candidateStat.ino,
     liveWorkingDir,
+    liveRef,
     baseHead: checkpoint.head,
     liveFingerprint,
   };
@@ -787,6 +793,7 @@ function archiveMicroverseCandidate(
 function transactionCandidate(sessionDir: string, transaction: MicroverseAttemptTransaction): MicroverseCandidate | null {
   if (!transaction.candidate_worktree || !transaction.live_working_dir
       || !transaction.live_head || !transaction.live_fingerprint
+      || !Object.hasOwn(transaction, 'live_ref')
       || !Number.isInteger(transaction.candidate_dev) || !Number.isInteger(transaction.candidate_ino)) return null;
   const candidateRoot = path.resolve(sessionDir, 'microverse-candidates', 'isolated-worktrees');
   const candidatePath = path.resolve(transaction.candidate_worktree);
@@ -805,6 +812,7 @@ function transactionCandidate(sessionDir: string, transaction: MicroverseAttempt
     device: candidateLstat.dev,
     inode: candidateLstat.ino,
     liveWorkingDir: transaction.live_working_dir,
+    liveRef: transaction.live_ref ?? null,
     baseHead: transaction.live_head,
     liveFingerprint: transaction.live_fingerprint,
   };
@@ -820,7 +828,9 @@ function promoteMicroverseCandidate(
   if (changedPaths.length === 0) return [];
   const liveHead = getHeadSha(candidate.liveWorkingDir);
   const liveFingerprint = getWorkingTreeFingerprint(candidate.liveWorkingDir);
-  if (liveHead !== candidate.baseHead || liveFingerprint !== candidate.liveFingerprint) {
+  const liveRef = getSymbolicHead(candidate.liveWorkingDir);
+  if (liveHead !== candidate.baseHead || liveRef !== candidate.liveRef
+      || liveFingerprint !== candidate.liveFingerprint) {
     const patchDir = path.join(sessionDir, 'microverse-candidate-patches');
     fs.mkdirSync(patchDir, { recursive: true, mode: 0o700 });
     const patchPath = path.join(patchDir, `${experimentId}.patch`);
@@ -843,6 +853,7 @@ function promoteMicroverseCandidate(
     candidate.worktreeDir,
     candidate.baseHead,
     expectedCandidateHead,
+    candidate.liveRef,
   );
   return changedPaths;
 }
@@ -913,6 +924,7 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
         throw new Error('Promoted Microverse candidate paths no longer match the live repository history.');
       }
       if (liveHead !== transaction.live_head
+          || getSymbolicHead(workingDir) !== transaction.live_ref
           || getWorkingTreeFingerprint(workingDir) !== transaction.live_fingerprint) {
         throw new MicroversePromotionDeferredError(
           `Live workspace still differs from the ${transaction.experiment_id} promotion boundary; candidate remains pending.`,

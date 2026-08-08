@@ -2155,6 +2155,7 @@ test('microverse defers accepted promotion when the live fingerprint changes and
   fs.writeFileSync(path.join(projectDir, 'index-only.txt'), 'index baseline\n');
   runGit(projectDir, ['add', 'score.txt', 'user.txt', 'index-only.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
+  const sourceBranch = runGit(projectDir, ['symbolic-ref', '--short', 'HEAD']);
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
 const args = process.argv.slice(2);
@@ -2200,6 +2201,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   fs.writeFileSync(path.join(projectDir, 'index-only.txt'), 'hidden staged user work\n');
   runGit(projectDir, ['add', 'index-only.txt']);
   runGit(projectDir, ['restore', '--worktree', '--source=HEAD', '--', 'index-only.txt']);
+  runGit(projectDir, ['switch', '-c', 'concurrent-user-branch']);
   await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', resolve);
@@ -2219,6 +2221,12 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   fs.writeFileSync(path.join(projectDir, 'user.txt'), 'baseline\n');
   fs.rmSync(path.join(projectDir, 'user-note.txt'));
   runGit(projectDir, ['restore', '--staged', '--worktree', '--', 'index-only.txt']);
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+  assert.equal(readJsonFile(path.join(sessionDir, 'state.json')).last_exit_reason, 'workspace_changed');
+  assert.equal(runGit(projectDir, ['symbolic-ref', '--short', 'HEAD']), 'concurrent-user-branch');
+  assert.equal(fs.existsSync(transaction.candidate_worktree), true);
+
+  runGit(projectDir, ['switch', sourceBranch]);
   runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
   const resumed = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(resumed.last_exit_reason, 'success');
