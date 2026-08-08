@@ -23,6 +23,26 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function sourceHandoffExitWasRequested(sessionDir: string, acceptingHandoff: boolean): boolean {
+  if (acceptingHandoff) return false;
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8')) as Record<string, unknown>;
+    return state.last_exit_reason === 'runtime_handoff';
+  } catch {
+    return false;
+  }
+}
+
+export function recordSupervisorSignalTermination(
+  sessionDir: string,
+  reason: string,
+  acceptingHandoff: boolean,
+): boolean {
+  return recordUnexpectedNoncompletionTermination(sessionDir, reason, {
+    expectedSourceHandoffExit: sourceHandoffExitWasRequested(sessionDir, acceptingHandoff),
+  });
+}
+
 export function supervisedRunnerDecision(sessionDir: string): 'restart' | 'wait_for_prd' | 'wait_for_handoff' | 'completed' | 'cancelled' {
   abortExpiredRuntimeHandoff(sessionDir);
   const logical = readLogicalPipeline(sessionDir);
@@ -79,11 +99,12 @@ async function main(argv: string[]): Promise<void> {
     throw new Error('Usage: node bin/supervised-runner.js <session-dir> --runner-bin=mux-runner.js|pipeline-runner.js [runner args]');
   }
   const forwarded = argv.filter((arg) => arg !== sessionDir && arg !== runnerArg);
+  const acceptingHandoff = forwarded.some((arg) => arg.startsWith('--handoff-request='));
   const signalExitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {
       try {
-        recordUnexpectedNoncompletionTermination(sessionDir, `supervisor received ${signal}`);
+        recordSupervisorSignalTermination(sessionDir, `supervisor received ${signal}`, acceptingHandoff);
       } finally {
         process.exit(signalExitCodes[signal] || 1);
       }

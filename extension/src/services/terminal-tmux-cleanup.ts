@@ -117,7 +117,11 @@ export function cleanupTerminalTmuxSession(
       || (exitReason === 'cancelled' && Boolean(state.cancel_requested_at))
     );
     if (!expectedNonDurableExit) {
-      recordUnexpectedNoncompletionTermination(resolvedSessionDir, 'tmux restart supervisor exited before logical completion');
+      recordUnexpectedNoncompletionTermination(
+        resolvedSessionDir,
+        'tmux restart supervisor exited before logical completion',
+        { expectedSourceHandoffExit: hasDurableJournal && exitReason === 'runtime_handoff' },
+      );
     }
 
     if (state.active === true) {

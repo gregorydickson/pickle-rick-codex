@@ -426,7 +426,11 @@ export function recordExecutionControlTelemetry(
 /** Persist the zero-rule signal for a logical pipeline that stopped without
  * completing or receiving an explicit durable cancellation. Idempotent so a
  * signal handler and an outer fatal-error boundary cannot double count it. */
-export function recordUnexpectedNoncompletionTermination(sessionDir: string, reason: string): boolean {
+export function recordUnexpectedNoncompletionTermination(
+  sessionDir: string,
+  reason: string,
+  options: { expectedSourceHandoffExit?: boolean } = {},
+): boolean {
   const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
   try {
     const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8')) as Record<string, unknown>;
@@ -435,7 +439,8 @@ export function recordUnexpectedNoncompletionTermination(sessionDir: string, rea
       ? (logical.events as Array<Record<string, unknown>>).filter((event) => String(event.kind || '').startsWith('runtime_handoff_'))
       : [];
     const handoffKind = String(handoffEvents.at(-1)?.kind || '');
-    if (handoffKind === 'runtime_handoff_requested' || handoffKind === 'runtime_handoff_released') return false;
+    if (options.expectedSourceHandoffExit
+        && (handoffKind === 'runtime_handoff_released' || handoffKind === 'runtime_handoff_completed')) return false;
   } catch {
     // A missing/corrupt durable journal is itself unexpected non-completion.
   }
