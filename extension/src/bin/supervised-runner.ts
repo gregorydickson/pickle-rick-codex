@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { abortExpiredRuntimeHandoff, hasPendingRuntimeHandoff, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { recordUnexpectedNoncompletionTermination } from '../services/productive-autonomy.js';
+import { captureProcessLivenessIdentity, type PersistedProcessIdentity } from '../services/orphan-reaper.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
 
@@ -23,23 +24,14 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function sourceHandoffExitWasRequested(sessionDir: string, acceptingHandoff: boolean): boolean {
-  if (acceptingHandoff) return false;
-  try {
-    const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8')) as Record<string, unknown>;
-    return state.last_exit_reason === 'runtime_handoff';
-  } catch {
-    return false;
-  }
-}
-
 export function recordSupervisorSignalTermination(
   sessionDir: string,
   reason: string,
   acceptingHandoff: boolean,
+  executorIdentity: PersistedProcessIdentity | null = null,
 ): boolean {
   return recordUnexpectedNoncompletionTermination(sessionDir, reason, {
-    expectedSourceHandoffExit: sourceHandoffExitWasRequested(sessionDir, acceptingHandoff),
+    sourceExecutorIdentity: acceptingHandoff ? null : executorIdentity,
   });
 }
 
@@ -56,7 +48,11 @@ export async function runSupervisedRunner(
   sessionDir: string,
   runnerBin: string,
   runnerArgs: string[],
-  testOptions: { runnerPath?: string; restartDelayMs?: number } = {},
+  testOptions: {
+    runnerPath?: string;
+    restartDelayMs?: number;
+    onExecutorIdentity?: (identity: PersistedProcessIdentity | null) => void;
+  } = {},
 ): Promise<number> {
   if (!ALLOWED_RUNNERS.has(runnerBin) || path.basename(runnerBin) !== runnerBin) {
     throw new Error(`Unsupported supervised runner: ${runnerBin}.`);
@@ -81,6 +77,7 @@ export async function runSupervisedRunner(
       env: process.env,
       stdio: 'inherit',
     });
+    testOptions.onExecutorIdentity?.(child.pid ? captureProcessLivenessIdentity(child.pid) : null);
     const exitCode = await waitForExit(child);
     const decision = supervisedRunnerDecision(sessionDir);
     appendLog(sessionDir, `${runnerBin} exited code=${exitCode}; decision=${decision}`);
@@ -100,17 +97,20 @@ async function main(argv: string[]): Promise<void> {
   }
   const forwarded = argv.filter((arg) => arg !== sessionDir && arg !== runnerArg);
   const acceptingHandoff = forwarded.some((arg) => arg.startsWith('--handoff-request='));
+  let executorIdentity: PersistedProcessIdentity | null = null;
   const signalExitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {
       try {
-        recordSupervisorSignalTermination(sessionDir, `supervisor received ${signal}`, acceptingHandoff);
+        recordSupervisorSignalTermination(sessionDir, `supervisor received ${signal}`, acceptingHandoff, executorIdentity);
       } finally {
         process.exit(signalExitCodes[signal] || 1);
       }
     });
   }
-  process.exitCode = await runSupervisedRunner(sessionDir, runnerBin, forwarded);
+  process.exitCode = await runSupervisedRunner(sessionDir, runnerBin, forwarded, {
+    onExecutorIdentity: (identity) => { executorIdentity = identity; },
+  });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

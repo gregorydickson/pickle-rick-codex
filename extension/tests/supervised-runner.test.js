@@ -17,7 +17,7 @@ import {
   terminateLogicalPipeline,
 } from '../services/durable-supervisor.js';
 import { recordSupervisorSignalTermination, runSupervisedRunner, supervisedRunnerDecision } from '../bin/supervised-runner.js';
-import { executionTelemetrySummary } from '../services/productive-autonomy.js';
+import { executionTelemetrySummary, recordUnexpectedNoncompletionTermination } from '../services/productive-autonomy.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
@@ -35,11 +35,14 @@ function autonomousSession() {
 
 const sourceRuntime = { runtime_id: 'blue', version: '1.0.0', build_hash: 'a'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
 const targetRuntime = { runtime_id: 'green', version: '2.0.0', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
+const sourceIdentity = { pid: 41001, pgid: 41000, start_time: 'Sat Aug  8 13:00:00 2026', fingerprint: 'c'.repeat(64) };
+const unrelatedIdentity = { ...sourceIdentity, pid: 41002, fingerprint: 'd'.repeat(64) };
 
 function releasedHandoffSession() {
   const sessionDir = autonomousSession();
-  fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({ last_exit_reason: 'runtime_handoff' }));
-  const lease = acquireSupervisorLease(sessionDir, { ownerId: 'blue-source', ttlMs: 60_000 });
+  const lease = acquireSupervisorLease(sessionDir, {
+    ownerId: 'blue-source', ttlMs: 60_000, ownerIdentity: sourceIdentity,
+  });
   const requestId = requestRuntimeHandoff(
     sessionDir, lease.owner_id, lease.token, sourceRuntime, targetRuntime, { phase: 'implement' },
   );
@@ -136,10 +139,27 @@ test('green supervisor fatal before handoff acceptance zeroes every score', () =
 test('source supervisor intentional exit after accepted handoff is excluded from zero scoring', () => {
   const { sessionDir, requestId } = releasedHandoffSession();
   acceptRuntimeHandoff(sessionDir, requestId, 'green-target', 60_000, targetRuntime);
-  assert.equal(recordSupervisorSignalTermination(sessionDir, 'source retired after release', false), false);
+  fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({ last_exit_reason: null, active: true }));
+  assert.equal(recordSupervisorSignalTermination(
+    sessionDir, 'source retired after green cleared shared state', false, sourceIdentity,
+  ), false);
+  assert.equal(recordUnexpectedNoncompletionTermination(
+    sessionDir, 'old source tmux cleanup after green startup', { consumeExpectedSourceHandoffExit: true },
+  ), false);
   const summary = executionTelemetrySummary(sessionDir);
   assert.equal(summary.unexpectedNoncompletionTermination, false);
   assert.equal(summary.autonomyScore, 1);
   assert.equal(summary.reliabilityScore, 1);
   assert.equal(summary.qualityScore, 1);
+});
+
+test('unrelated executor cannot consume the accepted source handoff exemption', () => {
+  const { sessionDir, requestId } = releasedHandoffSession();
+  acceptRuntimeHandoff(sessionDir, requestId, 'green-target', 60_000, targetRuntime);
+  assert.equal(recordSupervisorSignalTermination(sessionDir, 'unrelated fatal', false, unrelatedIdentity), true);
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedNoncompletionTermination, true);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
 });

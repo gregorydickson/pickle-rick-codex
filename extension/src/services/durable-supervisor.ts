@@ -48,6 +48,13 @@ export interface RuntimeHandoffResult {
   state: LogicalPipelineState;
 }
 
+export interface RuntimeHandoffSourceExitIntent {
+  request_id: string;
+  owner_id: string;
+  owner_identity: PersistedProcessIdentity;
+  source_runtime: InstalledRuntimeDescriptor;
+}
+
 export interface LogicalPipelineEvent {
   sequence: number;
   event_id: string;
@@ -653,11 +660,19 @@ export function releaseRuntimeHandoffLease(
   return mutate(sessionDir, (state) => {
     const nowMs = options.nowMs ?? Date.now();
     const lease = assertLeaseFence(state, ownerId, token, nowMs);
-    handoffRequest(state, requestId);
+    const request = handoffRequest(state, requestId);
     appendEvent(state, 'runtime_handoff_released', {
       request_id: requestId,
       owner_id: ownerId,
       lease_generation: lease.generation,
+      ...(lease.owner_identity ? {
+        source_exit_intent: {
+          request_id: requestId,
+          owner_id: ownerId,
+          owner_identity: lease.owner_identity,
+          source_runtime: request.details.source_runtime,
+        },
+      } : {}),
     }, nowMs);
     state.lease = null;
   });

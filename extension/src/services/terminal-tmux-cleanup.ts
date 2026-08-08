@@ -120,7 +120,7 @@ export function cleanupTerminalTmuxSession(
       recordUnexpectedNoncompletionTermination(
         resolvedSessionDir,
         'tmux restart supervisor exited before logical completion',
-        { expectedSourceHandoffExit: hasDurableJournal && exitReason === 'runtime_handoff' },
+        { consumeExpectedSourceHandoffExit: hasDurableJournal },
       );
     }
 

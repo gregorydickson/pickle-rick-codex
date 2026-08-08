@@ -6,6 +6,7 @@ import { StateManager } from './state-manager.js';
 import type { Ticket } from '../types/index.js';
 import type { CodexSpawnResult } from '../types/index.js';
 import type { WorkerLifecyclePhase } from './worker-lifecycle.js';
+import type { PersistedProcessIdentity } from './orphan-reaper.js';
 
 export type FailureDomain =
   | 'contract'
@@ -102,6 +103,12 @@ interface ExecutionTelemetryJournal {
   unexpected_noncompletion_termination?: {
     schema_version: 1;
     reason: string;
+    recorded_at: string;
+  };
+  expected_source_handoff_exit?: {
+    schema_version: 1;
+    request_id: string;
+    executor_identity: PersistedProcessIdentity;
     recorded_at: string;
   };
 }
@@ -423,29 +430,89 @@ export function recordExecutionControlTelemetry(
   return controls;
 }
 
+function acceptedSourceExitRequestId(
+  logical: Record<string, unknown>,
+  executorIdentity: PersistedProcessIdentity,
+): string | null {
+  const events = Array.isArray(logical.events) ? logical.events as Array<Record<string, unknown>> : [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const completed = events[index];
+    if (completed.kind !== 'runtime_handoff_completed') continue;
+    const completedDetails = completed.details as Record<string, unknown> | undefined;
+    const requestId = String(completedDetails?.request_id || '');
+    const released = events.slice(0, index).reverse().find((event) => (
+      event.kind === 'runtime_handoff_released'
+      && (event.details as Record<string, unknown> | undefined)?.request_id === requestId
+    ));
+    const request = events.slice(0, index).reverse().find((event) => (
+      event.kind === 'runtime_handoff_requested'
+      && (event.details as Record<string, unknown> | undefined)?.request_id === requestId
+    ));
+    const releasedDetails = released?.details as Record<string, unknown> | undefined;
+    const requestDetails = request?.details as Record<string, unknown> | undefined;
+    const intent = releasedDetails?.source_exit_intent as Record<string, unknown> | undefined;
+    const identity = intent?.owner_identity as PersistedProcessIdentity | undefined;
+    if (!request || !identity || intent?.request_id !== requestId
+        || intent.owner_id !== releasedDetails?.owner_id
+        || JSON.stringify(intent.source_runtime) !== JSON.stringify(requestDetails?.source_runtime)
+        || identity.pid !== executorIdentity.pid || identity.pgid !== executorIdentity.pgid
+        || identity.start_time !== executorIdentity.start_time
+        || identity.fingerprint !== executorIdentity.fingerprint) continue;
+    return requestId;
+  }
+  return null;
+}
+
 /** Persist the zero-rule signal for a logical pipeline that stopped without
  * completing or receiving an explicit durable cancellation. Idempotent so a
  * signal handler and an outer fatal-error boundary cannot double count it. */
 export function recordUnexpectedNoncompletionTermination(
   sessionDir: string,
   reason: string,
-  options: { expectedSourceHandoffExit?: boolean } = {},
+  options: {
+    sourceExecutorIdentity?: PersistedProcessIdentity | null;
+    consumeExpectedSourceHandoffExit?: boolean;
+  } = {},
 ): boolean {
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  if (options.consumeExpectedSourceHandoffExit) {
+    let consumed = false;
+    stateManager.update(filePath, (raw) => {
+      const journal = raw as unknown as ExecutionTelemetryJournal;
+      if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+      if (journal.expected_source_handoff_exit) {
+        delete journal.expected_source_handoff_exit;
+        consumed = true;
+      }
+      return journal as unknown as Record<string, unknown>;
+    }, { createDefault: () => ({ schema_version: 1, events: [], controls: EMPTY_CONTROLS }) });
+    if (consumed) return false;
+  }
   const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
   try {
     const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8')) as Record<string, unknown>;
     if (logical.terminal_state === 'completed' || logical.terminal_state === 'cancelled') return false;
-    const handoffEvents = Array.isArray(logical.events)
-      ? (logical.events as Array<Record<string, unknown>>).filter((event) => String(event.kind || '').startsWith('runtime_handoff_'))
-      : [];
-    const handoffKind = String(handoffEvents.at(-1)?.kind || '');
-    if (options.expectedSourceHandoffExit
-        && (handoffKind === 'runtime_handoff_released' || handoffKind === 'runtime_handoff_completed')) return false;
+    if (options.sourceExecutorIdentity) {
+      const requestId = acceptedSourceExitRequestId(logical, options.sourceExecutorIdentity);
+      if (requestId) {
+        stateManager.update(filePath, (raw) => {
+          const journal = raw as unknown as ExecutionTelemetryJournal;
+          if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+          journal.expected_source_handoff_exit = {
+            schema_version: 1,
+            request_id: requestId,
+            executor_identity: options.sourceExecutorIdentity as PersistedProcessIdentity,
+            recorded_at: new Date().toISOString(),
+          };
+          return journal as unknown as Record<string, unknown>;
+        }, { createDefault: () => ({ schema_version: 1, events: [], controls: EMPTY_CONTROLS }) });
+        return false;
+      }
+    }
   } catch {
     // A missing/corrupt durable journal is itself unexpected non-completion.
   }
-  const filePath = telemetryPath(sessionDir);
-  const stateManager = new StateManager();
   let recorded = false;
   stateManager.update(filePath, (raw) => {
     const journal = raw as unknown as ExecutionTelemetryJournal;
