@@ -215,8 +215,14 @@ function tokenizeShellWords(command: string): string[] {
       if (char === quote) {
         quote = null;
       } else if (char === '\\' && quote === '"' && index + 1 < command.length) {
-        index += 1;
-        current += command[index];
+        const escaped = command[index + 1];
+        if (['$', '`', '"', '\\', '\n'].includes(escaped)) {
+          index += 1;
+          if (escaped !== '\n') current += escaped;
+        } else {
+          current += `\\${escaped}`;
+          index += 1;
+        }
       } else {
         current += char;
       }
@@ -670,12 +676,15 @@ export function normalizeVerificationSteps(value: unknown, options: NormalizeVer
 }
 
 export function verificationStepCommand(step: VerificationStep): { executable: string; args: string[]; shell: boolean; display: string } {
+  const displayWord = (word: string): string => (
+    /^[A-Za-z0-9_@%+=:,./-]+$/.test(word) ? word : shellQuote(word)
+  );
   if (step.kind === 'process') {
-    return { executable: step.executable, args: [...step.args], shell: false, display: [step.executable, ...step.args].map(shellQuote).join(' ') };
+    return { executable: step.executable, args: [...step.args], shell: false, display: [step.executable, ...step.args].map(displayWord).join(' ') };
   }
   if (step.kind === 'package_script') {
     const args = ['run', step.script, ...(step.args?.length ? ['--', ...step.args] : [])];
-    return { executable: step.manager, args, shell: false, display: [step.manager, ...args].map(shellQuote).join(' ') };
+    return { executable: step.manager, args, shell: false, display: [step.manager, ...args].map(displayWord).join(' ') };
   }
   return { executable: process.env.SHELL || 'zsh', args: ['-lc', step.script], shell: true, display: step.script };
 }

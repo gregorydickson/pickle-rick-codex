@@ -1818,7 +1818,7 @@ test('mux-runner does not retry verification-contract failures and leaves the ti
   assert.match(log, /verification contract blocked/);
   assert.match(log, /without retry/);
   assert.doesNotMatch(log, /attempt 2\/2/);
-  assert.equal(fs.readFileSync(countPath, 'utf8'), '8');
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '5');
 });
 
 test('loop-runner completes a detached loop after fake codex returns LOOP_COMPLETE', () => {

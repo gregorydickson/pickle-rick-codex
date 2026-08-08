@@ -15,7 +15,7 @@ test('structured verification preserves argv without a shell', () => {
     executable: 'node',
     args: ['-e', 'process.exit(0)', 'a; echo unsafe'],
     shell: false,
-    display: "'node' '-e' 'process.exit(0)' 'a; echo unsafe'",
+    display: "node -e 'process.exit(0)' 'a; echo unsafe'",
   });
 });
 

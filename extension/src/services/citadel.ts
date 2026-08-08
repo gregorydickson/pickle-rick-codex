@@ -8,6 +8,8 @@ import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
+import { normalizeVerificationSteps, verificationStepCommand, verificationStepIdentity } from './verification-env.js';
+import type { VerificationStep } from '../types/index.js';
 
 export type CitadelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
@@ -79,22 +81,24 @@ function criteriaFromManifest(sessionDir: string): string[] {
   }));
 }
 
-function verificationCommandsFromManifest(sessionDir: string): string[] {
+function verificationStepsFromManifest(sessionDir: string, workingDir: string): VerificationStep[] {
   const manifest = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'refinement_manifest.json'), null);
   if (!Array.isArray(manifest?.tickets)) return [];
-  return uniqueStrings(manifest.tickets.flatMap((ticket) => {
+  const steps = manifest.tickets.flatMap((ticket) => {
     if (!ticket || typeof ticket !== 'object' || Array.isArray(ticket)) return [];
-    const verification = (ticket as Record<string, unknown>).verification;
-    if (typeof verification === 'string') return [verification];
-    if (!Array.isArray(verification)) return [];
-    return verification.flatMap((entry) => {
-      if (typeof entry === 'string') return [entry];
-      if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as Record<string, unknown>).command === 'string') {
-        return [String((entry as Record<string, unknown>).command)];
-      }
-      return [];
+    const record = ticket as Record<string, unknown>;
+    return normalizeVerificationSteps(record.verification, {
+      verify: typeof record.verify === 'string' ? record.verify : undefined,
+      cwd: workingDir,
     });
-  }));
+  });
+  const seen = new Set<string>();
+  return steps.filter((step) => {
+    const identity = verificationStepIdentity([step]);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 function criteriaFromPrd(markdown: string): string[] {
@@ -278,10 +282,11 @@ interface CitadelCheckDescriptor {
   command: string;
   executable: string;
   args: string[];
+  cwd?: string;
   skipped?: boolean;
 }
 
-function citadelCheckDescriptors(workingDir: string, ticketVerificationCommands: string[]): CitadelCheckDescriptor[] {
+function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: VerificationStep[]): CitadelCheckDescriptor[] {
   const scripts = packageScripts(workingDir);
   const packageChecks = ['typecheck', 'lint', 'test'].map((script): CitadelCheckDescriptor => ({
     command: `npm run ${script}`,
@@ -289,11 +294,15 @@ function citadelCheckDescriptors(workingDir: string, ticketVerificationCommands:
     args: ['run', script],
     skipped: !scripts[script],
   }));
-  const ticketChecks = uniqueStrings(ticketVerificationCommands).map((command): CitadelCheckDescriptor => ({
-    command,
-    executable: process.env.SHELL || 'zsh',
-    args: ['-lc', command],
-  }));
+  const ticketChecks = ticketVerificationSteps.map((step): CitadelCheckDescriptor => {
+    const command = verificationStepCommand(step);
+    return {
+      command: command.display,
+      executable: command.executable,
+      args: command.args,
+      ...(step.cwd ? { cwd: path.resolve(workingDir, step.cwd) } : {}),
+    };
+  });
   return [...packageChecks, ...ticketChecks];
 }
 
@@ -325,7 +334,7 @@ async function runMonitoredCitadelCheck(
     let timedOut = false;
     let cancelled = false;
     const child = spawn(descriptor.executable, descriptor.args, {
-      cwd: workingDir,
+      cwd: descriptor.cwd || workingDir,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
@@ -384,11 +393,11 @@ async function runMonitoredCitadelCheck(
 
 async function runCitadelChecksMonitored(
   workingDir: string,
-  ticketVerificationCommands: string[],
+  ticketVerificationSteps: VerificationStep[],
   options: CitadelCheckRunOptions,
 ): Promise<CitadelCheckResult[]> {
   const results: CitadelCheckResult[] = [];
-  for (const descriptor of citadelCheckDescriptors(workingDir, ticketVerificationCommands)) {
+  for (const descriptor of citadelCheckDescriptors(workingDir, ticketVerificationSteps)) {
     results.push(await runMonitoredCitadelCheck(descriptor, workingDir, options));
   }
   return results;
@@ -540,7 +549,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
   try {
     checks = await runCitadelChecksMonitored(
       workingDir,
-      verificationCommandsFromManifest(sessionDir),
+      verificationStepsFromManifest(sessionDir, workingDir),
       {
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
         isCancelled: () => {
