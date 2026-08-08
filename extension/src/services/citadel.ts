@@ -28,6 +28,9 @@ export interface CitadelFinding {
   file?: string | null;
   line?: number | null;
   recommendation?: string | null;
+  ticket_ids?: string[];
+  acceptance_criteria?: string[];
+  paths?: string[];
 }
 
 export interface CitadelReport {
@@ -225,6 +228,15 @@ function normalizeFinding(value: unknown, index: number): CitadelFinding {
   if (!title || !evidence) {
     throw new Error(`Invalid Citadel finding ${index}: title and evidence are required.`);
   }
+  for (const field of ['ticket_ids', 'acceptance_criteria', 'paths'] as const) {
+    if (raw[field] !== undefined && (!Array.isArray(raw[field])
+      || !(raw[field] as unknown[]).every((entry) => typeof entry === 'string' && entry.trim()))) {
+      throw new Error(`Invalid Citadel finding ${index}: ${field} must contain non-empty strings.`);
+    }
+  }
+  const ticketIds = stringArray(raw.ticket_ids);
+  const acceptanceCriteria = stringArray(raw.acceptance_criteria);
+  const paths = stringArray(raw.paths);
   return {
     severity,
     title,
@@ -234,6 +246,9 @@ function normalizeFinding(value: unknown, index: number): CitadelFinding {
     recommendation: typeof raw.recommendation === 'string' && raw.recommendation.trim()
       ? raw.recommendation.trim()
       : null,
+    ...(ticketIds.length > 0 ? { ticket_ids: ticketIds } : {}),
+    ...(acceptanceCriteria.length > 0 ? { acceptance_criteria: acceptanceCriteria } : {}),
+    ...(paths.length > 0 ? { paths } : {}),
   };
 }
 
@@ -578,7 +593,8 @@ function buildCitadelPrompt(
     'Only report findings supported by concrete file/line or command evidence. Do not report style preferences as release blockers.',
     `Citadel report path: ${reportPath}`,
     'Write exactly one JSON object there with keys: schema_version, verdict, reviewed_range, acceptance_criteria_checked, findings, generated_at.',
-    'Each finding must have severity (critical|high|medium|low|info), title, evidence, file, line, recommendation.',
+    'Each finding must have severity (critical|high|medium|low|info), title, evidence, file, line, recommendation, ticket_ids, acceptance_criteria, and paths.',
+    'For every blocking finding, attribute the exact affected ticket ids, criteria, and repository-relative paths; use empty arrays only when that dimension genuinely does not apply.',
     'Use verdict block when any critical/high finding exists; otherwise approve.',
     'After writing the report, return <promise>THE_CITADEL_APPROVES</promise>.',
   ].join('\n\n');

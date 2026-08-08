@@ -153,6 +153,9 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
       file: '  src/a.js  ',
       line: 4,
       recommendation: '  Keep the assertion  ',
+      ticket_ids: ['  R1  '],
+      acceptance_criteria: ['  AC-1  '],
+      paths: ['  src/a.js  '],
     }],
     acceptance_criteria_checked: [null, '  AC-1  ', ''],
     generated_at: generatedAt,
@@ -165,6 +168,9 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
     file: 'src/a.js',
     line: 4,
     recommendation: 'Keep the assertion',
+    ticket_ids: ['R1'],
+    acceptance_criteria: ['AC-1'],
+    paths: ['src/a.js'],
   });
   assert.deepEqual(report.acceptance_criteria_checked, ['AC-1']);
   assert.equal(report.generated_at, generatedAt);
