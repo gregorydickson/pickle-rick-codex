@@ -129,6 +129,25 @@ test('isolated candidate checkout cannot move source refs or write through boots
   }
 });
 
+test('working tree fingerprint binds staged index bytes even when worktree bytes match HEAD', () => {
+  const repoDir = makeTempRoot('pickle-rick-index-fingerprint-');
+  runGit(repoDir, ['init']);
+  runGit(repoDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'a\n');
+  runGit(repoDir, ['add', 'tracked.txt']);
+  runGit(repoDir, ['commit', '-m', 'base']);
+  const clean = getWorkingTreeFingerprint(repoDir);
+
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'b\n');
+  runGit(repoDir, ['add', 'tracked.txt']);
+  runGit(repoDir, ['restore', '--worktree', '--source=HEAD', '--', 'tracked.txt']);
+
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'a\n');
+  assert.notEqual(getWorkingTreeFingerprint(repoDir), clean);
+  assert.match(runGit(repoDir, ['status', '--porcelain']), /MM tracked\.txt/);
+});
+
 test('checkPatchApply classifies malformed patch payloads as invalid', () => {
   const repoDir = makeTempRoot('pickle-rick-git-utils-repo-');
   const patchPath = path.join(repoDir, 'broken.patch');

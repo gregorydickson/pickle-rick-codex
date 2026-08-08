@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runCodexExecMonitored, assertCodexSucceeded } from '../services/codex.js';
@@ -10,6 +11,7 @@ import {
   commitTrackedChanges,
   createPatchFromWorktree,
   createIsolatedTicketWorktree,
+  commitIsAncestorWithPathsUnchanged,
   fastForwardFromIsolatedCandidate,
   getHeadSha,
   getWorkingTreeFingerprint,
@@ -21,8 +23,9 @@ import {
   listWorkingTreeDirtyPaths,
   listUntrackedFiles,
   resetHeadPreservingWorktree,
+  normalizeIsolatedCandidateCommit,
   resetGitIndex,
-  removeTicketWorktree,
+  removeIsolatedTicketWorktree,
 } from '../services/git-utils.js';
 import { salvageDirtyTree, stageOwnedPaths } from '../services/dirty-tree-salvage.js';
 import {
@@ -111,10 +114,13 @@ interface MicroverseAttemptTransaction {
   checkpoint: MetricIterationCheckpoint;
   metric_state_before: MetricConvergenceState;
   candidate_worktree?: string;
+  candidate_dev?: number;
+  candidate_ino?: number;
   live_working_dir?: string;
   live_head?: string;
   live_fingerprint?: string;
-  phase?: 'running' | 'promotion_pending' | 'promoted';
+  phase?: 'running' | 'promotion_pending' | 'promoted' | 'quarantined';
+  quarantine_reason?: string;
   candidate_head?: string;
   promotion_result?: {
     result_score: number;
@@ -124,11 +130,20 @@ interface MicroverseAttemptTransaction {
     insight: string | null;
     verification: string[];
   };
+  archive_receipt?: {
+    artifact: string;
+    sha256: string;
+    experiment_id: string;
+    base_ref: string;
+  };
   created_at: string;
 }
 
 interface MicroverseCandidate {
   worktreeDir: string;
+  isolationRoot: string;
+  device: number;
+  inode: number;
   liveWorkingDir: string;
   baseHead: string;
   liveFingerprint: string;
@@ -138,6 +153,13 @@ class MicroversePromotionDeferredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'MicroversePromotionDeferredError';
+  }
+}
+
+class MicroverseCandidateArchiveError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'MicroverseCandidateArchiveError';
   }
 }
 
@@ -640,6 +662,8 @@ function writeMicroverseAttemptTransaction(
     checkpoint,
     metric_state_before: metricState,
     candidate_worktree: candidate?.worktreeDir,
+    candidate_dev: candidate?.device,
+    candidate_ino: candidate?.inode,
     live_working_dir: candidate?.liveWorkingDir,
     live_head: candidate?.baseHead,
     live_fingerprint: candidate?.liveFingerprint,
@@ -687,8 +711,12 @@ function createMicroverseCandidate(
     ticketId: `${experiment.id}-attempt-${experiment.attempt}`,
     baseRef: checkpoint.head,
   });
+  const candidateStat = fs.statSync(candidate.worktreeDir);
   return {
     worktreeDir: candidate.worktreeDir,
+    isolationRoot: path.join(sessionDir, 'microverse-candidates', 'isolated-worktrees'),
+    device: candidateStat.dev,
+    inode: candidateStat.ino,
     liveWorkingDir,
     baseHead: checkpoint.head,
     liveFingerprint,
@@ -697,7 +725,7 @@ function createMicroverseCandidate(
 
 function discardMicroverseCandidate(candidate: MicroverseCandidate | null): void {
   if (!candidate) return;
-  removeTicketWorktree(candidate.worktreeDir);
+  removeIsolatedTicketWorktree(candidate.worktreeDir, candidate.isolationRoot);
 }
 
 function archiveMicroverseCandidate(
@@ -706,25 +734,72 @@ function archiveMicroverseCandidate(
   experimentId: string | null,
 ): void {
   if (!candidate || !experimentId || !fs.existsSync(candidate.worktreeDir)) return;
-  archiveMicroverseExperiment({
-    workingDir: candidate.worktreeDir,
-    sessionDir,
-    experimentId,
-    baseRef: candidate.baseHead,
-    excludeUntrackedPaths: [],
-  });
+  try {
+    if (process.env.PICKLE_TEST_MODE === '1' && process.env.PICKLE_TEST_MICROVERSE_ARCHIVE_FAIL === '1') {
+      throw new Error('Injected isolated candidate archive failure.');
+    }
+    const archived = archiveMicroverseExperiment({
+      workingDir: candidate.worktreeDir,
+      sessionDir,
+      experimentId,
+      baseRef: candidate.baseHead,
+      excludeUntrackedPaths: [],
+    });
+    const artifactPath = path.resolve(sessionDir, archived.artifact);
+    const serialized = fs.readFileSync(artifactPath);
+    const digest = crypto.createHash('sha256').update(serialized).digest('hex');
+    const payload = JSON.parse(serialized.toString('utf8')) as Record<string, unknown>;
+    if (digest !== archived.sha256 || payload.experiment_id !== experimentId || payload.base_ref !== candidate.baseHead) {
+      throw new Error('Isolated candidate archive verification failed.');
+    }
+    const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+    if (transaction?.experiment_id === experimentId) {
+      atomicWriteJson(microverseAttemptPath(sessionDir), {
+        ...transaction,
+        archive_receipt: {
+          artifact: archived.artifact,
+          sha256: archived.sha256,
+          experiment_id: experimentId,
+          base_ref: candidate.baseHead,
+        },
+      } satisfies MicroverseAttemptTransaction);
+    }
+  } catch (error) {
+    const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+    if (transaction?.experiment_id === experimentId) {
+      atomicWriteJson(microverseAttemptPath(sessionDir), {
+        ...transaction,
+        phase: 'quarantined',
+        quarantine_reason: safeErrorMessage(error),
+      } satisfies MicroverseAttemptTransaction);
+    }
+    throw new MicroverseCandidateArchiveError(
+      `Could not durably archive isolated candidate ${experimentId}; candidate retained for quarantine.`,
+      { cause: error },
+    );
+  }
 }
 
 function transactionCandidate(sessionDir: string, transaction: MicroverseAttemptTransaction): MicroverseCandidate | null {
   if (!transaction.candidate_worktree || !transaction.live_working_dir
-      || !transaction.live_head || !transaction.live_fingerprint) return null;
+      || !transaction.live_head || !transaction.live_fingerprint
+      || !Number.isInteger(transaction.candidate_dev) || !Number.isInteger(transaction.candidate_ino)) return null;
   const candidateRoot = path.resolve(sessionDir, 'microverse-candidates', 'isolated-worktrees');
   const candidatePath = path.resolve(transaction.candidate_worktree);
   if (candidatePath === candidateRoot || !candidatePath.startsWith(`${candidateRoot}${path.sep}`)) {
     throw new Error('Invalid durable Microverse candidate path.');
   }
+  const candidateLstat = fs.lstatSync(candidatePath);
+  if (candidateLstat.isSymbolicLink()
+      || candidateLstat.dev !== transaction.candidate_dev
+      || candidateLstat.ino !== transaction.candidate_ino) {
+    throw new Error('Durable Microverse candidate identity changed.');
+  }
   return {
     worktreeDir: candidatePath,
+    isolationRoot: candidateRoot,
+    device: candidateLstat.dev,
+    inode: candidateLstat.ino,
     liveWorkingDir: transaction.live_working_dir,
     baseHead: transaction.live_head,
     liveFingerprint: transaction.live_fingerprint,
@@ -759,9 +834,6 @@ function promoteMicroverseCandidate(
     throw new Error(`Accepted Microverse candidate ${experimentId} has no committed improvement.`);
   }
   fastForwardFromIsolatedCandidate(candidate.liveWorkingDir, candidate.worktreeDir, candidate.baseHead);
-  if (listWorkingTreeDirtyPaths(candidate.liveWorkingDir).length > 0) {
-    throw new Error(`Microverse promotion left an unexpected dirty live workspace for ${experimentId}.`);
-  }
   return changedPaths;
 }
 
@@ -784,22 +856,51 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
       || !transaction.checkpoint || !transaction.metric_state_before) {
     throw new Error('Invalid durable Microverse attempt transaction.');
   }
-  if (transaction.schema_version === 2 && !transactionCandidate(sessionDir, transaction)) {
-    throw new Error('Invalid durable isolated Microverse attempt transaction.');
+  if (transaction.schema_version === 2) {
+    try {
+      if (!transactionCandidate(sessionDir, transaction)) {
+        throw new Error('Missing durable isolated candidate identity.');
+      }
+    } catch (error) {
+      const reason = safeErrorMessage(error);
+      atomicWriteJson(microverseAttemptPath(sessionDir), {
+        ...transaction,
+        phase: 'quarantined',
+        quarantine_reason: reason,
+      } satisfies MicroverseAttemptTransaction);
+      throw new MicroverseCandidateArchiveError(
+        `Isolated candidate ${transaction.experiment_id} identity is invalid; candidate retained for quarantine.`,
+        { cause: error },
+      );
+    }
+  }
+  if (transaction.schema_version === 2 && transaction.phase === 'quarantined') {
+    throw new MicroverseCandidateArchiveError(
+      `Isolated candidate ${transaction.experiment_id} remains quarantined: ${transaction.quarantine_reason || 'archive unavailable'}.`,
+    );
   }
   const ledger = readExperimentLedger(sessionDir);
   const experiment = ledger?.experiments.find((entry) => entry.id === transaction.experiment_id) || null;
   if (transaction.schema_version === 2
       && (transaction.phase === 'promotion_pending' || transaction.phase === 'promoted')) {
     const candidate = transactionCandidate(sessionDir, transaction)!;
+    if (fs.realpathSync(candidate.liveWorkingDir) !== fs.realpathSync(workingDir)) {
+      throw new Error('Durable Microverse promotion belongs to a different live checkout.');
+    }
     const promotion = transaction.promotion_result;
     if (!promotion || !transaction.candidate_head) {
       throw new Error('Invalid durable Microverse promotion transaction.');
     }
     const liveHead = getHeadSha(workingDir);
-    if (liveHead !== transaction.candidate_head) {
+    const alreadyPromoted = liveHead === transaction.candidate_head
+      || commitIsAncestorWithPathsUnchanged(
+        workingDir,
+        transaction.candidate_head,
+        promotion.changed_paths,
+      );
+    if (!alreadyPromoted) {
       if (transaction.phase === 'promoted') {
-        throw new Error('Promoted Microverse candidate no longer matches the live repository HEAD.');
+        throw new Error('Promoted Microverse candidate paths no longer match the live repository history.');
       }
       if (liveHead !== transaction.live_head
           || getWorkingTreeFingerprint(workingDir) !== transaction.live_fingerprint) {
@@ -853,11 +954,22 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
   }
   const candidate = transactionCandidate(sessionDir, transaction);
   if (candidate) {
+    if (fs.realpathSync(candidate.liveWorkingDir) !== fs.realpathSync(workingDir)) {
+      throw new Error('Durable Microverse candidate belongs to a different live checkout.');
+    }
+    archiveMicroverseCandidate(sessionDir, candidate, transaction.experiment_id);
     discardMicroverseCandidate(candidate);
   } else {
     // Backward-compatible recovery for transactions created before isolated
     // candidate worktrees were introduced.
-    revertMetricIterationSafely(sessionDir, workingDir, transaction.checkpoint);
+    const legacyCheckpoint = transaction.schema_version === 1
+        && !Array.isArray(transaction.checkpoint.ownedPaths)
+      ? {
+        ...transaction.checkpoint,
+        ownedPaths: listChangedPathsSince(workingDir, transaction.checkpoint.head),
+      }
+      : transaction.checkpoint;
+    revertMetricIterationSafely(sessionDir, workingDir, legacyCheckpoint);
   }
   writeMetricConvergenceState(sessionDir, transaction.metric_state_before);
   const reconciled = reconcileRunningExperiments(sessionDir, {
@@ -919,12 +1031,19 @@ function ensureMetricBaseline(sessionDir: string, loopConfig: LoopConfig, workin
     return existing;
   }
   const checkpoint = captureMetricIterationCheckpoint(workingDir);
+  const baselineSessionDir = path.join(sessionDir, 'microverse-baseline');
+  const isolated = createIsolatedTicketWorktree({
+    repoDir: workingDir,
+    sessionDir: baselineSessionDir,
+    ticketId: 'metric-baseline',
+    baseRef: checkpoint.head,
+  });
+  const isolatedRoot = path.join(baselineSessionDir, 'isolated-worktrees');
   let baseline;
   try {
-    baseline = measureMetric(command, { cwd: workingDir, timeoutMs: metricTimeoutMs(loopConfig) });
-  } catch (error) {
-    revertMetricIterationSafely(sessionDir, workingDir, checkpoint);
-    throw error;
+    baseline = measureMetric(command, { cwd: isolated.worktreeDir, timeoutMs: metricTimeoutMs(loopConfig) });
+  } finally {
+    removeIsolatedTicketWorktree(isolated.worktreeDir, isolatedRoot);
   }
   const state = createMetricConvergenceState(baseline, direction, tolerance, target.target, target.target_relation);
   ensureMetricTimeoutHeadroom(sessionDir, loopConfig, baseline);
@@ -1330,6 +1449,17 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
     try {
       recovered = recoverInterruptedMicroverseAttempt(sessionDir, initialState.working_dir as string);
     } catch (error) {
+      if (error instanceof MicroverseCandidateArchiveError) {
+        manager.update(statePath, (current) => {
+          current.last_loop_message = error.message;
+          return current;
+        });
+        const finalReason = exitLoopRunnerPhase(manager, statePath, 'error');
+        writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), finalReason);
+        appendRunnerLog(sessionDir, error.message);
+        appendRunnerLog(sessionDir, `loop-runner finished: ${finalReason}`);
+        throw error;
+      }
       if (!(error instanceof MicroversePromotionDeferredError)) throw error;
       manager.update(statePath, (current) => {
         current.last_loop_message = error.message;
@@ -1782,10 +1912,19 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
 
       if (metricResult && experiment) {
         if (metricResult.classification === 'improved' && candidate) {
+          normalizeIsolatedCandidateCommit(
+            candidate.worktreeDir,
+            candidate.baseHead,
+            `microverse: accept metric improvement to ${metricResult.state.latest.score}`,
+          );
           persistMicroversePromotion(sessionDir, 'promotion_pending', candidate, metricResult, experimentArtifact);
           try {
             promoteMicroverseCandidate(sessionDir, candidate, experiment.id);
             persistMicroversePromotion(sessionDir, 'promoted', candidate, metricResult, experimentArtifact);
+            if (process.env.PICKLE_TEST_MODE === '1'
+                && process.env.PICKLE_TEST_MICROVERSE_THROW_AFTER_PROMOTION === '1') {
+              throw new Error('Injected post-promotion Microverse failure.');
+            }
           } catch (error) {
             if (!(error instanceof MicroversePromotionDeferredError)) throw error;
             writeMetricConvergenceState(sessionDir, currentMetricState!);
@@ -1893,6 +2032,13 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       }
     }
   } catch (error) {
+    if (error instanceof MicroverseCandidateArchiveError) promotionDeferred = true;
+    const interruptedTransaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+    if (interruptedTransaction?.schema_version === 2
+        && (interruptedTransaction.phase === 'promotion_pending' || interruptedTransaction.phase === 'promoted')
+        && !microverseAttemptHasTerminalOutcome(sessionDir)) {
+      promotionDeferred = true;
+    }
     exitReason = manager.read(statePath).active === false
       ? ((manager.read(statePath).last_exit_reason as string | null) || 'cancelled')
       : 'error';
@@ -1904,9 +2050,9 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       try {
         archiveMicroverseCandidate(sessionDir, pendingMetricIteration.candidate, pendingMetricIteration.experimentId);
         revertMetricIterationSafely(sessionDir, pendingMetricIteration.cwd, pendingMetricIteration.checkpoint);
-        discardMicroverseCandidate(pendingMetricIteration.candidate);
         appendRunnerLog(sessionDir, `microverse iteration rolled back after ${exitReason}`);
       } catch (rollbackError) {
+        if (rollbackError instanceof MicroverseCandidateArchiveError) promotionDeferred = true;
         appendRunnerLog(sessionDir, `microverse rollback failed after ${exitReason}: ${safeErrorMessage(rollbackError)}`);
         thrownError = thrownError
           ? new AggregateError(

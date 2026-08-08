@@ -343,6 +343,15 @@ export function getWorkingTreeFingerprint(cwd: string, excludePrefixes?: string[
     .filter(Boolean)
     .sort();
   const hash = crypto.createHash('sha256');
+  // File bytes alone cannot distinguish staged content from the same worktree
+  // bytes backed by a different index entry. Bind the identity to HEAD, the
+  // symbolic branch, and the exact staged blob/mode/stage tuples as well.
+  hash.update(runGit(['rev-parse', 'HEAD'], cwd, { trim: false }));
+  hash.update('\0');
+  hash.update(runGit(['symbolic-ref', '-q', 'HEAD'], cwd, { allowFailure: true, trim: false }));
+  hash.update('\0');
+  hash.update(runGit(['ls-files', '--stage', '-z'], cwd, { trim: false }));
+  hash.update('\0');
 
   for (const relativePath of files) {
     const absolutePath = path.join(cwd, relativePath);
@@ -568,15 +577,74 @@ export function fastForwardFromIsolatedCandidate(
   candidateWorkingDir: string,
   baseSha: string,
 ): void {
-  runGit(['merge-base', '--is-ancestor', baseSha, 'HEAD'], candidateWorkingDir);
+  if (getWorkingTreeStatus(liveWorkingDir)) {
+    throw new Error('Refusing candidate promotion into a dirty live workspace.');
+  }
+  if (getHeadSha(liveWorkingDir) !== baseSha) {
+    throw new Error('Refusing candidate promotion after the live HEAD changed.');
+  }
+  const candidateParent = runGit(['rev-parse', 'HEAD^'], candidateWorkingDir);
+  const candidateCommitCount = runGit(['rev-list', '--count', `${baseSha}..HEAD`], candidateWorkingDir);
+  if (candidateParent !== baseSha || candidateCommitCount !== '1') {
+    throw new Error('Refusing non-normalized candidate commit topology.');
+  }
   runGit(['fetch', '--quiet', '--no-tags', candidateWorkingDir, 'HEAD'], liveWorkingDir, { timeout: 120_000 });
   runGit(['merge', '--ff-only', 'FETCH_HEAD'], liveWorkingDir);
+}
+
+export function normalizeIsolatedCandidateCommit(
+  candidateWorkingDir: string,
+  baseSha: string,
+  message: string,
+): string {
+  if (getWorkingTreeStatus(candidateWorkingDir)) {
+    throw new Error('Cannot normalize a dirty isolated candidate.');
+  }
+  const currentHead = getHeadSha(candidateWorkingDir);
+  const tree = runGit(['rev-parse', 'HEAD^{tree}'], candidateWorkingDir);
+  const normalized = runGit([
+    '-c', 'user.name=Pickle Rick',
+    '-c', 'user.email=pickle-rick@local.invalid',
+    'commit-tree', tree, '-p', baseSha, '-m', message,
+  ], candidateWorkingDir);
+  runGit(['update-ref', 'HEAD', normalized, currentHead], candidateWorkingDir);
+  return normalized;
+}
+
+export function commitIsAncestorWithPathsUnchanged(
+  cwd: string,
+  ancestorSha: string,
+  paths: string[],
+): boolean {
+  try {
+    runGit(['merge-base', '--is-ancestor', ancestorSha, 'HEAD'], cwd);
+    if (paths.length > 0) runGit(['diff', '--quiet', ancestorSha, 'HEAD', '--', ...paths], cwd);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function removeTicketWorktree(worktreeDir: string): void {
   const repoDir = getRepoRoot(worktreeDir) || worktreeDir;
   runGit(['worktree', 'remove', '--force', worktreeDir], repoDir, { allowFailure: true });
   fs.rmSync(worktreeDir, { recursive: true, force: true });
+}
+
+export function removeIsolatedTicketWorktree(worktreeDir: string, isolatedRoot: string): void {
+  if (!worktreeExists(worktreeDir)) return;
+  const root = fs.realpathSync(isolatedRoot);
+  const stat = fs.lstatSync(worktreeDir);
+  if (stat.isSymbolicLink()) throw new Error('Refusing to remove a symlinked isolated candidate.');
+  const candidate = fs.realpathSync(worktreeDir);
+  if (candidate === root || !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error('Refusing to remove an isolated candidate outside its validated root.');
+  }
+  const repoRoot = getRepoRoot(candidate);
+  if (!repoRoot || fs.realpathSync(repoRoot) !== candidate) {
+    throw new Error('Refusing to remove an isolated candidate with an invalid repository identity.');
+  }
+  fs.rmSync(candidate, { recursive: true, force: true });
 }
 
 export function worktreeHasDiff(worktreeDir: string, baseSha: string): boolean {

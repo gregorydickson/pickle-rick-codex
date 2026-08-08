@@ -2152,7 +2152,8 @@ test('microverse defers accepted promotion when the live fingerprint changes and
   initGitRepo(projectDir);
   fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
   fs.writeFileSync(path.join(projectDir, 'user.txt'), 'baseline\n');
-  runGit(projectDir, ['add', 'score.txt', 'user.txt']);
+  fs.writeFileSync(path.join(projectDir, 'index-only.txt'), 'index baseline\n');
+  runGit(projectDir, ['add', 'score.txt', 'user.txt', 'index-only.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -2196,6 +2197,9 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   });
   fs.writeFileSync(path.join(projectDir, 'user.txt'), 'concurrent tracked user work\n');
   fs.writeFileSync(path.join(projectDir, 'user-note.txt'), 'concurrent untracked user work\n');
+  fs.writeFileSync(path.join(projectDir, 'index-only.txt'), 'hidden staged user work\n');
+  runGit(projectDir, ['add', 'index-only.txt']);
+  runGit(projectDir, ['restore', '--worktree', '--source=HEAD', '--', 'index-only.txt']);
   await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', resolve);
@@ -2207,12 +2211,14 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'a');
   assert.equal(fs.readFileSync(path.join(projectDir, 'user.txt'), 'utf8'), 'concurrent tracked user work\n');
   assert.equal(fs.readFileSync(path.join(projectDir, 'user-note.txt'), 'utf8'), 'concurrent untracked user work\n');
+  assert.equal(runGit(projectDir, ['show', ':index-only.txt']), 'hidden staged user work');
   assert.equal(runGit(projectDir, ['log', '-1', '--format=%s']), 'baseline');
   assert.equal(fs.existsSync(transaction.candidate_worktree), true);
   assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-candidate-patches', 'exp-0001.patch')), true);
 
   fs.writeFileSync(path.join(projectDir, 'user.txt'), 'baseline\n');
   fs.rmSync(path.join(projectDir, 'user-note.txt'));
+  runGit(projectDir, ['restore', '--staged', '--worktree', '--', 'index-only.txt']);
   runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
   const resumed = readJsonFile(path.join(sessionDir, 'state.json'));
   assert.equal(resumed.last_exit_reason, 'success');
@@ -2220,6 +2226,96 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(fs.readFileSync(path.join(projectDir, 'user.txt'), 'utf8'), 'baseline\n');
   assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-attempt.json')), false);
   assert.equal(fs.existsSync(transaction.candidate_worktree), false);
+});
+
+test('microverse squashes arbitrary worker commit topology into one runtime-owned promotion', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  runGit(projectDir, ['add', 'score.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  const baselineHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)?.[1];
+const artifactPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)?.[1]?.trim();
+fs.writeFileSync(artifactPath, JSON.stringify({ experiment_id: experimentId, hypothesis: 'merge topology', hypothesis_family: 'fake/topology', differentiator: 'merge graph', rationale: 'normalize graph', target_paths: ['score.txt', 'extra.txt'], insight: 'merged', verification: ['tree complete'] }));
+const git = (gitArgs) => execFileSync('git', gitArgs, { encoding: 'utf8' }).trim();
+git(['config', 'user.name', 'Arbitrary Worker']); git(['config', 'user.email', 'worker@example.test']);
+fs.appendFileSync('score.txt', 'x'); fs.writeFileSync('extra.txt', 'side\\n'); git(['add', 'score.txt', 'extra.txt']); git(['commit', '-m', 'worker first']);
+const workerHead = git(['rev-parse', 'HEAD']); const base = git(['rev-parse', 'HEAD^']); const tree = git(['rev-parse', 'HEAD^{tree}']);
+const merge = git(['commit-tree', tree, '-p', workerHead, '-p', base, '-m', 'worker merge']); git(['update-ref', 'HEAD', merge, workerHead]);
+fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>LOOP_COMPLETE</promise>');
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'normalize topology'], {
+    env, cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'normalize worker graph', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte', stall_limit: 2,
+  });
+
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+  assert.equal(runGit(projectDir, ['rev-list', '--count', `${baselineHead}..HEAD`]), '1');
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD^']), baselineHead);
+  assert.equal(runGit(projectDir, ['log', '-1', '--format=%an <%ae>|%s']), 'Pickle Rick <pickle-rick@local.invalid>|microverse: accept metric improvement to 2');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'ax');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'extra.txt'), 'utf8'), 'side\n');
+});
+
+test('microverse resume finalizes an already-promoted candidate beneath an unrelated descendant', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  runGit(projectDir, ['add', 'score.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  createFakeCodex(fakeBin);
+  const firstEnv = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_MICROVERSE_THROW_AFTER_PROMOTION: '1',
+    FAKE_LOOP_COMPLETE_AFTER: '1',
+    FAKE_LOOP_MUTATE_FILE: 'score.txt',
+    FAKE_LOOP_APPEND_TEXT: 'x',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'resume promoted descendant'], {
+    env: firstEnv, cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'resume promotion', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte', stall_limit: 2,
+  });
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env: firstEnv, cwd: projectDir }),
+    /Injected post-promotion/,
+  );
+  const transaction = readJsonFile(path.join(sessionDir, 'microverse-attempt.json'));
+  assert.equal(transaction.phase, 'promoted');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'ax');
+
+  fs.writeFileSync(path.join(projectDir, 'user-descendant.txt'), 'preserve descendant\n');
+  runGit(projectDir, ['add', 'user-descendant.txt']);
+  runGit(projectDir, ['commit', '-m', 'user descendant']);
+  const descendantHead = runGit(projectDir, ['rev-parse', 'HEAD']);
+  const resumeEnv = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot, PICKLE_TEST_MODE: '1' });
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env: resumeEnv, cwd: projectDir });
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'));
+  assert.equal(runGit(projectDir, ['rev-parse', 'HEAD']), descendantHead);
+  assert.equal(fs.readFileSync(path.join(projectDir, 'user-descendant.txt'), 'utf8'), 'preserve descendant\n');
+  assert.equal(state.last_exit_reason, 'success');
+  assert.equal(ledger.experiments[0].status, 'accepted');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-attempt.json')), false);
 });
 
 test('microverse runtime target overrides premature LOOP_COMPLETE and stops when satisfied', () => {
@@ -2381,9 +2477,8 @@ test('microverse rejects and recovers a mutating baseline metric command', () =>
     () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir }),
     /must be read-only/,
   );
-  assert.equal(fs.readFileSync(path.join(projectDir, 'metric-side-effect.txt'), 'utf8'), 'mutation');
-  assert.match(runGit(projectDir, ['status', '--porcelain']), /metric-side-effect\.txt/);
-  assert.match(runGit(projectDir, ['show-ref']), /refs\/pickle\/salvage\//);
+  assert.equal(fs.existsSync(path.join(projectDir, 'metric-side-effect.txt')), false);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
 test('microverse retries a candidate-induced metric failure and accepts the corrected attempt', () => {
@@ -3259,7 +3354,7 @@ test('measured microverse restores a durable interrupted repository and metric t
     experiment_id: planned.id,
     iteration: 2,
     attempt: 1,
-    checkpoint: { head: baselineHead, untracked: [], ownedPaths: ['score.txt'] },
+    checkpoint: { head: baselineHead, untracked: [] },
     metric_state_before: metricBefore,
     created_at: '2026-07-18T00:01:00.000Z',
   });
@@ -4924,6 +5019,44 @@ setTimeout(() => process.exit(0), 10000);
   assert.match(log, /microverse iteration rolled back after cancelled/);
   assert.match(log, /loop-runner finished: cancelled/);
   assert.doesNotMatch(log, /finished: success/);
+});
+
+test('microverse retains the isolated candidate and transaction when durable archive fails', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  runGit(projectDir, ['add', 'score.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_MICROVERSE_ARCHIVE_FAIL: '1',
+    FAKE_LOOP_FAIL_AT: '1',
+    FAKE_LOOP_MUTATE_FILE: 'candidate.txt',
+    FAKE_LOOP_APPEND_TEXT: 'candidate evidence\n',
+  });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'retain failed archive'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'retain quarantine', metric: 'printf 1', direction: 'higher', stall_limit: 2,
+  });
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir }),
+    /candidate retained for quarantine/,
+  );
+  const transactionPath = path.join(sessionDir, 'microverse-attempt.json');
+  const transaction = readJsonFile(transactionPath);
+  assert.equal(fs.existsSync(transactionPath), true);
+  assert.equal(fs.existsSync(transaction.candidate_worktree), true);
+  assert.equal(fs.readFileSync(path.join(transaction.candidate_worktree, 'candidate.txt'), 'utf8'), 'candidate evidence\n');
+  assert.equal(fs.existsSync(path.join(projectDir, 'candidate.txt')), false);
+  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
 test('cancel stops live verification work without blocking the ticket', async () => {
