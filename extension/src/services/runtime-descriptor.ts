@@ -100,7 +100,13 @@ export function describeInstalledRuntime(runtimeRoot: string): InstalledRuntimeD
   if (persisted.descriptor_layout !== INSTALLED_DESCRIPTOR_LAYOUT) {
     throw new Error('Persisted runtime descriptor has no valid installed-layout binding.');
   }
-  const { descriptor_layout: _layout, ...persistedDescriptor } = persisted;
+  const persistedDescriptor: InstalledRuntimeDescriptor = {
+    runtime_id: persisted.runtime_id,
+    version: persisted.version,
+    build_hash: persisted.build_hash,
+    min_state_schema: persisted.min_state_schema,
+    max_state_schema: persisted.max_state_schema,
+  };
   const computed = computedRuntimeDescriptor(root);
   if (JSON.stringify(persistedDescriptor) !== JSON.stringify(computed)) {
     throw new Error('Installed runtime descriptor hash does not match runtime contents.');
