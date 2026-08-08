@@ -16,7 +16,10 @@ function fakeCodex(runtimeDir) {
   fs.writeFileSync(executable, `#!/usr/bin/env node
 console.log(JSON.stringify({ usage: { input_tokens: 11, cache_creation_input_tokens: 4, cache_read_input_tokens: 2, output_tokens: 3 } }));
 if (process.env.FAKE_OUTCOME === 'failed') process.exit(7);
-if (process.env.FAKE_OUTCOME === 'wait') setInterval(() => {}, 1000);
+if (process.env.FAKE_OUTCOME === 'wait') {
+  if (process.env.FAKE_MARKER) require('node:fs').writeFileSync(process.env.FAKE_MARKER, 'ready');
+  setInterval(() => {}, 1000);
+}
 `, { mode: 0o755 });
   fs.chmodSync(executable, 0o755);
   return executable;
@@ -27,7 +30,7 @@ async function invoke(sessionDir, command, outcome, phase, options = {}) {
     command,
     prompt: phase,
     timeoutMs: options.timeoutMs || 2_000,
-    env: { FAKE_OUTCOME: outcome },
+    env: { FAKE_OUTCOME: outcome, ...(options.env || {}) },
     cancelCheck: options.cancelCheck,
     telemetry: { sessionDir, ticketId: 'T1', phase, ticketAttempt: 2, phaseAttempt: 1, recoveryEpoch: 1 },
   });
@@ -39,7 +42,11 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   const success = await invoke(sessionDir, command, 'success', 'research');
   const failed = await invoke(sessionDir, command, 'failed', 'plan');
   const timedOut = await invoke(sessionDir, command, 'wait', 'implement', { timeoutMs: 80 });
-  const cancelled = await invoke(sessionDir, command, 'wait', 'review', { cancelCheck: () => true });
+  const cancelMarker = path.join(sessionDir, 'cancel-ready');
+  const cancelled = await invoke(sessionDir, command, 'wait', 'review', {
+    env: { FAKE_MARKER: cancelMarker },
+    cancelCheck: () => fs.existsSync(cancelMarker),
+  });
 
   assert.equal(success.exitCode, 0);
   assert.equal(failed.exitCode, 7);
