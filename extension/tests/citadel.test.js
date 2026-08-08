@@ -107,6 +107,59 @@ test('Citadel rejects destructive structured verification before spawning it', a
   assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
 });
 
+test('Citadel rejects an always-pass manifest verifier that drifts from the sealed release gate', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('The sealed verifier remains mandatory.');
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{
+      id: 'r1', acceptance_criteria: ['The sealed verifier remains mandatory.'],
+      verification: [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }],
+    }],
+  }));
+  const prd = '# Approved verifier PRD\n';
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
+  writePrdSeal(sessionDir, {
+    prd,
+    repository: { identity: 'fixture@HEAD', working_directory: cwd, execution_base_policy: 'sealed release' },
+    acceptance_criteria: [{ id: 'AC-VERIFY', text: 'The sealed verifier remains mandatory.' }],
+    scope_and_ownership: {}, dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [],
+    preservation_and_rollback: {}, completion_definition: {},
+    release_gates: {
+      ticket_verification: [{
+        ticket_id: 'r1', acceptance_criteria: ['The sealed verifier remains mandatory.'],
+        verification: [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(6)'] }],
+      }],
+      final_gate: 'citadel',
+    },
+  });
+
+  await assert.rejects(() => runCitadel(sessionDir), /sealed-verification-semantic-drift: r1/);
+});
+
+test('Citadel rejects representation drift without a valid seal-bound repair receipt', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('Verification representation is receipted.');
+  const step = { kind: 'process', executable: 'node', args: ['--version'] };
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{ id: 'r1', acceptance_criteria: ['Verification representation is receipted.'], verification: [step] }],
+  }));
+  const prd = '# Approved receipt PRD\n';
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
+  writePrdSeal(sessionDir, {
+    prd,
+    repository: { identity: 'fixture@HEAD', working_directory: cwd, execution_base_policy: 'sealed release' },
+    acceptance_criteria: [{ id: 'AC-RECEIPT', text: 'Verification representation is receipted.' }],
+    scope_and_ownership: {}, dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [],
+    preservation_and_rollback: {}, completion_definition: {},
+    release_gates: {
+      ticket_verification: [{
+        ticket_id: 'r1', acceptance_criteria: ['Verification representation is receipted.'], verification: { steps: [step] },
+      }],
+      final_gate: 'citadel',
+    },
+  });
+
+  await assert.rejects(() => runCitadel(sessionDir), /sealed-verification-receipt-missing-or-invalid: r1/);
+});
+
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({
     reviewed_range: 'abc..HEAD',

@@ -66,6 +66,7 @@ import {
   repairTicketDependencyContract,
   type DependencyGraphInspection,
 } from '../services/dependency-contract-repair.js';
+import { reconcileVerificationRepairTransaction } from '../services/verification-seal-contract.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -182,6 +183,10 @@ async function runSequentialWithLease(
   const reconciledDependencyTransaction = reconcileDependencyRepairTransaction(sessionDir);
   if (reconciledDependencyTransaction) {
     appendRunnerLog(sessionDir, runnerMode, `dependency repair transaction ${reconciledDependencyTransaction} before scheduler dispatch`);
+  }
+  const reconciledVerificationTransaction = reconcileVerificationRepairTransaction(sessionDir);
+  if (reconciledVerificationTransaction) {
+    appendRunnerLog(sessionDir, runnerMode, `verification repair transaction ${reconciledVerificationTransaction} before scheduler dispatch`);
   }
 
   let dependencyInspection = inspectTicketDependencyGraph(sessionDir);

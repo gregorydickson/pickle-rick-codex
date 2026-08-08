@@ -123,6 +123,23 @@ test('migration continuity detects post-handoff evidence mutation', () => {
   assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /continuity failed for ticket-recovery-history.json/);
 });
 
+test('migration preserves verification repair receipts and prepared crash transactions', () => {
+  const { sessionDir } = fixture();
+  writeJson(path.join(sessionDir, 'verification-contract-repair-receipts', 'p1r-001.json'), {
+    schema_version: 1, ticket_id: 'p1r-001', seal_semantic_hash: 'a'.repeat(64),
+  });
+  writeJson(path.join(sessionDir, 'verification-contract-repair-transaction.json'), {
+    schema_version: 1, status: 'prepared', ticket_id: 'p1r-001',
+  });
+
+  const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date());
+  assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'verification-contract-repair-receipts/p1r-001.json'));
+  assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'verification-contract-repair-transaction.json'));
+  verifyLiveSessionMigration(sessionDir, migration);
+  writeJson(path.join(sessionDir, 'verification-contract-repair-receipts', 'p1r-001.json'), { schema_version: 1 });
+  assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /continuity failed for verification-contract-repair-receipts/);
+});
+
 test('migration inventory includes and validates the authoritative logical journal', () => {
   const { sessionDir } = fixture();
   createLogicalPipeline(sessionDir, 'migration-journal');

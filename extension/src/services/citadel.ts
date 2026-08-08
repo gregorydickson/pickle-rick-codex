@@ -17,6 +17,7 @@ import {
   verificationStepCommand,
   verificationStepIdentity,
 } from './verification-env.js';
+import { assertAllTicketVerificationBoundToSeal } from './verification-seal-contract.js';
 import type { VerificationStep } from '../types/index.js';
 
 export type CitadelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -105,6 +106,7 @@ function criteriaFromSeal(sessionDir: string): string[] | null {
 }
 
 function verificationStepsFromManifest(sessionDir: string, workingDir: string): VerificationStep[] {
+  assertAllTicketVerificationBoundToSeal(sessionDir, workingDir);
   const manifest = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'refinement_manifest.json'), null);
   if (!Array.isArray(manifest?.tickets)) return [];
   const steps = manifest.tickets.flatMap((ticket) => {

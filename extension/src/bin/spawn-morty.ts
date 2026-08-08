@@ -64,7 +64,7 @@ import {
 } from '../services/candidate-recovery.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
+import { normalizeTicketId, readManifest, restructureTicketFiles, updateTicketStatus } from '../services/tickets.js';
 import {
   beginRefinementRepositoryAdvance,
   clearRefinementRepositoryAdvance,
@@ -89,6 +89,14 @@ import {
   VerificationContractError,
 } from '../services/verification-env.js';
 import { recordRecoveryStrategyProgress, type RecoveryStrategyEpoch } from '../services/productive-autonomy.js';
+import {
+  assertTicketVerificationBoundToSeal,
+  buildVerificationRepairReceipt,
+  persistVerificationRepairReceipt,
+  resolveSealedVerificationAuthorization,
+  VERIFICATION_REPAIR_TRANSACTION_FILE,
+  type VerificationRepairTransaction,
+} from '../services/verification-seal-contract.js';
 import {
   buildVerificationFailureSet,
   isPipelineSession,
@@ -689,7 +697,13 @@ interface RunTicketResult {
 export async function repairTicketVerificationContract(
   sessionDir: string,
   ticketId: string,
-  options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; diagnosticOnly?: boolean; assertDurableOwnership?: () => void } = {},
+  options: {
+    strategy?: RecoveryStrategyEpoch | null;
+    timeoutMs?: number;
+    diagnosticOnly?: boolean;
+    assertDurableOwnership?: () => void;
+    afterMaterialization?: () => void;
+  } = {},
 ): Promise<VerificationStep[]> {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
@@ -709,6 +723,12 @@ export async function repairTicketVerificationContract(
   const rawManifest = readJsonFile<{ tickets?: Ticket[] }>(path.join(sessionDir, 'refinement_manifest.json'), {}) || {};
   const ticket = rawManifest.tickets?.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedTicketId);
   if (!ticket) throw new Error(`contract-repair-ticket-missing: ${ticketId}`);
+  const manifestBefore = structuredClone(rawManifest) as { tickets: Ticket[] };
+  const manifestBeforeIdentity = JSON.stringify(rawManifest);
+  const sealedAuthorization = resolveSealedVerificationAuthorization(sessionDir, normalizedTicketId);
+  if (fs.existsSync(path.join(sessionDir, 'prd.lock.json')) && !sealedAuthorization) {
+    throw new Error(`contract-repair-sealed-verification-authorization-missing: ${normalizedTicketId}`);
+  }
   const acceptanceIdentity = JSON.stringify(ticket.acceptance_criteria || []);
   const artifactPath = path.join(sessionDir, 'contract-repairs', `${normalizedTicketId}.json`);
   const lastMessagePath = path.join(sessionDir, `${normalizedTicketId}.contract-repair.last-message.txt`);
@@ -722,10 +742,14 @@ export async function repairTicketVerificationContract(
     `Contract repair artifact path: ${artifactPath}`,
     `Immutable acceptance criteria JSON: ${acceptanceIdentity}`,
     `Invalid verification representation: ${JSON.stringify(ticket.verification ?? ticket.verify ?? null)}`,
+    `Authorized sealed verification steps JSON: ${JSON.stringify(sealedAuthorization?.authorized_steps ?? null)}`,
     options.strategy
       ? `Mandatory material repair strategy: ${options.strategy.materialApproach}; strategy hash ${options.strategy.strategyHash}.`
       : 'Mandatory material repair strategy: recompile-structured-contract.',
     'Inspect the repository only as needed to recover the intended deterministic verification semantics. Do not modify repository files, acceptance criteria, scope, dependencies, or any ticket field.',
+    sealedAuthorization
+      ? 'Your verification output must be exactly semantically identical to the authorized sealed verification steps. This is reconstruction, never replacement or weakening.'
+      : 'This unsealed legacy session has no sealed verification authority; preserve the strongest deterministic semantics recoverable from the existing representation.',
     'Write one JSON object with schema_version: 1, ticket_id, verification (a non-empty array of structured process/package_script/shell steps), and rationale. Prefer process or package_script; shell requires a non-empty justification.',
     'Return <promise>CONTRACT_REPAIR_COMPLETE</promise> after writing the artifact.',
   ].join('\n\n');
@@ -748,28 +772,64 @@ export async function repairTicketVerificationContract(
   assertCodexSucceeded(result, `Verification contract repair failed for ${normalizedTicketId}`);
   const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
   if (artifact.schema_version !== 1 || artifact.ticket_id !== normalizedTicketId) throw new Error('contract-repair-invalid-artifact: identity mismatch');
-  const steps = normalizeVerificationSteps(artifact.verification, { cwd: workingDir });
+  const steps = normalizeVerificationSteps(artifact.verification, sealedAuthorization ? {} : { cwd: workingDir });
   if (steps.length === 0) throw new Error('contract-repair-invalid-artifact: verification is empty');
+  if (sealedAuthorization && verificationStepIdentity(steps) !== sealedAuthorization.authorized_identity) {
+    throw new Error('contract-repair-invalid-artifact: verification weakens or changes the sealed deterministic obligation');
+  }
   if (options.diagnosticOnly) return steps;
   assertOwnership();
+  if (JSON.stringify(readJsonFile(path.join(sessionDir, 'refinement_manifest.json'), null)) !== manifestBeforeIdentity) {
+    throw new Error('contract-repair-authoritative-manifest-drift-before-apply');
+  }
+  const currentAuthorization = resolveSealedVerificationAuthorization(sessionDir, normalizedTicketId);
+  if (sealedAuthorization && (
+    !currentAuthorization
+    || currentAuthorization.seal_semantic_hash !== sealedAuthorization.seal_semantic_hash
+    || currentAuthorization.sealed_verification_sha256 !== sealedAuthorization.sealed_verification_sha256
+    || currentAuthorization.authorized_identity !== sealedAuthorization.authorized_identity
+  )) {
+    throw new Error('contract-repair-seal-drift-before-apply');
+  }
   ticket.verification = steps;
   ticket.verify = steps.map((step) => verificationStepCommand(step).display).join(' && ');
-  atomicWriteJson(path.join(sessionDir, 'refinement_manifest.json'), rawManifest);
+  ticket.status = 'Todo';
+  ticket.failure_kind = null;
+  ticket.failure_reason = null;
+  ticket.contract_repaired_at = new Date().toISOString();
+  ticket.contract_repair_strategy_hash = options.strategy?.strategyHash || null;
+  if (sealedAuthorization) {
+    const receipt = buildVerificationRepairReceipt(
+      sealedAuthorization,
+      ticket.verification,
+      options.strategy?.strategyHash || null,
+    );
+    const transaction: VerificationRepairTransaction = {
+      schema_version: 1,
+      status: 'prepared',
+      ticket_id: normalizedTicketId,
+      manifest_before: manifestBefore,
+      repaired_manifest: rawManifest as { tickets: Ticket[] },
+      receipt,
+      prepared_at: new Date().toISOString(),
+    };
+    atomicWriteJson(path.join(sessionDir, VERIFICATION_REPAIR_TRANSACTION_FILE), transaction);
+    restructureTicketFiles(sessionDir, transaction.repaired_manifest);
+    options.afterMaterialization?.();
+    persistVerificationRepairReceipt(sessionDir, receipt);
+    fs.rmSync(path.join(sessionDir, VERIFICATION_REPAIR_TRANSACTION_FILE), { force: true });
+  } else {
+    restructureTicketFiles(sessionDir, rawManifest as { tickets: Ticket[] });
+  }
   assertOwnership();
-  updateTicketStatus(sessionDir, normalizedTicketId, {
-    status: 'Todo',
-    failure_kind: null,
-    failure_reason: null,
-    contract_repaired_at: new Date().toISOString(),
-    contract_repair_strategy_hash: options.strategy?.strategyHash || null,
-  });
   const persisted = readManifest(sessionDir).tickets.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedTicketId);
   if (!persisted || JSON.stringify(persisted.acceptance_criteria || []) !== acceptanceIdentity) {
     throw new Error('contract-repair-acceptance-criteria-mutated');
   }
-  if (verificationStepIdentity(normalizeVerificationSteps(persisted.verification, { cwd: workingDir })) !== verificationStepIdentity(steps)) {
+  if (verificationStepIdentity(normalizeVerificationSteps(persisted.verification, sealedAuthorization ? {} : { cwd: workingDir })) !== verificationStepIdentity(steps)) {
     throw new Error('contract-repair-round-trip-drift');
   }
+  if (sealedAuthorization) assertTicketVerificationBoundToSeal(sessionDir, normalizedTicketId, workingDir);
   return steps;
 }
 
@@ -804,6 +864,14 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   const manifestTicket = manifest.tickets.find((ticket) => normalizeTicketId(ticket.id, ticket.id) === normalizedTicketId);
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
+  }
+  try {
+    assertTicketVerificationBoundToSeal(sessionDir, normalizedTicketId, workingDir);
+  } catch (error) {
+    throw new VerificationContractError({
+      ticketId: normalizedTicketId,
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
   let verificationSteps = normalizeVerificationSteps(manifestTicket.verification, {
     verify: manifestTicket.verify,
