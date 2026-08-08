@@ -13,21 +13,43 @@ export type FailureDomain =
   | 'quality'
   | 'infrastructure';
 
+export const AUTONOMOUS_FAILURE_TYPES = [
+  'contract_invalid',
+  'infrastructure_transient',
+  'worker_transport',
+  'artifact_invalid',
+  'implementation_invalid',
+  'verification_failed',
+  'review_refused',
+  'conformance_refused',
+  'quality_failed',
+  'completion_evidence_refused',
+  'workspace_unsafe',
+  'prd_contract_defect',
+] as const;
+
+export type AutonomousFailureType = (typeof AUTONOMOUS_FAILURE_TYPES)[number];
+
 export type RecoveryHandler =
   | 'repair_contract'
   | 'repair_verification'
   | 'remediate_candidate'
   | 'repair_conformance_evidence'
   | 'repair_quality_regression'
+  | 'repair_artifact'
+  | 'repair_implementation'
+  | 'repair_completion_evidence'
   | 'restart_executor'
-  | 'reconstruct_workspace';
+  | 'reconstruct_workspace'
+  | 'request_prd_revision';
 
 export interface FailureRoute {
+  failureType?: AutonomousFailureType;
   domain: FailureDomain;
   handler: RecoveryHandler;
   invalidate: string[];
   preserve: string[];
-  schedulerState: 'repairing';
+  schedulerState: 'repairing' | 'prd_revision_required';
 }
 
 export interface RecoveryStrategyInput {
@@ -130,6 +152,40 @@ const DOMAIN_POLICIES: Record<FailureDomain, Omit<FailureRoute, 'domain'>> = {
   },
 };
 
+const TYPE_POLICIES: Record<AutonomousFailureType, FailureRoute> = {
+  contract_invalid: { failureType: 'contract_invalid', ...DOMAIN_POLICIES.contract, domain: 'contract' },
+  infrastructure_transient: { failureType: 'infrastructure_transient', ...DOMAIN_POLICIES.infrastructure, domain: 'infrastructure' },
+  worker_transport: { failureType: 'worker_transport', ...DOMAIN_POLICIES.infrastructure, domain: 'infrastructure' },
+  artifact_invalid: {
+    failureType: 'artifact_invalid', domain: 'infrastructure', handler: 'repair_artifact',
+    invalidate: ['implement', 'verify', 'review', 'conformance', 'quality', 'promote'],
+    preserve: ['context', 'invalid_artifact_evidence'], schedulerState: 'repairing',
+  },
+  implementation_invalid: {
+    failureType: 'implementation_invalid', domain: 'review', handler: 'repair_implementation',
+    invalidate: ['implement', 'verify', 'review', 'conformance', 'quality', 'promote'],
+    preserve: ['context', 'rejected_candidate', 'implementation_evidence'], schedulerState: 'repairing',
+  },
+  verification_failed: { failureType: 'verification_failed', ...DOMAIN_POLICIES.verification, domain: 'verification' },
+  review_refused: { failureType: 'review_refused', ...DOMAIN_POLICIES.review, domain: 'review' },
+  conformance_refused: { failureType: 'conformance_refused', ...DOMAIN_POLICIES.conformance, domain: 'conformance' },
+  quality_failed: { failureType: 'quality_failed', ...DOMAIN_POLICIES.quality, domain: 'quality' },
+  completion_evidence_refused: {
+    failureType: 'completion_evidence_refused', domain: 'conformance', handler: 'repair_completion_evidence',
+    invalidate: ['conformance', 'quality', 'promote'], preserve: ['context', 'candidate', 'verification_evidence', 'review_evidence'],
+    schedulerState: 'repairing',
+  },
+  workspace_unsafe: {
+    failureType: 'workspace_unsafe', domain: 'infrastructure', handler: 'reconstruct_workspace',
+    invalidate: ['prepare', 'implement', 'verify', 'review', 'conformance', 'quality', 'promote'],
+    preserve: ['prd_seal', 'context', 'salvage_evidence'], schedulerState: 'repairing',
+  },
+  prd_contract_defect: {
+    failureType: 'prd_contract_defect', domain: 'contract', handler: 'request_prd_revision',
+    invalidate: [], preserve: ['all_verified_checkpoints', 'proposed_prd_patch'], schedulerState: 'prd_revision_required',
+  },
+};
+
 function readJournal<T>(filePath: string, empty: T): T {
   if (!fs.existsSync(filePath)) return empty;
   const value = JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
@@ -149,19 +205,37 @@ export function classifyFailure(input: {
   phase?: WorkerLifecyclePhase | string | null;
   message?: string;
 }): FailureDomain {
+  return typedRecoveryRoute(classifyAutonomousFailure(input)).domain;
+}
+
+export function classifyAutonomousFailure(input: {
+  kind?: string | null;
+  phase?: WorkerLifecyclePhase | string | null;
+  message?: string;
+}): AutonomousFailureType {
   const kind = String(input.kind || '').toLowerCase();
   const phase = String(input.phase || '').toLowerCase();
   const message = String(input.message || '').toLowerCase();
-  if (kind.includes('contract') || kind.includes('preflight') || message.includes('verification contract') || message.includes('preflight')) return 'contract';
-  if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review';
-  if (phase === 'conformance' || kind.includes('conformance')) return 'conformance';
-  if (kind.includes('quality') || message.includes('quality-gate') || message.includes('quality gate')) return 'quality';
-  if (kind.includes('test') || kind.includes('verification_failed') || message.includes('verification command failed')) return 'verification';
-  return 'infrastructure';
+  if (kind.includes('prd_contract_defect') || message.includes('contradictory prd')) return 'prd_contract_defect';
+  if (kind.includes('workspace_unsafe') || message.includes('unsafe workspace')) return 'workspace_unsafe';
+  if (kind.includes('completion_evidence') || message.includes('completion evidence')) return 'completion_evidence_refused';
+  if (kind.includes('contract') || kind.includes('preflight') || message.includes('verification contract') || message.includes('preflight')) return 'contract_invalid';
+  if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review_refused';
+  if (phase === 'conformance' || kind.includes('conformance')) return 'conformance_refused';
+  if (kind.includes('quality') || message.includes('quality-gate') || message.includes('quality gate')) return 'quality_failed';
+  if (kind.includes('test') || kind.includes('verification_failed') || message.includes('verification command failed')) return 'verification_failed';
+  if (kind.includes('artifact')) return 'artifact_invalid';
+  if (kind.includes('implementation')) return 'implementation_invalid';
+  if (kind.includes('transport') || message.includes('worker transport')) return 'worker_transport';
+  return 'infrastructure_transient';
 }
 
 export function recoveryRoute(domain: FailureDomain): FailureRoute {
   return { domain, ...DOMAIN_POLICIES[domain] };
+}
+
+export function typedRecoveryRoute(failureType: AutonomousFailureType): FailureRoute {
+  return structuredClone(TYPE_POLICIES[failureType]);
 }
 
 export function materialStrategyHash(input: RecoveryStrategyInput): string {

@@ -2,7 +2,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  AUTONOMOUS_FAILURE_TYPES,
   beginRecoveryStrategyEpoch,
+  classifyAutonomousFailure,
   classifyFailure,
   executionTelemetrySummary,
   nextMaterialApproach,
@@ -10,6 +12,7 @@ import {
   readRecoveryStrategyEpochs,
   recordExecutionTelemetry,
   recoveryRoute,
+  typedRecoveryRoute,
 } from '../services/productive-autonomy.js';
 import { makeTempRoot } from './helpers.js';
 
@@ -24,6 +27,25 @@ test('typed failures route to domain-specific handlers and minimal checkpoint in
   assert.deepEqual(recoveryRoute('review').preserve, ['context', 'rejected_candidate', 'review_evidence']);
   assert.ok(!recoveryRoute('infrastructure').invalidate.includes('context'));
   assert.equal(recoveryRoute('contract').handler, 'repair_contract');
+});
+
+test('every declared autonomous failure has a typed recovery policy', () => {
+  assert.equal(AUTONOMOUS_FAILURE_TYPES.length, 12);
+  for (const failureType of AUTONOMOUS_FAILURE_TYPES) {
+    const route = typedRecoveryRoute(failureType);
+    assert.equal(route.failureType, failureType);
+    assert.ok(route.handler);
+    assert.ok(Array.isArray(route.invalidate));
+    assert.ok(Array.isArray(route.preserve));
+  }
+  assert.equal(classifyAutonomousFailure({ kind: 'verification_contract' }), 'contract_invalid');
+  assert.equal(classifyAutonomousFailure({ kind: 'worker_transport' }), 'worker_transport');
+  assert.equal(classifyAutonomousFailure({ kind: 'workspace_unsafe' }), 'workspace_unsafe');
+  assert.equal(typedRecoveryRoute('prd_contract_defect').schedulerState, 'prd_revision_required');
+  assert.notDeepEqual(
+    typedRecoveryRoute('verification_failed').invalidate,
+    typedRecoveryRoute('worker_transport').invalidate,
+  );
 });
 
 test('strategy epochs reject consecutive identity and produce three materially distinct approaches', () => {
