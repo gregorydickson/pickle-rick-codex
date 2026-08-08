@@ -241,9 +241,36 @@ function writeLifecycleArtifact(phase) {
   }
 }
 
-if (prompt.includes('You are the autonomous ticket dependency graph contract repair worker')) {
+if (prompt.includes('You are the autonomous Citadel finding attribution repair worker')) {
+  const contextPath = extractPathAfter('Isolated read-only attribution context: ');
+  const artifactPath = extractPathAfter('Write the attribution artifact to: ');
+  const context = JSON.parse(fs.readFileSync(contextPath, 'utf8'));
+  const mutateSession = process.env.FAKE_ATTRIBUTION_MUTATE_SESSION || '';
+  if (mutateSession) {
+    const liveManifestPath = path.join(mutateSession, 'refinement_manifest.json');
+    const liveManifest = JSON.parse(fs.readFileSync(liveManifestPath, 'utf8'));
+    const unrelated = liveManifest.tickets.find((ticket) => String(ticket.id).toLowerCase() === 'independent');
+    unrelated.acceptance_criteria = ['MALICIOUSLY REPLACED'];
+    unrelated.status = 'Todo';
+    unrelated.completion_commit = null;
+    fs.writeFileSync(liveManifestPath, JSON.stringify(liveManifest, null, 2));
+    fs.writeFileSync(path.join(mutateSession, 'independent', 'linear_ticket_independent.md'), 'malicious ticket rewrite\\n');
+  }
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    schema_version: 1,
+    report_sha256: context.report_sha256,
+    attributions: context.finding_candidates.map((finding) => ({
+      finding_index: finding.finding_index,
+      ticket_id: finding.ticket_ids[0],
+      rationale: 'Fake isolated worker selected a listed candidate.',
+    })),
+  }, null, 2));
+  lastMessage = '<promise>CITADEL_ATTRIBUTION_REPAIR_COMPLETE</promise>';
+} else if (prompt.includes('You are the autonomous ticket dependency graph contract repair worker')) {
   const artifactPath = extractPathAfter('Dependency repair artifact path: ');
   const targetTicketId = extractPathAfter('Target ticket ID: ');
+  const manifestSha256 = extractPathAfter('Authoritative manifest SHA-256: ');
+  const prdSealSha256 = extractPathAfter('Authoritative PRD seal SHA-256: ');
   const graphLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Current ticket graph JSON: '));
   const graph = graphLine ? JSON.parse(graphLine.slice('Current ticket graph JSON: '.length)) : [];
   const repaired = graph.map((ticket) => ticket.ticket_id === targetTicketId
@@ -253,6 +280,8 @@ if (prompt.includes('You are the autonomous ticket dependency graph contract rep
   fs.writeFileSync(artifactPath, JSON.stringify({
     schema_version: 1,
     target_ticket_id: targetTicketId,
+    manifest_sha256: manifestSha256,
+    prd_seal_sha256: prdSealSha256,
     tickets: repaired,
     rationale: 'remove the target invalid dependency edge while preserving every ticket contract',
   }, null, 2));

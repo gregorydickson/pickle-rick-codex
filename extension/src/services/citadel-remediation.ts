@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { hasPipelineContract } from './pipeline.js';
 import { resetPipelineForAutonomousRemediation } from './pipeline-state.js';
-import { atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
+import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { normalizeTicketScopePath, resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
 import { isDurableOwnershipDrainError } from './durable-runtime.js';
@@ -64,6 +65,14 @@ interface RepairCitadelAttributionOptions {
   timeoutMs?: number;
   assertDurableOwnership?: () => void;
   artifact?: unknown;
+}
+
+interface AuthoritativeSnapshotEntry {
+  absolute_path: string;
+  relative_path: string;
+  content: string | null;
+  fingerprint: string;
+  mode: number | null;
 }
 
 interface TicketAttribution {
@@ -534,6 +543,130 @@ function deterministicAttributionArtifact(intent: CitadelAttributionRepairIntent
   };
 }
 
+const CONTROLLED_STATE_FIELDS = [
+  'active_child_pid',
+  'active_child_kind',
+  'active_child_command',
+  'active_child_identity',
+  'active_child_controller_pid',
+];
+
+function normalizedAuthoritativeContent(relativePath: string, content: string | null): string {
+  if (content === null) return '<missing>';
+  if (!relativePath.endsWith('.json')) return content;
+  try {
+    const value = JSON.parse(content) as Record<string, unknown>;
+    if (relativePath === 'state.json') {
+      for (const field of CONTROLLED_STATE_FIELDS) delete value[field];
+    }
+    if (relativePath === 'logical-pipeline.json' && value.lease && typeof value.lease === 'object') {
+      const lease = value.lease as Record<string, unknown>;
+      delete lease.renewed_at;
+      delete lease.expires_at;
+    }
+    return JSON.stringify(value);
+  } catch {
+    return content;
+  }
+}
+
+function authoritativePaths(sessionDir: string, intent: CitadelAttributionRepairIntent): string[] {
+  const fixed = [
+    'state.json',
+    'refinement_manifest.json',
+    'prd.md',
+    'prd_refined.md',
+    'prd.lock.json',
+    'logical-pipeline.json',
+    'pipeline.json',
+    'pipeline-state.json',
+    'refinement-acceptance.json',
+    path.relative(sessionDir, intent.archive_path),
+    path.relative(sessionDir, intent.report_path),
+    ATTRIBUTION_BLOCKED_FILE,
+  ];
+  const ticketFiles = readManifest(sessionDir).tickets.map((ticket) => {
+    const id = ticketId(ticket);
+    return path.join(id, `linear_ticket_${id}.md`);
+  });
+  return [...new Set([...fixed, ...ticketFiles])]
+    .filter((relative) => relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function captureAuthoritativeSnapshot(
+  sessionDir: string,
+  intent: CitadelAttributionRepairIntent,
+): AuthoritativeSnapshotEntry[] {
+  return authoritativePaths(sessionDir, intent).map((relativePath) => {
+    const absolutePath = path.join(sessionDir, relativePath);
+    const exists = fs.existsSync(absolutePath);
+    const content = exists ? fs.readFileSync(absolutePath, 'utf8') : null;
+    return {
+      absolute_path: absolutePath,
+      relative_path: relativePath,
+      content,
+      fingerprint: crypto.createHash('sha256')
+        .update(normalizedAuthoritativeContent(relativePath, content)).digest('hex'),
+      mode: exists ? fs.statSync(absolutePath).mode & 0o777 : null,
+    };
+  });
+}
+
+function restoreAuthoritativeEntry(entry: AuthoritativeSnapshotEntry): void {
+  if (entry.content === null) {
+    fs.rmSync(entry.absolute_path, { force: true });
+    return;
+  }
+  ensureDir(path.dirname(entry.absolute_path));
+  atomicWriteFile(entry.absolute_path, entry.content);
+  if (entry.mode !== null) fs.chmodSync(entry.absolute_path, entry.mode);
+}
+
+function quarantineAndRestoreAuthoritativeDrift(
+  sessionDir: string,
+  intent: CitadelAttributionRepairIntent,
+  snapshot: AuthoritativeSnapshotEntry[],
+  candidateArtifactPath: string,
+): string | null {
+  const drift = snapshot.flatMap((entry) => {
+    const exists = fs.existsSync(entry.absolute_path);
+    const content = exists ? fs.readFileSync(entry.absolute_path, 'utf8') : null;
+    const fingerprint = crypto.createHash('sha256')
+      .update(normalizedAuthoritativeContent(entry.relative_path, content)).digest('hex');
+    return fingerprint === entry.fingerprint ? [] : [{ entry, content, fingerprint }];
+  });
+  if (drift.length === 0) return null;
+  const quarantineDir = ensureDir(path.join(
+    sessionDir,
+    'citadel-attribution-quarantine',
+    `${intent.report_sha256}-${intent.attempt_count}-${crypto.randomUUID()}`,
+  ));
+  atomicWriteJson(path.join(quarantineDir, 'drift.json'), {
+    schema_version: 1,
+    report_sha256: intent.report_sha256,
+    attempt: intent.attempt_count,
+    changed_files: drift.map(({ entry, content, fingerprint }) => ({
+      path: entry.relative_path,
+      expected_sha256: entry.fingerprint,
+      observed_sha256: fingerprint,
+      observed_content_base64: content === null ? null : Buffer.from(content).toString('base64'),
+    })),
+    candidate_artifact_base64: fs.existsSync(candidateArtifactPath)
+      ? fs.readFileSync(candidateArtifactPath).toString('base64') : null,
+    quarantined_at: new Date().toISOString(),
+  });
+  for (const { entry } of drift) restoreAuthoritativeEntry(entry);
+  const unresolved = drift.filter(({ entry }) => {
+    const content = fs.existsSync(entry.absolute_path) ? fs.readFileSync(entry.absolute_path, 'utf8') : null;
+    return crypto.createHash('sha256').update(normalizedAuthoritativeContent(entry.relative_path, content)).digest('hex')
+      !== entry.fingerprint;
+  });
+  if (unresolved.length > 0) {
+    throw new Error(`citadel-attribution-authoritative-restore-failed: ${unresolved.map(({ entry }) => entry.relative_path).join(', ')}`);
+  }
+  return `citadel-attribution-authoritative-drift: ${drift.map(({ entry }) => entry.relative_path).join(', ')}; quarantined at ${quarantineDir}`;
+}
+
 export async function repairCitadelAttribution(
   sessionDir: string,
   options: RepairCitadelAttributionOptions = {},
@@ -553,33 +686,48 @@ export async function repairCitadelAttribution(
       const statePath = path.join(sessionDir, 'state.json');
       const manager = new StateManager();
       const state = manager.read(statePath);
+      const candidateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-citadel-attribution-'));
+      const contextPath = path.join(candidateDir, 'attribution-context.json');
+      const candidateArtifactPath = path.join(candidateDir, 'attribution-result.json');
       artifactPath = path.join(sessionDir, 'citadel-attribution-repairs', `${intent.report_sha256}-${intent.attempt_count}.json`);
-      const lastMessagePath = path.join(sessionDir, `citadel-attribution-repair-${intent.attempt_count}.last-message.txt`);
+      const lastMessagePath = path.join(candidateDir, 'last-message.txt');
       ensureDir(path.dirname(artifactPath));
       fs.rmSync(artifactPath, { force: true });
+      atomicWriteJson(contextPath, {
+        schema_version: 1,
+        report_sha256: intent.report_sha256,
+        archived_refusal: readJsonFile<Record<string, unknown>>(intent.archive_path, null),
+        finding_candidates: intent.finding_candidates,
+        candidate_ticket_contracts: readManifest(sessionDir).tickets.filter(completed).map((ticket) => ({
+          id: ticketId(ticket),
+          acceptance_criteria: ticket.acceptance_criteria || [],
+          scope: resolveTicketScope(ticket).allowedPaths,
+        })),
+        strategy,
+        strategy_hash: intent.strategy_history.at(-1)!.strategy_hash,
+      });
+      fs.chmodSync(contextPath, 0o400);
+      const authoritativeSnapshot = captureAuthoritativeSnapshot(sessionDir, intent);
       const prompt = [
       'You are the autonomous Citadel finding attribution repair worker.',
-      `Session directory: ${sessionDir}`,
-      `Working directory: ${String(state.working_dir || '')}`,
-      `Immutable archived refusal: ${intent.archive_path}`,
+      `Isolated read-only attribution context: ${contextPath}`,
       `Report SHA-256: ${intent.report_sha256}`,
-      `Candidate finding ownership JSON: ${JSON.stringify(intent.finding_candidates)}`,
-      `Candidate ticket contracts JSON: ${JSON.stringify(readManifest(sessionDir).tickets.filter(completed).map((ticket) => ({ id: ticketId(ticket), acceptance_criteria: ticket.acceptance_criteria || [], scope: resolveTicketScope(ticket).allowedPaths })))}`,
       `Mandatory novel attribution strategy: ${strategy}; strategy hash ${intent.strategy_history.at(-1)!.strategy_hash}.`,
-      `Write the attribution artifact to: ${artifactPath}`,
-      'Do not modify the repository, ticket state, manifest, archived refusal, or any acceptance criterion.',
+      `Write the attribution artifact to: ${candidateArtifactPath}`,
+      'This isolated workspace contains the complete context. Do not access or modify any live session, repository, ticket, manifest, state, journal, refusal, or acceptance criterion.',
       'Write exactly one JSON object with schema_version: 1, report_sha256, and attributions. Each attribution must contain finding_index, exactly one ticket_id from that finding candidate list, and a non-empty rationale grounded in the preserved finding evidence.',
       'Every candidate finding must appear exactly once. Do not invent tickets, criteria, paths, or findings.',
       'Return <promise>CITADEL_ATTRIBUTION_REPAIR_COMPLETE</promise> after writing the artifact.',
       ].join('\n\n');
       options.assertDurableOwnership?.();
-      let result;
+      let result: Awaited<ReturnType<typeof runCodexExecMonitored>> | null = null;
+      let workerError: unknown = null;
       try {
         result = await runCodexExecMonitored({
         telemetry: { sessionDir, ticketId: 'citadel-attribution', phase: 'citadel_attribution_repair' },
-        execArgs: ['--sandbox', 'workspace-write', '--skip-git-repo-check'], cwd: sessionDir, prompt,
+        execArgs: ['--sandbox', 'workspace-write', '--skip-git-repo-check'], cwd: candidateDir, prompt,
         timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
-        outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [], inheritConfiguredAddDirs: false,
+        outputLastMessagePath: lastMessagePath, progressArtifactPaths: [candidateArtifactPath], addDirs: [], inheritConfiguredAddDirs: false,
         successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE')
           || hasPromiseToken(lastMessage, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE'),
         onSpawn: (child) => manager.update(statePath, (current) => {
@@ -597,28 +745,34 @@ export async function repairCitadelAttribution(
         });
         options.assertDurableOwnership?.();
       } catch (error) {
-        if (isDurableOwnershipDrainError(error)) throw error;
-        const detail = error instanceof Error ? error.message : String(error);
-        const persisted = persistAttributionFailure(sessionDir, intent, detail);
-        return {
-          kind: 'attribution_repair_scheduled', archive_path: persisted.archive_path,
-          repair_intent_path: attributionRepairPath(sessionDir), candidate_ticket_ids: persisted.candidate_ticket_ids,
-          reason: detail, attempt_count: persisted.attempt_count,
-        };
+        workerError = error;
       } finally {
-        manager.update(statePath, (current) => {
-          current.active_child_pid = null;
-          current.active_child_kind = null;
-          current.active_child_command = null;
-          current.active_child_identity = null;
-          current.active_child_controller_pid = null;
-          return current;
-        });
+        try {
+          manager.update(statePath, (current) => {
+            current.active_child_pid = null;
+            current.active_child_kind = null;
+            current.active_child_command = null;
+            current.active_child_identity = null;
+            current.active_child_controller_pid = null;
+            return current;
+          });
+        } catch (error) {
+          workerError ||= error;
+        }
       }
+      let driftDetail: string | null = null;
       try {
+        driftDetail = quarantineAndRestoreAuthoritativeDrift(
+          sessionDir, intent, authoritativeSnapshot, candidateArtifactPath,
+        );
+        if (driftDetail) throw new Error(driftDetail);
+        if (workerError) throw workerError;
+        if (!result) throw new Error('Citadel attribution repair did not return a worker result.');
         assertCodexSucceeded(result, 'Citadel attribution repair failed');
-        artifactValue = readAttributionArtifact(artifactPath);
+        artifactValue = readAttributionArtifact(candidateArtifactPath);
       } catch (error) {
+        fs.rmSync(candidateDir, { recursive: true, force: true });
+        if (isDurableOwnershipDrainError(error) && !driftDetail) throw error;
         const detail = error instanceof Error ? error.message : String(error);
         const persisted = persistAttributionFailure(sessionDir, intent, detail);
         return {
@@ -627,10 +781,12 @@ export async function repairCitadelAttribution(
           reason: detail, attempt_count: persisted.attempt_count,
         };
       }
+      fs.rmSync(candidateDir, { recursive: true, force: true });
     }
   }
   try {
     const artifact = validateAttributionArtifact(intent, artifactValue);
+    if (artifactPath) atomicWriteJson(artifactPath, artifact);
     const repairedReport = reportWithResolvedAttribution(intent, artifact);
     atomicWriteJson(intent.report_path, repairedReport);
     const result = enqueueCitadelRemediationResult(sessionDir);

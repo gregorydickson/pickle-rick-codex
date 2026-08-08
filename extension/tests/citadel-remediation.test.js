@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeTempRoot, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, writeJson } from './helpers.js';
 import {
   enqueueCitadelRemediation,
   enqueueCitadelRemediationResult,
@@ -230,6 +230,73 @@ test('strict attribution artifact converges narrowly and invalid retries use nov
   const completed = JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-attribution-repair-current.json'), 'utf8'));
   assert.equal(completed.strategy_history.length, 2);
   assert.equal(new Set(completed.strategy_history.map((entry) => entry.strategy_hash)).size, 2);
+});
+
+test('malicious attribution worker cannot mutate live tickets while returning a valid artifact', async () => {
+  const sessionDir = multiTicketSession();
+  const workingDir = makeTempRoot('citadel-attribution-live-repo-');
+  writeJson(path.join(sessionDir, 'state.json'), {
+    schema_version: 1,
+    active: true,
+    working_dir: workingDir,
+    worker_timeout_seconds: 30,
+    history: [],
+  });
+  writeJson(path.join(sessionDir, 'citadel-report.json'), {
+    schema_version: 1,
+    verdict: 'block',
+    acceptance_criteria_checked: [],
+    findings: [{ severity: 'high', title: 'Cross-cutting reviewer finding.', evidence: 'Release proof is incomplete.' }],
+  });
+  assert.equal(enqueueCitadelRemediationResult(sessionDir).kind, 'attribution_repair_scheduled');
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const originalManifest = fs.readFileSync(manifestPath, 'utf8');
+  const binDir = makeTempRoot('citadel-attribution-malicious-bin-');
+  const invocationLog = path.join(sessionDir, 'fake-attribution-invocations.jsonl');
+  createFakeCodex(binDir);
+  const prior = {
+    PATH: process.env.PATH,
+    PICKLE_TEST_MODE: process.env.PICKLE_TEST_MODE,
+    FAKE_ATTRIBUTION_MUTATE_SESSION: process.env.FAKE_ATTRIBUTION_MUTATE_SESSION,
+    FAKE_CODEX_INVOCATION_LOG: process.env.FAKE_CODEX_INVOCATION_LOG,
+  };
+  Object.assign(process.env, prependPath(binDir, {
+    PICKLE_TEST_MODE: '1',
+    FAKE_ATTRIBUTION_MUTATE_SESSION: sessionDir,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+  }));
+  let result;
+  try {
+    result = await repairCitadelAttribution(sessionDir, { timeoutMs: 10_000 });
+  } finally {
+    for (const [key, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  assert.equal(result.kind, 'attribution_repair_scheduled');
+  assert.match(result.reason, /citadel-attribution-authoritative-drift/);
+  assert.match(result.reason, /refinement_manifest\.json/);
+  assert.equal(fs.readFileSync(manifestPath, 'utf8'), originalManifest);
+  const independent = readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'independent');
+  assert.equal(independent.status, 'Done');
+  assert.deepEqual(independent.acceptance_criteria, ['Independent behavior remains correct.']);
+  assert.equal(independent.completion_commit, '69696969696969');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'independent', 'linear_ticket_independent.md')), false);
+  const liveState = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+  assert.equal(liveState.active, true);
+  assert.equal(liveState.active_child_pid, null);
+  const pending = reconcileCitadelAttributionRepair(sessionDir);
+  assert.equal(pending.attempt_count, 1);
+  assert.equal(pending.strategy_history.at(-1).status, 'failed');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+  assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-attribution-quarantine')).length, 1);
+  const invocation = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map(JSON.parse)
+    .find((entry) => entry.prompt.includes('autonomous Citadel finding attribution repair worker'));
+  assert.notEqual(invocation.cwd, sessionDir);
+  assert.equal(invocation.args.includes('--add-dir'), false);
+  assert.doesNotMatch(invocation.prompt, new RegExp(sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
 test('schema-2 pending remediation migrates durably on restart without widening its ticket slice', () => {
