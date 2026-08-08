@@ -99,6 +99,11 @@ interface ExecutionTelemetryJournal {
   schema_version: 1;
   events: ExecutionTelemetryEvent[];
   controls?: ExecutionControlTelemetry;
+  unexpected_noncompletion_termination?: {
+    schema_version: 1;
+    reason: string;
+    recorded_at: string;
+  };
 }
 
 export interface ExecutionControlTelemetry {
@@ -131,6 +136,8 @@ export interface ExecutionTelemetrySummary {
   unexpectedTerminalExits: number;
   autonomyScore: 0 | 1;
   reliabilityScore: 0 | 1;
+  qualityScore: 0 | 1;
+  unexpectedNoncompletionTermination: boolean;
 }
 
 const STRATEGY_FILE = 'recovery-strategies.json';
@@ -416,11 +423,50 @@ export function recordExecutionControlTelemetry(
   return controls;
 }
 
+/** Persist the zero-rule signal for a logical pipeline that stopped without
+ * completing or receiving an explicit durable cancellation. Idempotent so a
+ * signal handler and an outer fatal-error boundary cannot double count it. */
+export function recordUnexpectedNoncompletionTermination(sessionDir: string, reason: string): boolean {
+  const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+  try {
+    const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8')) as Record<string, unknown>;
+    if (logical.terminal_state === 'completed' || logical.terminal_state === 'cancelled') return false;
+    const handoffEvents = Array.isArray(logical.events)
+      ? (logical.events as Array<Record<string, unknown>>).filter((event) => String(event.kind || '').startsWith('runtime_handoff_'))
+      : [];
+    const handoffKind = String(handoffEvents.at(-1)?.kind || '');
+    if (handoffKind === 'runtime_handoff_requested' || handoffKind === 'runtime_handoff_released') return false;
+  } catch {
+    // A missing/corrupt durable journal is itself unexpected non-completion.
+  }
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  let recorded = false;
+  stateManager.update(filePath, (raw) => {
+    const journal = raw as unknown as ExecutionTelemetryJournal;
+    if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+    if (journal.unexpected_noncompletion_termination) return journal as unknown as Record<string, unknown>;
+    const controls = { ...EMPTY_CONTROLS, ...(journal.controls || {}) };
+    controls.unexpected_terminal_exits += 1;
+    journal.controls = controls;
+    journal.unexpected_noncompletion_termination = {
+      schema_version: 1,
+      reason: String(reason || 'unexpected non-completion termination'),
+      recorded_at: new Date().toISOString(),
+    };
+    recorded = true;
+    return journal as unknown as Record<string, unknown>;
+  }, { createDefault: () => ({ schema_version: 1, events: [], controls: EMPTY_CONTROLS }) });
+  return recorded;
+}
+
 export function executionTelemetrySummary(sessionDir: string, ticketId?: string): ExecutionTelemetrySummary {
   const journal = readJournal<ExecutionTelemetryJournal>(telemetryPath(sessionDir), { schema_version: 1, events: [] });
   const events = journal.events
     .filter((event) => !ticketId || event.ticket_id === ticketId);
   const controls = { ...EMPTY_CONTROLS, ...(journal.controls || {}) };
+  const unexpectedNoncompletionTermination = Boolean(journal.unexpected_noncompletion_termination);
+  const zeroedByUnexpectedTermination = unexpectedNoncompletionTermination || controls.unexpected_terminal_exits > 0;
   return {
     ticketAttempts: new Set(events.map((event) => `${event.ticket_id}\0${event.ticket_attempt}`)).size,
     phaseAttempts: events.length,
@@ -441,8 +487,10 @@ export function executionTelemetrySummary(sessionDir: string, ticketId?: string)
     checkpointsInvalidated: controls.checkpoints_invalidated,
     postSealHumanInterventions: controls.post_seal_human_interventions,
     unexpectedTerminalExits: controls.unexpected_terminal_exits,
-    autonomyScore: controls.post_seal_human_interventions === 0 ? 1 : 0,
-    reliabilityScore: controls.unexpected_terminal_exits === 0 ? 1 : 0,
+    autonomyScore: controls.post_seal_human_interventions === 0 && !zeroedByUnexpectedTermination ? 1 : 0,
+    reliabilityScore: zeroedByUnexpectedTermination ? 0 : 1,
+    qualityScore: zeroedByUnexpectedTermination ? 0 : 1,
+    unexpectedNoncompletionTermination,
   };
 }
 

@@ -1,6 +1,7 @@
 // @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot } from './helpers.js';
@@ -13,6 +14,7 @@ import {
   terminateLogicalPipeline,
 } from '../services/durable-supervisor.js';
 import { runSupervisedRunner, supervisedRunnerDecision } from '../bin/supervised-runner.js';
+import { executionTelemetrySummary } from '../services/productive-autonomy.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
@@ -79,4 +81,27 @@ if (count === 1) {
   assert.equal(await run, 130);
   assert.equal(fs.readFileSync(countPath, 'utf8'), '2');
   assert.equal(supervisedRunnerDecision(sessionDir), 'cancelled');
+  const recoveredSummary = executionTelemetrySummary(sessionDir);
+  assert.equal(recoveredSummary.unexpectedNoncompletionTermination, false);
+  assert.equal(recoveredSummary.autonomyScore, 1);
+  assert.equal(recoveredSummary.reliabilityScore, 1);
+  assert.equal(recoveredSummary.qualityScore, 1);
+});
+
+test('production supervisor fatal boundary persists unexpected non-completion and zeroes every score', () => {
+  const sessionDir = autonomousSession();
+  fs.writeFileSync(path.join(sessionDir, 'logical-pipeline.json'), '{corrupt');
+  const result = spawnSync(process.execPath, [
+    path.join(process.cwd(), 'bin', 'supervised-runner.js'),
+    sessionDir,
+    '--runner-bin=mux-runner.js',
+  ], { encoding: 'utf8', timeout: 5_000 });
+  assert.equal(result.status, 1);
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedNoncompletionTermination, true);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
+  const telemetry = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8'));
+  assert.match(telemetry.unexpected_noncompletion_termination.reason, /supervisor fatal error/);
 });

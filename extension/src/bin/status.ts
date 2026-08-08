@@ -158,8 +158,10 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
   const executorRestarts = Math.max(telemetry.executorRestarts, durableAutonomy.executorRestarts);
   const postSealHumanInterventions = Math.max(telemetry.postSealHumanInterventions, durableAutonomy.humanInterventions);
   const unexpectedTerminalExits = Math.max(telemetry.unexpectedTerminalExits, durableAutonomy.unexpectedTerminals);
-  const autonomyScore = postSealHumanInterventions === 0 ? 1 : 0;
-  const reliabilityScore = unexpectedTerminalExits === 0 ? 1 : 0;
+  const zeroedByTermination = telemetry.unexpectedNoncompletionTermination || unexpectedTerminalExits > 0;
+  const autonomyScore = postSealHumanInterventions === 0 && !zeroedByTermination ? 1 : 0;
+  const reliabilityScore = unexpectedTerminalExits === 0 && !zeroedByTermination ? 1 : 0;
+  const qualityScore = zeroedByTermination ? 0 : 1;
   const strategies = readRecoveryStrategyEpochs(sessionDir);
   const currentStrategy = state.current_ticket
     ? [...strategies].reverse().find((epoch) => epoch.ticketId === state.current_ticket)
@@ -188,6 +190,7 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
     `Model Tokens: in ${telemetry.inputTokens} | cache-created ${telemetry.cacheCreationInputTokens} | cached ${telemetry.cachedInputTokens} | out ${telemetry.outputTokens}`,
     `Autonomy Score: ${autonomyScore} | post-seal human interventions ${postSealHumanInterventions}`,
     `Reliability Score: ${reliabilityScore} | unexpected terminal exits ${unexpectedTerminalExits}`,
+    `Quality Score: ${qualityScore} | unexpected non-completion ${zeroedByTermination ? 'yes' : 'no'}`,
     `Ticket: ${currentLabel}`,
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,
     nextTicket ? `Next Verification: ${ticketVerification(nextTicket)}` : null,

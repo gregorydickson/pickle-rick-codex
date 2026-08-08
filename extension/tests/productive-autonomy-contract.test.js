@@ -1,6 +1,8 @@
 // @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   AUTONOMOUS_FAILURE_TYPES,
   beginRecoveryStrategyEpoch,
@@ -10,7 +12,9 @@ import {
   nextMaterialApproach,
   planSchedulerContinuity,
   readRecoveryStrategyEpochs,
+  recordExecutionControlTelemetry,
   recordExecutionTelemetry,
+  recordUnexpectedNoncompletionTermination,
   recoveryRoute,
   resolveAutonomousRecovery,
   recoveryExecutionAction,
@@ -134,5 +138,42 @@ test('telemetry includes failed calls and separates attempts, epochs, and discar
     unexpectedTerminalExits: 0,
     autonomyScore: 1,
     reliabilityScore: 1,
+    qualityScore: 1,
+    unexpectedNoncompletionTermination: false,
   });
+});
+
+test('unexpected non-completion persistently zeroes autonomy, reliability, and quality', () => {
+  const sessionDir = makeTempRoot('pickle-zero-rule-');
+  assert.equal(recordUnexpectedNoncompletionTermination(sessionDir, 'supervisor crashed'), true);
+  assert.equal(recordUnexpectedNoncompletionTermination(sessionDir, 'duplicate boundary'), false);
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedTerminalExits, 1);
+  assert.equal(summary.unexpectedNoncompletionTermination, true);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
+});
+
+test('legacy unexpected-terminal counter alone applies the same three-score zero rule', () => {
+  const sessionDir = makeTempRoot('pickle-zero-rule-counter-');
+  recordExecutionControlTelemetry(sessionDir, { unexpected_terminal_exits: 1 });
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedNoncompletionTermination, false);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
+});
+
+test('completed and explicitly cancelled durable terminals are excluded from zero scoring', () => {
+  for (const terminalState of ['completed', 'cancelled']) {
+    const sessionDir = makeTempRoot(`pickle-zero-rule-${terminalState}-`);
+    fs.writeFileSync(path.join(sessionDir, 'logical-pipeline.json'), JSON.stringify({ terminal_state: terminalState }));
+    assert.equal(recordUnexpectedNoncompletionTermination(sessionDir, 'late supervisor signal'), false);
+    const summary = executionTelemetrySummary(sessionDir);
+    assert.equal(summary.unexpectedNoncompletionTermination, false);
+    assert.equal(summary.autonomyScore, 1);
+    assert.equal(summary.reliabilityScore, 1);
+    assert.equal(summary.qualityScore, 1);
+  }
 });

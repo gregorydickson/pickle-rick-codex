@@ -1,6 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteJson, nowIso } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
+import { recordUnexpectedNoncompletionTermination } from './productive-autonomy.js';
 import {
   killTmuxSessionById,
   readTmuxRunnerBinding,
@@ -103,6 +105,20 @@ export function cleanupTerminalTmuxSession(
       ? state.tmux_session_name
       : null;
     const at = (options.now || nowIso)();
+
+    // This command is sequenced after the restart supervisor itself, not after
+    // each executor child. Reaching it means the pipeline's automatic owner has
+    // ended; persist the zero-rule signal before any state-based early return.
+    const hasDurableJournal = fs.existsSync(path.join(resolvedSessionDir, 'logical-pipeline.json'));
+    const exitReason = String(state.last_exit_reason || '');
+    const expectedNonDurableExit = !hasDurableJournal && (
+      exitReason === 'success'
+      || exitReason === 'completed'
+      || (exitReason === 'cancelled' && Boolean(state.cancel_requested_at))
+    );
+    if (!expectedNonDurableExit) {
+      recordUnexpectedNoncompletionTermination(resolvedSessionDir, 'tmux restart supervisor exited before logical completion');
+    }
 
     if (state.active === true) {
       return { status: 'not-terminal', sessionName, reason: 'runtime state is still active' };

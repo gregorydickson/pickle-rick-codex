@@ -6,6 +6,7 @@ import test from 'node:test';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { StateManager } from '../services/state-manager.js';
+import { executionTelemetrySummary } from '../services/productive-autonomy.js';
 
 function bindingFor(sessionDir, overrides = {}) {
   return {
@@ -103,6 +104,39 @@ test('terminal tmux cleanup does not touch an active session', () => {
   const result = cleanupTerminalTmuxSession(sessionDir, { killSessionId: () => { kills += 1; } });
   assert.equal(result.status, 'not-terminal');
   assert.equal(kills, 0);
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedNoncompletionTermination, true);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
+});
+
+test('terminal cleanup excludes an explicit durable cancellation from zero scoring', () => {
+  const sessionDir = makeTempRoot('pickle-tmux-cancelled-');
+  terminalSession(sessionDir, { active: true });
+  writeJson(path.join(sessionDir, 'logical-pipeline.json'), { terminal_state: 'cancelled' });
+  cleanupTerminalTmuxSession(sessionDir);
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.unexpectedNoncompletionTermination, false);
+  assert.equal(summary.autonomyScore, 1);
+  assert.equal(summary.reliabilityScore, 1);
+  assert.equal(summary.qualityScore, 1);
+});
+
+test('terminal cleanup excludes successful and explicitly cancelled non-durable loops', () => {
+  for (const state of [
+    { last_exit_reason: 'success' },
+    { last_exit_reason: 'cancelled', cancel_requested_at: '2026-08-08T00:00:00.000Z' },
+  ]) {
+    const sessionDir = makeTempRoot('pickle-tmux-nondurable-expected-');
+    terminalSession(sessionDir, { active: true, ...state });
+    cleanupTerminalTmuxSession(sessionDir);
+    const summary = executionTelemetrySummary(sessionDir);
+    assert.equal(summary.unexpectedNoncompletionTermination, false);
+    assert.equal(summary.autonomyScore, 1);
+    assert.equal(summary.reliabilityScore, 1);
+    assert.equal(summary.qualityScore, 1);
+  }
 });
 
 test('terminal cleanup holds the state lock through recheck and immutable kill', () => {

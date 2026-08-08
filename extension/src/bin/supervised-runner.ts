@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { abortExpiredRuntimeHandoff, hasPendingRuntimeHandoff, readLogicalPipeline } from '../services/durable-supervisor.js';
+import { recordUnexpectedNoncompletionTermination } from '../services/productive-autonomy.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
 
@@ -78,11 +79,27 @@ async function main(argv: string[]): Promise<void> {
     throw new Error('Usage: node bin/supervised-runner.js <session-dir> --runner-bin=mux-runner.js|pipeline-runner.js [runner args]');
   }
   const forwarded = argv.filter((arg) => arg !== sessionDir && arg !== runnerArg);
+  const signalExitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => {
+      try {
+        recordUnexpectedNoncompletionTermination(sessionDir, `supervisor received ${signal}`);
+      } finally {
+        process.exit(signalExitCodes[signal] || 1);
+      }
+    });
+  }
   process.exitCode = await runSupervisedRunner(sessionDir, runnerBin, forwarded);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main(process.argv.slice(2)).catch((error) => {
+    const sessionDir = process.argv.slice(2).find((arg) => !arg.startsWith('--'));
+    try {
+      if (sessionDir) recordUnexpectedNoncompletionTermination(sessionDir, `supervisor fatal error: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      // Preserve the original fatal exit even if its telemetry journal is damaged.
+    }
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   });

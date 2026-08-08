@@ -112,4 +112,5 @@ test('status exposes durable executor restarts, checkpoint counters, and zero-in
   assert.match(output, /Checkpoints: reused 4 \| invalidated 1/);
   assert.match(output, /Autonomy Score: 1 \| post-seal human interventions 0/);
   assert.match(output, /Reliability Score: 1 \| unexpected terminal exits 0/);
+  assert.match(output, /Quality Score: 1 \| unexpected non-completion no/);
 });
