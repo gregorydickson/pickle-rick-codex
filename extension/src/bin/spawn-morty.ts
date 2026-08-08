@@ -53,6 +53,7 @@ import {
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
+import { recordExecutionControlTelemetry, recordModelCallTelemetry } from '../services/productive-autonomy.js';
 import { lifecycleContextInputHash, readLifecycleContextCheckpoint, writeLifecycleContextCheckpoint } from '../services/lifecycle-checkpoints.js';
 import { atomicWriteJson } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
@@ -85,6 +86,7 @@ import {
 } from '../services/pipeline-state.js';
 import type {
   CircuitIterationState,
+  CodexSpawnResult,
   Config,
   ConfigVerificationInput,
   SuccessCheck,
@@ -639,6 +641,9 @@ async function runVerificationCommand({
 interface RunTicketOptions {
   runnerMode?: string | null;
   timeoutMs?: number;
+  ticketAttempt?: number;
+  recoveryEpoch?: number;
+  strategyHash?: string | null;
   [key: string]: unknown;
 }
 
@@ -894,6 +899,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           lifecycleArtifacts.push(artifact);
         }
         appendRunnerLog(sessionDir, runnerMode, `reused content-addressed research/plan checkpoint ${cachedContext.digest}`);
+        recordExecutionControlTelemetry(sessionDir, { checkpoints_reused: expectedContextPhases.length });
       } catch {
         lifecycleArtifacts.length = 0;
       }
@@ -926,6 +932,8 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         const candidateArtifactPath = path.join(candidateRoot, normalizedTicketId, `${phase}.json`);
         const lastMessagePath = path.join(sessionDir, `${normalizedTicketId}.${phase}.last-message.txt`);
         prepareWorkerLifecycleArtifact(candidateArtifactPath);
+        let modelResult: CodexSpawnResult | null = null;
+        let modelOutcome: 'success' | 'failed' | 'cancelled' | 'timed_out' = 'failed';
         try {
           const result = await runCodexExecMonitored({
             // Lifecycle artifacts authorize repository advancement. Pin the sandbox
@@ -963,6 +971,8 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
             },
             cancelCheck: () => isSessionCancelled(manager, statePath),
           });
+          modelResult = result;
+          modelOutcome = result.cancelled ? 'cancelled' : result.timedOut ? 'timed_out' : result.exitCode === 0 ? 'success' : 'failed';
           if (result.cancelled || isSessionCancelled(manager, statePath)) {
             throw new CancellationError();
           }
@@ -982,7 +992,9 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           if (phaseRepositoryBoundary !== null && repositoryMutationFingerprint(workingDir) !== phaseRepositoryBoundary) {
             throw new Error(`worker-lifecycle-read-only-mutation: ${phase} modified the repository`);
           }
+          modelOutcome = 'success';
         } catch (error) {
+          if (modelResult && modelOutcome === 'success') modelOutcome = 'failed';
           const artifactContractFailure = readOnlyPhase
             && isLifecycleArtifactContractError(error)
             && repositoryMutationFingerprint(workingDir) === phaseRepositoryBoundary;
@@ -1009,6 +1021,18 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           acceptedArtifact = null;
           continue;
         } finally {
+          if (modelResult) {
+            recordModelCallTelemetry(sessionDir, {
+              ticketId: normalizedTicketId,
+              phase,
+              ticketAttempt: Number(options.ticketAttempt || 1),
+              phaseAttempt,
+              recoveryEpoch: Number(options.recoveryEpoch || 0),
+              strategyHash: options.strategyHash || null,
+              result: modelResult,
+              outcome: modelOutcome,
+            });
+          }
           updateActiveChild(statePath, manager, {
             active_child_pid: null,
             active_child_kind: null,

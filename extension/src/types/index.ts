@@ -372,6 +372,7 @@ export interface CodexSpawnResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  durationMs: number;
   lastMessage: string;
   usage: CodexUsage;
   terminatedAfterSuccess: boolean;
@@ -431,6 +432,15 @@ export interface CodexExecOptions {
   addDirs?: string[];
   inheritConfiguredAddDirs?: boolean;
   json?: boolean;
+  telemetry?: {
+    sessionDir: string;
+    ticketId: string;
+    phase: string;
+    ticketAttempt?: number;
+    phaseAttempt?: number;
+    recoveryEpoch?: number;
+    strategyHash?: string | null;
+  };
 }
 
 // ---------------------------------------------------------------------------

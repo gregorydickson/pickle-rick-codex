@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
+import { recordModelCallTelemetry } from './productive-autonomy.js';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
 import {
@@ -119,6 +120,7 @@ async function runSpawnedCommand({
   onSpawn,
   cancelCheck,
 }: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
+  const startedAt = Date.now();
   removeStaleOutputs([...cleanupPaths, outputLastMessagePath]);
 
   const maxCapturedStreamBytes = 4 * 1024 * 1024;
@@ -319,6 +321,7 @@ async function runSpawnedCommand({
           stdout,
           stderr,
           timedOut: forcedByTimeout,
+          durationMs: Date.now() - startedAt,
           lastMessage: message,
           usage: extractCodexUsage(stdout) as CodexUsage,
           terminatedAfterSuccess: forcedAfterSuccess,
@@ -428,7 +431,7 @@ export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpaw
 
 export async function runCodexExecMonitored(options: CodexExecOptions): Promise<CodexSpawnResult> {
   const { command, args } = buildCodexExecInvocation(options);
-  return await runSpawnedCommand({
+  const result = await runSpawnedCommand({
     command,
     args,
     cwd: options.cwd,
@@ -444,6 +447,18 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
     onSpawn: options.onSpawn,
     cancelCheck: options.cancelCheck,
   });
+  if (options.telemetry) {
+    recordModelCallTelemetry(options.telemetry.sessionDir, {
+      ticketId: options.telemetry.ticketId,
+      phase: options.telemetry.phase,
+      ticketAttempt: options.telemetry.ticketAttempt ?? 1,
+      phaseAttempt: options.telemetry.phaseAttempt ?? 1,
+      recoveryEpoch: options.telemetry.recoveryEpoch,
+      strategyHash: options.telemetry.strategyHash,
+      result,
+    });
+  }
+  return result;
 }
 
 export function assertCodexSucceeded(result: CodexSpawnResult, context: string = 'Codex execution failed'): void {

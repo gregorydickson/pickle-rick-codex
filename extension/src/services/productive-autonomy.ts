@@ -2,7 +2,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteJson } from './pickle-utils.js';
+import { StateManager } from './state-manager.js';
 import type { Ticket } from '../types/index.js';
+import type { CodexSpawnResult } from '../types/index.js';
 import type { WorkerLifecyclePhase } from './worker-lifecycle.js';
 
 export type FailureDomain =
@@ -86,6 +88,7 @@ export interface ExecutionTelemetryEvent {
   duration_ms: number;
   input_tokens: number;
   cached_input_tokens: number;
+  cache_creation_input_tokens?: number;
   output_tokens: number;
   productive_work: number;
   discarded_work: number;
@@ -95,6 +98,15 @@ export interface ExecutionTelemetryEvent {
 interface ExecutionTelemetryJournal {
   schema_version: 1;
   events: ExecutionTelemetryEvent[];
+  controls?: ExecutionControlTelemetry;
+}
+
+export interface ExecutionControlTelemetry {
+  executor_restarts: number;
+  checkpoints_reused: number;
+  checkpoints_invalidated: number;
+  post_seal_human_interventions: number;
+  unexpected_terminal_exits: number;
 }
 
 export interface ExecutionTelemetrySummary {
@@ -102,12 +114,23 @@ export interface ExecutionTelemetrySummary {
   phaseAttempts: number;
   recoveryEpochs: number;
   failedCalls: number;
+  successfulCalls: number;
+  timedOutCalls: number;
+  cancelledCalls: number;
   durationMs: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
   productiveWork: number;
   discardedWork: number;
+  executorRestarts: number;
+  checkpointsReused: number;
+  checkpointsInvalidated: number;
+  postSealHumanInterventions: number;
+  unexpectedTerminalExits: number;
+  autonomyScore: 0 | 1;
+  reliabilityScore: 0 | 1;
 }
 
 const STRATEGY_FILE = 'recovery-strategies.json';
@@ -296,31 +319,113 @@ export function recordExecutionTelemetry(
   input: Omit<ExecutionTelemetryEvent, 'sequence' | 'recorded_at'>,
 ): ExecutionTelemetryEvent {
   const filePath = telemetryPath(sessionDir);
-  const journal = readJournal<ExecutionTelemetryJournal>(filePath, { schema_version: 1, events: [] });
-  if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
-  const event: ExecutionTelemetryEvent = {
-    ...input,
-    sequence: journal.events.length + 1,
-    recorded_at: new Date().toISOString(),
-  };
-  atomicWriteJson(filePath, { schema_version: 1, events: [...journal.events, event] });
+  const stateManager = new StateManager();
+  let event: ExecutionTelemetryEvent | null = null;
+  stateManager.update(filePath, (raw) => {
+    const journal = raw as unknown as ExecutionTelemetryJournal;
+    if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+    event = { ...input, sequence: journal.events.length + 1, recorded_at: new Date().toISOString() };
+    journal.events.push(event);
+    return journal as unknown as Record<string, unknown>;
+  }, { createDefault: () => ({ schema_version: 1, events: [] }) });
+  if (!event) throw new Error('execution-telemetry-write-failed');
   return event;
 }
 
+export function recordModelCallTelemetry(
+  sessionDir: string,
+  input: {
+    ticketId: string;
+    phase: string;
+    ticketAttempt: number;
+    phaseAttempt: number;
+    recoveryEpoch?: number;
+    strategyHash?: string | null;
+    result: CodexSpawnResult;
+    outcome?: ExecutionTelemetryEvent['outcome'];
+    productiveWork?: number;
+    discardedWork?: number;
+  },
+): ExecutionTelemetryEvent {
+  const outcome = input.outcome ?? (input.result.cancelled
+    ? 'cancelled'
+    : input.result.timedOut
+      ? 'timed_out'
+      : input.result.exitCode === 0 ? 'success' : 'failed');
+  return recordExecutionTelemetry(sessionDir, {
+    ticket_id: input.ticketId,
+    phase: input.phase,
+    ticket_attempt: input.ticketAttempt,
+    phase_attempt: input.phaseAttempt,
+    recovery_epoch: input.recoveryEpoch ?? 0,
+    strategy_hash: input.strategyHash ?? null,
+    outcome,
+    duration_ms: input.result.durationMs,
+    input_tokens: input.result.usage.input_tokens,
+    cached_input_tokens: input.result.usage.cache_read_input_tokens,
+    cache_creation_input_tokens: input.result.usage.cache_creation_input_tokens,
+    output_tokens: input.result.usage.output_tokens,
+    productive_work: input.productiveWork ?? (outcome === 'success' ? 1 : 0),
+    discarded_work: input.discardedWork ?? (outcome === 'success' ? 0 : 1),
+  });
+}
+
+const EMPTY_CONTROLS: ExecutionControlTelemetry = {
+  executor_restarts: 0,
+  checkpoints_reused: 0,
+  checkpoints_invalidated: 0,
+  post_seal_human_interventions: 0,
+  unexpected_terminal_exits: 0,
+};
+
+export function recordExecutionControlTelemetry(
+  sessionDir: string,
+  delta: Partial<ExecutionControlTelemetry>,
+): ExecutionControlTelemetry {
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  let controls = { ...EMPTY_CONTROLS };
+  stateManager.update(filePath, (raw) => {
+    const journal = raw as unknown as ExecutionTelemetryJournal;
+    if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+    const prior = { ...EMPTY_CONTROLS, ...(journal.controls || {}) };
+    controls = Object.fromEntries(Object.keys(EMPTY_CONTROLS).map((key) => {
+      const name = key as keyof ExecutionControlTelemetry;
+      return [name, Math.max(0, Number(prior[name] || 0) + Number(delta[name] || 0))];
+    })) as unknown as ExecutionControlTelemetry;
+    journal.controls = controls;
+    return journal as unknown as Record<string, unknown>;
+  }, { createDefault: () => ({ schema_version: 1, events: [], controls: EMPTY_CONTROLS }) });
+  return controls;
+}
+
 export function executionTelemetrySummary(sessionDir: string, ticketId?: string): ExecutionTelemetrySummary {
-  const events = readJournal<ExecutionTelemetryJournal>(telemetryPath(sessionDir), { schema_version: 1, events: [] }).events
+  const journal = readJournal<ExecutionTelemetryJournal>(telemetryPath(sessionDir), { schema_version: 1, events: [] });
+  const events = journal.events
     .filter((event) => !ticketId || event.ticket_id === ticketId);
+  const controls = { ...EMPTY_CONTROLS, ...(journal.controls || {}) };
   return {
     ticketAttempts: new Set(events.map((event) => `${event.ticket_id}\0${event.ticket_attempt}`)).size,
     phaseAttempts: events.length,
     recoveryEpochs: new Set(events.filter((event) => event.recovery_epoch > 0).map((event) => `${event.ticket_id}\0${event.recovery_epoch}`)).size,
-    failedCalls: events.filter((event) => event.outcome !== 'success').length,
+    failedCalls: events.filter((event) => event.outcome === 'failed').length,
+    successfulCalls: events.filter((event) => event.outcome === 'success').length,
+    timedOutCalls: events.filter((event) => event.outcome === 'timed_out').length,
+    cancelledCalls: events.filter((event) => event.outcome === 'cancelled').length,
     durationMs: events.reduce((sum, event) => sum + event.duration_ms, 0),
     inputTokens: events.reduce((sum, event) => sum + event.input_tokens, 0),
     cachedInputTokens: events.reduce((sum, event) => sum + event.cached_input_tokens, 0),
+    cacheCreationInputTokens: events.reduce((sum, event) => sum + Number(event.cache_creation_input_tokens || 0), 0),
     outputTokens: events.reduce((sum, event) => sum + event.output_tokens, 0),
     productiveWork: events.reduce((sum, event) => sum + event.productive_work, 0),
     discardedWork: events.reduce((sum, event) => sum + event.discarded_work, 0),
+    executorRestarts: controls.executor_restarts,
+    checkpointsReused: controls.checkpoints_reused,
+    checkpointsInvalidated: controls.checkpoints_invalidated,
+    postSealHumanInterventions: controls.post_seal_human_interventions,
+    unexpectedTerminalExits: controls.unexpected_terminal_exits,
+    autonomyScore: controls.post_seal_human_interventions === 0 ? 1 : 0,
+    reliabilityScore: controls.unexpected_terminal_exits === 0 ? 1 : 0,
   };
 }
 

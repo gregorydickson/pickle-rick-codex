@@ -133,6 +133,10 @@ test('worker lifecycle persists eight validated phases and reads approved resear
     .map((line) => JSON.parse(line))
     .filter((entry) => entry.args[0] === 'exec');
   assert.equal(invocations.length, WORKER_LIFECYCLE_PHASES.length);
+  const telemetry = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8'));
+  assert.deepEqual(telemetry.events.map((event) => event.phase), WORKER_LIFECYCLE_PHASES);
+  assert.ok(telemetry.events.every((event) => event.outcome === 'success'));
+  assert.ok(telemetry.events.every((event) => event.duration_ms > 0));
   for (const invocation of invocations) {
     assert.ok(invocation.args.includes('--sandbox'));
     assert.ok(invocation.args.includes('workspace-write'));

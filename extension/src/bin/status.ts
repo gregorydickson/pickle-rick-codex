@@ -30,6 +30,24 @@ interface RenderStatusOptions {
   last?: boolean;
 }
 
+function durableAutonomySnapshot(sessionDir: string): { executorRestarts: number; humanInterventions: number; unexpectedTerminals: number } {
+  try {
+    const logical = JSON.parse(fs.readFileSync(path.join(sessionDir, 'logical-pipeline.json'), 'utf8')) as Record<string, unknown>;
+    const count = Number(logical.executor_restart_count || 0);
+    const events = Array.isArray(logical.events) ? logical.events as Record<string, unknown>[] : [];
+    const sealIndex = events.findIndex((event) => event.kind === 'prd_sealed');
+    const postSeal = sealIndex >= 0 ? events.slice(sealIndex + 1) : [];
+    const terminal = logical.terminal_state;
+    return {
+      executorRestarts: Number.isInteger(count) && count >= 0 ? count : 0,
+      humanInterventions: postSeal.filter((event) => event.kind === 'human_intervention').length,
+      unexpectedTerminals: terminal == null || terminal === 'completed' || terminal === 'cancelled' ? 0 : 1,
+    };
+  } catch {
+    return { executorRestarts: 0, humanInterventions: 0, unexpectedTerminals: 0 };
+  }
+}
+
 function formatIterationLimit(maxIterations: unknown): string {
   return Number.isInteger(maxIterations) && (maxIterations as number) > 0 ? String(maxIterations) : 'unlimited';
 }
@@ -136,6 +154,12 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
     ? `${currentTicket.id} - ${currentTicket.title}`
     : ((state.current_ticket as string | undefined) || 'none');
   const telemetry = executionTelemetrySummary(sessionDir);
+  const durableAutonomy = durableAutonomySnapshot(sessionDir);
+  const executorRestarts = Math.max(telemetry.executorRestarts, durableAutonomy.executorRestarts);
+  const postSealHumanInterventions = Math.max(telemetry.postSealHumanInterventions, durableAutonomy.humanInterventions);
+  const unexpectedTerminalExits = Math.max(telemetry.unexpectedTerminalExits, durableAutonomy.unexpectedTerminals);
+  const autonomyScore = postSealHumanInterventions === 0 ? 1 : 0;
+  const reliabilityScore = unexpectedTerminalExits === 0 ? 1 : 0;
   const strategies = readRecoveryStrategyEpochs(sessionDir);
   const currentStrategy = state.current_ticket
     ? [...strategies].reverse().find((epoch) => epoch.ticketId === state.current_ticket)
@@ -155,10 +179,15 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
     `Ticket Attempts: ${telemetry.ticketAttempts}`,
     `Phase Attempts: ${telemetry.phaseAttempts}`,
     `Recovery Epochs: ${telemetry.recoveryEpochs}`,
+    `Executor Restarts: ${executorRestarts}`,
+    `Checkpoints: reused ${telemetry.checkpointsReused} | invalidated ${telemetry.checkpointsInvalidated}`,
     currentStrategy ? `Recovery Strategy: ${currentStrategy.materialApproach} (${currentStrategy.strategyHash.slice(0, 12)})` : null,
     `Work: productive ${telemetry.productiveWork} | discarded ${telemetry.discardedWork}`,
     `Model Time: ${formatDuration(Math.floor(telemetry.durationMs / 1000))}`,
-    `Model Tokens: in ${telemetry.inputTokens} | cached ${telemetry.cachedInputTokens} | out ${telemetry.outputTokens} | failed calls ${telemetry.failedCalls}`,
+    `Model Calls: success ${telemetry.successfulCalls} | failed ${telemetry.failedCalls} | timed out ${telemetry.timedOutCalls} | cancelled ${telemetry.cancelledCalls}`,
+    `Model Tokens: in ${telemetry.inputTokens} | cache-created ${telemetry.cacheCreationInputTokens} | cached ${telemetry.cachedInputTokens} | out ${telemetry.outputTokens}`,
+    `Autonomy Score: ${autonomyScore} | post-seal human interventions ${postSealHumanInterventions}`,
+    `Reliability Score: ${reliabilityScore} | unexpected terminal exits ${unexpectedTerminalExits}`,
     `Ticket: ${currentLabel}`,
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,
     nextTicket ? `Next Verification: ${ticketVerification(nextTicket)}` : null,

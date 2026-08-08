@@ -628,6 +628,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
   let reviewerError: unknown = null;
   try {
     result = await runCodexExecMonitored({
+      telemetry: { sessionDir, ticketId: 'pipeline', phase: 'citadel' },
       cwd: workingDir,
       prompt: buildCitadelPrompt(sessionDir, reviewedRange, checksPath, expectedAcceptanceCriteria),
       timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,

@@ -51,6 +51,7 @@ export async function draftPrd(sessionDir: string, task: string, options: DraftP
   const outputLastMessagePath = path.join(sessionDir, 'draft-prd.last-message.txt');
   const prompt = buildDraftPrdPrompt({ task, sessionDir });
   const result = await runCodexExecMonitored({
+    telemetry: { sessionDir, ticketId: 'pipeline', phase: 'prd' },
     cwd: state.working_dir as string,
     prompt,
     timeoutMs: options.timeoutMs || 900_000,

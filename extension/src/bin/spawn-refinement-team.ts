@@ -240,6 +240,11 @@ async function runRefinementCodex(
   try {
     return await runCodexExecMonitored({
       ...options,
+      telemetry: {
+        sessionDir: path.dirname(statePath),
+        ticketId: 'refinement',
+        phase: label,
+      },
       execArgs: REFINEMENT_EXEC_ARGS,
       skipGitRepoCheck: true,
       inheritConfiguredAddDirs: false,

@@ -37,7 +37,7 @@ import {
   nextMaterialApproach,
   planSchedulerContinuity,
   readRecoveryStrategyEpochs,
-  recordExecutionTelemetry,
+  recordExecutionControlTelemetry,
   recoveryRoute,
   type FailureDomain,
 } from '../services/productive-autonomy.js';
@@ -211,6 +211,7 @@ async function runSequentialWithLease(
     ): boolean => {
       try {
         const route = recoveryRoute(latestFailureDomain);
+        recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: route.invalidate.length });
         const priorEpochs = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticket.id).length;
         const strategy = beginRecoveryStrategyEpoch(sessionDir, {
           ticketId: ticket.id,
@@ -422,7 +423,6 @@ async function runSequentialWithLease(
       }
 
       attempts += 1;
-      const attemptStartedAt = Date.now();
       try {
         appendRunnerLog(
           sessionDir,
@@ -433,24 +433,12 @@ async function runSequentialWithLease(
         const result = await runTicketFn(sessionDir, ticket.id, {
           ...options,
           runnerMode,
+          ticketAttempt: attempts,
+          recoveryEpoch: activeRecoveryEpoch,
+          strategyHash: activeStrategyHash,
         });
         options.assertDurableOwnership?.();
         if (result.status === 'done') {
-          recordExecutionTelemetry(sessionDir, {
-            ticket_id: ticket.id,
-            phase: 'ticket',
-            ticket_attempt: attempts,
-            phase_attempt: attempts,
-            recovery_epoch: activeRecoveryEpoch,
-            strategy_hash: activeStrategyHash,
-            outcome: 'success',
-            duration_ms: Date.now() - attemptStartedAt,
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            productive_work: result.applied ? 1 : 0,
-            discarded_work: 0,
-          });
           scrubTicketWorkerMessages(sessionDir, normalizeTicketId(ticket.id, ticket.id));
           ticket.status = 'Done';
           appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
@@ -461,21 +449,6 @@ async function runSequentialWithLease(
         // ticket is only ever marked Done when the oracle accepted it.
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} not completed: oracle refusal ${result.reason ?? result.status}`);
         const refusalMessage = `oracle refusal ${result.reason ?? result.status}`;
-        recordExecutionTelemetry(sessionDir, {
-          ticket_id: ticket.id,
-          phase: 'promote',
-          ticket_attempt: attempts,
-          phase_attempt: attempts,
-          recovery_epoch: activeRecoveryEpoch,
-          strategy_hash: activeStrategyHash,
-          outcome: 'failed',
-          duration_ms: Date.now() - attemptStartedAt,
-          input_tokens: 0,
-          cached_input_tokens: 0,
-          output_tokens: 0,
-          productive_work: 0,
-          discarded_work: result.applied ? 1 : 0,
-        });
         const recovery = decideRecovery('oracle_refusal', refusalMessage);
         if (recovery.action === 'retry') {
           if (yieldToScheduler) {
@@ -499,21 +472,6 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       } catch (error) {
-        recordExecutionTelemetry(sessionDir, {
-          ticket_id: ticket.id,
-          phase: String(manager.read(statePath).step || 'ticket'),
-          ticket_attempt: attempts,
-          phase_attempt: attempts,
-          recovery_epoch: activeRecoveryEpoch,
-          strategy_hash: activeStrategyHash,
-          outcome: manager.read(statePath).active === false ? 'cancelled' : 'failed',
-          duration_ms: Date.now() - attemptStartedAt,
-          input_tokens: 0,
-          cached_input_tokens: 0,
-          output_tokens: 0,
-          productive_work: 0,
-          discarded_work: 1,
-        });
         const cancelled = manager.read(statePath).active === false;
         if (cancelled) {
           exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';

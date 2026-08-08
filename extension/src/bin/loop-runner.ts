@@ -1222,6 +1222,13 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attemptOrdinal);
       fs.rmSync(outputLastMessagePath, { force: true });
       const result = await runCodexExecMonitored({
+        telemetry: {
+          sessionDir,
+          ticketId: experiment?.id || loopConfig.mode,
+          phase: loopConfig.mode,
+          ticketAttempt: iteration,
+          phaseAttempt: attemptOrdinal,
+        },
         cwd: state.working_dir as string,
         prompt: buildLoopPrompt({
           mode: loopConfig.mode,
