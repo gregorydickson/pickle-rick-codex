@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { projectRoot, makeTempRoot, runBash, runNode } from './helpers.js';
+import { describeInstalledRuntime } from '../services/runtime-descriptor.js';
 
 function countMatches(content, pattern) {
   return [...content.matchAll(pattern)].length;
@@ -64,6 +65,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.template.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.pickle-rick-runtime')));
   assert.ok(fs.existsSync(path.join(installRoot, '.runtime-descriptor.json')));
+  assert.deepEqual(describeInstalledRuntime(installRoot), describeInstalledRuntime(projectRoot));
   assert.ok(fs.existsSync(path.join(installRoot, 'images', 'pickle-rick.png')));
   assert.equal(fs.existsSync(path.join(installRoot, 'tests')), false);
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));

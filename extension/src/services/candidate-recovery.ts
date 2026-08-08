@@ -9,6 +9,7 @@ export interface RejectedCandidateCheckpoint {
   base_head: string;
   recovery_ref: string;
   changed_paths: string[];
+  staged_paths?: string[];
   evidence_path: string | null;
   recorded_at: string;
 }
@@ -22,14 +23,16 @@ function git(workingDir: string, args: string[]): string {
 }
 
 export function persistRejectedCandidateCheckpoint(input: {
-  sessionDir: string; workingDir: string; ticketId: string; baseHead: string; recoveryRef: string; evidencePath?: string | null;
+  sessionDir: string; workingDir: string; ticketId: string; baseHead: string; recoveryRef: string;
+  evidencePath?: string | null; stagedPaths?: string[];
 }): RejectedCandidateCheckpoint {
   git(input.workingDir, ['rev-parse', '--verify', input.recoveryRef]);
   const changedPaths = git(input.workingDir, ['diff', '--name-only', '-z', input.baseHead, input.recoveryRef, '--']).split('\0').filter(Boolean).sort();
   if (changedPaths.length === 0) throw new Error('rejected-candidate-empty: recovery ref contains no candidate changes');
   const checkpoint: RejectedCandidateCheckpoint = {
     schema_version: 1, ticket_id: input.ticketId, base_head: input.baseHead, recovery_ref: input.recoveryRef,
-    changed_paths: changedPaths, evidence_path: input.evidencePath || null, recorded_at: new Date().toISOString(),
+    changed_paths: changedPaths, staged_paths: [...new Set(input.stagedPaths || [])].sort(),
+    evidence_path: input.evidencePath || null, recorded_at: new Date().toISOString(),
   };
   fs.mkdirSync(path.dirname(checkpointPath(input.sessionDir, input.ticketId)), { recursive: true, mode: 0o700 });
   atomicWriteJson(checkpointPath(input.sessionDir, input.ticketId), checkpoint);
@@ -51,6 +54,7 @@ export function restoreRejectedCandidateCheckpoint(input: {
   const patch = execFileSync('git', ['diff', '--binary', checkpoint.base_head, checkpoint.recovery_ref, '--'], { cwd: input.workingDir, encoding: 'buffer' });
   const applied = spawnSync('git', ['apply', '--whitespace=nowarn', '-'], { cwd: input.workingDir, input: patch, encoding: 'buffer' });
   if (applied.status !== 0) throw new Error(`rejected-candidate-restore-failed: ${String(applied.stderr || '')}`);
+  for (const relative of checkpoint.staged_paths || []) git(input.workingDir, ['add', '--', relative]);
   return checkpoint;
 }
 

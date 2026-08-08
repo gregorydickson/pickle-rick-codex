@@ -7,9 +7,14 @@ import { atomicWriteJson } from './pickle-utils.js';
 export const RUNTIME_DESCRIPTOR_FILE = '.runtime-descriptor.json';
 
 const HASHED_RUNTIME_PATHS = [
+  'install.sh',
+  'package.json',
+  'skills',
   'extension/package.json',
   'extension/state-schema.json',
-  'extension/src',
+  'extension/bin',
+  'extension/services',
+  'extension/types',
 ] as const;
 
 function filesUnder(root: string, relative: string): string[] {
@@ -23,14 +28,26 @@ function filesUnder(root: string, relative: string): string[] {
   ));
 }
 
+function normalizedRuntimeContent(root: string, raw: Buffer): Buffer {
+  const text = raw.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(raw)) return raw;
+  const aliases = [root, '$HOME/.codex/pickle-rick', '~/.codex/pickle-rick']
+    .sort((left, right) => right.length - left.length);
+  let normalized = text;
+  for (const alias of aliases) normalized = normalized.split(alias).join('<PICKLE_RUNTIME_ROOT>');
+  return Buffer.from(normalized, 'utf8');
+}
+
 export function runtimeBuildHash(runtimeRoot: string): string {
   const root = fs.realpathSync(runtimeRoot);
   const files = HASHED_RUNTIME_PATHS.flatMap((relative) => filesUnder(root, relative)).sort();
   const hash = crypto.createHash('sha256');
   for (const relative of files) {
+    const raw = fs.readFileSync(path.join(root, relative));
+    const normalized = normalizedRuntimeContent(root, raw);
     hash.update(relative);
     hash.update('\0');
-    hash.update(fs.readFileSync(path.join(root, relative)));
+    hash.update(normalized);
     hash.update('\0');
   }
   return hash.digest('hex');

@@ -58,6 +58,8 @@ function sessionFiles(root: string, current = root): string[] {
     if (entry.isSymbolicLink()) throw new Error(`Session migration refuses symbolic link: ${relative}.`);
     if (entry.isDirectory()) return sessionFiles(root, absolute);
     if (!entry.isFile() || relative === LIVE_SESSION_MIGRATION_FILE
+      || relative === 'legacy-session-adoption-transaction.json'
+      || relative === 'legacy-session-adoption.json'
       || relative.endsWith('.lock')) return [];
     return [relative];
   });
