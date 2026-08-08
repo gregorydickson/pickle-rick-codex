@@ -1663,6 +1663,7 @@ test('runCodexExecMonitored drains SIGTERM final output and does not truncate la
   const artifactDir = makeTempRoot('pickle-codex-drain-artifacts-');
   const messagePath = path.join(artifactDir, 'phase.last-message.txt');
   const artifactPath = path.join(artifactDir, 'phase.json');
+  const signalCountPath = path.join(artifactDir, 'sigterm-count.txt');
   const codexPath = path.join(runtimeDir, 'codex');
   fs.writeFileSync(codexPath, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -1671,10 +1672,14 @@ if (args[0] === '--version') { console.log('codex test'); process.exit(0); }
 const output = args[args.indexOf('--output-last-message') + 1];
 fs.writeFileSync(output, '<promise>DONE</promise>');
 fs.writeFileSync(${JSON.stringify(artifactPath)}, '{"stage":"started"');
+let signalCount = 0;
 process.on('SIGTERM', () => {
+  signalCount += 1;
+  fs.writeFileSync(${JSON.stringify(signalCountPath)}, String(signalCount));
+  if (signalCount > 1) return;
   fs.appendFileSync(output, '\\nFINAL-DRAINED');
   fs.appendFileSync(${JSON.stringify(artifactPath)}, ',"final":true}');
-  setTimeout(() => process.exit(0), 30);
+  setTimeout(() => process.exit(0), 180);
 });
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
@@ -1694,6 +1699,80 @@ setInterval(() => {}, 1000);
   assert.equal(result.terminatedAfterSuccess, true);
   assert.match(result.lastMessage, /FINAL-DRAINED/);
   assert.deepEqual(JSON.parse(fs.readFileSync(artifactPath, 'utf8')), { stage: 'started', final: true });
+  assert.equal(fs.readFileSync(signalCountPath, 'utf8'), '1');
+});
+
+test('terminal-usage grace yields before the absolute deadline and drains observed JSONL success', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-usage-deadline-');
+  const artifactDir = makeTempRoot('pickle-codex-usage-deadline-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const artifactPath = path.join(artifactDir, 'phase.json');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const output = args[args.indexOf('--output-last-message') + 1];
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'deadline-test' }));
+fs.writeFileSync(output, '<promise>DONE</promise>');
+fs.writeFileSync(${JSON.stringify(artifactPath)}, JSON.stringify({ stage: 'started' }));
+process.on('SIGTERM', () => {
+  fs.appendFileSync(output, '\\nUSAGE-WAIT-DRAINED');
+  fs.writeFileSync(${JSON.stringify(artifactPath)}, JSON.stringify({ stage: 'started', final: true }));
+  setTimeout(() => process.exit(0), 30);
+});
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'bounded usage wait',
+    timeoutMs: 800,
+    outputLastMessagePath: messagePath,
+    progressArtifactPaths: [artifactPath],
+    successSignalGraceMs: 100,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminatedAfterSuccess, true);
+  assert.equal(result.usageReported, false);
+  assert.match(result.lastMessage, /USAGE-WAIT-DRAINED/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(artifactPath, 'utf8')), { stage: 'started', final: true });
+});
+
+test('absolute deadline recognizes unpolled success before classifying the command as timed out', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-deadline-success-');
+  const artifactDir = makeTempRoot('pickle-codex-deadline-success-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const output = args[args.indexOf('--output-last-message') + 1];
+process.on('SIGTERM', () => {
+  fs.appendFileSync(output, '\\nDEADLINE-DRAINED');
+  setTimeout(() => process.exit(0), 30);
+});
+setTimeout(() => fs.writeFileSync(output, '<promise>DONE</promise>'), 50);
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'deadline success check',
+    timeoutMs: 400,
+    outputLastMessagePath: messagePath,
+    successSignalGraceMs: 100,
+    successPollMs: 1_000,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminatedAfterSuccess, true);
+  assert.match(result.lastMessage, /DEADLINE-DRAINED/);
 });
 
 test('artifact progress extends success shutdown grace but never the absolute timeout', async () => {

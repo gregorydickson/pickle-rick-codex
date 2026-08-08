@@ -123,6 +123,7 @@ async function runSpawnedCommand({
   cancelCheck,
 }: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
   const startedAt = Date.now();
+  const absoluteDeadlineMs = startedAt + timeoutMs;
   removeStaleOutputs([...cleanupPaths, outputLastMessagePath]);
 
   const maxCapturedStreamBytes = 4 * 1024 * 1024;
@@ -158,6 +159,8 @@ async function runSpawnedCommand({
     let forcedAfterSuccess = false;
     let forcedByCancel = false;
     let forcedByTimeout = false;
+    let successTerminationSent = false;
+    let jsonStreamObserved = false;
     let progressSignature = '';
 
     const child = spawn(command, args, {
@@ -218,10 +221,16 @@ async function runSpawnedCommand({
     const armSuccessTermination = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       const usage = inspectCodexUsage(currentStdout());
-      const graceMs = awaitUsageOnSuccess && !usage.reported && !usage.turnCompleted
-        ? usageCompletionGraceMs : successSignalGraceMs;
+      jsonStreamObserved ||= detectOutputFormat(currentStdout()) === 'stream-json';
+      const awaitingTerminalUsage = awaitUsageOnSuccess && jsonStreamObserved
+        && !usage.reported && !usage.turnCompleted;
+      const drainReserveMs = 250;
+      const graceMs = awaitingTerminalUsage
+        ? Math.min(usageCompletionGraceMs, Math.max(0, absoluteDeadlineMs - Date.now() - drainReserveMs))
+        : successSignalGraceMs;
       successGraceTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
+        if (!successTerminationSent && child.exitCode === null && child.signalCode === null) {
+          successTerminationSent = true;
           forcedAfterSuccess = true;
           scheduleTermination('SIGTERM', 'SIGKILL');
         }
@@ -232,7 +241,7 @@ async function runSpawnedCommand({
       const signature = currentProgressSignature();
       if (signature === progressSignature) return;
       progressSignature = signature;
-      if (successObserved) armSuccessTermination();
+      if (successObserved && !successTerminationSent) armSuccessTermination();
     };
 
     const checkForSuccess = (): void => {
@@ -261,6 +270,17 @@ async function runSpawnedCommand({
 
     timeoutTimer = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
+        const successWasObserved = successObserved;
+        if (!successWasObserved) checkForSuccess();
+        if (!successWasObserved && successObserved) {
+          if (successGraceTimer) clearTimeout(successGraceTimer);
+          if (!successTerminationSent) {
+            successTerminationSent = true;
+            forcedAfterSuccess = true;
+            scheduleTermination('SIGTERM', 'SIGKILL');
+          }
+          return;
+        }
         forcedByTimeout = true;
         scheduleTermination('SIGTERM', 'SIGKILL');
       }
