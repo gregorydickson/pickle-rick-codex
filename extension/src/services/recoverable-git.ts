@@ -25,6 +25,8 @@ export interface RecoverableHardResetOptions {
   operation: string;
   /** Exact repository-relative files owned by the failed operation. */
   ownedPaths: string[];
+  /** Exact paths to archive as evidence even when they are not safe to roll back. */
+  evidencePaths?: string[];
   headRecoveryRef?: string;
   maxArchiveBytes?: number;
   log?: (message: string) => void;
@@ -156,14 +158,19 @@ export function archiveRecoverableGitState(options: RecoverableHardResetOptions)
   const maxBytes = archiveLimit(options.maxArchiveBytes);
   const targetHead = git(options.workingDir, ['rev-parse', `${options.targetHead}^{commit}`]);
   const currentHead = git(options.workingDir, ['rev-parse', 'HEAD']);
-  if (options.ownedPaths.length === 0 && currentHead === targetHead) {
+  const evidenceCandidates = options.evidencePaths ?? options.ownedPaths;
+  if (evidenceCandidates.length === 0 && currentHead === targetHead) {
     return { headRef: null, dirtyRef: null, estimatedBytes: 0 };
   }
-  const ownedPaths = normalizeOwnedPaths(options.workingDir, options.ownedPaths);
+  const ownedPaths = evidenceCandidates.length > 0
+    ? normalizeOwnedPaths(options.workingDir, evidenceCandidates)
+    : [];
   const headRef = currentHead === targetHead ? null : (options.headRecoveryRef || defaultRecoveryRef(options));
   try {
     if (headRef) validateRecoveryRef(options.workingDir, headRef);
-    const snapshot = buildOwnedSnapshot(options.workingDir, currentHead, ownedPaths, options.operation);
+    const snapshot = ownedPaths.length > 0
+      ? buildOwnedSnapshot(options.workingDir, currentHead, ownedPaths, options.operation)
+      : { commit: currentHead, dirty: false };
     const session = safeName(path.basename(options.sessionDir));
     const dirtyRef = `refs/pickle/salvage-history/${session}/${snapshot.commit}`;
     const latestDirtyRef = `refs/pickle/salvage/${session}`;
@@ -205,11 +212,11 @@ function targetContainsPath(workingDir: string, targetHead: string, ownedPath: s
 export function recoverableHardReset(options: RecoverableHardResetOptions): RecoverableGitArchive {
   const currentHead = git(options.workingDir, ['rev-parse', 'HEAD']);
   const targetHead = git(options.workingDir, ['rev-parse', `${options.targetHead}^{commit}`]);
-  if (options.ownedPaths.length === 0 && currentHead === targetHead) {
-    return { headRef: null, dirtyRef: null, estimatedBytes: 0 };
-  }
-  const ownedPaths = normalizeOwnedPaths(options.workingDir, options.ownedPaths);
+  const ownedPaths = options.ownedPaths.length > 0
+    ? normalizeOwnedPaths(options.workingDir, options.ownedPaths)
+    : [];
   const archive = archiveRecoverableGitState({ ...options, ownedPaths, targetHead });
+  if (ownedPaths.length === 0) return archive;
   try {
     if (currentHead !== targetHead) {
       git(options.workingDir, ['update-ref', 'HEAD', targetHead, currentHead]);

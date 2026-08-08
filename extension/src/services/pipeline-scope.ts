@@ -158,14 +158,13 @@ export function enforceLoopMutationScope(options: {
     sessionDir: options.sessionDir,
     targetHead: options.beforeHead,
     operation: `${options.mode}-scope-violation`,
-    // The loop runs behind the session operation fence, so every exact path in
-    // this before/after delta is attributable even when it violates its scope.
-    ownedPaths: changed,
+    ownedPaths: changed.filter((candidate) => pathIsInPipelineScope(candidate, allowedPaths)),
+    evidencePaths: changed,
     headRecoveryRef: `refs/pickle/optional-loop-recovery/${session}/${options.mode}`,
     log: options.log,
   });
   throw new PipelineScopeError(
     'PIPELINE_SCOPE_VIOLATION',
-    `${options.mode} touched paths outside immutable scope (${allowedPaths.join(', ')}): ${outside.join(', ')}; iteration was archived and rolled back`,
+    `${options.mode} touched paths outside immutable scope (${allowedPaths.join(', ')}): ${outside.join(', ')}; attributable in-scope work was archived and rolled back, while outside paths were preserved`,
   );
 }

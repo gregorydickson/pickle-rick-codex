@@ -1,5 +1,6 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from './codex.js';
@@ -157,6 +158,36 @@ export function getCitadelRepositoryFingerprint(workingDir: string): string {
     index: index.stdout,
     files: getWorkingTreeFingerprint(workingDir),
   });
+}
+
+function createCitadelWorktree(workingDir: string, checkpointHead: string): { workingDir: string; cleanup: () => void } {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-citadel-worktree-'));
+  const isolated = path.join(parent, 'repository');
+  execFileSync('git', ['worktree', 'add', '--detach', isolated, checkpointHead], {
+    cwd: workingDir,
+    stdio: ['ignore', 'ignore', 'pipe'],
+    timeout: 30_000,
+  });
+  for (const relative of ['node_modules', path.join('extension', 'node_modules')]) {
+    const source = path.join(workingDir, relative);
+    const destination = path.join(isolated, relative);
+    if (!fs.existsSync(source) || fs.existsSync(destination)) continue;
+    fs.symlinkSync(source, destination, 'junction');
+  }
+  return {
+    workingDir: isolated,
+    cleanup: () => {
+      try {
+        execFileSync('git', ['worktree', 'remove', '--force', isolated], {
+          cwd: workingDir,
+          stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: 30_000,
+        });
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    },
+  };
 }
 
 function normalizeFinding(value: unknown, index: number): CitadelFinding {
@@ -628,13 +659,22 @@ export async function runCitadel(
     return 'citadel-blocked';
   }
   const checkpointHead = getHeadSha(workingDir);
-  const checkpointFingerprint = getCitadelRepositoryFingerprint(workingDir);
+  const releaseCheckpointFingerprint = getCitadelRepositoryFingerprint(workingDir);
+  const assertReleaseWorkspaceUnchanged = (): void => {
+    if (getCitadelRepositoryFingerprint(workingDir) !== releaseCheckpointFingerprint) {
+      throw new Error('Citadel detected a concurrent mutation in the release workspace; the unattributed user paths were preserved.');
+    }
+  };
+  const isolated = createCitadelWorktree(workingDir, checkpointHead);
+  const citadelWorkingDir = isolated.workingDir;
+  const checkpointFingerprint = getCitadelRepositoryFingerprint(citadelWorkingDir);
+  try {
   let checks: CitadelCheckResult[];
   try {
     assertOwnership();
     checks = await runCitadelChecksMonitored(
-      workingDir,
-      verificationStepsFromManifest(sessionDir, workingDir),
+      citadelWorkingDir,
+      verificationStepsFromManifest(sessionDir, citadelWorkingDir),
       {
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
         isCancelled: shouldCancel,
@@ -663,12 +703,13 @@ export async function runCitadel(
     );
     assertOwnership();
   } catch (error) {
+    assertReleaseWorkspaceUnchanged();
     if (error instanceof CitadelChecksCancelledError) {
       assertOwnership();
-      restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
+      restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
       return 'cancelled';
     }
-    const restored = restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
+    const restored = restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
     if (restored) {
       throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.', { cause: error });
     }
@@ -677,7 +718,8 @@ export async function runCitadel(
   const checksPath = path.join(sessionDir, 'citadel-checks.json');
   assertOwnership();
   atomicWriteJson(checksPath, { schema_version: 1, reviewed_range: reviewedRange, checks });
-  if (restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check')) {
+  if (restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check')) {
+    assertReleaseWorkspaceUnchanged();
     throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.');
   }
   if (checks.some((check) => check.status === 'failed')) {
@@ -700,6 +742,7 @@ export async function runCitadel(
     };
     assertOwnership();
     atomicWriteJson(citadelReportPath(sessionDir), report);
+    assertReleaseWorkspaceUnchanged();
     return 'citadel-blocked';
   }
   if (!checks.some((check) => check.status === 'passed')) {
@@ -710,6 +753,7 @@ export async function runCitadel(
       'Citadel deterministic gate unavailable',
       'No declared deterministic typecheck, lint, or test command executed.',
     ));
+    assertReleaseWorkspaceUnchanged();
     return 'citadel-blocked';
   }
 
@@ -721,7 +765,7 @@ export async function runCitadel(
     assertOwnership();
     result = await runCodexExecMonitored({
       telemetry: { sessionDir, ticketId: 'pipeline', phase: 'citadel' },
-      cwd: workingDir,
+      cwd: citadelWorkingDir,
       prompt: buildCitadelPrompt(sessionDir, reviewedRange, checksPath, expectedAcceptanceCriteria),
       timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
       outputLastMessagePath,
@@ -756,10 +800,12 @@ export async function runCitadel(
       });
     }
   }
-  if (restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'reviewer')) {
+  if (restoreMutatedCitadelCheckpoint(citadelWorkingDir, sessionDir, checkpointHead, checkpointFingerprint, 'reviewer')) {
+    assertReleaseWorkspaceUnchanged();
     throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);
   }
   assertOwnership();
+  assertReleaseWorkspaceUnchanged();
   if (reviewerError) throw reviewerError;
   if (!result) throw new Error('Citadel reviewer returned no execution result.');
   if (result.cancelled) return 'cancelled';
@@ -796,5 +842,9 @@ export async function runCitadel(
     assertOwnership();
     persistCitadelReleaseApproval(sessionDir, report);
   }
+  assertReleaseWorkspaceUnchanged();
   return report.verdict === 'approve' ? 'success' : 'citadel-blocked';
+  } finally {
+    isolated.cleanup();
+  }
 }

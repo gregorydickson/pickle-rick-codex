@@ -84,12 +84,13 @@ test('pipeline scope is immutable on resume and resolved artifact drift fails cl
   );
 });
 
-test('out-of-scope optional-loop commit is archived, rolled back, and blocked', () => {
+test('out-of-scope optional-loop commit is archived and blocked without deleting unattributed paths', () => {
   const repo = initRepo();
   const session = makeTempRoot('pickle-scope-session-');
   const beforeHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(repo, 'src/safe.ts'), 'attributable edit\n');
   fs.writeFileSync(path.join(repo, 'docs/outside.md'), 'violating edit\n');
-  execFileSync('git', ['add', 'docs/outside.md'], { cwd: repo });
+  execFileSync('git', ['add', 'src/safe.ts', 'docs/outside.md'], { cwd: repo });
   execFileSync('git', ['commit', '-qm', 'bad optional loop commit'], { cwd: repo });
 
   assert.throws(
@@ -103,7 +104,8 @@ test('out-of-scope optional-loop commit is archived, rolled back, and blocked', 
     (error) => error instanceof PipelineScopeError && error.code === 'PIPELINE_SCOPE_VIOLATION',
   );
   assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(), beforeHead);
-  assert.equal(fs.readFileSync(path.join(repo, 'docs/outside.md'), 'utf8'), 'outside\n');
+  assert.equal(fs.readFileSync(path.join(repo, 'src/safe.ts'), 'utf8'), 'safe\n');
+  assert.equal(fs.readFileSync(path.join(repo, 'docs/outside.md'), 'utf8'), 'violating edit\n');
   const recoveryRef = `refs/pickle/optional-loop-recovery/${path.basename(session)}/szechuan-sauce`;
   assert.match(execFileSync('git', ['rev-parse', '--verify', recoveryRef], { cwd: repo, encoding: 'utf8' }), /^[0-9a-f]{40}\n$/);
 });

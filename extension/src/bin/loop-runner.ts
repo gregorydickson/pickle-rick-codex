@@ -570,13 +570,18 @@ function revertMetricIterationSafely(
   checkpoint: MetricIterationCheckpoint,
 ): void {
   const session = path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-');
+  const changedPaths = listChangedPathsSince(workingDir, checkpoint.head)
+    .filter((candidate) => !checkpoint.untracked.includes(candidate));
   recoverableHardReset({
     workingDir,
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    ownedPaths: listChangedPathsSince(workingDir, checkpoint.head)
-      .filter((candidate) => !checkpoint.untracked.includes(candidate)),
+    ownedPaths: changedPaths
+      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
+        candidate === owned || candidate.startsWith(`${owned}/`)
+      ))),
+    evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${session}`,
     log: (message) => appendRunnerLog(sessionDir, message),
   });
@@ -1311,6 +1316,10 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
             isMicroverseExperimentPlanFrozen(experiment),
           );
           adoptOrValidateWorkerExperimentPlan(sessionDir, experiment.id, experimentArtifact);
+          if (metricCheckpoint && currentMetricState) {
+            metricCheckpoint.ownedPaths = [...new Set(experimentArtifact.target_paths)].sort();
+            writeMicroverseAttemptTransaction(sessionDir, experiment, iteration, metricCheckpoint, currentMetricState);
+          }
         } catch (error) {
           workerFailure = 'worker_incomplete';
           workerFailureDetail = safeErrorMessage(error);

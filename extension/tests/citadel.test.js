@@ -225,12 +225,12 @@ test('Citadel cooperatively terminates a long deterministic check after lease lo
   await assert.rejects(
     () => runCitadel(sessionDir, {
       assertDurableOwnership: () => {
-        if (Date.now() - startedAt > 200) throw new Error('fixture lease ownership changed');
+        if (Date.now() - startedAt > 1_500) throw new Error('fixture lease ownership changed');
       },
     }),
     /fixture lease ownership changed/,
   );
-  assert.ok(Date.now() - startedAt < 3_000, 'Citadel did not drain its child promptly');
+  assert.ok(Date.now() - startedAt < 4_000, 'Citadel did not drain its child promptly');
   const state = new StateManager().read(statePath);
   assert.ok(Number.isInteger(state.active_child_pid), 'stale owner must preserve the child recovery identity for green');
   assert.ok(state.active_child_identity);

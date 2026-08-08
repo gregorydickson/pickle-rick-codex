@@ -19,6 +19,7 @@ import {
 } from './git-utils.js';
 import { enrichRefinementManifest, normalizeTicketId, normalizeTicketStatus, readManifest, updateTicketStatus } from './tickets.js';
 import { recoverableHardReset } from './recoverable-git.js';
+import { readFreshTicketScope } from './scope-contract.js';
 import { resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
 import type { RefinementManifest } from '../types/index.js';
@@ -607,15 +608,36 @@ export function reconcileVerifiedRefinementRepositoryAdvance(
       if (!isGitRepo(workingDir) || !advance.baseline_head_sha) {
         return { reconciled: false, ticketId: advance.ticket_id };
       }
+      const changedPaths = listChangedPathsSince(workingDir, advance.baseline_head_sha);
+      let allowedPaths = advance.phase === 'verified' && Array.isArray(advance.verified_changed_paths)
+        ? [...advance.verified_changed_paths]
+        : [];
+      if (allowedPaths.length === 0) {
+        try {
+          const contract = readFreshTicketScope(
+            sessionDir,
+            ticket,
+            advance.ticket_id,
+            advance.baseline_head_sha,
+          );
+          allowedPaths = [...contract.declared_paths, ...contract.expanded_paths];
+        } catch {
+          // Legacy direct-mode sessions predate scope.json. Their immutable
+          // ticket declaration is the only attributable recovery boundary.
+          allowedPaths = resolveTicketScope(ticket).allowedPaths;
+        }
+      }
       recoverableHardReset({
         workingDir,
         sessionDir,
         targetHead: advance.baseline_head_sha,
         operation: `interrupted-${advance.ticket_id}`,
-        ownedPaths: listChangedPathsSince(workingDir, advance.baseline_head_sha)
-          .filter((candidate) => resolveTicketScope(ticket).allowedPaths.some((allowed) => (
+        ownedPaths: changedPaths.filter((candidate) => (
+          allowedPaths.some((allowed) => (
             candidate === allowed || candidate.startsWith(`${allowed}/`)
-          ))),
+          ))
+        )),
+        evidencePaths: changedPaths,
         headRecoveryRef: `refs/pickle/recovery/${path.basename(sessionDir)}/${advance.ticket_id}`,
       });
     }

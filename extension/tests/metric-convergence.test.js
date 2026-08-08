@@ -152,6 +152,7 @@ test('metric checkpoint rollback restores commits and removes only iteration-cre
   execFileSync('git', ['add', 'tracked.txt'], { cwd });
   execFileSync('git', ['commit', '-qm', 'baseline'], { cwd });
   const checkpoint = captureMetricIterationCheckpoint(cwd);
+  checkpoint.ownedPaths = ['tracked.txt', 'remove.txt'];
   fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'regression\n');
   fs.writeFileSync(path.join(cwd, 'remove.txt'), 'iteration artifact\n');
   execFileSync('git', ['add', 'tracked.txt'], { cwd });

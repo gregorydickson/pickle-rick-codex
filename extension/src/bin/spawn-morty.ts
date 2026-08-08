@@ -402,15 +402,17 @@ function restoreRejectedWorkerMutation(
 ): string | null {
   if (!isGitRepo(workingDir) || repositoryMutationFingerprint(workingDir) === boundary.fingerprint) return null;
   const remediationIdentity = repositoryRemediationIdentity(workingDir);
+  const changedPaths = listChangedPathsSince(workingDir, boundary.head)
+    .filter((candidate) => !boundary.untracked.includes(candidate));
   const archive = recoverableHardReset({
     workingDir,
     sessionDir,
     targetHead: boundary.head,
     operation: `rejected-${ticketId}`,
-    ownedPaths: listChangedPathsSince(workingDir, boundary.head).filter((candidate) => (
-      !boundary.untracked.includes(candidate)
-      && boundary.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`))
+    ownedPaths: changedPaths.filter((candidate) => (
+      boundary.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`))
     )),
+    evidencePaths: changedPaths,
     headRecoveryRef: rejectedWorkerRef(sessionDir, ticketId),
     log: (message) => appendRunnerLog(sessionDir, runnerMode, message),
   });
@@ -1239,6 +1241,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       workingDir,
       changedPathsBeforeGate,
     );
+    if (mutationBoundary) mutationBoundary.allowedPaths = scopeVerdict.allowedPaths;
     if (!scopeVerdict.ok) {
       throw new Error(`scope-violation: ${scopeVerdict.reason || scopeVerdict.violations.join(', ')}`);
     }
@@ -1275,6 +1278,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       workingDir,
       postGateChangedPaths,
     );
+    if (mutationBoundary) mutationBoundary.allowedPaths = postGateScopeVerdict.allowedPaths;
     if (!postGateScopeVerdict.ok) {
       throw new Error(`scope-violation: ${postGateScopeVerdict.reason || postGateScopeVerdict.violations.join(', ')}`);
     }

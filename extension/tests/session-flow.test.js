@@ -2302,8 +2302,8 @@ test('microverse rejects and recovers a mutating baseline metric command', () =>
     () => runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir }),
     /must be read-only/,
   );
-  assert.equal(fs.existsSync(path.join(projectDir, 'metric-side-effect.txt')), false);
-  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'metric-side-effect.txt'), 'utf8'), 'mutation');
+  assert.match(runGit(projectDir, ['status', '--porcelain']), /metric-side-effect\.txt/);
   assert.match(runGit(projectDir, ['show-ref']), /refs\/pickle\/salvage\//);
 });
 
@@ -3718,11 +3718,12 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
 test('Citadel rejects deterministic check and reviewer index mutations', () => {
   const deterministicDataRoot = makeTempRoot();
   const deterministicProject = makeTempRoot('pickle-rick-project-');
+  const independentlyInjectedPath = path.join(deterministicProject, 'user-injected.txt');
   initGitRepo(deterministicProject);
   fs.writeFileSync(path.join(deterministicProject, 'tracked.txt'), 'baseline\n');
   fs.writeFileSync(path.join(deterministicProject, 'package.json'), JSON.stringify({
     scripts: {
-      typecheck: "node -e \"require('fs').writeFileSync('tracked.txt','mutated\\n')\" && git add tracked.txt && node -e \"process.exit(3)\"",
+      typecheck: `node -e "require('fs').writeFileSync('tracked.txt','mutated\\n'); require('fs').writeFileSync('${independentlyInjectedPath}','user work\\n')" && git add tracked.txt && node -e "process.exit(3)"`,
     },
   }));
   runGit(deterministicProject, ['add', 'tracked.txt', 'package.json']);
@@ -3739,10 +3740,11 @@ test('Citadel rejects deterministic check and reviewer index mutations', () => {
       env: { PICKLE_DATA_ROOT: deterministicDataRoot },
       cwd: deterministicProject,
     }),
-    /deterministic Citadel check modified the target repository/,
+    /Citadel detected a concurrent mutation/,
   );
-  assert.equal(runGit(deterministicProject, ['status', '--porcelain']), '');
+  assert.match(runGit(deterministicProject, ['status', '--porcelain']), /user-injected\.txt/);
   assert.equal(fs.readFileSync(path.join(deterministicProject, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(fs.readFileSync(independentlyInjectedPath, 'utf8'), 'user work\n');
   assert.ok(runGit(deterministicProject, ['show-ref', '--verify', `refs/pickle/salvage/${path.basename(deterministicSession)}`]));
 
   const reviewerDataRoot = makeTempRoot();

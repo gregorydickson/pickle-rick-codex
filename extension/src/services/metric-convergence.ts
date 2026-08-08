@@ -59,6 +59,7 @@ export interface MeasureMetricOptions {
 export interface MetricIterationCheckpoint {
   head: string;
   untracked: string[];
+  ownedPaths?: string[];
 }
 
 export class MetricMutationError extends Error {
@@ -251,20 +252,25 @@ export function captureMetricIterationCheckpoint(cwd: string): MetricIterationCh
   }
   const head = runGit(cwd, ['rev-parse', 'HEAD']);
   if (!head) throw new Error('Microverse metric iterations require a repository with an existing HEAD commit.');
-  return { head, untracked: untrackedPaths(cwd) };
+  return { head, untracked: untrackedPaths(cwd), ownedPaths: [] };
 }
 
 export function revertMetricIteration(cwd: string, checkpoint: MetricIterationCheckpoint, sessionDir: string): void {
   if (!/^[0-9a-f]{7,64}$/i.test(checkpoint.head)) {
     throw new Error('Cannot revert metric iteration: invalid checkpoint HEAD.');
   }
+  const changedPaths = listChangedPathsSince(cwd, checkpoint.head)
+    .filter((candidate) => !checkpoint.untracked.includes(candidate));
   recoverableHardReset({
     workingDir: cwd,
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    ownedPaths: listChangedPathsSince(cwd, checkpoint.head)
-      .filter((candidate) => !checkpoint.untracked.includes(candidate)),
+    ownedPaths: changedPaths
+      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
+        candidate === owned || candidate.startsWith(`${owned}/`)
+      ))),
+    evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-')}`,
   });
 }
