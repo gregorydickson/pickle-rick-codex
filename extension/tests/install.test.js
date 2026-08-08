@@ -135,6 +135,22 @@ test('install.sh copies the runtime and installs the global persona and skills',
     { cwd: realProjectDir, env: installerEnv(codexHome, installRoot) },
   ).trim();
   assert.equal(resolved, sessionDir);
+
+  const markerPath = path.join(installRoot, '.pickle-rick-runtime');
+  const installedSkillPath = path.join(installRoot, 'skills', 'pickle', 'SKILL.md');
+  const installedSkill = fs.readFileSync(installedSkillPath, 'utf8');
+  assert.ok(installedSkill.includes(canonicalInstallRoot));
+  for (const literalAlias of ['$HOME/.codex/pickle-rick', '~/.codex/pickle-rick']) {
+    fs.rmSync(markerPath);
+    fs.writeFileSync(installedSkillPath, installedSkill.split(canonicalInstallRoot).join(literalAlias));
+    assert.throws(
+      () => describeInstalledRuntime(installRoot),
+      /requires its installed-layout marker/,
+    );
+    fs.writeFileSync(markerPath, '');
+    fs.writeFileSync(installedSkillPath, installedSkill);
+    assert.deepEqual(describeInstalledRuntime(installRoot), describeInstalledRuntime(projectRoot));
+  }
 });
 
 test('install.sh writes managed marker blocks on first install and remains idempotent', () => {
