@@ -562,6 +562,43 @@ function rewriteScopedVitestCommand(command: string, cwd: string | undefined): s
   return rewritten.join(' ');
 }
 
+function rewriteScopedVitestStepFromTokens(tokens: string[], cwd: string | undefined): VerificationStep | null {
+  if (typeof cwd !== 'string' || !cwd.trim()) return null;
+
+  const packageManager = tokens[0];
+  if (!['pnpm', 'npm', 'yarn', 'bun'].includes(packageManager)) return null;
+
+  const testIndex = tokens.indexOf('test');
+  const separatorIndex = tokens.indexOf('--');
+  if (testIndex === -1 || separatorIndex === -1 || separatorIndex <= testIndex || separatorIndex === tokens.length - 1) {
+    return null;
+  }
+  if (tokens.some((token, index) => index > separatorIndex && token === '&&')) return null;
+
+  const targetArgs = tokens.slice(separatorIndex + 1).filter(Boolean);
+  const packageDir = extractPackageDirFromTokens(tokens, cwd);
+  const scriptArgs = extractVitestScriptArgs(readPackageJson(packageDir)?.scripts?.test);
+  const execArgs = packageManagerExecArgs(packageManager);
+  if (targetArgs.length === 0 || !scriptArgs || !execArgs) return null;
+
+  return {
+    kind: 'process',
+    executable: execArgs[0],
+    args: [...execArgs.slice(1), 'vitest', 'run', ...scriptArgs, ...targetArgs],
+    cwd: packageDir,
+  };
+}
+
+function rewriteStructuredScopedVitestStep(step: VerificationStep, cwd: string | undefined): VerificationStep {
+  const effectiveCwd = step.cwd || cwd;
+  if (!effectiveCwd || step.kind === 'shell') return step;
+  if (step.kind === 'process') {
+    return rewriteScopedVitestStepFromTokens([step.executable, ...step.args], effectiveCwd) || step;
+  }
+  const tokens = [step.manager, 'run', step.script, ...(step.args?.length ? ['--', ...step.args] : [])];
+  return rewriteScopedVitestStepFromTokens(tokens, effectiveCwd) || step;
+}
+
 function rewriteScopedVerificationCommands(commands: string[], cwd: string | undefined): string[] {
   return commands.map((command) => rewriteScopedVitestCommand(command, cwd));
 }
@@ -676,11 +713,15 @@ export function normalizeVerificationSteps(value: unknown, options: NormalizeVer
     return source.map((entry) => {
       const step = structuredStep(entry);
       if (!step) throw new VerificationContractError({ message: `invalid structured verification step: ${JSON.stringify(entry)}` });
-      return step;
+      return rewriteStructuredScopedVitestStep(step, options.cwd);
     });
   }
-  const legacy = normalizeVerificationCommands(value, options);
-  return legacy.map(migrateLegacyCommand);
+  const commands = normalizeVerificationValue(value);
+  const legacy = commands.length > 0 ? commands : ('verify' in options ? normalizeVerificationValue(options.verify) : []);
+  return legacy.map((command) => {
+    const normalized = quoteTestPatternArguments(command);
+    return rewriteScopedVitestStepFromTokens(tokenizeShellWords(normalized), options.cwd) || migrateLegacyCommand(normalized);
+  });
 }
 
 export function verificationStepCommand(step: VerificationStep): { executable: string; args: string[]; shell: boolean; display: string } {
