@@ -1,10 +1,14 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
+import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { hasPipelineContract } from './pipeline.js';
 import { resetPipelineForAutonomousRemediation } from './pipeline-state.js';
 import { atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { normalizeTicketScopePath, resolveTicketScope } from './execution-gate.js';
+import { StateManager } from './state-manager.js';
+import { isDurableOwnershipDrainError } from './durable-runtime.js';
 import { normalizeTicketId, readManifest, ticketDependencyIds, updateTicketStatus } from './tickets.js';
 import type { Ticket } from '../types/index.js';
 
@@ -13,7 +17,7 @@ const CURRENT_FILE = 'citadel-remediation-current.json';
 const ATTRIBUTION_BLOCKED_FILE = 'citadel-remediation-attribution-blocked.json';
 
 export interface CitadelAttributionRepairIntent {
-  schema_version: 2;
+  schema_version: 3;
   failure_kind: 'citadel_attribution_repair_required';
   status: 'pending';
   archive_path: string;
@@ -25,6 +29,15 @@ export interface CitadelAttributionRepairIntent {
   acceptance_criteria_checked: unknown[];
   reason: string;
   repair_task: string;
+  attempt_count: number;
+  strategy_history: Array<{
+    attempt: number;
+    strategy: string;
+    strategy_hash: string;
+    status: 'started' | 'failed';
+    detail?: string;
+    recorded_at: string;
+  }>;
   scheduled_at: string;
 }
 
@@ -38,7 +51,20 @@ export type CitadelRemediationEnqueueResult = {
   repair_intent_path: string;
   candidate_ticket_ids: string[];
   reason: string;
+  attempt_count: number;
 };
+
+interface CitadelAttributionArtifact {
+  schema_version: 1;
+  report_sha256: string;
+  attributions: Array<{ finding_index: number; ticket_id: string; rationale: string }>;
+}
+
+interface RepairCitadelAttributionOptions {
+  timeoutMs?: number;
+  assertDurableOwnership?: () => void;
+  artifact?: unknown;
+}
 
 interface TicketAttribution {
   ticket_ids: string[];
@@ -269,7 +295,7 @@ function validFindingAttribution(value: unknown): boolean {
 function isAttributionRepairIntent(value: unknown): value is CitadelAttributionRepairIntent {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return record.schema_version === 2
+  return record.schema_version === 3
     && record.failure_kind === 'citadel_attribution_repair_required'
     && record.status === 'pending'
     && typeof record.archive_path === 'string'
@@ -283,6 +309,16 @@ function isAttributionRepairIntent(value: unknown): value is CitadelAttributionR
     && Array.isArray(record.acceptance_criteria_checked)
     && typeof record.reason === 'string'
     && typeof record.repair_task === 'string'
+    && Number.isInteger(record.attempt_count) && Number(record.attempt_count) >= 0
+    && Array.isArray(record.strategy_history)
+    && record.strategy_history.every((entry) => (
+      entry && typeof entry === 'object' && !Array.isArray(entry)
+      && Number.isInteger((entry as Record<string, unknown>).attempt)
+      && typeof (entry as Record<string, unknown>).strategy === 'string'
+      && typeof (entry as Record<string, unknown>).strategy_hash === 'string'
+      && ['started', 'failed'].includes(String((entry as Record<string, unknown>).status))
+      && typeof (entry as Record<string, unknown>).recorded_at === 'string'
+    ))
     && typeof record.scheduled_at === 'string';
 }
 
@@ -298,6 +334,19 @@ export function reconcileCitadelAttributionRepair(sessionDir: string): CitadelAt
     const archived = readJsonFile<Record<string, unknown>>(raw.archive_path, null);
     return archived && reportSha256(archived) === raw.report_sha256 ? raw : null;
   }
+  if (raw.schema_version === 2 && raw.failure_kind === 'citadel_attribution_repair_required') {
+    const archived = typeof raw.archive_path === 'string'
+      ? readJsonFile<Record<string, unknown>>(raw.archive_path, null) : null;
+    if (!archived) return null;
+    const migrated: CitadelAttributionRepairIntent = {
+      ...(raw as unknown as Omit<CitadelAttributionRepairIntent, 'schema_version' | 'attempt_count' | 'strategy_history'>),
+      schema_version: 3,
+      attempt_count: 0,
+      strategy_history: [],
+    };
+    atomicWriteJson(repairPath, migrated);
+    return migrated;
+  }
   if (raw.schema_version !== 1 || raw.failure_kind !== 'citadel_attribution_ambiguous'
     || typeof raw.archive_path !== 'string') return null;
   const report = readJsonFile<Record<string, unknown>>(raw.archive_path, null);
@@ -307,7 +356,7 @@ export function reconcileCitadelAttributionRepair(sessionDir: string): CitadelAt
     ? structuredClone(report.acceptance_criteria_checked) : [];
   const findingCandidates = candidateFindingAttribution(findings, readManifest(sessionDir).tickets);
   const migrated: CitadelAttributionRepairIntent = {
-    schema_version: 2,
+    schema_version: 3,
     failure_kind: 'citadel_attribution_repair_required',
     status: 'pending',
     archive_path: raw.archive_path,
@@ -319,10 +368,293 @@ export function reconcileCitadelAttributionRepair(sessionDir: string): CitadelAt
     acceptance_criteria_checked: acceptanceCriteria,
     reason: typeof raw.reason === 'string' ? raw.reason : 'legacy Citadel attribution was ambiguous',
     repair_task: 'Attribute each preserved blocking finding to exactly one completed ticket using ticket IDs, acceptance criteria, and owned repository paths.',
+    attempt_count: 0,
+    strategy_history: [],
     scheduled_at: typeof raw.recorded_at === 'string' ? raw.recorded_at : new Date().toISOString(),
   };
   atomicWriteJson(repairPath, migrated);
   return migrated;
+}
+
+function nextAttributionStrategy(intent: CitadelAttributionRepairIntent): string {
+  const strategies = [
+    'bind-findings-to-criterion-owners',
+    'trace-finding-paths-to-ticket-scopes',
+    'independently-reconstruct-finding-ownership',
+  ];
+  return strategies[intent.attempt_count]
+    || `synthesize-attribution-from-${intent.attempt_count}-prior-strategies-${intent.report_sha256.slice(0, 12)}`;
+}
+
+function persistAttributionAttempt(
+  sessionDir: string,
+  intent: CitadelAttributionRepairIntent,
+  strategy: string,
+): CitadelAttributionRepairIntent {
+  const strategyHash = crypto.createHash('sha256').update(JSON.stringify({
+    report: intent.report_sha256,
+    candidates: intent.finding_candidates,
+    strategy,
+    prior: intent.strategy_history.map((entry) => entry.strategy_hash),
+  })).digest('hex');
+  if (intent.strategy_history.some((entry) => entry.strategy_hash === strategyHash)) {
+    throw new Error('citadel-attribution-strategy-not-novel');
+  }
+  const next: CitadelAttributionRepairIntent = {
+    ...intent,
+    attempt_count: intent.attempt_count + 1,
+    strategy_history: [...intent.strategy_history, {
+      attempt: intent.attempt_count + 1,
+      strategy,
+      strategy_hash: strategyHash,
+      status: 'started',
+      recorded_at: new Date().toISOString(),
+    }],
+  };
+  atomicWriteJson(attributionRepairPath(sessionDir), next);
+  return next;
+}
+
+function persistAttributionFailure(
+  sessionDir: string,
+  intent: CitadelAttributionRepairIntent,
+  detail: string,
+): CitadelAttributionRepairIntent {
+  const next = structuredClone(intent);
+  const latest = next.strategy_history.at(-1);
+  if (latest) {
+    latest.status = 'failed';
+    latest.detail = detail;
+    latest.recorded_at = new Date().toISOString();
+  }
+  next.reason = detail;
+  atomicWriteJson(attributionRepairPath(sessionDir), next);
+  return next;
+}
+
+function validateAttributionArtifact(
+  intent: CitadelAttributionRepairIntent,
+  value: unknown,
+): CitadelAttributionArtifact {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('citadel-attribution-invalid-artifact: expected an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !['schema_version', 'report_sha256', 'attributions'].includes(key))
+    || record.schema_version !== 1 || record.report_sha256 !== intent.report_sha256
+    || !Array.isArray(record.attributions)) {
+    throw new Error('citadel-attribution-invalid-artifact: schema or report identity mismatch');
+  }
+  const attributions = record.attributions.map((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('citadel-attribution-invalid-artifact: attribution row must be an object');
+    }
+    const row = raw as Record<string, unknown>;
+    if (Object.keys(row).some((key) => !['finding_index', 'ticket_id', 'rationale'].includes(key))
+      || !Number.isInteger(row.finding_index)
+      || typeof row.ticket_id !== 'string'
+      || typeof row.rationale !== 'string' || !row.rationale.trim()) {
+      throw new Error('citadel-attribution-invalid-artifact: row identity and rationale are required');
+    }
+    const candidate = intent.finding_candidates.find((entry) => entry.finding_index === row.finding_index);
+    const selectedTicketId = normalizeTicketId(row.ticket_id, '');
+    if (!candidate || !candidate.ticket_ids.includes(selectedTicketId)) {
+      throw new Error(`citadel-attribution-invalid-artifact: finding ${row.finding_index} selected a non-candidate ticket`);
+    }
+    return { finding_index: Number(row.finding_index), ticket_id: selectedTicketId, rationale: row.rationale.trim() };
+  });
+  if (attributions.length !== intent.finding_candidates.length
+    || new Set(attributions.map((entry) => entry.finding_index)).size !== attributions.length
+    || intent.finding_candidates.some((candidate) => !attributions.some((entry) => entry.finding_index === candidate.finding_index))) {
+    throw new Error('citadel-attribution-invalid-artifact: every actionable finding must be attributed exactly once');
+  }
+  return { schema_version: 1, report_sha256: intent.report_sha256, attributions };
+}
+
+function readAttributionArtifact(artifactPath: string): Record<string, unknown> | null {
+  try {
+    const stat = fs.lstatSync(artifactPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 1024 * 1024) {
+      throw new Error('citadel-attribution-invalid-artifact: artifact must be a regular file no larger than 1 MiB');
+    }
+    return JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error('citadel-attribution-invalid-artifact: malformed JSON', { cause: error });
+    throw error;
+  }
+}
+
+function reportWithResolvedAttribution(
+  intent: CitadelAttributionRepairIntent,
+  artifact: CitadelAttributionArtifact,
+): Record<string, unknown> {
+  const archived = readJsonFile<Record<string, unknown>>(intent.archive_path, null);
+  if (!archived || reportSha256(archived) !== intent.report_sha256 || !Array.isArray(archived.findings)) {
+    throw new Error('citadel-attribution-archive-identity-mismatch');
+  }
+  const findings = structuredClone(archived.findings);
+  for (const resolved of artifact.attributions) {
+    const finding = findings[resolved.finding_index];
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      throw new Error(`citadel-attribution-invalid-artifact: finding ${resolved.finding_index} is missing`);
+    }
+    const record = finding as Record<string, unknown>;
+    const candidates = intent.finding_candidates.find((entry) => entry.finding_index === resolved.finding_index)!;
+    const selectedCriteria = candidates.criteria
+      .filter((entry) => entry.ticket_ids.includes(resolved.ticket_id)).map((entry) => entry.value);
+    const selectedPaths = candidates.paths
+      .filter((entry) => entry.ticket_ids.includes(resolved.ticket_id)).map((entry) => entry.value);
+    record.ticket_ids = [resolved.ticket_id];
+    if (candidates.criteria.length > 0) {
+      if (selectedCriteria.length > 0) record.acceptance_criteria = selectedCriteria;
+      else delete record.acceptance_criteria;
+    }
+    if (candidates.paths.length > 0) {
+      if (selectedPaths.length > 0) record.paths = selectedPaths;
+      else delete record.paths;
+      if (typeof record.file === 'string') {
+        const normalizedFile = normalizeTicketScopePath(record.file);
+        if (!normalizedFile || !selectedPaths.includes(normalizedFile)) record.file = null;
+      }
+    }
+  }
+  return { ...archived, findings };
+}
+
+function deterministicAttributionArtifact(intent: CitadelAttributionRepairIntent): CitadelAttributionArtifact | null {
+  if (intent.finding_candidates.some((entry) => entry.ticket_ids.length !== 1)) return null;
+  return {
+    schema_version: 1,
+    report_sha256: intent.report_sha256,
+    attributions: intent.finding_candidates.map((entry) => ({
+      finding_index: entry.finding_index,
+      ticket_id: entry.ticket_ids[0],
+      rationale: 'Only deterministic candidate remaining after criterion and path ownership narrowing.',
+    })),
+  };
+}
+
+export async function repairCitadelAttribution(
+  sessionDir: string,
+  options: RepairCitadelAttributionOptions = {},
+): Promise<CitadelRemediationEnqueueResult | null> {
+  const repairStartedAtMs = Date.now();
+  let intent = reconcileCitadelAttributionRepair(sessionDir);
+  if (!intent) return null;
+  const deterministic = deterministicAttributionArtifact(intent);
+  let artifactValue: unknown = deterministic;
+  let artifactPath: string | null = null;
+  if (!artifactValue) {
+    const strategy = nextAttributionStrategy(intent);
+    intent = persistAttributionAttempt(sessionDir, intent, strategy);
+    if (options.artifact !== undefined) {
+      artifactValue = options.artifact;
+    } else {
+      const statePath = path.join(sessionDir, 'state.json');
+      const manager = new StateManager();
+      const state = manager.read(statePath);
+      artifactPath = path.join(sessionDir, 'citadel-attribution-repairs', `${intent.report_sha256}-${intent.attempt_count}.json`);
+      const lastMessagePath = path.join(sessionDir, `citadel-attribution-repair-${intent.attempt_count}.last-message.txt`);
+      ensureDir(path.dirname(artifactPath));
+      fs.rmSync(artifactPath, { force: true });
+      const prompt = [
+      'You are the autonomous Citadel finding attribution repair worker.',
+      `Session directory: ${sessionDir}`,
+      `Working directory: ${String(state.working_dir || '')}`,
+      `Immutable archived refusal: ${intent.archive_path}`,
+      `Report SHA-256: ${intent.report_sha256}`,
+      `Candidate finding ownership JSON: ${JSON.stringify(intent.finding_candidates)}`,
+      `Candidate ticket contracts JSON: ${JSON.stringify(readManifest(sessionDir).tickets.filter(completed).map((ticket) => ({ id: ticketId(ticket), acceptance_criteria: ticket.acceptance_criteria || [], scope: resolveTicketScope(ticket).allowedPaths })))}`,
+      `Mandatory novel attribution strategy: ${strategy}; strategy hash ${intent.strategy_history.at(-1)!.strategy_hash}.`,
+      `Write the attribution artifact to: ${artifactPath}`,
+      'Do not modify the repository, ticket state, manifest, archived refusal, or any acceptance criterion.',
+      'Write exactly one JSON object with schema_version: 1, report_sha256, and attributions. Each attribution must contain finding_index, exactly one ticket_id from that finding candidate list, and a non-empty rationale grounded in the preserved finding evidence.',
+      'Every candidate finding must appear exactly once. Do not invent tickets, criteria, paths, or findings.',
+      'Return <promise>CITADEL_ATTRIBUTION_REPAIR_COMPLETE</promise> after writing the artifact.',
+      ].join('\n\n');
+      options.assertDurableOwnership?.();
+      let result;
+      try {
+        result = await runCodexExecMonitored({
+        telemetry: { sessionDir, ticketId: 'citadel-attribution', phase: 'citadel_attribution_repair' },
+        execArgs: ['--sandbox', 'workspace-write', '--skip-git-repo-check'], cwd: sessionDir, prompt,
+        timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
+        outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [], inheritConfiguredAddDirs: false,
+        successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE')
+          || hasPromiseToken(lastMessage, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE'),
+        onSpawn: (child) => manager.update(statePath, (current) => {
+          current.active_child_pid = child.pid;
+          current.active_child_kind = 'codex';
+          current.active_child_command = 'citadel-attribution-repair';
+          current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+          current.active_child_controller_pid = process.pid;
+          return current;
+        }),
+        cancelCheck: () => {
+          const cancellationAtMs = Date.parse(String(manager.read(statePath).cancel_requested_at || ''));
+          return Number.isFinite(cancellationAtMs) && cancellationAtMs >= repairStartedAtMs;
+        },
+        });
+        options.assertDurableOwnership?.();
+      } catch (error) {
+        if (isDurableOwnershipDrainError(error)) throw error;
+        const detail = error instanceof Error ? error.message : String(error);
+        const persisted = persistAttributionFailure(sessionDir, intent, detail);
+        return {
+          kind: 'attribution_repair_scheduled', archive_path: persisted.archive_path,
+          repair_intent_path: attributionRepairPath(sessionDir), candidate_ticket_ids: persisted.candidate_ticket_ids,
+          reason: detail, attempt_count: persisted.attempt_count,
+        };
+      } finally {
+        manager.update(statePath, (current) => {
+          current.active_child_pid = null;
+          current.active_child_kind = null;
+          current.active_child_command = null;
+          current.active_child_identity = null;
+          current.active_child_controller_pid = null;
+          return current;
+        });
+      }
+      try {
+        assertCodexSucceeded(result, 'Citadel attribution repair failed');
+        artifactValue = readAttributionArtifact(artifactPath);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const persisted = persistAttributionFailure(sessionDir, intent, detail);
+        return {
+          kind: 'attribution_repair_scheduled', archive_path: persisted.archive_path,
+          repair_intent_path: attributionRepairPath(sessionDir), candidate_ticket_ids: persisted.candidate_ticket_ids,
+          reason: detail, attempt_count: persisted.attempt_count,
+        };
+      }
+    }
+  }
+  try {
+    const artifact = validateAttributionArtifact(intent, artifactValue);
+    const repairedReport = reportWithResolvedAttribution(intent, artifact);
+    atomicWriteJson(intent.report_path, repairedReport);
+    const result = enqueueCitadelRemediationResult(sessionDir);
+    if (result.kind !== 'remediation_enqueued') throw new Error('citadel-attribution-resolution-remained-ambiguous');
+    atomicWriteJson(path.join(sessionDir, 'citadel-attribution-repair-current.json'), {
+      schema_version: 1, report_sha256: intent.report_sha256, archive_path: intent.archive_path,
+      artifact_path: artifactPath, attributions: artifact.attributions,
+      strategy_history: intent.strategy_history, resolved_at: new Date().toISOString(),
+    });
+    return result;
+  } catch (error) {
+    if (isDurableOwnershipDrainError(error)) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    const current = reconcileCitadelAttributionRepair(sessionDir) || intent;
+    const persisted = current.strategy_history.length > 0
+      ? persistAttributionFailure(sessionDir, current, detail)
+      : { ...current, reason: detail };
+    if (current.strategy_history.length === 0) atomicWriteJson(attributionRepairPath(sessionDir), persisted);
+    return {
+      kind: 'attribution_repair_scheduled', archive_path: persisted.archive_path,
+      repair_intent_path: attributionRepairPath(sessionDir), candidate_ticket_ids: persisted.candidate_ticket_ids,
+      reason: detail, attempt_count: persisted.attempt_count,
+    };
+  }
 }
 
 function dependentTicketIds(tickets: Ticket[], directTicketIds: string[]): string[] {
@@ -490,6 +822,7 @@ export function enqueueCitadelRemediationResult(sessionDir: string): CitadelReme
       repair_intent_path: attributionRepairPath(sessionDir),
       candidate_ticket_ids: existingRepair.candidate_ticket_ids,
       reason: existingRepair.reason,
+      attempt_count: existingRepair.attempt_count,
     };
   }
   const archiveDir = ensureDir(path.join(sessionDir, 'citadel-remediation'));
@@ -502,7 +835,7 @@ export function enqueueCitadelRemediationResult(sessionDir: string): CitadelReme
     const reason = error instanceof Error ? error.message : String(error);
     const findingCandidates = candidateFindingAttribution(findings, tickets);
     const repairIntent: CitadelAttributionRepairIntent = {
-      schema_version: 2,
+      schema_version: 3,
       failure_kind: 'citadel_attribution_repair_required',
       status: 'pending',
       archive_path: archivePath,
@@ -514,6 +847,8 @@ export function enqueueCitadelRemediationResult(sessionDir: string): CitadelReme
       acceptance_criteria_checked: acceptanceCriteria,
       reason,
       repair_task: 'Attribute each preserved blocking finding to exactly one completed ticket using ticket IDs, acceptance criteria, and owned repository paths.',
+      attempt_count: 0,
+      strategy_history: [],
       scheduled_at: new Date().toISOString(),
     };
     atomicWriteJson(attributionRepairPath(sessionDir), repairIntent);
@@ -523,6 +858,7 @@ export function enqueueCitadelRemediationResult(sessionDir: string): CitadelReme
       repair_intent_path: attributionRepairPath(sessionDir),
       candidate_ticket_ids: repairIntent.candidate_ticket_ids,
       reason,
+      attempt_count: repairIntent.attempt_count,
     };
   }
   const directTicketIds = [...new Set(findingAttribution.flatMap((entry) => entry.ticket_ids))];

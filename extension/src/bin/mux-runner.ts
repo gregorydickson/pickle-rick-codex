@@ -52,7 +52,12 @@ import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js
 import { runCitadel } from '../services/citadel.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
-import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
+import {
+  enqueueCitadelRemediationResult,
+  reconcileCitadelAttributionRepair,
+  reconcileCitadelRemediation,
+  repairCitadelAttribution,
+} from '../services/citadel-remediation.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
 import { repairTicketDependencyContract } from '../services/dependency-contract-repair.js';
@@ -74,6 +79,7 @@ interface RunSequentialDeps {
   repairTicketVerificationContract?: typeof repairTicketVerificationContract;
   repairTicketDependencyContract?: typeof repairTicketDependencyContract;
   runCitadel?: typeof runCitadel;
+  repairCitadelAttribution?: typeof repairCitadelAttribution;
 }
 
 function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
@@ -797,6 +803,7 @@ export async function runSequential(
   options: RunSequentialOptions = {},
   deps: RunSequentialDeps = {},
 ): Promise<string> {
+  const repairAttributionFn = deps.repairCitadelAttribution ?? repairCitadelAttribution;
   const configuredRunStartedAtMs = Number(options.runStartedAtMs);
   const runStartedAtMs = Number.isFinite(configuredRunStartedAtMs) && configuredRunStartedAtMs > 0
     ? configuredRunStartedAtMs
@@ -848,6 +855,23 @@ export async function runSequential(
       }, deps);
       if (exitReason !== 'success' || options.runnerMode === 'pipeline') break;
 
+      if (reconcileCitadelAttributionRepair(sessionDir)) {
+        ownership.assertOwned();
+        const attribution = await repairAttributionFn(sessionDir, {
+          timeoutMs: options.timeoutMs,
+          assertDurableOwnership: ownership.assertOwned,
+        });
+        ownership.assertOwned();
+        if (!attribution || attribution.kind === 'attribution_repair_scheduled') {
+          exitReason = 'citadel_attribution_repair_scheduled';
+          exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+          appendRunnerLog(sessionDir, options.runnerMode || 'pickle', 'Citadel attribution repair remains durable; scheduled autonomous restart.');
+          break;
+        }
+        appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel attribution resolved; narrow remediation enqueued for ${attribution.ticket_ids.join(', ')}.`);
+        continue;
+      }
+
       releaseGateHeld = true;
       ownership.assertOwned();
       const citadelExit = await (deps.runCitadel ?? runCitadel)(sessionDir, {
@@ -855,8 +879,24 @@ export async function runSequential(
       });
       ownership.assertOwned();
       if (citadelExit === 'citadel-blocked') {
-        const archivePath = enqueueCitadelRemediation(sessionDir);
-        appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel refusal preserved at ${archivePath}; autonomous remediation enqueued.`);
+        const remediation = enqueueCitadelRemediationResult(sessionDir);
+        if (remediation.kind === 'attribution_repair_scheduled') {
+          const attribution = await repairAttributionFn(sessionDir, {
+            timeoutMs: options.timeoutMs,
+            assertDurableOwnership: ownership.assertOwned,
+          });
+          ownership.assertOwned();
+          if (!attribution || attribution.kind === 'attribution_repair_scheduled') {
+            exitReason = 'citadel_attribution_repair_scheduled';
+            exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+            appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel refusal preserved at ${remediation.archive_path}; attribution repair scheduled.`);
+            releaseGateHeld = false;
+            break;
+          }
+          appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel attribution resolved; narrow remediation enqueued for ${attribution.ticket_ids.join(', ')}.`);
+        } else {
+          appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel refusal preserved at ${remediation.archive_path}; autonomous remediation enqueued.`);
+        }
         exitReason = 'success';
         releaseGateHeld = false;
         continue;

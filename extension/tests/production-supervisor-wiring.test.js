@@ -6,8 +6,8 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
-import { runSequential } from '../bin/mux-runner.js';
-import { enqueueCitadelRemediation, parsePipelineHandoffOptions } from '../bin/pipeline-runner.js';
+import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
+import { enqueueCitadelRemediation, parsePipelineHandoffOptions, runPipeline } from '../bin/pipeline-runner.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import {
   acceptRuntimeHandoff,
@@ -39,6 +39,7 @@ import { assertCitadelReleaseApproval, deriveCitadelAcceptanceCriteria, persistC
 import { PreflightError } from '../services/verification-env.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { buildTicketPhasePrompt } from '../services/prompts.js';
+import { reconcileCitadelAttributionRepair, repairCitadelAttribution } from '../services/citadel-remediation.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -97,6 +98,30 @@ function createAcceptedSession(status = 'Todo') {
   });
   writeRefinementAcceptance(sessionDir, { workingDir });
   return { sessionDir, workingDir };
+}
+
+function addIndependentDoneTicket(sessionDir, workingDir) {
+  fs.appendFileSync(
+    path.join(sessionDir, 'prd_refined.md'),
+    '\n### AC-INDEPENDENT-01: Independent completed work retains its checkpoint.\n',
+  );
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].status = 'Done';
+  manifest.tickets[0].completion_commit = 'a'.repeat(40);
+  manifest.tickets.push({
+    id: 'R2',
+    title: 'Preserve independent checkpoint',
+    description: 'Exercise narrow Citadel attribution repair.',
+    acceptance_criteria: ['Independent completed work retains its checkpoint.'],
+    verification: ['node -e "process.exit(0)"'],
+    allowed_paths: ['independent.txt'],
+    priority: 'P1',
+    status: 'Done',
+    completion_commit: 'b'.repeat(40),
+  });
+  writeJson(manifestPath, manifest);
+  writeRefinementAcceptance(sessionDir, { workingDir });
 }
 
 async function approveCitadelFixture(sessionDir) {
@@ -379,6 +404,128 @@ test('standalone mux carries exact Citadel refusal evidence into autonomous reme
   assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length, 1);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-current.json')), true);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('standalone mux durably resumes unattributed Citadel repair and preserves unrelated Done checkpoints', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  addIndependentDoneTicket(sessionDir, workingDir);
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  let citadelRuns = 0;
+  const blockWithoutAttribution = async (dir) => {
+    citadelRuns += 1;
+    writeJson(path.join(dir, 'citadel-report.json'), {
+      schema_version: 1,
+      verdict: 'block',
+      acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
+      findings: [{
+        severity: 'high',
+        title: 'Reviewer found incomplete release proof.',
+        evidence: 'The restart proof is insufficient.',
+        recommendation: 'Repair the responsible ticket and rerun the release gate.',
+      }],
+    });
+    return 'citadel-blocked';
+  };
+
+  const firstReason = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runCitadel: blockWithoutAttribution,
+    repairCitadelAttribution: async (dir) => await repairCitadelAttribution(dir, { artifact: {
+      schema_version: 1,
+      report_sha256: 'invalid',
+      attributions: [{ finding_index: 0, ticket_id: 'R1', rationale: 'Invalid hash fixture.' }],
+    } }),
+  });
+  assert.equal(firstReason, 'citadel_attribution_repair_scheduled');
+  assert.equal(muxRunnerExitFailed(firstReason), false);
+  assert.equal(citadelRuns, 1);
+  assert.deepEqual(readManifest(sessionDir).tickets.map(({ status }) => status), ['Done', 'Done']);
+  assert.equal(readManifest(sessionDir).tickets[1].completion_commit, 'b'.repeat(40));
+  assert.ok(reconcileCitadelAttributionRepair(sessionDir));
+
+  const rerunTickets = [];
+  const secondReason = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    repairCitadelAttribution: async (dir) => {
+      const intent = reconcileCitadelAttributionRepair(dir);
+      return await repairCitadelAttribution(dir, { artifact: {
+        schema_version: 1,
+        report_sha256: intent.report_sha256,
+        attributions: [{ finding_index: 0, ticket_id: 'R1', rationale: 'The finding concerns the R1 restart contract.' }],
+      } });
+    },
+    runTicket: async (dir, ticketId) => {
+      rerunTickets.push(ticketId);
+      updateTicketStatus(dir, ticketId, { status: 'Done' });
+      return { status: 'done', applied: true };
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(secondReason, 'success');
+  assert.deepEqual(rerunTickets, ['r1']);
+  assert.equal(readManifest(sessionDir).tickets[1].status, 'Done');
+  assert.equal(readManifest(sessionDir).tickets[1].completion_commit, 'b'.repeat(40));
+  assert.equal(reconcileCitadelAttributionRepair(sessionDir), null);
+});
+
+test('pipeline treats unattributed Citadel repair as a restart-safe nonterminal wakeup', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  addIndependentDoneTicket(sessionDir, workingDir);
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'repair unattributed Citadel refusal',
+  }));
+  ensurePipelineState(sessionDir);
+  let citadelRuns = 0;
+  const firstReason = await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel: async (dir) => {
+      citadelRuns += 1;
+      writeJson(path.join(dir, 'citadel-report.json'), {
+        schema_version: 1,
+        verdict: 'block',
+        acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
+        findings: [{ severity: 'high', title: 'Internal release report is unattributed.', evidence: 'Restart proof is incomplete.' }],
+      });
+      return 'citadel-blocked';
+    },
+    repairCitadelAttribution: async (dir) => await repairCitadelAttribution(dir, { artifact: {
+      schema_version: 1,
+      report_sha256: 'invalid',
+      attributions: [{ finding_index: 0, ticket_id: 'R1', rationale: 'Invalid hash fixture.' }],
+    } }),
+  });
+  assert.equal(firstReason, 'citadel_attribution_repair_scheduled');
+  assert.equal(citadelRuns, 1);
+  assert.equal(new StateManager().read(path.join(sessionDir, 'state.json')).last_exit_reason, firstReason);
+  assert.ok(reconcileCitadelAttributionRepair(sessionDir));
+
+  const rerunTickets = [];
+  const secondReason = await runPipeline(sessionDir, {
+    repairCitadelAttribution: async (dir) => {
+      const intent = reconcileCitadelAttributionRepair(dir);
+      return await repairCitadelAttribution(dir, { artifact: {
+        schema_version: 1,
+        report_sha256: intent.report_sha256,
+        attributions: [{ finding_index: 0, ticket_id: 'R1', rationale: 'The release proof belongs to R1.' }],
+      } });
+    },
+    runSequential: async (dir) => {
+      for (const ticket of readManifest(dir).tickets.filter(({ status }) => status === 'Todo')) {
+        rerunTickets.push(ticket.id);
+        updateTicketStatus(dir, ticket.id, { status: 'Done' });
+      }
+      return 'success';
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(secondReason, 'success');
+  assert.deepEqual(rerunTickets, ['r1']);
+  assert.equal(readManifest(sessionDir).tickets[1].completion_commit, 'b'.repeat(40));
 });
 
 test('replacement standalone mux reconciles a predecessor Citadel intent before worker dispatch', async () => {

@@ -26,7 +26,12 @@ import { runCitadel } from '../services/citadel.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
-import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
+import {
+  enqueueCitadelRemediationResult,
+  reconcileCitadelAttributionRepair,
+  reconcileCitadelRemediation,
+  repairCitadelAttribution,
+} from '../services/citadel-remediation.js';
 
 export { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
 
@@ -37,6 +42,9 @@ interface RunPipelineOptions {
   assertDurableOwnership?: () => void;
   handoffRequestId?: string;
   targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
+  runSequential?: typeof runSequential;
+  runCitadel?: typeof runCitadel;
+  repairCitadelAttribution?: typeof repairCitadelAttribution;
   [key: string]: unknown;
 }
 
@@ -89,11 +97,23 @@ function isBlockingExitReason(exitReason: string): boolean {
 }
 
 export function pipelineExitFailed(exitReason: string): boolean {
-  return exitReason !== 'success' && exitReason !== 'dependency_repair_scheduled';
+  return exitReason !== 'success'
+    && exitReason !== 'dependency_repair_scheduled'
+    && exitReason !== 'citadel_attribution_repair_scheduled';
 }
 
 function readSessionExitReason(sessionDir: string): string {
   return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
+}
+
+function recordAttributionRepairWakeup(sessionDir: string): void {
+  const exitReason = 'citadel_attribution_repair_scheduled';
+  finishPipelinePhase(sessionDir, 'citadel', { exitReason });
+  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+    state.last_exit_reason = exitReason;
+    state.step = 'paused';
+    return state;
+  });
 }
 
 async function runPipelinePhase(
@@ -163,6 +183,9 @@ async function runPipelineWithLease(
   runStartedAtMs: number,
 ): Promise<string> {
   let exitReason = 'error';
+  const runSequentialFn = options.runSequential ?? runSequential;
+  const runCitadelFn = options.runCitadel ?? runCitadel;
+  const repairAttributionFn = options.repairCitadelAttribution ?? repairCitadelAttribution;
   appendRunnerLog(sessionDir, getRunnerDescriptor('pipeline').runnerStartMarker);
   try {
     const pipeline = readPipelineContract(sessionDir);
@@ -170,6 +193,21 @@ async function runPipelineWithLease(
     if (reconcileCitadelRemediation(sessionDir)) {
       pipelineState = ensurePipelineState(sessionDir, pipeline);
       appendRunnerLog(sessionDir, 'Recovered pending Citadel remediation intent.');
+    }
+    if (reconcileCitadelAttributionRepair(sessionDir)) {
+      options.assertDurableOwnership?.();
+      const attribution = await repairAttributionFn(sessionDir, {
+        timeoutMs: Number(options.timeoutMs) || undefined,
+        assertDurableOwnership: options.assertDurableOwnership,
+      });
+      options.assertDurableOwnership?.();
+      if (!attribution || attribution.kind === 'attribution_repair_scheduled') {
+        recordAttributionRepairWakeup(sessionDir);
+        appendRunnerLog(sessionDir, 'Citadel attribution repair remains durable; scheduled autonomous restart.');
+        return 'citadel_attribution_repair_scheduled';
+      }
+      pipelineState = ensurePipelineState(sessionDir, pipeline);
+      appendRunnerLog(sessionDir, `Citadel attribution resolved; narrow remediation enqueued for ${attribution.ticket_ids.join(', ')}.`);
     }
     let nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
     exitReason = 'success';
@@ -180,7 +218,7 @@ async function runPipelineWithLease(
           sessionDir,
           'pickle',
           runStartedAtMs,
-          async () => await runSequential(sessionDir, {
+          async () => await runSequentialFn(sessionDir, {
             ...options,
             runnerMode: 'pipeline',
             operationLeaseHeld: true,
@@ -194,7 +232,7 @@ async function runPipelineWithLease(
           sessionDir,
           'citadel',
           runStartedAtMs,
-          async () => await runCitadel(sessionDir, { assertDurableOwnership: options.assertDurableOwnership }),
+          async () => await runCitadelFn(sessionDir, { assertDurableOwnership: options.assertDurableOwnership }),
         );
       } else if (nextPhase === 'anatomy-park') {
         exitReason = await runPipelineLoopPhase(
@@ -218,9 +256,23 @@ async function runPipelineWithLease(
 
       if (nextPhase === 'citadel' && exitReason === 'citadel-blocked') {
         options.assertDurableOwnership?.();
-        const archivePath = enqueueCitadelRemediation(sessionDir);
+        const remediation = enqueueCitadelRemediationResult(sessionDir);
         options.assertDurableOwnership?.();
-        appendRunnerLog(sessionDir, `Citadel refusal preserved at ${archivePath}; autonomous remediation enqueued.`);
+        if (remediation.kind === 'attribution_repair_scheduled') {
+          const attribution = await repairAttributionFn(sessionDir, {
+            timeoutMs: Number(options.timeoutMs) || undefined,
+            assertDurableOwnership: options.assertDurableOwnership,
+          });
+          options.assertDurableOwnership?.();
+          if (!attribution || attribution.kind === 'attribution_repair_scheduled') {
+            recordAttributionRepairWakeup(sessionDir);
+            appendRunnerLog(sessionDir, `Citadel refusal preserved at ${remediation.archive_path}; attribution repair scheduled.`);
+            return 'citadel_attribution_repair_scheduled';
+          }
+          appendRunnerLog(sessionDir, `Citadel attribution resolved; narrow remediation enqueued for ${attribution.ticket_ids.join(', ')}.`);
+        } else {
+          appendRunnerLog(sessionDir, `Citadel refusal preserved at ${remediation.archive_path}; autonomous remediation enqueued.`);
+        }
         exitReason = 'success';
         pipelineState = ensurePipelineState(sessionDir, pipeline);
         nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
