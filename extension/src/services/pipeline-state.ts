@@ -970,6 +970,30 @@ export function finishPipelinePhase(
   }, options);
 }
 
+export function resetPipelineForAutonomousRemediation(
+  sessionDir: string,
+  reason: string,
+): TransitionPipelineStateResult {
+  return transitionPipelineState(sessionDir, (pipelineState, sessionState, pipeline) => {
+    const pickleIndex = pipeline.phases.indexOf('pickle');
+    if (pickleIndex < 0) throw new PipelineStateError('Pipeline has no pickle remediation phase.');
+    for (const phase of pipeline.phases.slice(pickleIndex)) {
+      pipelineState.phase_statuses[phase] = PHASE_STATUS_TODO;
+    }
+    pipelineState.current_phase = 'pickle';
+    pipelineState.current_phase_index = pickleIndex;
+    pipelineState.phase_started_at = null;
+    pipelineState.completed_at = null;
+    pipelineState.last_exit_reason = null;
+    pipelineState.last_error = reason;
+    sessionState.active = true;
+    sessionState.last_exit_reason = null;
+    sessionState.step = 'pickle';
+    sessionState.current_ticket = null;
+    appendHistoryEntry(sessionState, 'citadel_remediation_enqueued');
+  });
+}
+
 export function cancelPipelineSession(
   sessionDir: string,
   options: CancelPipelineSessionOptions = {},

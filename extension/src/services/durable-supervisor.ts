@@ -71,6 +71,11 @@ interface ClockOptions {
   nowMs?: number;
 }
 
+interface TerminalOptions extends ClockOptions {
+  ownerId?: string;
+  token?: string;
+}
+
 interface AcquireLeaseOptions extends ClockOptions {
   ownerId: string;
   ttlMs: number;
@@ -191,6 +196,9 @@ function replayJournal(events: LogicalPipelineEvent[]): Omit<LogicalPipelineStat
         leaseGeneration = eventLease.generation;
         break;
       }
+      case 'lease_released':
+        lease = null;
+        break;
       case 'executor_lost':
         executorRestartCount += 1;
         break;
@@ -647,15 +655,33 @@ export function watchdogRecoverSupervisor(
   };
 }
 
+export function releaseSupervisorLease(
+  sessionDir: string,
+  ownerId: string,
+  token: string,
+  options: ClockOptions = {},
+): LogicalPipelineState {
+  return mutate(sessionDir, (state) => {
+    if (!state.lease || state.lease.owner_id !== ownerId || state.lease.token !== token) {
+      throw new Error('Supervisor lease ownership changed before release.');
+    }
+    state.lease = null;
+    appendEvent(state, 'lease_released', { owner_id: ownerId }, options.nowMs ?? Date.now());
+  });
+}
+
 export function terminateLogicalPipeline(
   sessionDir: string,
   terminalState: string,
-  options: ClockOptions = {},
+  options: TerminalOptions = {},
 ): LogicalPipelineState {
   if (!(LOGICAL_PIPELINE_TERMINAL_STATES as readonly string[]).includes(terminalState)) {
     throw new Error(`Unexpected terminal state ${terminalState}; autonomy, reliability, and quality scores are zero.`);
   }
   return mutate(sessionDir, (state) => {
+    if (state.lease && (state.lease.owner_id !== options.ownerId || state.lease.token !== options.token)) {
+      throw new Error('Only the active supervisor lease may terminate the logical pipeline.');
+    }
     appendEvent(state, `pipeline_${terminalState}`, { terminal_state: terminalState }, options.nowMs ?? Date.now());
     state.terminal_state = terminalState as LogicalPipelineTerminalState;
     state.lease = null;

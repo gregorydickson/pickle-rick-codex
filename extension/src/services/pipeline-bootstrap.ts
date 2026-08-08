@@ -41,6 +41,7 @@ import type {
   VerificationBaselines,
 } from '../types/index.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
+import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from './session-prd-seal.js';
 
 interface CreateBootstrapSessionOptions {
   prdPath?: string | null;
@@ -316,6 +317,7 @@ export async function createBootstrapSession({
   } else {
     writeTaskPrdIntoSession(sessionDir, effectiveTaskPrompt);
   }
+  initializePrdDevelopmentPipeline(sessionDir);
 
   const manager = new StateManager();
   manager.update(path.join(sessionDir, 'state.json'), (state) => {
@@ -477,6 +479,7 @@ export async function ensureBootstrapSessionReady(
   const state = manager.read(statePath);
   const config = loadConfig();
   capturePipelineVerificationBaselines(sessionDir, { state, summary, config });
+  ensureSessionPrdSeal(sessionDir);
 
   return { state, summary };
 }

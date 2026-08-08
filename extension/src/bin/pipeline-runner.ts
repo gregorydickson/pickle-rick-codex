@@ -1,16 +1,23 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { readPipelineContract, resolveNextPipelinePhase } from '../services/pipeline.js';
 import { PipelineScopeError, resolvePipelineScope } from '../services/pipeline-scope.js';
-import { beginPipelinePhase, cancelPipelineSession, ensurePipelineState, finishPipelinePhase } from '../services/pipeline-state.js';
+import {
+  beginPipelinePhase,
+  cancelPipelineSession,
+  ensurePipelineState,
+  finishPipelinePhase,
+  resetPipelineForAutonomousRemediation,
+} from '../services/pipeline-state.js';
 import {
   preparePipelineAnatomyParkPhase,
   preparePipelineLoopPhaseSession,
   preparePipelineSzechuanSaucePhase,
 } from '../services/pipeline-phase-setup.js';
-import { readJsonFile } from '../services/pickle-utils.js';
+import { atomicWriteJson, ensureDir, readJsonFile } from '../services/pickle-utils.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager } from '../services/state-manager.js';
 import { finalizeTerminalState } from '../services/state-terminal.js';
@@ -19,11 +26,14 @@ import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
 import { runCitadel } from '../services/citadel.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
+import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { readManifest, updateTicketStatus } from '../services/tickets.js';
 
 type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSession>[2];
 
 interface RunPipelineOptions {
   onFailure?: string;
+  assertDurableOwnership?: () => void;
   [key: string]: unknown;
 }
 
@@ -72,6 +82,51 @@ export function pipelineExitFailed(exitReason: string): boolean {
 
 function readSessionExitReason(sessionDir: string): string {
   return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
+}
+
+export function enqueueCitadelRemediation(sessionDir: string): string {
+  const report = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'citadel-report.json'), null);
+  if (!report) throw new Error('Citadel refusal did not persist a remediation report.');
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const summary = findings
+    .map((finding) => String((finding as Record<string, unknown>)?.title || '').trim())
+    .filter(Boolean)
+    .join('; ') || 'Citadel release gate refused the candidate.';
+  const archiveDir = ensureDir(path.join(sessionDir, 'citadel-remediation'));
+  const archivePath = path.join(archiveDir, `citadel-report-${Date.now()}-${crypto.randomUUID()}.json`);
+  atomicWriteJson(archivePath, report);
+
+  const tickets = readManifest(sessionDir).tickets;
+  const affected = tickets.filter((ticket) => String(ticket.status || '').trim().toLowerCase() === 'done');
+  if (affected.length === 0) throw new Error('Citadel refusal has no completed ticket to remediate.');
+  atomicWriteJson(path.join(sessionDir, 'citadel-remediation-pending.json'), {
+    schema_version: 1,
+    archive_path: archivePath,
+    ticket_ids: affected.map((ticket) => ticket.id),
+    summary,
+  });
+  reconcileCitadelRemediation(sessionDir);
+  return archivePath;
+}
+
+export function reconcileCitadelRemediation(sessionDir: string): boolean {
+  const pendingPath = path.join(sessionDir, 'citadel-remediation-pending.json');
+  const pending = readJsonFile<Record<string, unknown>>(pendingPath, null);
+  if (!pending) return false;
+  if (pending.schema_version !== 1 || !Array.isArray(pending.ticket_ids) || typeof pending.summary !== 'string') {
+    throw new Error('Citadel remediation intent is invalid.');
+  }
+  for (const ticketId of pending.ticket_ids) {
+    updateTicketStatus(sessionDir, String(ticketId), {
+      status: 'Todo',
+      recovery_task: `Remediate preserved Citadel findings: ${pending.summary}`,
+      citadel_report: pending.archive_path,
+      citadel_remediation_enqueued_at: new Date().toISOString(),
+    });
+  }
+  resetPipelineForAutonomousRemediation(sessionDir, pending.summary);
+  fs.rmSync(pendingPath, { force: true });
+  return true;
 }
 
 async function runPipelinePhase(
@@ -145,9 +200,14 @@ async function runPipelineWithLease(
   try {
     const pipeline = readPipelineContract(sessionDir);
     let pipelineState = ensurePipelineState(sessionDir, pipeline);
+    if (reconcileCitadelRemediation(sessionDir)) {
+      pipelineState = ensurePipelineState(sessionDir, pipeline);
+      appendRunnerLog(sessionDir, 'Recovered pending Citadel remediation intent.');
+    }
     let nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
     exitReason = 'success';
     while (nextPhase) {
+      options.assertDurableOwnership?.();
       if (nextPhase === 'pickle') {
         exitReason = await runPipelinePhase(
           sessionDir,
@@ -157,6 +217,8 @@ async function runPipelineWithLease(
             ...options,
             runnerMode: 'pipeline',
             operationLeaseHeld: true,
+            durableOwnershipHeld: options.assertDurableOwnership !== undefined,
+            assertDurableOwnership: options.assertDurableOwnership,
             runStartedAtMs,
           }),
         );
@@ -185,6 +247,15 @@ async function runPipelineWithLease(
         );
       } else {
         throw new Error(`Unsupported pipeline phase: ${nextPhase}.`);
+      }
+
+      if (nextPhase === 'citadel' && exitReason === 'citadel-blocked') {
+        const archivePath = enqueueCitadelRemediation(sessionDir);
+        appendRunnerLog(sessionDir, `Citadel refusal preserved at ${archivePath}; autonomous remediation enqueued.`);
+        exitReason = 'success';
+        pipelineState = ensurePipelineState(sessionDir, pipeline);
+        nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
+        continue;
       }
 
       if (exitReason !== 'success') {
@@ -231,10 +302,31 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
     undefined,
     Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
   );
+  const durableRuntime = fs.existsSync(path.join(sessionDir, 'prd.lock.json'))
+    && fs.existsSync(path.join(sessionDir, 'logical-pipeline.json'));
+  if (!durableRuntime) {
+    try {
+      return await runPipelineWithLease(sessionDir, options, runStartedAtMs);
+    } finally {
+      releaseOperation();
+    }
+  }
+  let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
+  let exitReason = 'error';
   try {
-    return await runPipelineWithLease(sessionDir, options, runStartedAtMs);
+    ownership = startDurableRuntimeOwnership(sessionDir);
+    exitReason = await runPipelineWithLease(sessionDir, {
+      ...options,
+      onFailure: 'retry',
+      assertDurableOwnership: ownership.assertOwned,
+    }, runStartedAtMs);
+    return exitReason;
   } finally {
-    releaseOperation();
+    try {
+      ownership?.finish(exitReason);
+    } finally {
+      releaseOperation();
+    }
   }
 }
 

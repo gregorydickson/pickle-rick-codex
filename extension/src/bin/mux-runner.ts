@@ -42,11 +42,14 @@ import {
   type FailureDomain,
 } from '../services/productive-autonomy.js';
 import { runTicket } from './spawn-morty.js';
+import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
   runnerMode?: string;
   timeoutMs?: number;
+  durableOwnershipHeld?: boolean;
+  assertDurableOwnership?: () => void;
   [key: string]: unknown;
 }
 
@@ -104,7 +107,7 @@ async function runSequentialWithLease(
   const runTicketFn = deps.runTicket ?? runTicket;
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
-  const failureMode = options.onFailure || 'abort';
+  const failureMode = options.durableOwnershipHeld === true ? 'retry' : options.onFailure || 'abort';
   const runnerMode = options.runnerMode || 'pickle';
   const runnerDescriptor = getRunnerDescriptor(runnerMode);
   const runnerLabel = runnerDescriptor.runnerStartMarker.replace(/\s+started$/, '');
@@ -158,6 +161,7 @@ async function runSequentialWithLease(
   if (scheduledDiagnosticTicketId) pendingTicketIds.add(scheduledDiagnosticTicketId);
   const repairingTicketIds = new Set<string>();
   while (pendingTicketIds.size > 0 && exitReason === 'success') {
+    options.assertDurableOwnership?.();
     const currentSummary = summarizeTickets(sessionDir);
     const runnable = (candidate: typeof currentSummary.tickets[number]): boolean => (
       pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
@@ -425,10 +429,12 @@ async function runSequentialWithLease(
           runnerMode,
           `starting ticket ${ticket.id} attempt ${attempts}${Number.isFinite(maxAttempts) ? `/${maxAttempts}` : ' (adaptive)'}`,
         );
+        options.assertDurableOwnership?.();
         const result = await runTicketFn(sessionDir, ticket.id, {
           ...options,
           runnerMode,
         });
+        options.assertDurableOwnership?.();
         if (result.status === 'done') {
           recordExecutionTelemetry(sessionDir, {
             ticket_id: ticket.id,
@@ -627,10 +633,33 @@ export async function runSequential(
     undefined,
     Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
   );
+  const durableRuntime = fs.existsSync(path.join(sessionDir, 'prd.lock.json'))
+    && fs.existsSync(path.join(sessionDir, 'logical-pipeline.json'));
+  if (!durableRuntime) {
+    try {
+      return await runSequentialWithLease(sessionDir, { ...options, runStartedAtMs }, deps);
+    } finally {
+      releaseOperation();
+    }
+  }
+  let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
+  let exitReason = 'error';
   try {
-    return await runSequentialWithLease(sessionDir, { ...options, runStartedAtMs }, deps);
+    ownership = startDurableRuntimeOwnership(sessionDir);
+    exitReason = await runSequentialWithLease(sessionDir, {
+      ...options,
+      onFailure: 'retry',
+      durableOwnershipHeld: true,
+      assertDurableOwnership: ownership.assertOwned,
+      runStartedAtMs,
+    }, deps);
+    return exitReason;
   } finally {
-    releaseOperation();
+    try {
+      ownership?.finish(exitReason);
+    } finally {
+      releaseOperation();
+    }
   }
 }
 
