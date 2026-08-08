@@ -246,7 +246,7 @@ export function classifyAutonomousFailure(input: {
   if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review_refused';
   if (phase === 'conformance' || kind.includes('conformance')) return 'conformance_refused';
   if (kind.includes('quality') || message.includes('quality-gate') || message.includes('quality gate')) return 'quality_failed';
-  if (kind.includes('test') || kind.includes('verification_failed') || message.includes('verification command failed')) return 'verification_failed';
+  if (kind.includes('test') || kind.includes('verification_failed') || message.includes('verification command failed') || message.includes('verification-command-failed')) return 'verification_failed';
   if (kind.includes('artifact')) return 'artifact_invalid';
   if (kind.includes('implementation')) return 'implementation_invalid';
   if (kind.includes('transport') || message.includes('worker transport')) return 'worker_transport';

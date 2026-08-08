@@ -55,7 +55,12 @@ import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
 import { recordExecutionControlTelemetry, recordModelCallTelemetry } from '../services/productive-autonomy.js';
 import { lifecycleContextInputHash, readLifecycleContextCheckpoint, writeLifecycleContextCheckpoint } from '../services/lifecycle-checkpoints.js';
-import { atomicWriteJson } from '../services/pickle-utils.js';
+import {
+  clearRejectedCandidateCheckpoint,
+  persistRejectedCandidateCheckpoint,
+  restoreRejectedCandidateCheckpoint,
+} from '../services/candidate-recovery.js';
+import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
 import {
@@ -76,9 +81,11 @@ import {
   isPreflightError,
   isVerificationContractError,
   normalizeVerificationSteps,
+  verificationStepIdentity,
   verificationStepCommand,
   VerificationContractError,
 } from '../services/verification-env.js';
+import type { RecoveryStrategyEpoch } from '../services/productive-autonomy.js';
 import {
   buildVerificationFailureSet,
   isPipelineSession,
@@ -156,7 +163,7 @@ interface VerificationCommandErrorInput {
   failures?: VerificationFailure[];
 }
 
-class VerificationCommandError extends Error {
+export class VerificationCommandError extends Error {
   command: string;
   stdout: string;
   stderr: string;
@@ -173,6 +180,10 @@ class VerificationCommandError extends Error {
     this.exitCode = exitCode;
     this.failures = Array.isArray(failures) ? failures : [];
   }
+}
+
+export function isVerificationCommandError(error: unknown): error is VerificationCommandError {
+  return error instanceof VerificationCommandError;
 }
 
 export function subtractBaselineFailures(
@@ -389,7 +400,7 @@ function restoreRejectedWorkerMutation(
 ): string | null {
   if (!isGitRepo(workingDir) || repositoryMutationFingerprint(workingDir) === boundary.fingerprint) return null;
   const remediationIdentity = repositoryRemediationIdentity(workingDir);
-  recoverableHardReset({
+  const archive = recoverableHardReset({
     workingDir,
     sessionDir,
     targetHead: boundary.head,
@@ -400,6 +411,10 @@ function restoreRejectedWorkerMutation(
   });
   if (repositoryMutationFingerprint(workingDir) !== boundary.fingerprint) {
     throw new Error('worker-rollback-failed: rejected worker changes were anchored, but the original repository boundary was not restored');
+  }
+  const recoveryRef = archive.dirtyRef || archive.headRef;
+  if (recoveryRef) {
+    persistRejectedCandidateCheckpoint({ sessionDir, workingDir, ticketId, baseHead: boundary.head, recoveryRef });
   }
   return remediationIdentity;
 }
@@ -644,6 +659,7 @@ interface RunTicketOptions {
   ticketAttempt?: number;
   recoveryEpoch?: number;
   strategyHash?: string | null;
+  recoveryStrategy?: RecoveryStrategyEpoch | null;
   [key: string]: unknown;
 }
 
@@ -651,6 +667,78 @@ interface RunTicketResult {
   status: string;
   applied: boolean;
   reason?: string;
+}
+
+export async function repairTicketVerificationContract(
+  sessionDir: string,
+  ticketId: string,
+  options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; diagnosticOnly?: boolean } = {},
+): Promise<VerificationStep[]> {
+  const manager = new StateManager();
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = manager.read(statePath);
+  const workingDir = String(state.working_dir || '');
+  const normalizedTicketId = normalizeTicketId(ticketId, ticketId);
+  const rawManifest = readJsonFile<{ tickets?: Ticket[] }>(path.join(sessionDir, 'refinement_manifest.json'), {}) || {};
+  const ticket = rawManifest.tickets?.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedTicketId);
+  if (!ticket) throw new Error(`contract-repair-ticket-missing: ${ticketId}`);
+  const acceptanceIdentity = JSON.stringify(ticket.acceptance_criteria || []);
+  const artifactPath = path.join(sessionDir, 'contract-repairs', `${normalizedTicketId}.json`);
+  const lastMessagePath = path.join(sessionDir, `${normalizedTicketId}.contract-repair.last-message.txt`);
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true, mode: 0o700 });
+  fs.rmSync(artifactPath, { force: true });
+  const prompt = [
+    'You are the autonomous verification contract repair worker.',
+    `Session dir: ${sessionDir}`,
+    `Working directory: ${workingDir}`,
+    `Ticket ID: ${normalizedTicketId}`,
+    `Contract repair artifact path: ${artifactPath}`,
+    `Immutable acceptance criteria JSON: ${acceptanceIdentity}`,
+    `Invalid verification representation: ${JSON.stringify(ticket.verification ?? ticket.verify ?? null)}`,
+    options.strategy
+      ? `Mandatory material repair strategy: ${options.strategy.materialApproach}; strategy hash ${options.strategy.strategyHash}.`
+      : 'Mandatory material repair strategy: recompile-structured-contract.',
+    'Inspect the repository only as needed to recover the intended deterministic verification semantics. Do not modify repository files, acceptance criteria, scope, dependencies, or any ticket field.',
+    'Write one JSON object with schema_version: 1, ticket_id, verification (a non-empty array of structured process/package_script/shell steps), and rationale. Prefer process or package_script; shell requires a non-empty justification.',
+    'Return <promise>CONTRACT_REPAIR_COMPLETE</promise> after writing the artifact.',
+  ].join('\n\n');
+  let result;
+  try {
+    result = await runCodexExecMonitored({
+      execArgs: ['--sandbox', 'workspace-write'], cwd: workingDir, prompt,
+      timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
+      outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [sessionDir], inheritConfiguredAddDirs: false,
+      successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CONTRACT_REPAIR_COMPLETE') || hasPromiseToken(lastMessage, 'CONTRACT_REPAIR_COMPLETE'),
+      onSpawn: (child) => updateActiveChild(statePath, manager, { active_child_pid: child.pid, active_child_kind: 'codex', active_child_command: 'contract-repair' }),
+      cancelCheck: () => isSessionCancelled(manager, statePath),
+    });
+  } finally {
+    updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
+  }
+  assertCodexSucceeded(result, `Verification contract repair failed for ${normalizedTicketId}`);
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+  if (artifact.schema_version !== 1 || artifact.ticket_id !== normalizedTicketId) throw new Error('contract-repair-invalid-artifact: identity mismatch');
+  const steps = normalizeVerificationSteps(artifact.verification, { cwd: workingDir });
+  if (steps.length === 0) throw new Error('contract-repair-invalid-artifact: verification is empty');
+  if (options.diagnosticOnly) return steps;
+  ticket.verification = steps;
+  ticket.verify = steps.map((step) => verificationStepCommand(step).display).join(' && ');
+  atomicWriteJson(path.join(sessionDir, 'refinement_manifest.json'), rawManifest);
+  updateTicketStatus(sessionDir, normalizedTicketId, {
+    status: 'Todo',
+    failure_kind: null,
+    failure_reason: null,
+    contract_repaired_at: new Date().toISOString(),
+    contract_repair_strategy_hash: options.strategy?.strategyHash || null,
+  });
+  const persisted = readManifest(sessionDir).tickets.find((entry) => normalizeTicketId(entry.id, entry.id) === normalizedTicketId);
+  if (!persisted || JSON.stringify(persisted.acceptance_criteria || []) !== acceptanceIdentity) {
+    throw new Error('contract-repair-acceptance-criteria-mutated');
+  }
+  if (verificationStepIdentity(normalizeVerificationSteps(persisted.verification, { cwd: workingDir })) !== verificationStepIdentity(steps)) {
+    throw new Error('contract-repair-round-trip-drift');
+  }
+  return steps;
 }
 
 export async function runTicket(sessionDir: string, ticketId: string, options: RunTicketOptions = {}): Promise<RunTicketResult> {
@@ -736,6 +824,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         });
       },
     });
+    clearRejectedCandidateCheckpoint(sessionDir, normalizedTicketId);
     try {
       logActivity({
         event: 'ticket_completed',
@@ -877,6 +966,22 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         () => manager.read(statePath).quality_baseline,
       );
     }
+    const restoredCandidateCheckpoint = restoreRejectedCandidateCheckpoint({
+      sessionDir,
+      workingDir,
+      ticketId: normalizedTicketId,
+      expectedBaseHead: baselineHeadSha,
+      validateScope: (changedPaths) => {
+        const verdict = evaluatePersistedTicketScope(
+          sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha, workingDir, changedPaths,
+        );
+        if (!verdict.ok) throw new Error(`rejected-candidate-scope-violation: ${verdict.reason || verdict.violations.join(', ')}`);
+      },
+    });
+    const restoredCandidate = restoredCandidateCheckpoint
+      ? { ref: restoredCandidateCheckpoint.recovery_ref, changedPaths: restoredCandidateCheckpoint.changed_paths }
+      : null;
+    if (restoredCandidate) appendRunnerLog(sessionDir, runnerMode, `restored rejected candidate ${restoredCandidate.ref} for ${normalizedTicketId}`);
     updateActiveChild(statePath, manager, {
       worker_pid: process.pid,
       active_child_pid: null,
@@ -953,6 +1058,8 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
               remediationFeedback,
               artifactRecoveryFeedback,
               tmuxMode,
+              recoveryStrategy: options.recoveryStrategy || null,
+              restoredCandidate,
             }),
             timeoutMs: options.timeoutMs || config.defaults.worker_timeout_seconds * 1000,
             outputLastMessagePath: lastMessagePath,

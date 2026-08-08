@@ -9,6 +9,7 @@ import type { WorkerLifecycleArtifact, WorkerLifecyclePhase } from './worker-lif
 export type TicketFailureKind =
   | 'oracle_refusal'
   | 'worker_failure'
+  | 'verification_failed'
   | 'preflight'
   | 'verification_contract';
 
@@ -155,7 +156,7 @@ function validateRecoveryHistory(value: unknown): TicketRecoveryHistory {
   if (candidate.schema_version !== 1 || !Array.isArray(candidate.events)) {
     throw new Error('ticket-recovery-corrupt: unsupported history schema');
   }
-  const failureKinds = new Set<TicketFailureKind>(['oracle_refusal', 'worker_failure', 'preflight', 'verification_contract']);
+  const failureKinds = new Set<TicketFailureKind>(['oracle_refusal', 'worker_failure', 'verification_failed', 'preflight', 'verification_contract']);
   const lifecyclePhases = new Set<WorkerLifecyclePhase>([
     'research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'simplify', 'conformance',
   ]);

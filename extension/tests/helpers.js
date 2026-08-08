@@ -180,6 +180,7 @@ function writeLifecycleArtifact(phase) {
   const artifactPath = extractPathAfter('Lifecycle artifact path: ');
   const missingPhase = process.env.FAKE_LIFECYCLE_MISSING_PHASE || '';
   const refusalPhase = process.env.FAKE_LIFECYCLE_REFUSAL_PHASE || '';
+  const refusalLimit = Number(process.env.FAKE_LIFECYCLE_REFUSAL_COUNT || '0');
   const invalidOncePhase = process.env.FAKE_LIFECYCLE_INVALID_ONCE_PHASE || '';
   if (!artifactPath || phase === missingPhase) return;
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
@@ -187,6 +188,10 @@ function writeLifecycleArtifact(phase) {
   const invalidOnceMarker = controlSessionDir
     ? path.join(controlSessionDir, '.fake-' + phase + '-invalid-once')
     : '';
+  const refusalCounterPath = controlSessionDir && refusalPhase ? path.join(controlSessionDir, '.fake-' + refusalPhase + '-refusal-count') : '';
+  const priorRefusals = refusalCounterPath && fs.existsSync(refusalCounterPath) ? Number(fs.readFileSync(refusalCounterPath, 'utf8')) : 0;
+  const shouldRefuse = phase === refusalPhase && (refusalLimit === 0 || priorRefusals < refusalLimit);
+  if (shouldRefuse && refusalCounterPath) fs.writeFileSync(refusalCounterPath, String(priorRefusals + 1));
   if (phase === invalidOncePhase && invalidOnceMarker && !fs.existsSync(invalidOnceMarker)) {
     fs.writeFileSync(invalidOnceMarker, 'consumed\\n');
     fs.writeFileSync(artifactPath, '{invalid json');
@@ -199,7 +204,7 @@ function writeLifecycleArtifact(phase) {
   const artifact = phase === 'research'
     ? { ...base, evidence: ['approved research marker'] }
     : phase === 'research_review' || phase === 'plan_review'
-      ? phase === refusalPhase
+      ? shouldRefuse
         ? { ...base, verdict: 'changes_requested', evidence: ['reviewed ' + phase], findings: ['retry dispatch is not repository-bound'] }
         : { ...base, verdict: 'approved', evidence: ['approved ' + phase + ' evidence'] }
       : phase === 'plan'
@@ -207,7 +212,7 @@ function writeLifecycleArtifact(phase) {
         : phase === 'implement'
           ? { ...base, files_changed: process.env.FAKE_CODEX_MUTATE_FILE ? [process.env.FAKE_CODEX_MUTATE_FILE] : [], verification: ['fake implementation verification'] }
           : phase === 'review'
-            ? phase === refusalPhase
+            ? shouldRefuse
               ? {
                   ...base,
                   verdict: 'changes_requested',
@@ -218,7 +223,7 @@ function writeLifecycleArtifact(phase) {
               : { ...base, verdict: 'approved', implementation_reviewed: true, evidence: ['reviewed implementation diff'] }
             : phase === 'simplify'
               ? { ...base, verification: ['fake simplification verification'] }
-              : phase === refusalPhase
+              : shouldRefuse
                 ? {
                     ...base,
                     verdict: 'changes_requested',
@@ -236,7 +241,18 @@ function writeLifecycleArtifact(phase) {
   }
 }
 
-if (prompt.includes('You are the Citadel release reviewer')) {
+if (prompt.includes('You are the autonomous verification contract repair worker')) {
+  const artifactPath = extractPathAfter('Contract repair artifact path: ');
+  const ticketId = extractPathAfter('Ticket ID: ');
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    schema_version: 1,
+    ticket_id: ticketId,
+    verification: [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }],
+    rationale: 'replace malformed generated shell text with an argv-safe deterministic check',
+  }, null, 2));
+  lastMessage = '<promise>CONTRACT_REPAIR_COMPLETE</promise>';
+} else if (prompt.includes('You are the Citadel release reviewer')) {
   const reportPath = extractPathAfter('Citadel report path: ');
   const criteriaLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Required acceptance criteria '));
   const expectedCriteria = criteriaLine ? JSON.parse(criteriaLine.slice(criteriaLine.indexOf(': ') + 2)) : [];

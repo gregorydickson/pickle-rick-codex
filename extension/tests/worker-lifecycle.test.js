@@ -259,6 +259,11 @@ test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings i
   );
   assert.equal(git(projectDir, ['rev-parse', 'HEAD']), baseline);
   assert.equal(git(projectDir, ['status', '--porcelain']), '');
+  const candidateCheckpointPath = path.join(sessionDir, 'rejected-candidates', 'r1.json');
+  assert.equal(fs.existsSync(candidateCheckpointPath), true);
+  const candidateCheckpoint = JSON.parse(fs.readFileSync(candidateCheckpointPath, 'utf8'));
+  assert.match(candidateCheckpoint.recovery_ref, /^refs\/pickle\/salvage-history\//);
+  assert.deepEqual(candidateCheckpoint.changed_paths, ['feature.txt']);
   const firstRunCalls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length;
 
   runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], {
@@ -269,14 +274,57 @@ test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings i
   const implementPrompt = fs.readFileSync(path.join(promptLog, 'implement.prompt.txt'), 'utf8');
   assert.match(implementPrompt, /Prior rejected lifecycle feedback/);
   assert.match(implementPrompt, /retry dispatch is not repository-bound/);
+  assert.match(implementPrompt, /rejected candidate was restored from durable ref/);
   const allCalls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   const retryPhases = allCalls.slice(firstRunCalls)
     .map((entry) => entry.args[entry.args.indexOf('--output-last-message') + 1])
     .map((lastMessagePath) => path.basename(lastMessagePath).split('.')[1]);
   assert.deepEqual(retryPhases, ['implement', 'review', 'simplify', 'conformance']);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
+  assert.equal(fs.existsSync(candidateCheckpointPath), false);
 });
 }
+
+test('field-equivalent malformed contract plus two review refusals completes within fifteen model calls', () => {
+  const fakeBin = makeTempRoot('pickle-field-equivalent-bin-');
+  createFakeCodex(fakeBin);
+  const dataRoot = makeTempRoot();
+  const invocationLog = path.join(dataRoot, 'codex-field-equivalent.jsonl');
+  const promptLog = makeTempRoot('pickle-field-equivalent-prompts-');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'implemented\n',
+    FAKE_LIFECYCLE_REFUSAL_PHASE: 'review',
+    FAKE_LIFECYCLE_REFUSAL_COUNT: '2',
+    FAKE_LIFECYCLE_PROMPT_LOG: promptLog,
+  });
+  const { projectDir, sessionDir } = setupLifecycleRun(env);
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const originalCriteria = structuredClone(manifest.tickets[0].acceptance_criteria);
+  manifest.tickets[0].verification = ['node -e "const ids=[...s.matchAll(new RegExp(`(AR-`+p+)`,`g`))]"'];
+  writeJson(manifestPath, manifest);
+
+  runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry'], { env, cwd: projectDir });
+
+  const calls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    .filter((entry) => entry.args[0] === 'exec');
+  assert.ok(calls.length <= 15, `expected <=15 model calls, got ${calls.length}`);
+  assert.equal(calls.length, 13);
+  const phases = calls.map((entry) => path.basename(entry.args[entry.args.indexOf('--output-last-message') + 1] || '').split('.')[1]);
+  assert.equal(phases.filter((phase) => phase === 'research').length, 1);
+  assert.equal(phases.filter((phase) => phase === 'plan').length, 1);
+  assert.equal(phases[0], 'contract-repair');
+  const repairedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.deepEqual(repairedManifest.tickets[0].acceptance_criteria, originalCriteria);
+  assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
+  const finalImplementPrompt = fs.readFileSync(path.join(promptLog, 'implement.prompt.txt'), 'utf8');
+  assert.match(finalImplementPrompt, /Mandatory recovery strategy:/);
+  assert.match(finalImplementPrompt, /rejected candidate was restored from durable ref/);
+});
 
 for (const [label, envFlag, phase, expected] of [
   ['missing', 'FAKE_LIFECYCLE_MISSING_PHASE', 'plan', /worker-lifecycle-missing-artifact/],

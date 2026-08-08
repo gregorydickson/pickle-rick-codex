@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { describeVerificationContract, normalizeVerificationCommands } from './verification-env.js';
 import { serializeApprovedWorkerContext, type WorkerLifecycleArtifact, type WorkerLifecyclePhase } from './worker-lifecycle.js';
+import type { RecoveryStrategyEpoch } from './productive-autonomy.js';
 import type { Ticket, VerificationContract } from '../types/index.js';
 
 const REFINEMENT_LEAF_BOUNDARY = [
@@ -147,6 +148,8 @@ export interface TicketPhasePromptInput {
   remediationFeedback?: WorkerLifecycleArtifact | null;
   artifactRecoveryFeedback?: string | null;
   tmuxMode?: boolean;
+  recoveryStrategy?: RecoveryStrategyEpoch | null;
+  restoredCandidate?: { ref: string; changedPaths: string[] } | null;
 }
 
 function lifecycleArtifactContract(phase: WorkerLifecyclePhase, ticketId: string): string {
@@ -173,6 +176,8 @@ export function buildTicketPhasePrompt({
   remediationFeedback = null,
   artifactRecoveryFeedback = null,
   tmuxMode = false,
+  recoveryStrategy = null,
+  restoredCandidate = null,
 }: TicketPhasePromptInput): string {
   const verificationCommands = normalizeVerificationCommands(ticket?.verification, {
     verify: ticket?.verify,
@@ -227,6 +232,12 @@ export function buildTicketPhasePrompt({
       : null,
     artifactRecoveryFeedback
       ? `Prior artifact-contract attempt failed and must be corrected in this retry: ${artifactRecoveryFeedback}`
+      : null,
+    recoveryStrategy
+      ? `Mandatory recovery strategy: ${recoveryStrategy.materialApproach}. Strategy hash: ${recoveryStrategy.strategyHash}. Recovery handler: ${recoveryStrategy.handler}. Change the implementation approach materially in accordance with this strategy; do not merely repeat the rejected attempt.`
+      : null,
+    phase === 'implement' && restoredCandidate
+      ? `A rejected candidate was restored from durable ref ${restoredCandidate.ref}. Its scope-validated paths are ${JSON.stringify(restoredCandidate.changedPaths)}. Remediate this preserved candidate in place; do not reconstruct it from scratch.`
       : null,
     `Return <promise>${phase.toUpperCase()}_COMPLETE</promise> when this phase is finished.`,
     'Stop immediately after writing any phase-result artifacts and the promise token.',

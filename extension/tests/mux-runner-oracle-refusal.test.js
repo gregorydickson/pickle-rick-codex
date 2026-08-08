@@ -11,6 +11,7 @@ import { StateManager } from '../services/state-manager.js';
 import { updateTicketStatus } from '../services/tickets.js';
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
+import { VerificationCommandError } from '../bin/spawn-morty.js';
 import {
   buildTicketRecoveryFailureIdentity,
   recordTicketRecoveryFailure,
@@ -466,10 +467,15 @@ test('mux-runner schedules diagnostic work instead of terminating when all ticke
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('all blocked repair task');
   updateTicketStatus(sessionDir, 'r1', { status: 'Blocked', failure_reason: 'contract needs repair' });
   let calls = 0;
+  let repairs = 0;
   const finalReason = await withDataRoot(dataRoot, () => runSequential(
     sessionDir,
     { onFailure: 'retry', runnerMode: 'pickle' },
     {
+      repairTicketVerificationContract: async () => {
+        repairs += 1;
+        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+      },
       runTicket: async () => {
         calls += 1;
         return { status: 'done', applied: true };
@@ -478,7 +484,36 @@ test('mux-runner schedules diagnostic work instead of terminating when all ticke
   ));
   assert.equal(finalReason, 'success');
   assert.equal(calls, 1);
+  assert.equal(repairs, 1);
   assert.match(readRunnerLog(sessionDir), /all tickets blocked; scheduled diagnose-and-select-material-repair-strategy/);
+  assert.match(readRunnerLog(sessionDir), /executed diagnostic contract repair/);
+});
+
+test('mux-runner records verification command failures as typed verification recovery', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('typed verification failure task');
+  let calls = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async (_dir, ticketId, options) => {
+        calls += 1;
+        if (calls === 1) {
+          throw new VerificationCommandError({
+            command: 'node --test', stdout: '', stderr: 'assertion failed', exitCode: 1, failures: [],
+          });
+        }
+        assert.match(options.recoveryStrategy.materialApproach, /obligation|verification|diagnostic|fixture/);
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+  assert.equal(finalReason, 'success', readRunnerLog(sessionDir));
+  const history = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-history.json'), 'utf8'));
+  assert.equal(history.events[0].failure_kind, 'verification_failed');
+  assert.equal(history.events[0].failure_domain, 'verification');
+  assert.notEqual(history.events[0].failure_kind, 'worker_failure');
 });
 
 test('mux-runner yields a repairing ticket to independent dependency-ready work', async () => {
