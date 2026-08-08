@@ -46,21 +46,22 @@ function makeCitadelLifecycleSession(criterion) {
 
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({
+    reviewed_range: 'abc..HEAD',
     findings: [{ severity: 'high', title: 'Broken contract', evidence: 'src/a.ts:4 contradicts src/b.ts:9' }],
     acceptance_criteria_checked: ['AC-1'],
   }, 'abc..HEAD', ['AC-1']);
   assert.equal(report.verdict, 'block');
   assert.equal(report.findings[0].severity, 'high');
-  assert.throws(() => validateCitadelReport({ findings: [{ severity: 'urgent' }] }, 'abc..HEAD', ['AC-1']), /unsupported severity/);
+  assert.throws(() => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [{ severity: 'urgent' }] }, 'abc..HEAD', ['AC-1']), /unsupported severity/);
 });
 
 test('validateCitadelReport rejects empty and incomplete acceptance-criteria evidence', () => {
   assert.throws(
-    () => validateCitadelReport({ findings: [], acceptance_criteria_checked: [] }, 'abc..HEAD', []),
+    () => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [], acceptance_criteria_checked: [] }, 'abc..HEAD', []),
     /declares no acceptance criteria/,
   );
   assert.throws(
-    () => validateCitadelReport({ findings: [], acceptance_criteria_checked: ['AC-1'] }, 'abc..HEAD', ['AC-1', 'AC-2']),
+    () => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [], acceptance_criteria_checked: ['AC-1'] }, 'abc..HEAD', ['AC-1', 'AC-2']),
     /coverage is incomplete.*AC-2/,
   );
 });
@@ -74,13 +75,14 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
   }
   for (const finding of [null, [], {}, { severity: 'low', title: ' ', evidence: 'proof' }]) {
     assert.throws(
-      () => validateCitadelReport({ findings: [finding], acceptance_criteria_checked: ['AC-1'] }, 'abc..HEAD', ['AC-1']),
+      () => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [finding], acceptance_criteria_checked: ['AC-1'] }, 'abc..HEAD', ['AC-1']),
       /expected an object|unsupported severity|title and evidence are required/,
     );
   }
 
   const generatedAt = '2026-07-18T00:00:00.000Z';
   const report = validateCitadelReport({
+    reviewed_range: 'abc..HEAD',
     findings: [{
       severity: 'INFO',
       title: '  Checked contract  ',
@@ -105,6 +107,7 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
   assert.equal(report.generated_at, generatedAt);
 
   const defaults = validateCitadelReport({
+    reviewed_range: 'abc..HEAD',
     findings: [{ severity: 'low', title: 'Advisory', evidence: 'Observed', file: '', line: 0, recommendation: '' }],
     acceptance_criteria_checked: ['AC-1'],
   }, 'abc..HEAD', ['AC-1']);
@@ -278,10 +281,11 @@ const prompt = fs.readFileSync(0, 'utf8');
 const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
 const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
 const mode = criteria[0] || '';
+const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
 fs.writeFileSync(reportPath, JSON.stringify({
   schema_version: 1,
   verdict: 'approve',
-  reviewed_range: 'provided by gate',
+  reviewed_range: reviewedRange,
   acceptance_criteria_checked: mode.includes('invalid evidence') ? [] : criteria,
   findings: [],
   generated_at: '2026-07-18T00:00:00.000Z'

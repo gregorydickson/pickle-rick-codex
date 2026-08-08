@@ -430,6 +430,7 @@ interface AutoCommitDetachedTicketChangesInput {
   ticket: Ticket;
   config: Config;
   changedPaths: string[];
+  assertDurableOwnership?: () => void;
 }
 
 function autoCommitDetachedTicketChanges({
@@ -443,6 +444,7 @@ function autoCommitDetachedTicketChanges({
   ticket,
   config,
   changedPaths,
+  assertDurableOwnership,
 }: AutoCommitDetachedTicketChangesInput): string | null {
   if (!tmuxMode || !baselineTrackedClean || !isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir)) {
     return null;
@@ -456,10 +458,12 @@ function autoCommitDetachedTicketChanges({
 
   appendRunnerLog(sessionDir, runnerMode, `no clean commit boundary detected for ${ticketId}; auto-committing ticket changes`);
   try {
+    assertDurableOwnership?.();
     // Stage the already-fenced ticket delta only. Whole-tree staging here would
     // sweep in a concurrent/user or quality-command mutation after scope review.
     resetGitIndex(workingDir);
     stagePaths(workingDir, changedPaths);
+    assertDurableOwnership?.();
     commitTrackedChanges(workingDir, ticketCommitMessage(ticketId, ticket));
     const head = getHeadSha(workingDir);
     appendRunnerLog(sessionDir, runnerMode, `ticket ${ticketId} auto-committed: ${head}`);
@@ -660,6 +664,7 @@ interface RunTicketOptions {
   recoveryEpoch?: number;
   strategyHash?: string | null;
   recoveryStrategy?: RecoveryStrategyEpoch | null;
+  assertDurableOwnership?: () => void;
   [key: string]: unknown;
 }
 
@@ -672,8 +677,10 @@ interface RunTicketResult {
 export async function repairTicketVerificationContract(
   sessionDir: string,
   ticketId: string,
-  options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; diagnosticOnly?: boolean } = {},
+  options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; diagnosticOnly?: boolean; assertDurableOwnership?: () => void } = {},
 ): Promise<VerificationStep[]> {
+  const assertOwnership = (): void => options.assertDurableOwnership?.();
+  assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
@@ -712,6 +719,7 @@ export async function repairTicketVerificationContract(
       onSpawn: (child) => updateActiveChild(statePath, manager, { active_child_pid: child.pid, active_child_kind: 'codex', active_child_command: 'contract-repair' }),
       cancelCheck: () => isSessionCancelled(manager, statePath),
     });
+    assertOwnership();
   } finally {
     updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
   }
@@ -721,9 +729,11 @@ export async function repairTicketVerificationContract(
   const steps = normalizeVerificationSteps(artifact.verification, { cwd: workingDir });
   if (steps.length === 0) throw new Error('contract-repair-invalid-artifact: verification is empty');
   if (options.diagnosticOnly) return steps;
+  assertOwnership();
   ticket.verification = steps;
   ticket.verify = steps.map((step) => verificationStepCommand(step).display).join(' && ');
   atomicWriteJson(path.join(sessionDir, 'refinement_manifest.json'), rawManifest);
+  assertOwnership();
   updateTicketStatus(sessionDir, normalizedTicketId, {
     status: 'Todo',
     failure_kind: null,
@@ -742,6 +752,8 @@ export async function repairTicketVerificationContract(
 }
 
 export async function runTicket(sessionDir: string, ticketId: string, options: RunTicketOptions = {}): Promise<RunTicketResult> {
+  const assertOwnership = (): void => options.assertDurableOwnership?.();
+  assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
@@ -794,6 +806,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     .sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.artifact ?? null;
 
   function updateTicketAndClearAdvance(updates: Record<string, unknown>): void {
+    assertOwnership();
     const advancePath = refinementRepositoryAdvancePath(sessionDir);
     updateTicketStatus(sessionDir, normalizedTicketId, updates, {
       transactionPaths: [advancePath],
@@ -802,6 +815,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   }
 
   function finalizeSuccess(applied: boolean): RunTicketResult {
+    assertOwnership();
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'Done',
       completed_at: new Date().toISOString(),
@@ -842,6 +856,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   }
 
   function finalizeRefusal(applied: boolean, decision: CompletionDecision & { ok: false }): RunTicketResult {
+    assertOwnership();
     // The oracle found no attributable completion evidence: do NOT flip Done and do
     // NOT stamp a completion_commit. Surface the refusal reason for the caller/logs.
     appendRunnerLog(
@@ -862,16 +877,19 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   }
 
   async function runDeterministicVerification(): Promise<void> {
+    assertOwnership();
     manager.update(statePath, (current) => {
       current.step = 'verify';
       appendHistory(current, 'verify', normalizedTicketId);
       return current;
     });
     for (const step of verificationSteps) {
+      assertOwnership();
       if (isSessionCancelled(manager, statePath)) throw new CancellationError();
       const command = verificationStepCommand(step).display;
       try {
         await runVerificationCommand({ step, cwd: workingDir, timeoutMs: config.defaults.worker_timeout_seconds * 1000, manager, statePath, env: verificationReady.env });
+        assertOwnership();
       } catch (error) {
         if (error instanceof VerificationCommandError) {
           const remainingFailures = subtractBaselineFailures(sessionDir, normalizedTicketId, command, workingDir, error.failures);
@@ -887,6 +905,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   }
 
   try {
+    assertOwnership();
     verificationReady = assertTicketVerificationReady({
       ticket: normalizedTicket,
       // Config is a valid verification input at runtime; ConfigDefaults lacks
@@ -910,6 +929,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     }
     workspaceBaseline = captureWorkspaceSnapshot(workingDir);
     persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+    assertOwnership();
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
       started_at: new Date().toISOString(),
@@ -949,6 +969,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           }),
         },
       );
+      assertOwnership();
       if (isSessionCancelled(manager, statePath)) throw new CancellationError();
       if (repositoryMutationFingerprint(workingDir) !== beforeQualityBaseline) {
         throw new Error(
@@ -1011,6 +1032,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     }
 
     for (const phase of WORKER_LIFECYCLE_PHASES) {
+      assertOwnership();
       if (lifecycleArtifacts.some((artifact) => artifact.phase === phase)) continue;
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
@@ -1024,6 +1046,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       let artifactRecoveryFeedback: string | null = null;
 
       for (let phaseAttempt = 1; phaseAttempt <= maxPhaseAttempts; phaseAttempt += 1) {
+        assertOwnership();
         const phaseState = manager.update(statePath, (current) => {
           current.current_ticket = normalizedTicketId;
           current.step = phase;
@@ -1079,6 +1102,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
             cancelCheck: () => isSessionCancelled(manager, statePath),
           });
           modelResult = result;
+          assertOwnership();
           modelOutcome = result.cancelled ? 'cancelled' : result.timedOut ? 'timed_out' : result.exitCode === 0 ? 'success' : 'failed';
           if (result.cancelled || isSessionCancelled(manager, statePath)) {
             throw new CancellationError();
@@ -1154,6 +1178,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       if (!acceptedArtifact) {
         throw new Error(`worker-lifecycle-invalid-artifact: ${phase} exhausted bounded artifact recovery`);
       }
+      assertOwnership();
       atomicWriteJson(artifactPath, acceptedArtifact);
       if (acceptedArtifact.verdict === 'changes_requested') {
         const refusalPath = archiveWorkerLifecycleRefusal(
@@ -1166,12 +1191,15 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       }
       lifecycleArtifacts.push(acceptedArtifact);
       if (phase === 'plan_review') {
+        assertOwnership();
         writeLifecycleContextCheckpoint(sessionDir, normalizedTicketId, contextInputHash, lifecycleArtifacts.slice(0, 4));
       }
+      assertOwnership();
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
       if (phase === 'implement') await runDeterministicVerification();
     }
 
+    assertOwnership();
     const changedPathsBeforeGate = changedPathsSinceSnapshot(workingDir, workspaceBaseline);
     const scopeVerdict = evaluatePersistedTicketScope(
       sessionDir,
@@ -1203,6 +1231,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         }),
       },
     );
+    assertOwnership();
     if (isSessionCancelled(manager, statePath)) throw new CancellationError();
     if (workerGate.verdict === 'red') {
       const failures = workerGate.failures.map((failure) => failure.command).join(', ');
@@ -1237,6 +1266,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       changedPaths: postGateChangedPaths,
     });
 
+    assertOwnership();
     const autoCommitSha = autoCommitDetachedTicketChanges({
       sessionDir,
       runnerMode,
@@ -1248,6 +1278,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       ticket: normalizedTicket,
       config,
       changedPaths: postGateChangedPaths,
+      assertDurableOwnership: assertOwnership,
     });
 
     // Reconcile the completion commit's Pickle-Ticket trailer (amends an untrailed
@@ -1260,6 +1291,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       autoCommitSha,
       ticketId: normalizedTicketId,
     });
+    assertOwnership();
     const applied = getWorkingTreeFingerprint(workingDir) !== baselineFingerprint;
     const decision = evaluateCompletionEvidence(buildCompletionCtx({
       sessionDir,
@@ -1375,12 +1407,18 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     });
     throw handledError;
   } finally {
-    updateActiveChild(statePath, manager, {
-      worker_pid: null,
-      active_child_pid: null,
-      active_child_kind: null,
-      active_child_command: null,
-    });
+    try {
+      assertOwnership();
+      updateActiveChild(statePath, manager, {
+        worker_pid: null,
+        active_child_pid: null,
+        active_child_kind: null,
+        active_child_command: null,
+      });
+    } catch {
+      // Preserve the immutable child/recovery handle for the new owner. A stale
+      // worker must never erase state written by its replacement.
+    }
   }
 }
 

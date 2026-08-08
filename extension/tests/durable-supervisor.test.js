@@ -5,6 +5,7 @@ import { makeTempRoot } from './helpers.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
   acceptRuntimeHandoff,
+  abortExpiredRuntimeHandoff,
   acquireSupervisorLease,
   assertSupervisorLeaseFence,
   beginAutonomousExecution,
@@ -113,8 +114,14 @@ test('watchdog replaces a killed executor and resumes from the durable journal c
 test('normal terminal contract accepts only completed and cancelled and seals the journal', () => {
   const sessionDir = createAutonomousPipeline('terminal-contract-');
   assert.throws(() => terminateLogicalPipeline(sessionDir, 'failed'), /scores are zero/);
-  const completed = terminateLogicalPipeline(sessionDir, 'completed', { nowMs: 3_000 });
-  assert.equal(completed.terminal_state, 'completed');
+  assert.throws(() => terminateLogicalPipeline(sessionDir, 'completed', { nowMs: 3_000 }), /active supervisor lease/);
+  const owner = acquireSupervisorLease(sessionDir, { ownerId: 'terminal-owner', ttlMs: 1_000, nowMs: 3_000 });
+  assert.throws(
+    () => terminateLogicalPipeline(sessionDir, 'completed', { ownerId: owner.owner_id, token: owner.token, nowMs: 3_100 }),
+    /fresh Citadel approval|State file not found/,
+  );
+  const completed = terminateLogicalPipeline(sessionDir, 'cancelled', { ownerId: owner.owner_id, token: owner.token, nowMs: 3_101 });
+  assert.equal(completed.terminal_state, 'cancelled');
   assert.equal(completed.lease, null);
   assert.throws(
     () => acquireSupervisorLease(sessionDir, { ownerId: 'too-late', ttlMs: 1_000, nowMs: 4_000 }),
@@ -122,8 +129,42 @@ test('normal terminal contract accepts only completed and cancelled and seals th
   );
 
   const cancelledDir = createAutonomousPipeline('cancelled-contract-');
-  assert.equal(terminateLogicalPipeline(cancelledDir, 'cancelled').terminal_state, 'cancelled');
+  const canceller = acquireSupervisorLease(cancelledDir, { ownerId: 'cancel-owner', ttlMs: 10_000 });
+  assert.equal(terminateLogicalPipeline(cancelledDir, 'cancelled', { ownerId: canceller.owner_id, token: canceller.token }).terminal_state, 'cancelled');
   assert.equal(readLogicalPipeline(cancelledDir).events.at(-1).kind, 'pipeline_cancelled');
+});
+
+test('released handoff reserves takeover for green and old blue cannot reacquire', () => {
+  const sessionDir = createAutonomousPipeline('blue-green-no-reacquire-');
+  const blue = acquireSupervisorLease(sessionDir, { ownerId: 'blue', ttlMs: 5_000, nowMs: 3_000 });
+  const requestId = requestRuntimeHandoff(sessionDir, blue.owner_id, blue.token, blueRuntime, greenRuntime, { phase: 'implement' }, { nowMs: 3_100 });
+  releaseRuntimeHandoffLease(sessionDir, blue.owner_id, blue.token, requestId, { nowMs: 3_200 });
+  assert.throws(
+    () => acquireSupervisorLease(sessionDir, { ownerId: 'blue-restart', ttlMs: 5_000, nowMs: 3_201 }),
+    /reserved for the pending runtime handoff target/,
+  );
+  assert.equal(acceptRuntimeHandoff(sessionDir, requestId, 'green', 5_000, greenRuntime, { nowMs: 3_300 }).lease.owner_id, 'green');
+});
+
+test('released handoff aborts after target timeout and restores autonomous takeover', () => {
+  const sessionDir = createAutonomousPipeline('blue-green-timeout-');
+  const blue = acquireSupervisorLease(sessionDir, { ownerId: 'blue', ttlMs: 5_000, nowMs: 3_000 });
+  const requestId = requestRuntimeHandoff(sessionDir, blue.owner_id, blue.token, blueRuntime, greenRuntime, { phase: 'implement' }, { nowMs: 3_100 });
+  releaseRuntimeHandoffLease(sessionDir, blue.owner_id, blue.token, requestId, { nowMs: 3_200 });
+  assert.equal(abortExpiredRuntimeHandoff(sessionDir, 1_000, { nowMs: 4_099 }), false);
+  assert.equal(abortExpiredRuntimeHandoff(sessionDir, 1_000, { nowMs: 4_100 }), true);
+  assert.equal(acquireSupervisorLease(sessionDir, { ownerId: 'blue-recovered', ttlMs: 5_000, nowMs: 4_101 }).owner_id, 'blue-recovered');
+  assert.throws(() => acceptRuntimeHandoff(sessionDir, requestId, 'late-green', 5_000, greenRuntime, { nowMs: 4_102 }), /aborted/);
+});
+
+test('handoff timeout recovers when source dies before releasing its expired lease', () => {
+  const sessionDir = createAutonomousPipeline('blue-green-source-crash-');
+  const blue = acquireSupervisorLease(sessionDir, { ownerId: 'blue', ttlMs: 500, nowMs: 3_000 });
+  requestRuntimeHandoff(sessionDir, blue.owner_id, blue.token, blueRuntime, greenRuntime, { phase: 'implement' }, { nowMs: 3_100 });
+  assert.equal(abortExpiredRuntimeHandoff(sessionDir, 1_000, { nowMs: 4_100 }), true);
+  const recovered = acquireSupervisorLease(sessionDir, { ownerId: 'blue-recovered', ttlMs: 5_000, nowMs: 4_101 });
+  assert.equal(recovered.owner_id, 'blue-recovered');
+  assert.equal(readLogicalPipeline(sessionDir).executor_restart_count, 1);
 });
 
 test('blue-green handoff fences the shadow until release and resumes under one new owner', () => {

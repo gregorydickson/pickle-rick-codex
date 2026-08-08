@@ -7,6 +7,7 @@ import { makeTempRoot } from './helpers.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
   beginAutonomousExecution,
+  acquireSupervisorLease,
   createLogicalPipeline,
   requestPrdRevision,
   terminateLogicalPipeline,
@@ -34,12 +35,10 @@ test('supervised runner restarts every nonterminal autonomous executor exit', ()
   assert.equal(supervisedRunnerDecision(sessionDir), 'wait_for_prd');
 });
 
-test('supervised runner exits only for the two logical terminal states', () => {
-  const completed = autonomousSession();
-  terminateLogicalPipeline(completed, 'completed');
-  assert.equal(supervisedRunnerDecision(completed), 'completed');
+test('supervised runner exits for cooperative logical cancellation', () => {
   const cancelled = autonomousSession();
-  terminateLogicalPipeline(cancelled, 'cancelled');
+  const cancelledLease = acquireSupervisorLease(cancelled, { ownerId: 'cancelled-test', ttlMs: 60_000 });
+  terminateLogicalPipeline(cancelled, 'cancelled', { ownerId: cancelledLease.owner_id, token: cancelledLease.token });
   assert.equal(supervisedRunnerDecision(cancelled), 'cancelled');
 });
 
@@ -59,8 +58,9 @@ if (count === 1) {
   fs.writeFileSync(pidPath, String(process.pid));
   setInterval(() => {}, 1000);
 } else {
-  const { terminateLogicalPipeline } = await import(durableModule);
-  terminateLogicalPipeline(sessionDir, 'completed');
+  const { acquireSupervisorLease, terminateLogicalPipeline } = await import(durableModule);
+  const lease = acquireSupervisorLease(sessionDir, { ownerId: 'fixture-replacement', ttlMs: 60000 });
+  terminateLogicalPipeline(sessionDir, 'cancelled', { ownerId: lease.owner_id, token: lease.token });
 }
 `);
 
@@ -76,7 +76,7 @@ if (count === 1) {
   }
   assert.ok(fs.existsSync(pidPath), 'first executor did not start');
   process.kill(Number(fs.readFileSync(pidPath, 'utf8')), 'SIGKILL');
-  assert.equal(await run, 0);
+  assert.equal(await run, 130);
   assert.equal(fs.readFileSync(countPath, 'utf8'), '2');
-  assert.equal(supervisedRunnerDecision(sessionDir), 'completed');
+  assert.equal(supervisedRunnerDecision(sessionDir), 'cancelled');
 });

@@ -33,18 +33,25 @@ import { acquireSessionOperation } from '../services/session-operation.js';
 import {
   beginRecoveryStrategyEpoch,
   classifyAutonomousFailure,
-  classifyFailure,
   executionTelemetrySummary,
   nextMaterialApproach,
   planSchedulerContinuity,
   readRecoveryStrategyEpochs,
   recordExecutionControlTelemetry,
   recoveryRoute,
+  recoveryExecutionAction,
+  resolveAutonomousRecovery,
   type FailureDomain,
+  type FailureRoute,
   type RecoveryStrategyEpoch,
 } from '../services/productive-autonomy.js';
 import { isVerificationCommandError, repairTicketVerificationContract, runTicket } from './spawn-morty.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
+import { runCitadel } from '../services/citadel.js';
+import { requestPrdRevision } from '../services/durable-supervisor.js';
+import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
+import { archiveCitadelRefusalAndResetTickets } from '../services/citadel-remediation.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -52,12 +59,15 @@ interface RunSequentialOptions {
   timeoutMs?: number;
   durableOwnershipHeld?: boolean;
   assertDurableOwnership?: () => void;
+  handoffRequestId?: string;
+  targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
   [key: string]: unknown;
 }
 
 interface RunSequentialDeps {
   runTicket?: typeof runTicket;
   repairTicketVerificationContract?: typeof repairTicketVerificationContract;
+  runCitadel?: typeof runCitadel;
 }
 
 function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
@@ -120,6 +130,9 @@ async function runSequentialWithLease(
   let failedTicketId: string | null = null;
 
   appendRunnerLog(sessionDir, runnerMode, runnerDescriptor.runnerStartMarker);
+  // A SIGKILL can leave a detached worker process group alive. Reap the exact
+  // captured identity before runner startup clears its recovery handle.
+  assertRecordedActiveChildRecovered(sessionDir, manager);
   enterMuxRunnerPhase(manager, statePath, {
     markRunStart,
     runStartedAtMs: Number(options.runStartedAtMs),
@@ -148,7 +161,7 @@ async function runSequentialWithLease(
       ticketId, domain: 'contract', handler: route.handler, checkpoint: route.invalidate[0] || 'prepare',
       constraints: [(error as Error).message], materialApproach: nextMaterialApproach('contract', priorEpochs),
     }, 'failure');
-    await repairContractFn(sessionDir, ticketId, { strategy, timeoutMs: options.timeoutMs });
+    await repairContractFn(sessionDir, ticketId, { strategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
     appendRunnerLog(sessionDir, runnerMode, `repaired invalid verification contract for ${ticketId} before scheduler dispatch`);
     summary = summarizeTickets(sessionDir);
   }
@@ -234,6 +247,8 @@ async function runSequentialWithLease(
     let activeStrategyHash: string | null = activeStrategy?.strategyHash || null;
     let activeRecoveryEpoch = priorTicketStrategies.length;
     let latestFailureDomain: FailureDomain = 'infrastructure';
+    let latestFailureRoute: FailureRoute = recoveryRoute('infrastructure');
+    let pendingContractRepair = false;
     let yieldToScheduler = false;
 
     const selectRecoveryStrategy = (
@@ -241,7 +256,22 @@ async function runSequentialWithLease(
       trigger: 'failure' | 'retry_threshold' | 'time_threshold' | 'circuit_threshold' = 'retry_threshold',
     ): RecoveryStrategyEpoch | null => {
       try {
-        const route = recoveryRoute(latestFailureDomain);
+        const route = latestFailureRoute;
+        const executionAction = recoveryExecutionAction(route);
+        if (executionAction === 'request_prd_revision') {
+          requestPrdRevision(
+            sessionDir,
+            reason,
+            `Review and repair ${route.failureType || route.domain} before resuming autonomous execution.`,
+          );
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} paused for explicit PRD revision approval`);
+          return null;
+        }
+        if (executionAction === 'restart_executor') {
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} requested a supervised executor restart`);
+          return null;
+        }
+        pendingContractRepair = executionAction === 'repair_contract';
         recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: route.invalidate.length });
         const priorEpochs = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticket.id).length;
         const strategy = beginRecoveryStrategyEpoch(sessionDir, {
@@ -324,12 +354,13 @@ async function runSequentialWithLease(
           evidencePath: refusal?.artifactPath || null,
           remediationIdentity: refusal?.remediationIdentity || null,
         });
-        latestFailureDomain = classifyFailure({
+        latestFailureRoute = resolveAutonomousRecovery({
           kind: failureKind,
           phase: refusal?.phase || manager.read(statePath).step as string | undefined,
           message,
         });
-        const route = recoveryRoute(latestFailureDomain);
+        latestFailureDomain = latestFailureRoute.domain;
+        const route = latestFailureRoute;
         let event;
         try {
           event = recordTicketRecoveryFailure({
@@ -478,11 +509,18 @@ async function runSequentialWithLease(
 
       attempts += 1;
       try {
+        if (pendingContractRepair) {
+          options.assertDurableOwnership?.();
+          await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          pendingContractRepair = false;
+          options.assertDurableOwnership?.();
+        }
         if (scheduledDiagnosticTicketId === normalizeTicketId(ticket.id, ticket.id)) {
           if (!activeStrategy && !startAutomaticRecoveryEpoch('all-blocked diagnostic repair', 'failure')) {
             throw new Error('diagnostic-repair-strategy-unavailable');
           }
-          await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs });
+          await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          pendingContractRepair = false;
           scheduledDiagnosticTicketId = null;
           appendRunnerLog(sessionDir, runnerMode, `executed diagnostic contract repair for ${ticket.id}`);
         }
@@ -551,7 +589,7 @@ async function runSequentialWithLease(
                 repairingTicketIds.add(normalized);
                 break;
               }
-              await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs });
+              await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
               appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight routed to autonomous contract repair`);
               continue;
             }
@@ -571,7 +609,7 @@ async function runSequentialWithLease(
                 repairingTicketIds.add(normalized);
                 break;
               }
-              await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs });
+              await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
               appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract routed to autonomous contract repair`);
               continue;
             }
@@ -684,7 +722,15 @@ export async function runSequential(
   let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
   let exitReason = 'error';
   try {
-    ownership = startDurableRuntimeOwnership(sessionDir);
+    ownership = startDurableRuntimeOwnership(sessionDir, {
+      handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
+      targetRuntime: options.targetRuntime,
+    });
+    if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
+      ownership.assertOwned();
+      finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);
+      ownership.assertOwned();
+    }
     exitReason = await runSequentialWithLease(sessionDir, {
       ...options,
       onFailure: 'retry',
@@ -692,6 +738,18 @@ export async function runSequential(
       assertDurableOwnership: ownership.assertOwned,
       runStartedAtMs,
     }, deps);
+    if (exitReason === 'success' && options.runnerMode !== 'pipeline') {
+      ownership.assertOwned();
+      const citadelExit = await (deps.runCitadel ?? runCitadel)(sessionDir, {
+        assertDurableOwnership: ownership.assertOwned,
+      });
+      ownership.assertOwned();
+      if (citadelExit !== 'success') {
+        exitReason = citadelExit;
+        ownership.assertOwned();
+        if (citadelExit === 'citadel-blocked') archiveCitadelRefusalAndResetTickets(sessionDir);
+      }
+    }
     return exitReason;
   } finally {
     try {
@@ -711,6 +769,11 @@ async function main(argv: string[]): Promise<void> {
     onFailure: parseFailureMode(argv),
     launchOwnerPid: parseLaunchOwnerPid(argv),
     runStartedAtMs: parseRunStartedAtMs(argv),
+    handoffRequestId: argv.find((arg) => arg.startsWith('--handoff-request='))?.split('=')[1],
+    targetRuntime: (() => {
+      const encoded = argv.find((arg) => arg.startsWith('--target-runtime='))?.split('=')[1];
+      return encoded ? JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) : undefined;
+    })(),
   });
   if (muxRunnerExitFailed(exitReason)) {
     process.exitCode = 1;
@@ -726,6 +789,7 @@ export function muxRunnerExitFailed(exitReason: string): boolean {
     || exitReason === 'circuit_open'
     || exitReason === 'recovery_exhausted'
     || exitReason === 'recovery_required'
+    || exitReason === 'citadel-blocked'
     || String(exitReason).startsWith('preflight-')
   );
 }

@@ -18,18 +18,16 @@ export interface TerminalTmuxCleanupOptions {
 }
 
 function recordCleanup(
-  stateManager: StateManager,
+  state: Record<string, unknown>,
   statePath: string,
   status: TerminalTmuxCleanupStatus,
   reason: string,
   at: string,
 ): void {
-  stateManager.update(statePath, (current) => {
-    current.tmux_cleanup_status = status;
-    current.tmux_cleanup_reason = reason;
-    current.tmux_cleanup_at = at;
-    return current;
-  });
+  state.tmux_cleanup_status = status;
+  state.tmux_cleanup_reason = reason;
+  state.tmux_cleanup_at = at;
+  atomicWriteJson(statePath, state);
 }
 
 /**
@@ -44,6 +42,8 @@ export function cleanupTerminalTmuxSession(
   const resolvedSessionDir = path.resolve(sessionDir);
   const statePath = path.join(resolvedSessionDir, 'state.json');
   const stateManager = options.stateManager || new StateManager();
+  stateManager.acquireLock(statePath);
+  try {
   const state = stateManager.read(statePath);
   const sessionName = typeof state.tmux_session_name === 'string' && state.tmux_session_name
     ? state.tmux_session_name
@@ -54,7 +54,7 @@ export function cleanupTerminalTmuxSession(
     return { status: 'not-terminal', sessionName, reason: 'runtime state is still active' };
   }
   if (state.preserve_tmux_monitor === true) {
-    recordCleanup(stateManager, statePath, 'preserved', 'monitor persistence was explicitly requested', at);
+    recordCleanup(state, statePath, 'preserved', 'monitor persistence was explicitly requested', at);
     return { status: 'preserved', sessionName, reason: 'monitor persistence was explicitly requested' };
   }
   if (!sessionName) {
@@ -69,17 +69,22 @@ export function cleanupTerminalTmuxSession(
       quarantined_at: at,
       action: 'left-running',
     });
-    recordCleanup(stateManager, statePath, 'quarantined', reason, at);
+    recordCleanup(state, statePath, 'quarantined', reason, at);
     return { status: 'quarantined', sessionName, reason };
   }
 
   // Persist intent before killing: this command commonly runs inside the tmux
   // session it owns, so successful cleanup can terminate this process promptly.
-  recordCleanup(stateManager, statePath, 'cleaned', 'terminal owned tmux session cleanup requested', at);
+  // The state lock remains held across the kill. A resume cannot set active or
+  // replace the tmux name between this final check and the signal.
+  recordCleanup(state, statePath, 'cleaned', 'terminal owned tmux session cleanup requested', at);
   const removed = (options.clearSession || clearTmuxSession)(sessionName, resolvedSessionDir);
   return {
     status: removed ? 'cleaned' : 'missing',
     sessionName,
     reason: removed ? 'terminal owned tmux session removed' : 'owned tmux session was already absent',
   };
+  } finally {
+    stateManager.releaseLock(statePath);
+  }
 }

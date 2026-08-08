@@ -19,13 +19,14 @@ import { readJsonFile } from './pickle-utils.js';
 import { validateRefinementAcceptance } from './refinement-artifacts.js';
 import { readManifest, ticketDependencyIds } from './tickets.js';
 import type { PersistedState } from './state-manager.js';
+import { recordExecutionControlTelemetry } from './productive-autonomy.js';
 
 export function initializePrdDevelopmentPipeline(sessionDir: string): void {
   const journalPath = path.join(sessionDir, 'logical-pipeline.json');
   if (!fs.existsSync(journalPath)) createLogicalPipeline(sessionDir, path.basename(sessionDir));
 }
 
-export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
+function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): PrdSeal {
   const state = readJsonFile<PersistedState>(path.join(sessionDir, 'state.json'), null);
   if (!state || typeof state.working_dir !== 'string' || !state.working_dir) {
     throw new Error('Cannot seal PRD without a valid session working directory.');
@@ -101,6 +102,13 @@ export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
   const existing = readPrdSeal(sessionDir);
   const candidate = createPrdSeal({ ...sealInput, sealedAt: existing.sealed_at });
   if (candidate.semantic_hash !== existing.semantic_hash) {
+    if (logical.control_state === 'prd_revision_required') {
+      if (!approveRevision) {
+        throw new Error('Accepted refinement changed the sealed PRD; explicit human approval is required before autonomous execution may resume.');
+      }
+      approvePrdRevision(sessionDir, sealInput);
+      return readPrdSeal(sessionDir);
+    }
     const executionEvents = logical.events.filter((event) => !['pipeline_created', 'prd_sealed'].includes(event.kind));
     if (logical.control_state !== 'autonomous_execution' || logical.lease !== null || executionEvents.length > 0) {
       throw new Error('Accepted refinement changed after autonomous execution acquired durable history.');
@@ -110,10 +118,7 @@ export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
       'Accepted refinement contract changed before executor ownership.',
       'Replace the pre-launch PRD seal with the newly accepted refinement contract.',
     );
-    const revised = approvePrdRevision(sessionDir, sealInput);
-    const seal = readPrdSeal(sessionDir);
-    if (revised.prd_seal_hash !== seal.semantic_hash) throw new Error('Revised logical pipeline seal projection mismatch.');
-    return seal;
+    throw new Error('Accepted refinement changed the sealed PRD; explicit human approval is required before autonomous execution may resume.');
   }
 
   const seal = writePrdSeal(sessionDir, sealInput);
@@ -125,5 +130,16 @@ export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
   if (logical.control_state !== 'autonomous_execution' || logical.prd_seal_hash !== seal.semantic_hash) {
     throw new Error('Logical pipeline control state does not match the accepted PRD seal.');
   }
+  return seal;
+}
+
+export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
+  return resolveSessionPrdSeal(sessionDir, false);
+}
+
+/** Explicit operator action used only after reviewing a persisted PRD revision request. */
+export function approveSessionPrdRevision(sessionDir: string): PrdSeal {
+  const seal = resolveSessionPrdSeal(sessionDir, true);
+  recordExecutionControlTelemetry(sessionDir, { post_seal_human_interventions: 1 });
   return seal;
 }

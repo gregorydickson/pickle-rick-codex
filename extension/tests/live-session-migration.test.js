@@ -10,6 +10,8 @@ import {
   prepareLiveSessionMigration,
   verifyLiveSessionMigration,
 } from '../services/live-session-migration.js';
+import { beginAutonomousExecution, createLogicalPipeline } from '../services/durable-supervisor.js';
+import { writePrdSeal } from '../services/prd-seal.js';
 
 const sourceRuntime = { runtime_id: 'installed-blue', version: '0.2.17', build_hash: '1'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
 const targetRuntime = { runtime_id: 'candidate-green', version: '0.3.0', build_hash: '2'.repeat(64), min_state_schema: 1, max_state_schema: 2 };
@@ -92,4 +94,20 @@ test('migration continuity detects post-handoff evidence mutation', () => {
   const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date());
   writeJson(path.join(sessionDir, 'ticket-recovery-history.json'), { schema_version: 1, events: [] });
   assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /continuity failed for ticket-recovery-history.json/);
+});
+
+test('migration inventory includes and validates the authoritative logical journal', () => {
+  const { sessionDir } = fixture();
+  createLogicalPipeline(sessionDir, 'migration-journal');
+  writePrdSeal(sessionDir, {
+    prd: '# Approved\n', repository: { identity: 'repo@base', working_directory: sessionDir, execution_base_policy: 'sealed' },
+    acceptance_criteria: [{ id: 'AC-1', text: 'Preserve journal.' }], scope_and_ownership: {},
+    dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [], preservation_and_rollback: {},
+    completion_definition: {}, release_gates: [],
+  });
+  beginAutonomousExecution(sessionDir);
+  const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date());
+  assert.ok(migration.preserved_artifacts.some((entry) => entry.path === 'logical-pipeline.json'));
+  writeJson(path.join(sessionDir, 'logical-pipeline.json'), { schema_version: 1, events: [] });
+  assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /logical pipeline|journal/i);
 });

@@ -1,13 +1,20 @@
 import crypto from 'node:crypto';
 import {
   acquireSupervisorLease,
+  acceptRuntimeHandoff,
   readLogicalPipeline,
   releaseSupervisorLease,
   renewSupervisorLease,
   terminateLogicalPipeline,
   watchdogRecoverSupervisor,
   type SupervisorLease,
+  type InstalledRuntimeDescriptor,
 } from './durable-supervisor.js';
+import {
+  captureProcessLivenessIdentity,
+  inspectProcessLivenessIdentity,
+  type PersistedProcessIdentity,
+} from './orphan-reaper.js';
 
 export const DEFAULT_SUPERVISOR_LEASE_TTL_MS = 60_000;
 
@@ -22,6 +29,8 @@ interface RuntimeOwnershipOptions {
   ownerId?: string;
   ttlMs?: number;
   renewEveryMs?: number;
+  handoffRequestId?: string;
+  targetRuntime?: InstalledRuntimeDescriptor;
 }
 
 function ownerPid(ownerId: string): number | null {
@@ -31,17 +40,17 @@ function ownerPid(ownerId: string): number | null {
 }
 
 function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function executorAlive(ownerId: string): boolean {
+function executorAlive(ownerId: string, identity?: PersistedProcessIdentity): boolean {
   const pid = ownerPid(ownerId);
-  return pid !== null && processAlive(pid);
+  if (pid === null) return false;
+  // Legacy leases lack immutable identity. Never declare an unexpired legacy
+  // owner dead solely because the new field is absent; wait for lease expiry.
+  if (!identity) return processAlive(pid);
+  if (identity.pid !== pid) return false;
+  return inspectProcessLivenessIdentity(identity) === 'matched';
 }
 
 export function startDurableRuntimeOwnership(
@@ -51,16 +60,27 @@ export function startDurableRuntimeOwnership(
   const ttlMs = options.ttlMs ?? DEFAULT_SUPERVISOR_LEASE_TTL_MS;
   const renewEveryMs = options.renewEveryMs ?? Math.max(100, Math.floor(ttlMs / 3));
   const ownerId = options.ownerId ?? `runner:${process.pid}:${crypto.randomUUID()}`;
+  const ownerIdentity = captureProcessLivenessIdentity(process.pid);
+  if (!ownerIdentity) throw new Error('Cannot capture immutable durable runner process identity.');
   const current = readLogicalPipeline(sessionDir);
   if (current.control_state !== 'autonomous_execution' || current.terminal_state !== null) {
     throw new Error(`Logical pipeline is not runnable from ${current.control_state}/${String(current.terminal_state)}.`);
   }
 
   let activeLease: SupervisorLease;
-  if (!current.lease) {
-    activeLease = acquireSupervisorLease(sessionDir, { ownerId, ttlMs });
+  if (!current.lease && options.handoffRequestId && options.targetRuntime) {
+    activeLease = acceptRuntimeHandoff(
+      sessionDir,
+      options.handoffRequestId,
+      ownerId,
+      ttlMs,
+      options.targetRuntime,
+      { ownerIdentity },
+    ).lease;
+  } else if (!current.lease) {
+    activeLease = acquireSupervisorLease(sessionDir, { ownerId, ttlMs, ownerIdentity });
   } else {
-    const recovery = watchdogRecoverSupervisor(sessionDir, { ownerId, ttlMs, executorAlive });
+    const recovery = watchdogRecoverSupervisor(sessionDir, { ownerId, ttlMs, ownerIdentity, executorAlive });
     if (!recovery.recovered || !recovery.lease || recovery.lease.owner_id !== ownerId) {
       throw new Error(`Logical pipeline is already owned by live executor ${current.lease.owner_id}.`);
     }
@@ -101,6 +121,7 @@ export function startDurableRuntimeOwnership(
       if (finished) return;
       finished = true;
       clearInterval(timer);
+      if (readLogicalPipeline(sessionDir).control_state === 'prd_revision_required') return;
       assertOwned();
       if (exitReason === 'success') {
         terminateLogicalPipeline(sessionDir, 'completed', { ownerId, token: activeLease.token });

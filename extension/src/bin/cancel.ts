@@ -8,6 +8,9 @@ import {
 } from '../services/orphan-reaper.js';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
 import { sessionOperationOwnerPid } from '../services/session-operation.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { cancelLogicalPipelineByOperator, readLogicalPipeline } from '../services/durable-supervisor.js';
 
 function runtimePids(state: PersistedState): number[] {
   const refinementPids = Array.isArray(state?.refinement_child_identities)
@@ -115,6 +118,10 @@ async function main(argv: string[]): Promise<void> {
     console.log(`Cancellation blocked on recovery for ${resolved}: ${unsafeRecovery.reason}`);
     process.exitCode = 1;
     return;
+  }
+  const logicalPath = path.join(resolved, 'logical-pipeline.json');
+  if (fs.existsSync(logicalPath) && readLogicalPipeline(resolved).terminal_state === null) {
+    cancelLogicalPipelineByOperator(resolved, 'explicit pickle-cancel operator request');
   }
   cleanupTerminalTmuxSession(resolved);
   console.log(`Cancelled ${resolved}`);

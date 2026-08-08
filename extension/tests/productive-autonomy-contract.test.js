@@ -12,6 +12,8 @@ import {
   readRecoveryStrategyEpochs,
   recordExecutionTelemetry,
   recoveryRoute,
+  resolveAutonomousRecovery,
+  recoveryExecutionAction,
   typedRecoveryRoute,
 } from '../services/productive-autonomy.js';
 import { makeTempRoot } from './helpers.js';
@@ -37,11 +39,17 @@ test('every declared autonomous failure has a typed recovery policy', () => {
     assert.ok(route.handler);
     assert.ok(Array.isArray(route.invalidate));
     assert.ok(Array.isArray(route.preserve));
+    assert.ok(recoveryExecutionAction(route));
   }
   assert.equal(classifyAutonomousFailure({ kind: 'verification_contract' }), 'contract_invalid');
   assert.equal(classifyAutonomousFailure({ kind: 'worker_transport' }), 'worker_transport');
   assert.equal(classifyAutonomousFailure({ kind: 'workspace_unsafe' }), 'workspace_unsafe');
   assert.equal(typedRecoveryRoute('prd_contract_defect').schedulerState, 'prd_revision_required');
+  assert.equal(resolveAutonomousRecovery({ kind: 'artifact_invalid' }).handler, 'repair_artifact');
+  assert.equal(resolveAutonomousRecovery({ kind: 'implementation_invalid' }).handler, 'repair_implementation');
+  assert.equal(resolveAutonomousRecovery({ kind: 'completion_evidence_refused' }).handler, 'repair_completion_evidence');
+  assert.equal(resolveAutonomousRecovery({ kind: 'workspace_unsafe' }).handler, 'reconstruct_workspace');
+  assert.equal(resolveAutonomousRecovery({ kind: 'prd_contract_defect' }).handler, 'request_prd_revision');
   assert.notDeepEqual(
     typedRecoveryRoute('verification_failed').invalidate,
     typedRecoveryRoute('worker_transport').invalidate,

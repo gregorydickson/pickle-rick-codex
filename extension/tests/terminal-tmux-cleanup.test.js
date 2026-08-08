@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
 import { makeTempRoot, writeJson } from './helpers.js';
+import { StateManager } from '../services/state-manager.js';
 
 function terminalSession(sessionDir, overrides = {}) {
   writeJson(path.join(sessionDir, 'state.json'), {
@@ -79,4 +80,22 @@ test('terminal tmux cleanup does not touch an active session', () => {
 
   assert.equal(result.status, 'not-terminal');
   assert.equal(clearCalls, 0);
+});
+
+test('terminal cleanup holds the state lock through the final check and kill', () => {
+  const sessionDir = makeTempRoot('pickle-tmux-atomic-');
+  terminalSession(sessionDir);
+  const manager = new StateManager();
+  let lockHeldDuringKill = false;
+  const originalAcquire = manager.acquireLock.bind(manager);
+  const originalRelease = manager.releaseLock.bind(manager);
+  let held = false;
+  manager.acquireLock = (statePath) => { originalAcquire(statePath); held = true; };
+  manager.releaseLock = (statePath) => { held = false; originalRelease(statePath); };
+  const result = cleanupTerminalTmuxSession(sessionDir, {
+    stateManager: manager,
+    clearSession: () => { lockHeldDuringKill = held; return true; },
+  });
+  assert.equal(result.status, 'cleaned');
+  assert.equal(lockHeldDuringKill, true);
 });

@@ -8,6 +8,8 @@ import {
   replacePrdSealAfterRevision,
 } from './prd-seal.js';
 import { StateManager } from './state-manager.js';
+import { inspectProcessLivenessIdentity, type PersistedProcessIdentity } from './orphan-reaper.js';
+import { assertCitadelReleaseApproval } from './citadel.js';
 
 export const LOGICAL_PIPELINE_SCHEMA_VERSION = 1;
 export const LOGICAL_PIPELINE_FILE_NAME = 'logical-pipeline.json';
@@ -28,6 +30,7 @@ export interface SupervisorLease {
   acquired_at: string;
   renewed_at: string;
   expires_at: string;
+  owner_identity?: PersistedProcessIdentity;
 }
 
 export interface InstalledRuntimeDescriptor {
@@ -79,6 +82,7 @@ interface TerminalOptions extends ClockOptions {
 interface AcquireLeaseOptions extends ClockOptions {
   ownerId: string;
   ttlMs: number;
+  ownerIdentity?: PersistedProcessIdentity;
 }
 
 interface RenewLeaseOptions extends AcquireLeaseOptions {
@@ -86,7 +90,7 @@ interface RenewLeaseOptions extends AcquireLeaseOptions {
 }
 
 export interface WatchdogRecoveryOptions extends AcquireLeaseOptions {
-  executorAlive?: (ownerId: string) => boolean;
+  executorAlive?: (ownerId: string, identity?: PersistedProcessIdentity) => boolean;
 }
 
 export interface WatchdogRecoveryResult {
@@ -158,6 +162,13 @@ function validateLease(value: unknown): SupervisorLease | null {
   requireNonEmpty(lease.expires_at, 'lease.expires_at');
   if (!Number.isInteger(lease.generation) || lease.generation < 1) throw new Error('Invalid logical pipeline lease generation.');
   if (!Number.isFinite(Date.parse(lease.expires_at))) throw new Error('Invalid logical pipeline lease expiry.');
+  if (lease.owner_identity !== undefined) {
+    const identity = lease.owner_identity;
+    if (!identity || identity.pid <= 0 || identity.pgid <= 0
+      || !identity.start_time || !identity.fingerprint) {
+      throw new Error('Invalid logical pipeline lease process identity.');
+    }
+  }
   return lease;
 }
 
@@ -204,6 +215,9 @@ function replayJournal(events: LogicalPipelineEvent[]): Omit<LogicalPipelineStat
         break;
       case 'checkpoint_recorded':
       case 'runtime_handoff_requested':
+        break;
+      case 'runtime_handoff_aborted':
+        lease = null;
         break;
       case 'runtime_handoff_released':
         lease = null;
@@ -385,7 +399,13 @@ export function requestPrdRevision(
   });
 }
 
-function createLease(ownerId: string, ttlMs: number, generation: number, nowMs: number): SupervisorLease {
+function createLease(
+  ownerId: string,
+  ttlMs: number,
+  generation: number,
+  nowMs: number,
+  ownerIdentity?: PersistedProcessIdentity,
+): SupervisorLease {
   requireNonEmpty(ownerId, 'lease owner');
   validateLeaseTtl(ttlMs);
   return {
@@ -395,7 +415,20 @@ function createLease(ownerId: string, ttlMs: number, generation: number, nowMs: 
     acquired_at: iso(nowMs),
     renewed_at: iso(nowMs),
     expires_at: iso(nowMs + ttlMs),
+    ...(ownerIdentity ? { owner_identity: ownerIdentity } : {}),
   };
+}
+
+function pendingRuntimeHandoff(state: LogicalPipelineState): LogicalPipelineEvent | null {
+  const completed = new Set(state.events
+    .filter((event) => event.kind === 'runtime_handoff_completed' || event.kind === 'runtime_handoff_aborted')
+    .map((event) => String(event.details.request_id)));
+  return [...state.events].reverse().find((event) => event.kind === 'runtime_handoff_requested'
+    && !completed.has(String(event.details.request_id))) ?? null;
+}
+
+export function hasPendingRuntimeHandoff(sessionDir: string): boolean {
+  return pendingRuntimeHandoff(readLogicalPipeline(sessionDir)) !== null;
 }
 
 function validateLeaseTtl(ttlMs: number): void {
@@ -406,6 +439,9 @@ export function acquireSupervisorLease(sessionDir: string, options: AcquireLease
   let acquired: SupervisorLease | null = null;
   mutate(sessionDir, (state) => {
     if (state.control_state !== 'autonomous_execution') throw new Error('Supervisor lease requires autonomous execution.');
+    if (pendingRuntimeHandoff(state)) {
+      throw new Error('Supervisor lease acquisition is reserved for the pending runtime handoff target.');
+    }
     const nowMs = options.nowMs ?? Date.now();
     if (state.lease && Date.parse(state.lease.expires_at) > nowMs) {
       throw new Error(`Supervisor lease is held by ${state.lease.owner_id}.`);
@@ -416,7 +452,7 @@ export function acquireSupervisorLease(sessionDir: string, options: AcquireLease
       state.executor_restart_count += 1;
     }
     const generation = state.lease_generation + 1;
-    acquired = createLease(options.ownerId, options.ttlMs, generation, nowMs);
+    acquired = createLease(options.ownerId, options.ttlMs, generation, nowMs, options.ownerIdentity);
     state.lease = acquired;
     state.lease_generation = generation;
     appendEvent(state, generation === 1 ? 'lease_acquired' : 'lease_recovered', {
@@ -512,7 +548,43 @@ function handoffRequest(state: LogicalPipelineState, requestId: string): Logical
   if (state.events.some((event) => event.kind === 'runtime_handoff_completed' && event.details.request_id === requestId)) {
     throw new Error(`Runtime handoff request already completed: ${requestId}.`);
   }
+  if (state.events.some((event) => event.kind === 'runtime_handoff_aborted' && event.details.request_id === requestId)) {
+    throw new Error(`Runtime handoff request was aborted: ${requestId}.`);
+  }
   return request;
+}
+
+export function abortExpiredRuntimeHandoff(
+  sessionDir: string,
+  timeoutMs = 60_000,
+  options: ClockOptions = {},
+): boolean {
+  let aborted = false;
+  mutate(sessionDir, (state) => {
+    const request = pendingRuntimeHandoff(state);
+    if (!request) return;
+    const nowMs = options.nowMs ?? Date.now();
+    if (nowMs - Date.parse(request.occurred_at) < timeoutMs) return;
+    if (state.lease) {
+      const expired = Date.parse(state.lease.expires_at) <= nowMs;
+      const identityDead = state.lease.owner_identity
+        ? inspectProcessLivenessIdentity(state.lease.owner_identity) !== 'matched'
+        : false;
+      if (!expired && !identityDead) return;
+      appendEvent(state, 'executor_lost', {
+        owner_id: state.lease.owner_id,
+        reason: expired ? 'expired_lease_during_handoff' : 'dead_source_during_handoff',
+      }, nowMs);
+      state.executor_restart_count += 1;
+      state.lease = null;
+    }
+    appendEvent(state, 'runtime_handoff_aborted', {
+      request_id: request.details.request_id,
+      reason: 'target_accept_timeout',
+    }, nowMs);
+    aborted = true;
+  });
+  return aborted;
 }
 
 export function requestRuntimeHandoff(
@@ -530,11 +602,7 @@ export function requestRuntimeHandoff(
   mutate(sessionDir, (state) => {
     const nowMs = options.nowMs ?? Date.now();
     const lease = assertLeaseFence(state, ownerId, token, nowMs);
-    const completed = new Set(state.events
-      .filter((event) => event.kind === 'runtime_handoff_completed')
-      .map((event) => String(event.details.request_id)));
-    if (state.events.some((event) => event.kind === 'runtime_handoff_requested'
-      && !completed.has(String(event.details.request_id)))) {
+    if (pendingRuntimeHandoff(state)) {
       throw new Error('A runtime handoff request is already pending.');
     }
     appendEvent(state, 'runtime_handoff_requested', {
@@ -574,7 +642,7 @@ export function acceptRuntimeHandoff(
   ownerId: string,
   ttlMs: number,
   targetRuntime: InstalledRuntimeDescriptor,
-  options: ClockOptions = {},
+  options: ClockOptions & { ownerIdentity?: PersistedProcessIdentity } = {},
 ): RuntimeHandoffResult {
   validateRuntime(targetRuntime);
   let lease: SupervisorLease | null = null;
@@ -594,7 +662,7 @@ export function acceptRuntimeHandoff(
     }
     checkpoint = request.details.checkpoint as Record<string, unknown>;
     const generation = current.lease_generation + 1;
-    lease = createLease(ownerId, ttlMs, generation, nowMs);
+    lease = createLease(ownerId, ttlMs, generation, nowMs, options.ownerIdentity);
     current.lease = lease;
     current.lease_generation = generation;
     appendEvent(current, 'runtime_handoff_completed', {
@@ -624,10 +692,15 @@ export function watchdogRecoverSupervisor(
   let resumeCheckpoint: Record<string, unknown> | null = null;
   const state = mutate(sessionDir, (current) => {
     if (current.control_state !== 'autonomous_execution') throw new Error('Watchdog recovery requires autonomous execution.');
+    if (pendingRuntimeHandoff(current)) {
+      throw new Error('Watchdog recovery is reserved for the pending runtime handoff target.');
+    }
     const nowMs = options.nowMs ?? Date.now();
     const previous = current.lease;
     const expired = previous ? Date.parse(previous.expires_at) <= nowMs : false;
-    const dead = previous && options.executorAlive ? !options.executorAlive(previous.owner_id) : false;
+    const dead = previous && options.executorAlive
+      ? !options.executorAlive(previous.owner_id, previous.owner_identity)
+      : false;
     if (previous && !expired && !dead) return;
     reason = previous ? (expired ? 'expired_lease' : 'dead_executor') : 'missing_lease';
     resumeCheckpoint = latestCheckpoint(current);
@@ -636,7 +709,7 @@ export function watchdogRecoverSupervisor(
       current.executor_restart_count += 1;
     }
     const generation = current.lease_generation + 1;
-    current.lease = createLease(options.ownerId, options.ttlMs, generation, nowMs);
+    current.lease = createLease(options.ownerId, options.ttlMs, generation, nowMs, options.ownerIdentity);
     current.lease_generation = generation;
     appendEvent(current, 'lease_recovered', {
       owner_id: options.ownerId,
@@ -679,11 +752,33 @@ export function terminateLogicalPipeline(
     throw new Error(`Unexpected terminal state ${terminalState}; autonomy, reliability, and quality scores are zero.`);
   }
   return mutate(sessionDir, (state) => {
-    if (state.lease && (state.lease.owner_id !== options.ownerId || state.lease.token !== options.token)) {
+    if (!state.lease) {
+      throw new Error('Logical pipeline termination requires an active supervisor lease.');
+    }
+    if (state.lease.owner_id !== options.ownerId || state.lease.token !== options.token) {
       throw new Error('Only the active supervisor lease may terminate the logical pipeline.');
     }
+    if (terminalState === 'completed') assertCitadelReleaseApproval(sessionDir);
     appendEvent(state, `pipeline_${terminalState}`, { terminal_state: terminalState }, options.nowMs ?? Date.now());
     state.terminal_state = terminalState as LogicalPipelineTerminalState;
+    state.lease = null;
+  });
+}
+
+export function cancelLogicalPipelineByOperator(
+  sessionDir: string,
+  reason: string,
+  options: ClockOptions = {},
+): LogicalPipelineState {
+  requireNonEmpty(reason, 'operator cancellation reason');
+  return mutate(sessionDir, (state) => {
+    appendEvent(state, 'pipeline_cancelled', {
+      terminal_state: 'cancelled',
+      operator_initiated: true,
+      reason,
+      previous_owner_id: state.lease?.owner_id ?? null,
+    }, options.nowMs ?? Date.now());
+    state.terminal_state = 'cancelled';
     state.lease = null;
   });
 }

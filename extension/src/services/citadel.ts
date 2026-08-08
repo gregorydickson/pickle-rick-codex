@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from './codex.js';
 import { getHeadSha, getWorkingTreeFingerprint, listWorkingTreeDirtyPaths } from './git-utils.js';
 import { recoverableHardReset } from './recoverable-git.js';
@@ -196,6 +197,9 @@ export function validateCitadelReport(
   if (!Array.isArray(raw.findings)) {
     throw new Error('Invalid Citadel report: findings must be an array.');
   }
+  if (raw.reviewed_range !== reviewedRange) {
+    throw new Error('Invalid Citadel report: reviewed range does not match the current release range.');
+  }
   const findings = raw.findings.map(normalizeFinding);
   const acceptanceCriteria = Array.isArray(raw.acceptance_criteria_checked)
     ? raw.acceptance_criteria_checked
@@ -223,6 +227,45 @@ export function validateCitadelReport(
       ? raw.generated_at
       : new Date().toISOString(),
   };
+}
+
+const CITADEL_RELEASE_APPROVAL_FILE = 'citadel-release-approval.json';
+
+function reportHash(report: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(report)).digest('hex');
+}
+
+export function assertCitadelReleaseApproval(sessionDir: string): void {
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  const workingDir = String(state.working_dir || '');
+  const approval = readJsonFile<Record<string, unknown>>(path.join(sessionDir, CITADEL_RELEASE_APPROVAL_FILE), null);
+  const report = readJsonFile<Record<string, unknown>>(citadelReportPath(sessionDir), null);
+  if (!approval || !report || approval.report_hash !== reportHash(report)
+    || approval.head !== getHeadSha(workingDir)
+    || approval.repository_fingerprint !== getCitadelRepositoryFingerprint(workingDir)) {
+    throw new Error('Logical completion requires fresh Citadel approval for the current repository identity.');
+  }
+  const expectedRange = `${String(state.start_commit || '')}..HEAD`;
+  if (approval.reviewed_range !== expectedRange) throw new Error('Citadel approval range is stale.');
+  const validated = validateCitadelReport(report, expectedRange, deriveCitadelAcceptanceCriteria(sessionDir));
+  if (validated.verdict !== 'approve') throw new Error('Citadel did not approve the release.');
+}
+
+export function persistCitadelReleaseApproval(sessionDir: string, report: CitadelReport): void {
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  const workingDir = String(state.working_dir || '');
+  const expectedRange = `${String(state.start_commit || '')}..HEAD`;
+  const validated = validateCitadelReport(report, expectedRange, deriveCitadelAcceptanceCriteria(sessionDir));
+  if (validated.verdict !== 'approve') throw new Error('Cannot persist a blocked Citadel release approval.');
+  atomicWriteJson(citadelReportPath(sessionDir), validated);
+  atomicWriteJson(path.join(sessionDir, CITADEL_RELEASE_APPROVAL_FILE), {
+    schema_version: 1,
+    reviewed_range: expectedRange,
+    head: getHeadSha(workingDir),
+    repository_fingerprint: getCitadelRepositoryFingerprint(workingDir),
+    report_hash: reportHash(validated),
+    approved_at: new Date().toISOString(),
+  });
 }
 
 function packageScripts(workingDir: string): Record<string, string> {
@@ -505,7 +548,12 @@ export function recoverCitadelStartCommit(
   return startCommit;
 }
 
-export async function runCitadel(sessionDir: string): Promise<'success' | 'citadel-blocked' | 'cancelled'> {
+export async function runCitadel(
+  sessionDir: string,
+  options: { assertDurableOwnership?: () => void } = {},
+): Promise<'success' | 'citadel-blocked' | 'cancelled'> {
+  const assertOwnership = (): void => options.assertDurableOwnership?.();
+  assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
@@ -514,6 +562,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
     throw new Error('Citadel requires a git-backed session with a persisted working_dir.');
   }
   const startCommit = recoverCitadelStartCommit(manager, statePath, state, workingDir);
+  assertOwnership();
   if (!startCommit) {
     throw new Error('Citadel could not recover a reachable start_commit for this git-backed session.');
   }
@@ -522,10 +571,12 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
     throw new Error(`Citadel requires a clean release tree; dirty paths: ${preexistingDirtyPaths.join(', ')}`);
   }
   fs.rmSync(citadelReportPath(sessionDir), { force: true });
+  fs.rmSync(path.join(sessionDir, CITADEL_RELEASE_APPROVAL_FILE), { force: true });
   const expectedAcceptanceCriteria = deriveCitadelAcceptanceCriteria(sessionDir);
   const reviewedRange = `${startCommit}..HEAD`;
   const scopeFailure = auditPersistedScopeForCitadel(sessionDir, workingDir);
   if (scopeFailure) {
+    assertOwnership();
     atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
       reviewedRange,
       expectedAcceptanceCriteria,
@@ -535,6 +586,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
     return 'citadel-blocked';
   }
   if (expectedAcceptanceCriteria.length === 0) {
+    assertOwnership();
     atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
       reviewedRange,
       [],
@@ -547,6 +599,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
   const checkpointFingerprint = getCitadelRepositoryFingerprint(workingDir);
   let checks: CitadelCheckResult[];
   try {
+    assertOwnership();
     checks = await runCitadelChecksMonitored(
       workingDir,
       verificationStepsFromManifest(sessionDir, workingDir),
@@ -578,6 +631,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
         },
       },
     );
+    assertOwnership();
   } catch (error) {
     const restored = restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
     if (error instanceof CitadelChecksCancelledError) return 'cancelled';
@@ -587,6 +641,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
     throw error;
   }
   const checksPath = path.join(sessionDir, 'citadel-checks.json');
+  assertOwnership();
   atomicWriteJson(checksPath, { schema_version: 1, reviewed_range: reviewedRange, checks });
   if (restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check')) {
     throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.');
@@ -609,10 +664,12 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
         })),
       generated_at: new Date().toISOString(),
     };
+    assertOwnership();
     atomicWriteJson(citadelReportPath(sessionDir), report);
     return 'citadel-blocked';
   }
   if (!checks.some((check) => check.status === 'passed')) {
+    assertOwnership();
     atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
       reviewedRange,
       expectedAcceptanceCriteria,
@@ -627,6 +684,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
   let result;
   let reviewerError: unknown = null;
   try {
+    assertOwnership();
     result = await runCodexExecMonitored({
       telemetry: { sessionDir, ticketId: 'pipeline', phase: 'citadel' },
       cwd: workingDir,
@@ -651,6 +709,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
         return current.last_exit_reason === 'cancelled' || Boolean(current.cancel_requested_at);
       },
     });
+    assertOwnership();
   } catch (error) {
     reviewerError = error;
   } finally {
@@ -666,6 +725,7 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
   if (restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'reviewer')) {
     throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);
   }
+  assertOwnership();
   if (reviewerError) throw reviewerError;
   if (!result) throw new Error('Citadel reviewer returned no execution result.');
   if (result.cancelled) return 'cancelled';
@@ -696,6 +756,11 @@ export async function runCitadel(sessionDir: string): Promise<'success' | 'citad
       'The reviewer did not emit the required <promise>THE_CITADEL_APPROVES</promise> token.',
     );
   }
+  assertOwnership();
   atomicWriteJson(citadelReportPath(sessionDir), report);
+  if (report.verdict === 'approve') {
+    assertOwnership();
+    persistCitadelReleaseApproval(sessionDir, report);
+  }
   return report.verdict === 'approve' ? 'success' : 'citadel-blocked';
 }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { readJsonFile } from '../services/pickle-utils.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
+import { approveSessionPrdRevision } from '../services/session-prd-seal.js';
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import {
   assertPipelineResumeCompatible,
@@ -420,6 +421,8 @@ test('baseline blue', () => {
   });
   writeRefinementAcceptance(sessionDir);
 
+  await assert.rejects(() => ensureBootstrapSessionReady(sessionDir), /explicit human approval/);
+  approveSessionPrdRevision(sessionDir);
   await ensureBootstrapSessionReady(sessionDir);
 
   const baselines = readVerificationBaselines(sessionDir);

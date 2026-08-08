@@ -92,6 +92,32 @@ export function captureProcessIdentity(pid: number): PersistedProcessIdentity | 
   };
 }
 
+/** Capture immutable liveness identity for a process without requiring it to
+ * lead its process group. This is for leases/locks, never group signalling. */
+export function captureProcessLivenessIdentity(pid: number): PersistedProcessIdentity | null {
+  const identity = inspectProcess(pid);
+  if (!identity) return null;
+  return {
+    pid: identity.pid,
+    pgid: identity.pgid,
+    start_time: identity.startTime,
+    fingerprint: identity.fingerprint,
+  };
+}
+
+export function inspectProcessLivenessIdentity(
+  persisted: PersistedProcessIdentity,
+): 'not-running' | 'matched' | 'reused' {
+  const current = inspectProcess(persisted.pid);
+  if (!current) return 'not-running';
+  return current.pid === persisted.pid
+    && current.pgid === persisted.pgid
+    && current.startTime === persisted.start_time
+    && current.fingerprint === persisted.fingerprint
+    ? 'matched'
+    : 'reused';
+}
+
 export function captureSpawnedProcessIdentity(pid: number, attempts: number = 5): PersistedProcessIdentity | null {
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
     const identity = captureProcessIdentity(pid);

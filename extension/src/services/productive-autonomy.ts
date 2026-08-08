@@ -241,7 +241,8 @@ export function classifyAutonomousFailure(input: {
   const message = String(input.message || '').toLowerCase();
   if (kind.includes('prd_contract_defect') || message.includes('contradictory prd')) return 'prd_contract_defect';
   if (kind.includes('workspace_unsafe') || message.includes('unsafe workspace')) return 'workspace_unsafe';
-  if (kind.includes('completion_evidence') || message.includes('completion evidence')) return 'completion_evidence_refused';
+  if (kind.includes('completion_evidence') || kind.includes('oracle_refusal')
+    || message.includes('completion evidence') || message.includes('oracle refusal')) return 'completion_evidence_refused';
   if (kind.includes('contract') || kind.includes('preflight') || message.includes('verification contract') || message.includes('preflight')) return 'contract_invalid';
   if (phase === 'review' || kind.includes('review') || message.includes('review requested changes')) return 'review_refused';
   if (phase === 'conformance' || kind.includes('conformance')) return 'conformance_refused';
@@ -259,6 +260,29 @@ export function recoveryRoute(domain: FailureDomain): FailureRoute {
 
 export function typedRecoveryRoute(failureType: AutonomousFailureType): FailureRoute {
   return structuredClone(TYPE_POLICIES[failureType]);
+}
+
+/** Production dispatch seam: callers classify once and retain the exact typed
+ * handler instead of collapsing distinct failures back to a domain default. */
+export function resolveAutonomousRecovery(input: {
+  kind?: string | null;
+  phase?: WorkerLifecyclePhase | string | null;
+  message?: string;
+}): FailureRoute {
+  return typedRecoveryRoute(classifyAutonomousFailure(input));
+}
+
+export type RecoveryExecutionAction = 'repair_contract' | 'retry_worker' | 'restart_executor' | 'request_prd_revision';
+
+export function recoveryExecutionAction(route: FailureRoute): RecoveryExecutionAction {
+  if (route.schedulerState === 'prd_revision_required' || route.handler === 'request_prd_revision') {
+    return 'request_prd_revision';
+  }
+  if (route.handler === 'repair_contract') return 'repair_contract';
+  if (route.handler === 'restart_executor') return 'restart_executor';
+  // The remaining specialized handlers execute through the worker lifecycle;
+  // their exact handler and checkpoint invalidation are persisted in strategy.
+  return 'retry_worker';
 }
 
 export function materialStrategyHash(input: RecoveryStrategyInput): string {

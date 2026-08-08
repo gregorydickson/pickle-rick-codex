@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readLogicalPipeline } from '../services/durable-supervisor.js';
+import { abortExpiredRuntimeHandoff, hasPendingRuntimeHandoff, readLogicalPipeline } from '../services/durable-supervisor.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
 
@@ -22,10 +22,12 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export function supervisedRunnerDecision(sessionDir: string): 'restart' | 'wait_for_prd' | 'completed' | 'cancelled' {
+export function supervisedRunnerDecision(sessionDir: string): 'restart' | 'wait_for_prd' | 'wait_for_handoff' | 'completed' | 'cancelled' {
+  abortExpiredRuntimeHandoff(sessionDir);
   const logical = readLogicalPipeline(sessionDir);
   if (logical.terminal_state === 'completed') return 'completed';
   if (logical.terminal_state === 'cancelled') return 'cancelled';
+  if (hasPendingRuntimeHandoff(sessionDir)) return 'wait_for_handoff';
   return logical.control_state === 'prd_revision_required' ? 'wait_for_prd' : 'restart';
 }
 
@@ -40,13 +42,14 @@ export async function runSupervisedRunner(
   }
   const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
   const runnerPath = testOptions.runnerPath || path.join(runtimeBin, runnerBin);
+  const acceptingHandoff = runnerArgs.some((arg) => arg.startsWith('--handoff-request='));
   let restartCount = 0;
 
   while (true) {
     const before = supervisedRunnerDecision(sessionDir);
     if (before === 'completed') return 0;
     if (before === 'cancelled') return 130;
-    if (before === 'wait_for_prd') {
+    if (before === 'wait_for_prd' || (before === 'wait_for_handoff' && !acceptingHandoff)) {
       await delay(1_000);
       continue;
     }

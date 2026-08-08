@@ -227,7 +227,7 @@ async function runPipelineWithLease(
           sessionDir,
           'citadel',
           runStartedAtMs,
-          async () => await runCitadel(sessionDir),
+          async () => await runCitadel(sessionDir, { assertDurableOwnership: options.assertDurableOwnership }),
         );
       } else if (nextPhase === 'anatomy-park') {
         exitReason = await runPipelineLoopPhase(
@@ -250,7 +250,9 @@ async function runPipelineWithLease(
       }
 
       if (nextPhase === 'citadel' && exitReason === 'citadel-blocked') {
+        options.assertDurableOwnership?.();
         const archivePath = enqueueCitadelRemediation(sessionDir);
+        options.assertDurableOwnership?.();
         appendRunnerLog(sessionDir, `Citadel refusal preserved at ${archivePath}; autonomous remediation enqueued.`);
         exitReason = 'success';
         pipelineState = ensurePipelineState(sessionDir, pipeline);

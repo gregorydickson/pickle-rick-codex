@@ -2,13 +2,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { runSequential } from '../bin/mux-runner.js';
 import { enqueueCitadelRemediation } from '../bin/pipeline-runner.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
-import { readLogicalPipeline } from '../services/durable-supervisor.js';
+import { acquireSupervisorLease, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { readPrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from '../services/session-prd-seal.js';
 import {
@@ -22,8 +23,11 @@ import {
   finishPipelinePhase,
   readPipelineState,
 } from '../services/pipeline-state.js';
-import { readManifest } from '../services/tickets.js';
+import { readManifest, updateTicketStatus } from '../services/tickets.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
+import { captureSpawnedProcessIdentity, inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
+import { StateManager } from '../services/state-manager.js';
+import { assertCitadelReleaseApproval, deriveCitadelAcceptanceCriteria, persistCitadelReleaseApproval } from '../services/citadel.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -71,6 +75,19 @@ function createAcceptedSession(status = 'Todo') {
   return { sessionDir, workingDir };
 }
 
+async function approveCitadelFixture(sessionDir) {
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  persistCitadelReleaseApproval(sessionDir, {
+    schema_version: 1,
+    verdict: 'approve',
+    reviewed_range: `${state.start_commit}..HEAD`,
+    acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(sessionDir),
+    findings: [],
+    generated_at: new Date().toISOString(),
+  });
+  return 'success';
+}
+
 test('bootstrap readiness writes a validated seal and crosses the explicit autonomous boundary', async () => {
   const { sessionDir } = createAcceptedSession();
   initializePrdDevelopmentPipeline(sessionDir);
@@ -91,11 +108,11 @@ test('runtime heartbeat owns, renews, excludes a second runner, and releases rec
   ensureSessionPrdSeal(sessionDir);
   const ownership = startDurableRuntimeOwnership(sessionDir, {
     ownerId: `runner:${process.pid}:first`,
-    ttlMs: 90,
-    renewEveryMs: 20,
+    ttlMs: 500,
+    renewEveryMs: 50,
   });
   const initialExpiry = ownership.lease().expires_at;
-  await new Promise((resolve) => setTimeout(resolve, 65));
+  await new Promise((resolve) => setTimeout(resolve, 140));
   ownership.assertOwned();
   assert.ok(Date.parse(ownership.lease().expires_at) > Date.parse(initialExpiry));
   assert.throws(
@@ -124,6 +141,19 @@ test('verified repository advance does not mutate the sealed execution-base iden
   );
 });
 
+test('pre-launch semantic seal drift pauses for explicit human PRD approval', () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].acceptance_criteria.push('Human must approve changed semantics.');
+  writeJson(manifestPath, manifest);
+  writeRefinementAcceptance(sessionDir, { workingDir });
+  assert.throws(() => ensureSessionPrdSeal(sessionDir), /explicit human approval/);
+  assert.equal(readLogicalPipeline(sessionDir).control_state, 'prd_revision_required');
+});
+
 test('sealed runner ignores skip/abort choices and completes through autonomous retry', async () => {
   const { sessionDir } = createAcceptedSession();
   initializePrdDevelopmentPipeline(sessionDir);
@@ -136,10 +166,85 @@ test('sealed runner ignores skip/abort choices and completes through autonomous 
         ? { status: 'incomplete', applied: false, reason: 'retry autonomously' }
         : { status: 'done', applied: true };
     },
+    runCitadel: approveCitadelFixture,
   });
   assert.equal(result, 'success');
   assert.equal(calls, 2);
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+});
+
+test('replacement runner reaps an identity-matched detached child before redispatch', async () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const identity = captureSpawnedProcessIdentity(child.pid);
+  assert.ok(identity, 'failed to capture detached child identity');
+  new StateManager().update(path.join(sessionDir, 'state.json'), (current) => {
+    current.active_child_pid = child.pid;
+    current.active_child_identity = identity;
+    current.active_child_controller_pid = 999999;
+    return current;
+  });
+  let childWasGoneAtDispatch = false;
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async () => {
+      childWasGoneAtDispatch = inspectProcessLivenessIdentity(identity) !== 'matched';
+      return { status: 'done', applied: true };
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(result, 'success');
+  assert.equal(childWasGoneAtDispatch, true);
+});
+
+test('Citadel approval is invalidated by any later repository commit', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  await approveCitadelFixture(sessionDir);
+  assert.doesNotThrow(() => assertCitadelReleaseApproval(sessionDir));
+  fs.appendFileSync(path.join(workingDir, 'README.md'), 'post-approval mutation\n');
+  git(workingDir, ['add', 'README.md']);
+  git(workingDir, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'stale approval']);
+  assert.throws(() => assertCitadelReleaseApproval(sessionDir), /fresh Citadel approval/);
+});
+
+test('standalone mux archives Citadel refusal and schedules ticket remediation', async () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async (dir, ticketId) => {
+      updateTicketStatus(dir, ticketId, { status: 'Done' });
+      return { status: 'done', applied: true };
+    },
+    runCitadel: async (dir) => {
+      writeJson(path.join(dir, 'citadel-report.json'), {
+        schema_version: 1,
+        verdict: 'block',
+        reviewed_range: 'fixture..HEAD',
+        acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
+        findings: [{ severity: 'high', title: 'Refused', evidence: 'release defect' }],
+        generated_at: new Date().toISOString(),
+      });
+      return 'citadel-blocked';
+    },
+  });
+  assert.equal(result, 'citadel-blocked');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+  assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length, 1);
+});
+
+test('legacy unexpired runner lease is not stolen merely because immutable identity is absent', () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  acquireSupervisorLease(sessionDir, { ownerId: `runner:${process.pid}:legacy`, ttlMs: 60_000 });
+  assert.throws(() => startDurableRuntimeOwnership(sessionDir), /already owned by live executor/);
 });
 
 test('Citadel refusal is archived, enqueues remediation, and resets affected phases', () => {
