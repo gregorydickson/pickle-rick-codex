@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { recoverableHardReset } from './recoverable-git.js';
+import { listChangedPathsSince } from './git-utils.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 
 export type MetricDirection = 'higher' | 'lower';
@@ -262,7 +263,8 @@ export function revertMetricIteration(cwd: string, checkpoint: MetricIterationCh
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    preserveUntracked: checkpoint.untracked,
+    ownedPaths: listChangedPathsSince(cwd, checkpoint.head)
+      .filter((candidate) => !checkpoint.untracked.includes(candidate)),
     headRecoveryRef: `refs/pickle/microverse-recovery/${path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-')}`,
   });
 }

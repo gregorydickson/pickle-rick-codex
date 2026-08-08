@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { repoRoot } from './helpers.js';
 
-test('worker, Citadel, and Microverse hard reset only through the recoverable Git seam', () => {
+test('worker, Citadel, and Microverse rollback only through the path-scoped recoverable Git seam', () => {
   const sources = [
     'src/bin/spawn-morty.ts',
     'src/bin/loop-runner.ts',
@@ -17,8 +17,9 @@ test('worker, Citadel, and Microverse hard reset only through the recoverable Gi
     assert.doesNotMatch(source, /reset[^\n]{0,40}--hard|\['reset',\s*'--hard'/, `${relativePath} bypasses recoverable-git`);
     assert.match(source, /recoverableHardReset/, `${relativePath} must use recoverable-git`);
   }
-  assert.match(
-    fs.readFileSync(path.join(repoRoot, 'src/services/recoverable-git.ts'), 'utf8'),
-    /\['reset', '--hard', options\.targetHead\]/,
-  );
+  const seam = fs.readFileSync(path.join(repoRoot, 'src/services/recoverable-git.ts'), 'utf8');
+  assert.doesNotMatch(seam, /reset[^\n]{0,40}--hard|\['reset',\s*'--hard'/);
+  assert.doesNotMatch(seam, /git stash|\['stash'|ls-files', '--others'.*exclude-standard/);
+  assert.match(seam, /ownedPaths: string\[\]/);
+  assert.match(seam, /\['restore'.*'--staged'.*'--worktree'/s);
 });

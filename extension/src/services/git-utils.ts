@@ -173,6 +173,16 @@ export function listWorkingTreeDirtyPaths(cwd: string, excludePrefixes?: string[
   return [...new Set(paths)].sort((left, right) => left.localeCompare(right));
 }
 
+/** Return exact file paths changed in commits or the worktree since a checkpoint. */
+export function listChangedPathsSince(cwd: string, checkpointHead: string): string[] {
+  const committed = runGit(['diff', '--name-only', '-z', checkpointHead, 'HEAD', '--'], cwd, {
+    trim: false,
+    timeout: 30_000,
+  }).split('\0').filter(Boolean);
+  return [...new Set([...committed, ...listWorkingTreeDirtyPaths(cwd)])]
+    .sort((left, right) => left.localeCompare(right));
+}
+
 export function hasTrackedWorkingTreeChanges(cwd: string): boolean {
   return porcelainStatusLines(getWorkingTreeStatus(cwd)).some((line) => !line.startsWith('?? '));
 }

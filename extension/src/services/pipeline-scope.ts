@@ -158,7 +158,9 @@ export function enforceLoopMutationScope(options: {
     sessionDir: options.sessionDir,
     targetHead: options.beforeHead,
     operation: `${options.mode}-scope-violation`,
-    preserveUntracked: options.preserveUntracked,
+    // The loop runs behind the session operation fence, so every exact path in
+    // this before/after delta is attributable even when it violates its scope.
+    ownedPaths: changed,
     headRecoveryRef: `refs/pickle/optional-loop-recovery/${session}/${options.mode}`,
     log: options.log,
   });

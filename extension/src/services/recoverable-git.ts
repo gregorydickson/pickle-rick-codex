@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { stashUnattributableRemainder } from './dirty-tree-salvage.js';
 
 export type DestructiveGitSafetyErrorKind =
   | 'destructive-archive-cap-exceeded'
@@ -23,7 +23,8 @@ export interface RecoverableHardResetOptions {
   sessionDir: string;
   targetHead: string;
   operation: string;
-  preserveUntracked?: string[];
+  /** Exact repository-relative files owned by the failed operation. */
+  ownedPaths: string[];
   headRecoveryRef?: string;
   maxArchiveBytes?: number;
   log?: (message: string) => void;
@@ -35,13 +36,14 @@ export interface RecoverableGitArchive {
   estimatedBytes: number;
 }
 
-function git(workingDir: string, args: string[]): string {
+function git(workingDir: string, args: string[], env?: NodeJS.ProcessEnv): string {
   return execFileSync('git', args, {
     cwd: workingDir,
     encoding: 'utf8',
     timeout: 30_000,
     maxBuffer: 16 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: env ? { ...process.env, ...env } : process.env,
   }).trim();
 }
 
@@ -57,12 +59,67 @@ function archiveLimit(explicit: number | undefined): number {
   return Math.floor(configured);
 }
 
-function untrackedPaths(workingDir: string): string[] {
-  return git(workingDir, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
+function normalizeOwnedPaths(workingDir: string, candidates: string[]): string[] {
+  const repoRoot = fs.realpathSync(git(workingDir, ['rev-parse', '--show-toplevel']));
+  const normalized = [...new Set(candidates.map((candidate) => candidate.replaceAll('\\', '/')))].sort();
+  if (normalized.length === 0) {
+    throw new DestructiveGitSafetyError('destructive-archive-failed', 'path-scoped recovery requires at least one operation-owned file');
+  }
+  for (const candidate of normalized) {
+    const target = path.resolve(repoRoot, candidate);
+    const relative = path.relative(repoRoot, target).replaceAll('\\', '/');
+    if (!candidate || candidate === '.' || relative !== candidate || relative.startsWith('../') || path.isAbsolute(relative)) {
+      throw new DestructiveGitSafetyError('destructive-archive-failed', `invalid operation-owned recovery path: ${candidate}`);
+    }
+    try {
+      if (fs.lstatSync(target).isDirectory()) {
+        throw new DestructiveGitSafetyError('destructive-archive-failed', `operation-owned recovery path must name a file, not a directory: ${candidate}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return normalized;
 }
 
-function estimateArchiveBytes(workingDir: string, targetHead: string, maxBytes: number): number {
-  const diff = spawnSync('git', ['diff', '--binary', targetHead, '--'], {
+function validateRecoveryRef(workingDir: string, recoveryRef: string): void {
+  git(workingDir, ['check-ref-format', recoveryRef]);
+}
+
+function buildOwnedSnapshot(
+  workingDir: string,
+  currentHead: string,
+  ownedPaths: string[],
+  operation: string,
+): { commit: string; dirty: boolean } {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-owned-recovery-'));
+  const indexPath = path.join(temporaryDir, 'index');
+  const env = { GIT_INDEX_FILE: indexPath };
+  try {
+    git(workingDir, ['read-tree', currentHead], env);
+    for (const ownedPath of ownedPaths) {
+      git(workingDir, ['add', '-A', '--', ownedPath], env);
+    }
+    const tree = git(workingDir, ['write-tree'], env);
+    const currentTree = git(workingDir, ['rev-parse', `${currentHead}^{tree}`]);
+    if (tree === currentTree) return { commit: currentHead, dirty: false };
+    const commit = git(workingDir, [
+      'commit-tree', tree, '-p', currentHead, '-m', `pickle recovery: ${operation}`,
+    ]);
+    return { commit, dirty: true };
+  } finally {
+    fs.rmSync(temporaryDir, { recursive: true, force: true });
+  }
+}
+
+function estimateArchiveBytes(
+  workingDir: string,
+  targetHead: string,
+  snapshotCommit: string,
+  ownedPaths: string[],
+  maxBytes: number,
+): number {
+  const diff = spawnSync('git', ['diff', '--binary', targetHead, snapshotCommit, '--', ...ownedPaths], {
     cwd: workingDir,
     encoding: 'buffer',
     timeout: 30_000,
@@ -70,69 +127,101 @@ function estimateArchiveBytes(workingDir: string, targetHead: string, maxBytes: 
   });
   if (diff.error || diff.status !== 0) {
     if ((diff.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS') {
-      throw new DestructiveGitSafetyError('destructive-archive-cap-exceeded', `tracked recovery archive exceeds ${maxBytes} bytes`);
+      throw new DestructiveGitSafetyError('destructive-archive-cap-exceeded', `owned recovery archive exceeds ${maxBytes} bytes`);
     }
-    throw new DestructiveGitSafetyError('destructive-archive-failed', `could not measure tracked recovery state: ${String(diff.stderr || diff.error?.message || '')}`);
+    throw new DestructiveGitSafetyError('destructive-archive-failed', `could not measure owned recovery state: ${String(diff.stderr || diff.error?.message || '')}`);
   }
-  let bytes = Buffer.isBuffer(diff.stdout) ? diff.stdout.length : Buffer.byteLength(String(diff.stdout || ''));
-  const repoRoot = fs.realpathSync(git(workingDir, ['rev-parse', '--show-toplevel']));
-  for (const relativePath of untrackedPaths(workingDir)) {
-    const target = path.resolve(repoRoot, relativePath);
-    const relative = path.relative(repoRoot, target);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-      throw new DestructiveGitSafetyError('destructive-archive-failed', `refusing to archive out-of-repository path ${relativePath}`);
-    }
-    try {
-      bytes += fs.lstatSync(target).size;
-    } catch (error) {
-      throw new DestructiveGitSafetyError('destructive-archive-failed', `could not size recovery path ${relativePath}`, { cause: error });
-    }
-    if (bytes > maxBytes) {
-      throw new DestructiveGitSafetyError('destructive-archive-cap-exceeded', `recovery archive requires ${bytes} bytes, above ${maxBytes}-byte cap`);
-    }
+  const bytes = Buffer.isBuffer(diff.stdout) ? diff.stdout.length : Buffer.byteLength(String(diff.stdout || ''));
+  if (bytes > maxBytes) {
+    throw new DestructiveGitSafetyError('destructive-archive-cap-exceeded', `owned recovery archive requires ${bytes} bytes, above ${maxBytes}-byte cap`);
   }
   return bytes;
 }
 
+function defaultRecoveryRef(options: RecoverableHardResetOptions): string {
+  return `refs/pickle/recovery/${safeName(path.basename(options.sessionDir))}/${safeName(options.operation)}`;
+}
+
 export function archiveRecoverableGitState(options: RecoverableHardResetOptions): RecoverableGitArchive {
   const maxBytes = archiveLimit(options.maxArchiveBytes);
-  const estimatedBytes = estimateArchiveBytes(options.workingDir, options.targetHead, maxBytes);
+  const targetHead = git(options.workingDir, ['rev-parse', `${options.targetHead}^{commit}`]);
   const currentHead = git(options.workingDir, ['rev-parse', 'HEAD']);
-  let headRef: string | null = null;
-  let dirtyRef: string | null = null;
+  if (options.ownedPaths.length === 0 && currentHead === targetHead) {
+    return { headRef: null, dirtyRef: null, estimatedBytes: 0 };
+  }
+  const ownedPaths = normalizeOwnedPaths(options.workingDir, options.ownedPaths);
+  const headRef = currentHead === targetHead ? null : (options.headRecoveryRef || defaultRecoveryRef(options));
   try {
-    if (currentHead !== options.targetHead) {
-      headRef = options.headRecoveryRef || `refs/pickle/recovery/${safeName(path.basename(options.sessionDir))}/${safeName(options.operation)}`;
+    if (headRef) validateRecoveryRef(options.workingDir, headRef);
+    const snapshot = buildOwnedSnapshot(options.workingDir, currentHead, ownedPaths, options.operation);
+    const session = safeName(path.basename(options.sessionDir));
+    const dirtyRef = `refs/pickle/salvage-history/${session}/${snapshot.commit}`;
+    const latestDirtyRef = `refs/pickle/salvage/${session}`;
+    if (snapshot.dirty) {
+      validateRecoveryRef(options.workingDir, dirtyRef);
+      validateRecoveryRef(options.workingDir, latestDirtyRef);
+    }
+    const estimatedBytes = estimateArchiveBytes(
+      options.workingDir,
+      targetHead,
+      snapshot.commit,
+      ownedPaths,
+      maxBytes,
+    );
+    if (headRef) {
       git(options.workingDir, ['update-ref', headRef, currentHead]);
       options.log?.(`archived destructive-operation HEAD at ${headRef}: ${currentHead}`);
     }
-    if (git(options.workingDir, ['status', '--porcelain']).trim()) {
-      dirtyRef = stashUnattributableRemainder(options.workingDir, options.sessionDir, options.log || (() => {}));
-      if (!dirtyRef) throw new Error('dirty snapshot did not produce a recovery ref');
+    if (snapshot.dirty) {
+      git(options.workingDir, ['update-ref', dirtyRef, snapshot.commit]);
+      git(options.workingDir, ['update-ref', latestDirtyRef, snapshot.commit]);
+      options.log?.(`archived operation-owned dirty state at ${dirtyRef}: ${snapshot.commit}`);
     }
+    return { headRef, dirtyRef: snapshot.dirty ? dirtyRef : null, estimatedBytes };
   } catch (error) {
-    throw new DestructiveGitSafetyError('destructive-archive-failed', 'recovery state could not be anchored; destructive operation aborted', { cause: error });
+    if (error instanceof DestructiveGitSafetyError) throw error;
+    throw new DestructiveGitSafetyError('destructive-archive-failed', 'operation-owned recovery state could not be anchored; rollback aborted', { cause: error });
   }
-  return { headRef, dirtyRef, estimatedBytes };
 }
 
+function targetContainsPath(workingDir: string, targetHead: string, ownedPath: string): boolean {
+  return git(workingDir, ['ls-tree', '-z', targetHead, '--', ownedPath]).length > 0;
+}
+
+/**
+ * Restore only files explicitly owned by a failed operation. The historical name
+ * remains API-compatible; this implementation never performs a repository reset.
+ */
 export function recoverableHardReset(options: RecoverableHardResetOptions): RecoverableGitArchive {
-  const archive = archiveRecoverableGitState(options);
+  const currentHead = git(options.workingDir, ['rev-parse', 'HEAD']);
+  const targetHead = git(options.workingDir, ['rev-parse', `${options.targetHead}^{commit}`]);
+  if (options.ownedPaths.length === 0 && currentHead === targetHead) {
+    return { headRef: null, dirtyRef: null, estimatedBytes: 0 };
+  }
+  const ownedPaths = normalizeOwnedPaths(options.workingDir, options.ownedPaths);
+  const archive = archiveRecoverableGitState({ ...options, ownedPaths, targetHead });
   try {
-    git(options.workingDir, ['reset', '--hard', options.targetHead]);
-    const preserved = new Set(options.preserveUntracked || []);
+    if (currentHead !== targetHead) {
+      git(options.workingDir, ['update-ref', 'HEAD', targetHead, currentHead]);
+    }
     const repoRoot = fs.realpathSync(git(options.workingDir, ['rev-parse', '--show-toplevel']));
-    for (const relativePath of untrackedPaths(options.workingDir)) {
-      if (preserved.has(relativePath)) continue;
-      const target = path.resolve(repoRoot, relativePath);
-      const relative = path.relative(repoRoot, target);
-      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-        throw new Error(`refusing to remove out-of-repository path ${relativePath}`);
+    for (const ownedPath of ownedPaths) {
+      if (targetContainsPath(options.workingDir, targetHead, ownedPath)) {
+        git(options.workingDir, ['restore', `--source=${targetHead}`, '--staged', '--worktree', '--', ownedPath]);
+        continue;
       }
-      fs.rmSync(target, { recursive: true, force: true });
+      git(options.workingDir, ['update-index', '--force-remove', '--', ownedPath]);
+      const target = path.join(repoRoot, ownedPath);
+      try {
+        const stat = fs.lstatSync(target);
+        if (stat.isDirectory()) throw new Error(`refusing recursive removal of operation-owned directory ${ownedPath}`);
+        fs.unlinkSync(target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
     }
   } catch (error) {
-    throw new DestructiveGitSafetyError('destructive-reset-failed', 'recovery state was archived, but checkpoint restore failed', { cause: error });
+    throw new DestructiveGitSafetyError('destructive-reset-failed', 'recovery state was archived, but path-scoped checkpoint restore failed', { cause: error });
   }
   return archive;
 }

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from './codex.js';
-import { getHeadSha, getWorkingTreeFingerprint, listWorkingTreeDirtyPaths } from './git-utils.js';
+import { getHeadSha, getWorkingTreeFingerprint, listChangedPathsSince, listWorkingTreeDirtyPaths } from './git-utils.js';
 import { recoverableHardReset } from './recoverable-git.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
@@ -507,6 +507,7 @@ function restoreMutatedCitadelCheckpoint(
     sessionDir,
     targetHead: checkpointHead,
     operation: `citadel-${suffix}`,
+    ownedPaths: listChangedPathsSince(workingDir, checkpointHead),
     headRecoveryRef: `refs/pickle/salvage/${path.basename(sessionDir)}-citadel-${suffix}`,
   });
   if (getCitadelRepositoryFingerprint(workingDir) !== checkpointFingerprint) {

@@ -11,6 +11,7 @@ import {
   getWorkingTreeStatus,
   isGitRepo,
   isWorkingTreeDirty,
+  listChangedPathsSince,
   listUntrackedFiles,
   readCommitTrailer,
   resetGitIndex,
@@ -18,6 +19,7 @@ import {
 } from './git-utils.js';
 import { enrichRefinementManifest, normalizeTicketId, normalizeTicketStatus, readManifest, updateTicketStatus } from './tickets.js';
 import { recoverableHardReset } from './recoverable-git.js';
+import { resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
 import type { RefinementManifest } from '../types/index.js';
 
@@ -610,7 +612,10 @@ export function reconcileVerifiedRefinementRepositoryAdvance(
         sessionDir,
         targetHead: advance.baseline_head_sha,
         operation: `interrupted-${advance.ticket_id}`,
-        preserveUntracked: advance.baseline_untracked_files,
+        ownedPaths: listChangedPathsSince(workingDir, advance.baseline_head_sha)
+          .filter((candidate) => resolveTicketScope(ticket).allowedPaths.some((allowed) => (
+            candidate === allowed || candidate.startsWith(`${allowed}/`)
+          ))),
         headRecoveryRef: `refs/pickle/recovery/${path.basename(sessionDir)}/${advance.ticket_id}`,
       });
     }

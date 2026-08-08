@@ -13,6 +13,7 @@ import {
   isGitRepo,
   isPathTracked,
   isWorkingTreeDirty,
+  listChangedPathsSince,
   listWorkingTreeDirtyPaths,
   listUntrackedFiles,
   resetHeadPreservingWorktree,
@@ -574,7 +575,8 @@ function revertMetricIterationSafely(
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    preserveUntracked: checkpoint.untracked,
+    ownedPaths: listChangedPathsSince(workingDir, checkpoint.head)
+      .filter((candidate) => !checkpoint.untracked.includes(candidate)),
     headRecoveryRef: `refs/pickle/microverse-recovery/${session}`,
     log: (message) => appendRunnerLog(sessionDir, message),
   });

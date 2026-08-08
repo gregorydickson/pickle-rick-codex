@@ -19,6 +19,7 @@ import {
   isGitRepo,
   isIndexClean,
   isWorkingTreeDirty,
+  listChangedPathsSince,
   listUntrackedFiles,
   readCommitTrailer,
   resetGitIndex,
@@ -384,6 +385,7 @@ interface WorkerMutationBoundary {
   head: string;
   fingerprint: string;
   untracked: string[];
+  allowedPaths: string[];
 }
 
 function rejectedWorkerRef(sessionDir: string, ticketId: string): string {
@@ -405,7 +407,10 @@ function restoreRejectedWorkerMutation(
     sessionDir,
     targetHead: boundary.head,
     operation: `rejected-${ticketId}`,
-    preserveUntracked: boundary.untracked,
+    ownedPaths: listChangedPathsSince(workingDir, boundary.head).filter((candidate) => (
+      !boundary.untracked.includes(candidate)
+      && boundary.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`))
+    )),
     headRecoveryRef: rejectedWorkerRef(sessionDir, ticketId),
     log: (message) => appendRunnerLog(sessionDir, runnerMode, message),
   });
@@ -956,10 +961,12 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         head: baselineHeadSha,
         fingerprint: repositoryMutationFingerprint(workingDir),
         untracked: baselineUntrackedFiles,
+        allowedPaths: [],
       };
     }
     workspaceBaseline = captureWorkspaceSnapshot(workingDir);
-    persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+    const ticketScope = persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+    if (mutationBoundary) mutationBoundary.allowedPaths = ticketScope.declared_paths;
     assertOwnership();
     updateTicketStatus(sessionDir, normalizedTicketId, {
       status: 'In Progress',
