@@ -188,14 +188,46 @@ test('worker lifecycle retries malformed read-only conformance output without di
   assert.match(retriedPrompt, /conformance wrote invalid JSON/);
 });
 
+test('deterministic verification fails immediately after implement before review phases run', () => {
+  const fakeBin = makeTempRoot('pickle-worker-verify-order-bin-');
+  createFakeCodex(fakeBin);
+  const dataRoot = makeTempRoot();
+  const invocationLog = path.join(dataRoot, 'codex-invocations.jsonl');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_MUTATE_FILE: 'feature.txt',
+    FAKE_CODEX_MUTATE_PHASE: 'implement',
+    FAKE_CODEX_APPEND_TEXT: 'implemented\n',
+  });
+  const { projectDir, sessionDir } = setupLifecycleRun(env);
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].verification = [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(23)'] }];
+  writeJson(manifestPath, manifest);
+  acceptTestRefinement(sessionDir, projectDir);
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir }),
+    /verification-command-failed|verification-contract-failed/,
+  );
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const phases = invocations.filter((entry) => entry.args[0] === 'exec')
+    .map((entry) => entry.args[entry.args.indexOf('--output-last-message') + 1])
+    .map((lastMessagePath) => path.basename(lastMessagePath).split('.')[1]);
+  assert.deepEqual(phases, ['research', 'research_review', 'plan', 'plan_review', 'implement']);
+});
+
 for (const refusalPhase of ['review', 'conformance']) {
 test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings into bounded remediation`, () => {
   const fakeBin = makeTempRoot('pickle-worker-lifecycle-refusal-bin-');
   createFakeCodex(fakeBin);
   const dataRoot = makeTempRoot();
   const promptLog = makeTempRoot('pickle-worker-lifecycle-refusal-prompts-');
+  const invocationLog = path.join(dataRoot, `codex-${refusalPhase}.jsonl`);
   const baseEnv = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
     FAKE_CODEX_MUTATE_FILE: 'feature.txt',
     FAKE_CODEX_MUTATE_PHASE: 'implement',
     FAKE_CODEX_APPEND_TEXT: 'implemented\n',
@@ -223,6 +255,7 @@ test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings i
   );
   assert.equal(git(projectDir, ['rev-parse', 'HEAD']), baseline);
   assert.equal(git(projectDir, ['status', '--porcelain']), '');
+  const firstRunCalls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length;
 
   runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], {
     env: { ...baseEnv, FAKE_LIFECYCLE_PROMPT_LOG: promptLog },
@@ -232,6 +265,11 @@ test(`worker lifecycle persists ${refusalPhase} refusal and feeds its findings i
   const implementPrompt = fs.readFileSync(path.join(promptLog, 'implement.prompt.txt'), 'utf8');
   assert.match(implementPrompt, /Prior rejected lifecycle feedback/);
   assert.match(implementPrompt, /retry dispatch is not repository-bound/);
+  const allCalls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const retryPhases = allCalls.slice(firstRunCalls)
+    .map((entry) => entry.args[entry.args.indexOf('--output-last-message') + 1])
+    .map((lastMessagePath) => path.basename(lastMessagePath).split('.')[1]);
+  assert.deepEqual(retryPhases, ['implement', 'review', 'simplify', 'conformance']);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
 });
 }

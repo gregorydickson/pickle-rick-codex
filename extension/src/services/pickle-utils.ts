@@ -244,6 +244,13 @@ export function parseTicketFile(filePath: string): ParsedTicket | null {
   if (!content) return null;
   const frontmatter = parseFrontmatter(content);
   if (!frontmatter) return null;
+  let verification;
+  try {
+    const parsed = JSON.parse(frontmatter.verification || 'null');
+    if (Array.isArray(parsed)) verification = parsed;
+  } catch {
+    verification = undefined;
+  }
   return {
     id: frontmatter.id || path.basename(path.dirname(filePath)),
     title: frontmatter.title || path.basename(filePath, '.md'),
@@ -251,6 +258,7 @@ export function parseTicketFile(filePath: string): ParsedTicket | null {
     order: Number(frontmatter.order || 0),
     complexity_tier: frontmatter.complexity_tier || 'medium',
     verify: frontmatter.verify || '',
+    ...(verification ? { verification } : {}),
     filePath,
     content,
     frontmatter,

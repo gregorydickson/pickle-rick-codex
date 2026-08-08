@@ -155,6 +155,7 @@ export interface ParsedTicket {
   order: number;
   complexity_tier: string;
   verify: string;
+  verification?: VerificationStep[];
   filePath: string;
   content: string;
   frontmatter: Record<string, string>;
@@ -310,12 +311,18 @@ export interface VerificationContract {
   vars: Record<string, VerificationEnvVarSpec>;
 }
 
+export type VerificationStep =
+  | { kind: 'process'; executable: string; args: string[]; cwd?: string }
+  | { kind: 'package_script'; manager: 'npm' | 'pnpm' | 'yarn'; script: string; args?: string[]; cwd?: string }
+  | { kind: 'shell'; script: string; justification: string; cwd?: string };
+
 export interface PreflightDiagnostic {
   kind:
     | 'preflight-missing-env'
     | 'preflight-invalid-env'
     | 'preflight-missing-executable'
-    | 'preflight-unsafe-glob';
+    | 'preflight-unsafe-glob'
+    | 'preflight-invalid-verification';
   name: string;
   message: string;
 }
@@ -324,6 +331,7 @@ export interface VerificationEnvResult {
   contract: VerificationContract | null;
   env: Record<string, string | undefined>;
   diagnostics: PreflightDiagnostic[];
+  steps: VerificationStep[];
 }
 
 export interface TicketVerificationInput {

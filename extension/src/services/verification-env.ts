@@ -9,6 +9,7 @@ import type {
   VerificationEnvResult,
   VerificationEnvVarSpec,
   VerificationRequirement,
+  VerificationStep,
 } from '../types/index.js';
 
 const SAFE_REPLACE_ENV_KEYS: readonly string[] = [
@@ -581,7 +582,118 @@ interface NormalizeVerificationCommandsOptions {
   verify?: unknown;
 }
 
+function legacyCommandSyntax(command: string): { balanced: boolean; shell: boolean } {
+  let quote: "'" | '"' | null = null;
+  let shell = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === '`') return { balanced: false, shell: true };
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (char === '\\' && quote === '"') index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+    else if ('|;<>()$'.includes(char)) shell = true;
+  }
+  return { balanced: quote === null, shell };
+}
+
+function structuredStep(value: unknown): VerificationStep | null {
+  if (!isPlainObject(value) || typeof value.kind !== 'string') return null;
+  const cwd = typeof value.cwd === 'string' && value.cwd.trim() ? value.cwd.trim() : undefined;
+  if (value.kind === 'process') {
+    if (typeof value.executable !== 'string' || !value.executable.trim() || !Array.isArray(value.args)
+      || value.args.some((arg) => typeof arg !== 'string')) return null;
+    return { kind: 'process', executable: value.executable.trim(), args: [...value.args] as string[], ...(cwd ? { cwd } : {}) };
+  }
+  if (value.kind === 'package_script') {
+    if (!['npm', 'pnpm', 'yarn'].includes(String(value.manager)) || typeof value.script !== 'string' || !value.script.trim()
+      || (value.args !== undefined && (!Array.isArray(value.args) || value.args.some((arg) => typeof arg !== 'string')))) return null;
+    return {
+      kind: 'package_script',
+      manager: value.manager as 'npm' | 'pnpm' | 'yarn',
+      script: value.script.trim(),
+      ...(Array.isArray(value.args) ? { args: [...value.args] as string[] } : {}),
+      ...(cwd ? { cwd } : {}),
+    };
+  }
+  if (value.kind === 'shell') {
+    if (typeof value.script !== 'string' || !value.script.trim()
+      || typeof value.justification !== 'string' || !value.justification.trim()) return null;
+    const syntax = legacyCommandSyntax(value.script);
+    if (!syntax.balanced && !value.script.includes('`')) return null;
+    return { kind: 'shell', script: value.script.trim(), justification: value.justification.trim(), ...(cwd ? { cwd } : {}) };
+  }
+  return null;
+}
+
+function migrateLegacyCommand(command: string): VerificationStep {
+  const syntax = legacyCommandSyntax(command);
+  if (!syntax.balanced) {
+    throw new VerificationContractError({
+      command,
+      message: 'unsafe legacy verification command contains backticks or unbalanced quoting; repair it into a structured process/package_script step before implementation',
+    });
+  }
+  if (syntax.shell) {
+    return { kind: 'shell', script: command, justification: 'migrated legacy command requiring shell syntax' };
+  }
+  const words = tokenizeShellWords(command);
+  if (words.length === 0) {
+    throw new VerificationContractError({ command, message: 'empty legacy verification command' });
+  }
+  if (['npm', 'pnpm', 'yarn'].includes(words[0]) && words[1] === 'run' && words[2]) {
+    const separator = words[3] === '--' ? 4 : 3;
+    return {
+      kind: 'package_script', manager: words[0] as 'npm' | 'pnpm' | 'yarn', script: words[2],
+      ...(words.length > separator ? { args: words.slice(separator) } : {}),
+    };
+  }
+  return { kind: 'process', executable: words[0], args: words.slice(1) };
+}
+
+export function normalizeVerificationSteps(value: unknown, options: NormalizeVerificationCommandsOptions = {}): VerificationStep[] {
+  const parsed = parseMaybeJson(value);
+  const source = Array.isArray(parsed)
+    ? parsed
+    : (isPlainObject(parsed) && Array.isArray(parsed.steps) ? parsed.steps : null);
+  if (source && source.some((entry) => isPlainObject(entry) && 'kind' in entry)) {
+    return source.map((entry) => {
+      const step = structuredStep(entry);
+      if (!step) throw new VerificationContractError({ message: `invalid structured verification step: ${JSON.stringify(entry)}` });
+      return step;
+    });
+  }
+  const legacy = normalizeVerificationCommands(value, options);
+  return legacy.map(migrateLegacyCommand);
+}
+
+export function verificationStepCommand(step: VerificationStep): { executable: string; args: string[]; shell: boolean; display: string } {
+  if (step.kind === 'process') {
+    return { executable: step.executable, args: [...step.args], shell: false, display: [step.executable, ...step.args].map(shellQuote).join(' ') };
+  }
+  if (step.kind === 'package_script') {
+    const args = ['run', step.script, ...(step.args?.length ? ['--', ...step.args] : [])];
+    return { executable: step.manager, args, shell: false, display: [step.manager, ...args].map(shellQuote).join(' ') };
+  }
+  return { executable: process.env.SHELL || 'zsh', args: ['-lc', step.script], shell: true, display: step.script };
+}
+
+export function verificationStepIdentity(steps: VerificationStep[]): string {
+  return JSON.stringify(steps);
+}
+
 export function normalizeVerificationCommands(value: unknown, options: NormalizeVerificationCommandsOptions = {}): string[] {
+  const parsed = parseMaybeJson(value);
+  const structured = Array.isArray(parsed) && parsed.some((entry) => isPlainObject(entry) && 'kind' in entry);
+  if (structured) {
+    return parsed.map((entry) => {
+      const step = structuredStep(entry);
+      if (!step) throw new VerificationContractError({ message: `invalid structured verification step: ${JSON.stringify(entry)}` });
+      return verificationStepCommand(step).display;
+    });
+  }
   const commands = normalizeVerificationValue(value);
   if (commands.length > 0) {
     return rewriteScopedVerificationCommands(commands, options.cwd).map(quoteTestPatternArguments);
@@ -948,7 +1060,7 @@ export function resolveVerificationEnv({
     .filter((d): d is PreflightDiagnostic => d !== null);
   diagnostics.push(...verificationCommandDiagnostics(ticket, cwd, env));
 
-  return { contract, env, diagnostics };
+  return { contract, env, diagnostics, steps: normalizeVerificationSteps(ticket?.verification, { verify: ticket?.verify, cwd }) };
 }
 
 export function assertTicketVerificationReady({

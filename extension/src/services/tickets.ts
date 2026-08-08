@@ -10,7 +10,7 @@ import {
   readTextFile,
   slugify,
 } from './pickle-utils.js';
-import { normalizeVerificationCommands, resolveTicketVerificationContract } from './verification-env.js';
+import { normalizeVerificationCommands, normalizeVerificationSteps, resolveTicketVerificationContract } from './verification-env.js';
 import type {
   ConfigVerificationInput,
   FreezeContract,
@@ -473,7 +473,7 @@ function hasExplicitFreezeShaSource(contract: FreezeContract | null | undefined)
 function normalizeTicketContracts(ticket: Ticket): { ticket: Ticket; changed: boolean } {
   let changed = false;
   const nextTicket: Ticket = { ...ticket };
-  const verification = normalizeVerificationCommands(ticket?.verification, { verify: ticket?.verify });
+  const verification = normalizeVerificationSteps(ticket?.verification, { verify: ticket?.verify });
   if (JSON.stringify(ticket?.verification) !== JSON.stringify(verification)) {
     changed = true;
     nextTicket.verification = verification;
@@ -1050,6 +1050,7 @@ export function validateRefinementManifest(
 
 function collectTicketFrontmatter(ticket: Ticket, order: number): Map<string, unknown> {
   const verification = ticketVerificationCommands(ticket);
+  const verificationSteps = normalizeVerificationSteps(ticket.verification, { verify: ticket.verify });
   const entries = new Map<string, unknown>([
     ['id', ticket.id],
     ['title', ticket.title],
@@ -1058,6 +1059,7 @@ function collectTicketFrontmatter(ticket: Ticket, order: number): Map<string, un
     ['priority', ticket.priority || 'P1'],
     ['complexity_tier', ticket.complexity_tier || 'medium'],
     ['verify', verification.join(' && ')],
+    ['verification', verificationSteps],
   ]);
   const excludedKeys = new Set<string>([
     'acceptance_criteria',
@@ -1071,7 +1073,6 @@ function collectTicketFrontmatter(ticket: Ticket, order: number): Map<string, un
     'order',
     'priority',
     'complexity_tier',
-    'verification',
     'verify',
   ]);
 

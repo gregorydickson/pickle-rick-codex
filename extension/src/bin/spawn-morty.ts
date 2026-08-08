@@ -53,6 +53,7 @@ import {
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
+import { lifecycleContextInputHash, readLifecycleContextCheckpoint, writeLifecycleContextCheckpoint } from '../services/lifecycle-checkpoints.js';
 import { atomicWriteJson } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { normalizeTicketId, readManifest, updateTicketStatus } from '../services/tickets.js';
@@ -73,7 +74,8 @@ import {
   assertTicketVerificationReady,
   isPreflightError,
   isVerificationContractError,
-  normalizeVerificationCommands,
+  normalizeVerificationSteps,
+  verificationStepCommand,
   VerificationContractError,
 } from '../services/verification-env.js';
 import {
@@ -89,6 +91,7 @@ import type {
   Ticket,
   VerificationEnvResult,
   VerificationFailure,
+  VerificationStep,
 } from '../types/index.js';
 
 function phasePromiseToken(phase: string): string {
@@ -515,7 +518,7 @@ function terminateChild(child: ChildProcess | null | undefined, signal: NodeJS.S
 }
 
 interface RunVerificationCommandOptions {
-  command: string;
+  step: VerificationStep;
   cwd: string;
   timeoutMs: number;
   manager: StateManager;
@@ -524,13 +527,16 @@ interface RunVerificationCommandOptions {
 }
 
 async function runVerificationCommand({
-  command,
+  step,
   cwd,
   timeoutMs,
   manager,
   statePath,
   env,
 }: RunVerificationCommandOptions): Promise<void> {
+  const descriptor = verificationStepCommand(step);
+  const command = descriptor.display;
+  const stepCwd = step.cwd ? path.resolve(cwd, step.cwd) : cwd;
   return await new Promise<void>((resolve, reject) => {
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
@@ -538,8 +544,8 @@ async function runVerificationCommand({
     let forcedByCancel = false;
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
-    const child = spawn(process.env.SHELL || 'zsh', ['-lc', command], {
-      cwd,
+    const child = spawn(descriptor.executable, descriptor.args, {
+      cwd: stepCwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
       detached: process.platform !== 'win32',
@@ -617,7 +623,7 @@ async function runVerificationCommand({
           exitCode: code,
           failures: buildVerificationFailureSet({
             command,
-            cwd,
+            cwd: stepCwd,
             stdout,
             stderr,
             exitCode: code,
@@ -656,16 +662,16 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
-  const verificationCommands = normalizeVerificationCommands(manifestTicket.verification, {
+  const verificationSteps = normalizeVerificationSteps(manifestTicket.verification, {
     verify: manifestTicket.verify,
     cwd: workingDir,
   });
-  if (verificationCommands.length === 0) {
+  if (verificationSteps.length === 0) {
     throw new Error(`ticket ${normalizedTicketId} has invalid verification manifest: expected one or more verification commands`);
   }
   const normalizedTicket: Ticket = {
     ...manifestTicket,
-    verification: verificationCommands,
+    verification: verificationSteps,
   };
 
   let verificationReady: VerificationEnvResult;
@@ -761,6 +767,31 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     return { status: 'incomplete', applied, reason: decision.reason };
   }
 
+  async function runDeterministicVerification(): Promise<void> {
+    manager.update(statePath, (current) => {
+      current.step = 'verify';
+      appendHistory(current, 'verify', normalizedTicketId);
+      return current;
+    });
+    for (const step of verificationSteps) {
+      if (isSessionCancelled(manager, statePath)) throw new CancellationError();
+      const command = verificationStepCommand(step).display;
+      try {
+        await runVerificationCommand({ step, cwd: workingDir, timeoutMs: config.defaults.worker_timeout_seconds * 1000, manager, statePath, env: verificationReady.env });
+      } catch (error) {
+        if (error instanceof VerificationCommandError) {
+          const remainingFailures = subtractBaselineFailures(sessionDir, normalizedTicketId, command, workingDir, error.failures);
+          if (remainingFailures.length === 0) continue;
+          error.failures = remainingFailures;
+        }
+        if (!(error instanceof CancellationError) && shouldClassifyVerificationContractFailure(normalizedTicket, command) && !isPreflightError(error)) {
+          throw new VerificationContractError({ ticketId: normalizedTicketId, command, message: `verification contract failed for ${command}: ${error instanceof Error ? error.message : String(error)}` });
+        }
+        throw error;
+      }
+    }
+  }
+
   try {
     verificationReady = assertTicketVerificationReady({
       ticket: normalizedTicket,
@@ -848,7 +879,28 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       active_child_command: null,
     });
 
+    const contextInputHash = lifecycleContextInputHash(normalizedTicket, baselineHeadSha);
+    const cachedContext = readLifecycleContextCheckpoint(sessionDir, normalizedTicketId, contextInputHash);
+    if (cachedContext) {
+      const expectedContextPhases: WorkerLifecyclePhase[] = ['research', 'research_review', 'plan', 'plan_review'];
+      try {
+        for (const phase of expectedContextPhases) {
+          const artifact = cachedContext.artifacts.find((entry) => entry.phase === phase);
+          if (!artifact) throw new Error(`checkpoint missing ${phase}`);
+          if (artifact.schema_version !== 1 || artifact.ticket_id !== normalizedTicketId || !artifact.summary?.trim()) {
+            throw new Error(`checkpoint contains invalid ${phase}`);
+          }
+          if (artifact.verdict === 'changes_requested') throw new Error(`checkpoint contains refused ${phase}`);
+          lifecycleArtifacts.push(artifact);
+        }
+        appendRunnerLog(sessionDir, runnerMode, `reused content-addressed research/plan checkpoint ${cachedContext.digest}`);
+      } catch {
+        lifecycleArtifacts.length = 0;
+      }
+    }
+
     for (const phase of WORKER_LIFECYCLE_PHASES) {
+      if (lifecycleArtifacts.some((artifact) => artifact.phase === phase)) continue;
       if (isSessionCancelled(manager, statePath)) {
         throw new CancellationError();
       }
@@ -982,49 +1034,11 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         throw new WorkerLifecycleRefusalError(phase, refusalPath, acceptedArtifact);
       }
       lifecycleArtifacts.push(acceptedArtifact);
+      if (phase === 'plan_review') {
+        writeLifecycleContextCheckpoint(sessionDir, normalizedTicketId, contextInputHash, lifecycleArtifacts.slice(0, 4));
+      }
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
-    }
-
-    for (const command of verificationCommands) {
-      if (isSessionCancelled(manager, statePath)) {
-        throw new CancellationError();
-      }
-      try {
-        await runVerificationCommand({
-          command,
-          cwd: workingDir,
-          timeoutMs: config.defaults.worker_timeout_seconds * 1000,
-          manager,
-          statePath,
-          env: verificationReady.env,
-        });
-      } catch (error) {
-        if (error instanceof VerificationCommandError) {
-          const remainingFailures = subtractBaselineFailures(
-            sessionDir,
-            normalizedTicketId,
-            command,
-            workingDir,
-            error.failures,
-          );
-          if (remainingFailures.length === 0) {
-            continue;
-          }
-          error.failures = remainingFailures;
-        }
-        if (
-          !(error instanceof CancellationError)
-          && shouldClassifyVerificationContractFailure(normalizedTicket, command)
-          && !isPreflightError(error)
-        ) {
-          throw new VerificationContractError({
-            ticketId: normalizedTicketId,
-            command,
-            message: `verification contract failed for ${command}: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
-        throw error;
-      }
+      if (phase === 'implement') await runDeterministicVerification();
     }
 
     const changedPathsBeforeGate = changedPathsSinceSnapshot(workingDir, workspaceBaseline);
