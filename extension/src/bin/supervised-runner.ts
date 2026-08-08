@@ -33,12 +33,13 @@ export async function runSupervisedRunner(
   sessionDir: string,
   runnerBin: string,
   runnerArgs: string[],
+  testOptions: { runnerPath?: string; restartDelayMs?: number } = {},
 ): Promise<number> {
   if (!ALLOWED_RUNNERS.has(runnerBin) || path.basename(runnerBin) !== runnerBin) {
     throw new Error(`Unsupported supervised runner: ${runnerBin}.`);
   }
   const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
-  const runnerPath = path.join(runtimeBin, runnerBin);
+  const runnerPath = testOptions.runnerPath || path.join(runtimeBin, runnerBin);
   let restartCount = 0;
 
   while (true) {
@@ -62,7 +63,7 @@ export async function runSupervisedRunner(
     if (decision === 'completed') return 0;
     if (decision === 'cancelled') return 130;
     restartCount += 1;
-    await delay(Math.min(30_000, 250 * (2 ** Math.min(restartCount, 7))));
+    await delay(testOptions.restartDelayMs ?? Math.min(30_000, 250 * (2 ** Math.min(restartCount, 7))));
   }
 }
 

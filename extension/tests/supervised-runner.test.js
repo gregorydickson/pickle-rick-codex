@@ -1,6 +1,8 @@
 // @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { makeTempRoot } from './helpers.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
@@ -9,7 +11,7 @@ import {
   requestPrdRevision,
   terminateLogicalPipeline,
 } from '../services/durable-supervisor.js';
-import { supervisedRunnerDecision } from '../bin/supervised-runner.js';
+import { runSupervisedRunner, supervisedRunnerDecision } from '../bin/supervised-runner.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
@@ -39,4 +41,42 @@ test('supervised runner exits only for the two logical terminal states', () => {
   const cancelled = autonomousSession();
   terminateLogicalPipeline(cancelled, 'cancelled');
   assert.equal(supervisedRunnerDecision(cancelled), 'cancelled');
+});
+
+test('SIGKILL of an executor is replaced and the logical pipeline still completes', async () => {
+  const sessionDir = autonomousSession();
+  const fixtureDir = makeTempRoot('pickle-supervised-executor-');
+  const countPath = path.join(fixtureDir, 'count');
+  const pidPath = path.join(fixtureDir, 'pid');
+  const durableModule = new URL('../services/durable-supervisor.js', import.meta.url).href;
+  const runnerPath = path.join(fixtureDir, 'executor.mjs');
+  fs.writeFileSync(runnerPath, `
+import fs from 'node:fs';
+const [sessionDir, countPath, pidPath, durableModule] = process.argv.slice(2);
+const count = Number(fs.existsSync(countPath) ? fs.readFileSync(countPath, 'utf8') : 0) + 1;
+fs.writeFileSync(countPath, String(count));
+if (count === 1) {
+  fs.writeFileSync(pidPath, String(process.pid));
+  setInterval(() => {}, 1000);
+} else {
+  const { terminateLogicalPipeline } = await import(durableModule);
+  terminateLogicalPipeline(sessionDir, 'completed');
+}
+`);
+
+  const run = runSupervisedRunner(
+    sessionDir,
+    'mux-runner.js',
+    [countPath, pidPath, durableModule],
+    { runnerPath, restartDelayMs: 10 },
+  );
+  const deadline = Date.now() + 5_000;
+  while (!fs.existsSync(pidPath) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(fs.existsSync(pidPath), 'first executor did not start');
+  process.kill(Number(fs.readFileSync(pidPath, 'utf8')), 'SIGKILL');
+  assert.equal(await run, 0);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '2');
+  assert.equal(supervisedRunnerDecision(sessionDir), 'completed');
 });
