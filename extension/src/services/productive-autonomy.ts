@@ -86,6 +86,12 @@ export interface RecoveryStrategyProgress {
   recordedAt: string;
 }
 
+export interface MaterialRecoveryPlan {
+  route: FailureRoute;
+  materialApproach: string;
+  inputHashes: string[];
+}
+
 export interface ExecutionTelemetryEvent {
   sequence: number;
   ticket_id: string;
@@ -414,6 +420,51 @@ export function nextMaterialApproach(domain: FailureDomain, priorEpochs: number)
     infrastructure: ['restart-executor', 'reconstruct-workspace', 'revalidate-checkpoint-and-relaunch'],
   };
   return approaches[domain][priorEpochs % approaches[domain].length];
+}
+
+/**
+ * Select a durable strategy without ever cycling back into an unresolved hash.
+ * The first three epochs retain the domain-specific fast paths. Exhausting
+ * those paths escalates once through contract repair, then returns to the
+ * original typed handler with the accumulated unresolved evidence as a new
+ * causal input. Later diagnostic epochs remain unique because each one binds
+ * the complete, growing set of prior strategy hashes.
+ */
+export function nextMaterialRecoveryPlan(
+  route: FailureRoute,
+  unresolvedEpochs: RecoveryStrategyEpoch[],
+): MaterialRecoveryPlan {
+  const inputHashes = unresolvedEpochs.map((epoch) => epoch.strategyHash);
+  const priorEpochs = unresolvedEpochs.length;
+  if (priorEpochs < 3) {
+    return {
+      route: structuredClone(route),
+      materialApproach: nextMaterialApproach(route.domain, priorEpochs),
+      inputHashes,
+    };
+  }
+  if (priorEpochs === 3) {
+    const contractRoute = typedRecoveryRoute('contract_invalid');
+    return {
+      route: contractRoute,
+      materialApproach: route.domain === 'contract'
+        ? 're-refine-contract-slice-from-unresolved-evidence'
+        : `repair-contract-after-${route.failureType || route.domain}-strategy-exhaustion`,
+      inputHashes,
+    };
+  }
+  if (priorEpochs === 4) {
+    return {
+      route: structuredClone(route),
+      materialApproach: `diagnose-cross-phase-causal-gap-after-contract-repair-${route.domain}`,
+      inputHashes,
+    };
+  }
+  return {
+    route: structuredClone(route),
+    materialApproach: `synthesize-novel-${route.domain}-strategy-from-${priorEpochs}-unresolved-epochs`,
+    inputHashes,
+  };
 }
 
 export function recordExecutionTelemetry(

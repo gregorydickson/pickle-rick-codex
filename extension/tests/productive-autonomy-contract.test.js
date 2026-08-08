@@ -11,6 +11,7 @@ import {
   executionTelemetrySummary,
   materialStrategyHash,
   nextMaterialApproach,
+  nextMaterialRecoveryPlan,
   planSchedulerContinuity,
   readRecoveryStrategyEpochs,
   readUnresolvedRecoveryStrategyEpochs,
@@ -149,6 +150,33 @@ test('strategy epochs reject A-B-A reuse across restart until verified progress 
   const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'recovery-strategies.json'), 'utf8'));
   assert.deepEqual(persisted.progress.map((event) => event.ticketId), ['r2', 'r1']);
   assert.equal(readRecoveryStrategyEpochs(sessionDir).length, 4);
+});
+
+test('strategy exhaustion escalates through contract repair and durable diagnostics without hash reuse', () => {
+  const sessionDir = makeTempRoot('pickle-strategy-escalation-');
+  const route = typedRecoveryRoute('review_refused');
+  const epochs = [];
+  for (let index = 0; index < 7; index += 1) {
+    const plan = nextMaterialRecoveryPlan(route, epochs);
+    const epoch = beginRecoveryStrategyEpoch(sessionDir, {
+      ticketId: 'r1', domain: plan.route.domain, handler: plan.route.handler,
+      checkpoint: plan.route.invalidate[0] || 'executor', inputHashes: plan.inputHashes,
+      constraints: ['unchanged review refusal'], materialApproach: plan.materialApproach,
+    }, 'circuit_threshold');
+    epochs.push(epoch);
+  }
+
+  assert.deepEqual(epochs.slice(0, 3).map((epoch) => epoch.materialApproach), [
+    'apply-review-findings-to-candidate',
+    'reduce-diff-and-reverify',
+    'reconstruct-candidate-from-approved-context',
+  ]);
+  assert.equal(epochs[3].handler, 'repair_contract');
+  assert.equal(epochs[3].domain, 'contract');
+  assert.match(epochs[4].materialApproach, /diagnose-cross-phase-causal-gap/);
+  assert.match(epochs[6].materialApproach, /6-unresolved-epochs/);
+  assert.equal(new Set(epochs.map((epoch) => epoch.strategyHash)).size, epochs.length);
+  assert.deepEqual(readUnresolvedRecoveryStrategyEpochs(sessionDir, 'r1'), epochs);
 });
 
 test('strategy progress history fails closed when a persisted reset boundary is corrupt', () => {

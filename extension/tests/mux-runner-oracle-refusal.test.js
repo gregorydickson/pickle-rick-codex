@@ -13,7 +13,9 @@ import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 import { VerificationCommandError } from '../bin/spawn-morty.js';
 import {
+  beginRecoveryStrategyEpoch,
   executionTelemetrySummary,
+  nextMaterialApproach,
   readRecoveryStrategyEpochs,
 } from '../services/productive-autonomy.js';
 import {
@@ -233,13 +235,14 @@ test('literal no-progress run selects three material strategies without human in
     defaults: { circuit_breaker: { same_error_threshold: 3, no_progress_threshold: 3 } },
   });
   let calls = 0;
+  let contractRepairs = 0;
   const finalReason = await withDataRoot(dataRoot, () => runSequential(
     sessionDir,
     { onFailure: 'retry', runnerMode: 'pickle' },
     {
       runTicket: async () => {
         calls += 1;
-        if (calls === 10) return { status: 'done', applied: true };
+        if (calls === 13) return { status: 'done', applied: true };
         const artifact = {
           schema_version: 1,
           phase: 'review',
@@ -250,20 +253,82 @@ test('literal no-progress run selects three material strategies without human in
         };
         throw new WorkerLifecycleRefusalError('review', `/evidence/no-progress-${calls}.json`, artifact);
       },
+      repairTicketVerificationContract: async () => {
+        contractRepairs += 1;
+        return [{ kind: 'process', executable: process.execPath, args: ['--version'] }];
+      },
     },
   ));
 
   const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'r1');
   const authorizations = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-recovery-authorizations.json'), 'utf8'));
   assert.equal(finalReason, 'success');
-  assert.equal(calls, 10);
-  assert.ok(strategies.length >= 3);
+  assert.equal(calls, 13);
+  assert.equal(contractRepairs, 1);
+  assert.ok(strategies.length >= 4);
   assert.equal(new Set(strategies.slice(0, 3).map((epoch) => epoch.materialApproach)).size, 3);
   assert.equal(new Set(strategies.slice(0, 3).map((epoch) => epoch.strategyHash)).size, 3);
   assert.ok(authorizations.authorizations.length >= 3);
+  assert.equal(strategies[3].handler, 'repair_contract');
   assert.ok(authorizations.authorizations.every((authorization) => authorization.authorized_by === 'runner'));
   assert.equal(executionTelemetrySummary(sessionDir).postSealHumanInterventions, 0);
   assert.doesNotMatch(readRunnerLog(sessionDir), /paused for explicit PRD revision approval|stopping during ticket|refusing ticket/);
+});
+
+test('mux-runner resumes a persisted strategy-exhaustion stop through durable escalation', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('strategy exhaustion relaunch task');
+  writeJson(path.join(dataRoot, 'config.json'), {
+    defaults: { circuit_breaker: { same_error_threshold: 3, no_progress_threshold: 3 } },
+  });
+  const base = {
+    ticketId: 'r1', domain: 'review', handler: 'remediate_candidate', checkpoint: 'implement',
+    constraints: ['unchanged review refusal'],
+  };
+  for (let index = 0; index < 3; index += 1) {
+    beginRecoveryStrategyEpoch(sessionDir, {
+      ...base, materialApproach: nextMaterialApproach('review', index),
+    }, 'circuit_threshold');
+  }
+  const identity = buildTicketRecoveryFailureIdentity({
+    failureKind: 'worker_failure', message: 'unchanged review refusal', phase: 'review',
+  });
+  for (let index = 0; index < 3; index += 1) {
+    recordTicketRecoveryFailure({ sessionDir, ticketId: 'r1', failureKind: 'worker_failure', identity });
+  }
+  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+    state.recovery_required = true;
+    state.recovery_kind = 'ticket_recovery_history';
+    state.recovery_reason = 'recovery-strategy-not-novel: predecessor exhausted A/B/C';
+    return state;
+  });
+
+  let contractRepairs = 0;
+  let calls = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketVerificationContract: async () => {
+        contractRepairs += 1;
+        return [{ kind: 'process', executable: process.execPath, args: ['--version'] }];
+      },
+      runTicket: async (_dir, ticketId, options) => {
+        calls += 1;
+        assert.equal(options.recoveryStrategy.handler, 'repair_contract');
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success');
+  assert.equal(contractRepairs, 1);
+  assert.equal(calls, 1);
+  assert.equal(new StateManager().read(path.join(sessionDir, 'state.json')).recovery_required, false);
+  assert.match(readRunnerLog(sessionDir), /resumed obsolete strategy-exhaustion stop through autonomous escalation/);
+  const strategies = readRecoveryStrategyEpochs(sessionDir);
+  assert.equal(strategies.length, 4);
+  assert.equal(strategies[3].handler, 'repair_contract');
 });
 
 test('mux-runner adaptive recovery rolls interleaved recurring lineages into a new strategy epoch', async () => {

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
 import { canExecute, loadCircuitState, openCircuitBreaker, resetCircuitBreaker } from '../services/circuit-breaker.js';
-import { getRunStartEpoch, markRunStart } from '../services/session.js';
+import { appendHistory, getRunStartEpoch, markRunStart } from '../services/session.js';
 import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
@@ -34,6 +34,7 @@ import {
   beginRecoveryStrategyEpoch,
   classifyAutonomousFailure,
   executionTelemetrySummary,
+  nextMaterialRecoveryPlan,
   nextMaterialApproach,
   planSchedulerContinuity,
   readUnresolvedRecoveryStrategyEpochs,
@@ -115,6 +116,26 @@ function shouldStop(state: PersistedState): string | null {
   return null;
 }
 
+function resumeStrategyExhaustionAfterUpgrade(
+  manager: StateManager,
+  statePath: string,
+): boolean {
+  let resumed = false;
+  manager.update(statePath, (state) => {
+    if (state.recovery_required === true
+      && state.recovery_kind === 'ticket_recovery_history'
+      && String(state.recovery_reason || '').startsWith('recovery-strategy-not-novel:')) {
+      state.recovery_required = false;
+      state.recovery_kind = null;
+      state.recovery_reason = null;
+      appendHistory(state, 'strategy_exhaustion_resumed', (state.current_ticket as string | null) || undefined);
+      resumed = true;
+    }
+    return state;
+  });
+  return resumed;
+}
+
 async function runSequentialWithLease(
   sessionDir: string,
   options: RunSequentialOptions = {},
@@ -140,6 +161,9 @@ async function runSequentialWithLease(
     markRunStart,
     runStartedAtMs: Number(options.runStartedAtMs),
   });
+  if (resumeStrategyExhaustionAfterUpgrade(manager, statePath)) {
+    appendRunnerLog(sessionDir, runnerMode, 'resumed obsolete strategy-exhaustion stop through autonomous escalation');
+  }
 
   let summary;
   try {
@@ -259,7 +283,9 @@ async function runSequentialWithLease(
       trigger: 'failure' | 'retry_threshold' | 'time_threshold' | 'circuit_threshold' = 'retry_threshold',
     ): RecoveryStrategyEpoch | null => {
       try {
-        const route = latestFailureRoute;
+        const priorStrategies = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticket.id);
+        const plan = nextMaterialRecoveryPlan(latestFailureRoute, priorStrategies);
+        const route = plan.route;
         const executionAction = recoveryExecutionAction(route);
         if (executionAction === 'request_prd_revision') {
           requestPrdRevision(
@@ -275,14 +301,14 @@ async function runSequentialWithLease(
         }
         pendingContractRepair = executionAction === 'repair_contract';
         recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: route.invalidate.length });
-        const priorEpochs = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticket.id).length;
         const strategy = beginRecoveryStrategyEpoch(sessionDir, {
           ticketId: ticket.id,
-          domain: latestFailureDomain,
+          domain: route.domain,
           handler: route.handler,
           checkpoint: route.invalidate[0] || 'executor',
+          inputHashes: plan.inputHashes,
           constraints: [reason],
-          materialApproach: nextMaterialApproach(latestFailureDomain, priorEpochs),
+          materialApproach: plan.materialApproach,
         }, trigger);
         activeStrategyHash = strategy.strategyHash;
         activeStrategy = strategy;
