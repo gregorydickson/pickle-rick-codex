@@ -1853,6 +1853,9 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         }
       }
 
+      if (metricCheckpoint && experiment && candidate) {
+        archiveMicroverseCandidate(sessionDir, candidate, experiment.id);
+      }
       let metricResult: ReturnType<typeof processMetricIteration> | null = null;
       if (metricCheckpoint && experiment && currentMetricState) {
         try {
