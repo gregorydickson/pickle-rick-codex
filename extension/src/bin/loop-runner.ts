@@ -8,7 +8,11 @@ import { canExecute, loadCircuitState, recordIteration, resetCircuitBreaker } fr
 import { logActivity } from '../services/activity-logger.js';
 import {
   commitTrackedChanges,
+  createPatchFromWorktree,
+  createIsolatedTicketWorktree,
+  fastForwardFromIsolatedCandidate,
   getHeadSha,
+  getWorkingTreeFingerprint,
   getWorkingTreeStatus,
   isGitRepo,
   isPathTracked,
@@ -18,6 +22,7 @@ import {
   listUntrackedFiles,
   resetHeadPreservingWorktree,
   resetGitIndex,
+  removeTicketWorktree,
 } from '../services/git-utils.js';
 import { salvageDirtyTree, stageOwnedPaths } from '../services/dirty-tree-salvage.js';
 import {
@@ -99,13 +104,41 @@ interface ControlFileSnapshot {
 }
 
 interface MicroverseAttemptTransaction {
-  schema_version: 1;
+  schema_version: 1 | 2;
   experiment_id: string;
   iteration: number;
   attempt: number;
   checkpoint: MetricIterationCheckpoint;
   metric_state_before: MetricConvergenceState;
+  candidate_worktree?: string;
+  live_working_dir?: string;
+  live_head?: string;
+  live_fingerprint?: string;
+  phase?: 'running' | 'promotion_pending' | 'promoted';
+  candidate_head?: string;
+  promotion_result?: {
+    result_score: number;
+    metric_state_after: MetricConvergenceState;
+    changed_paths: string[];
+    diff_artifact: string | null;
+    insight: string | null;
+    verification: string[];
+  };
   created_at: string;
+}
+
+interface MicroverseCandidate {
+  worktreeDir: string;
+  liveWorkingDir: string;
+  baseHead: string;
+  liveFingerprint: string;
+}
+
+class MicroversePromotionDeferredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MicroversePromotionDeferredError';
+  }
 }
 
 class PostWorkerMetricMeasurementError extends Error {
@@ -577,10 +610,10 @@ function revertMetricIterationSafely(
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    // A metric checkpoint is captured only after a completely clean-tree gate.
-    // Every subsequent change therefore belongs to this attempt, including
-    // mutations made before the worker can publish its declared target paths.
-    ownedPaths: changedPaths,
+    ownedPaths: changedPaths
+      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
+        candidate === owned || candidate.startsWith(`${owned}/`)
+      ))),
     evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${session}`,
     log: (message) => appendRunnerLog(sessionDir, message),
@@ -597,16 +630,139 @@ function writeMicroverseAttemptTransaction(
   iteration: number,
   checkpoint: MetricIterationCheckpoint,
   metricState: MetricConvergenceState,
+  candidate?: MicroverseCandidate,
 ): void {
   atomicWriteJson(microverseAttemptPath(sessionDir), {
-    schema_version: 1,
+    schema_version: candidate ? 2 : 1,
     experiment_id: experiment.id,
     iteration,
     attempt: experiment.attempt,
     checkpoint,
     metric_state_before: metricState,
+    candidate_worktree: candidate?.worktreeDir,
+    live_working_dir: candidate?.liveWorkingDir,
+    live_head: candidate?.baseHead,
+    live_fingerprint: candidate?.liveFingerprint,
+    phase: candidate ? 'running' : undefined,
     created_at: new Date().toISOString(),
   } satisfies MicroverseAttemptTransaction);
+}
+
+function persistMicroversePromotion(
+  sessionDir: string,
+  phase: 'promotion_pending' | 'promoted',
+  candidate: MicroverseCandidate,
+  metricResult: ReturnType<typeof processMetricIteration>,
+  artifact: WorkerExperimentArtifact | null,
+): void {
+  const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+  if (!transaction || transaction.schema_version !== 2) {
+    throw new Error('Cannot persist Microverse promotion without its isolated attempt transaction.');
+  }
+  atomicWriteJson(microverseAttemptPath(sessionDir), {
+    ...transaction,
+    phase,
+    candidate_head: getHeadSha(candidate.worktreeDir),
+    promotion_result: {
+      result_score: metricResult.state.latest.score,
+      metric_state_after: metricResult.state,
+      changed_paths: metricResult.changedPaths,
+      diff_artifact: metricResult.diffArtifact,
+      insight: artifact?.insight || null,
+      verification: artifact?.verification || [],
+    },
+  } satisfies MicroverseAttemptTransaction);
+}
+
+function createMicroverseCandidate(
+  sessionDir: string,
+  liveWorkingDir: string,
+  experiment: MicroverseExperimentRecord,
+  checkpoint: MetricIterationCheckpoint,
+): MicroverseCandidate {
+  const liveFingerprint = getWorkingTreeFingerprint(liveWorkingDir);
+  const candidate = createIsolatedTicketWorktree({
+    repoDir: liveWorkingDir,
+    sessionDir: path.join(sessionDir, 'microverse-candidates'),
+    ticketId: `${experiment.id}-attempt-${experiment.attempt}`,
+    baseRef: checkpoint.head,
+  });
+  return {
+    worktreeDir: candidate.worktreeDir,
+    liveWorkingDir,
+    baseHead: checkpoint.head,
+    liveFingerprint,
+  };
+}
+
+function discardMicroverseCandidate(candidate: MicroverseCandidate | null): void {
+  if (!candidate) return;
+  removeTicketWorktree(candidate.worktreeDir);
+}
+
+function archiveMicroverseCandidate(
+  sessionDir: string,
+  candidate: MicroverseCandidate | null,
+  experimentId: string | null,
+): void {
+  if (!candidate || !experimentId || !fs.existsSync(candidate.worktreeDir)) return;
+  archiveMicroverseExperiment({
+    workingDir: candidate.worktreeDir,
+    sessionDir,
+    experimentId,
+    baseRef: candidate.baseHead,
+    excludeUntrackedPaths: [],
+  });
+}
+
+function transactionCandidate(sessionDir: string, transaction: MicroverseAttemptTransaction): MicroverseCandidate | null {
+  if (!transaction.candidate_worktree || !transaction.live_working_dir
+      || !transaction.live_head || !transaction.live_fingerprint) return null;
+  const candidateRoot = path.resolve(sessionDir, 'microverse-candidates', 'isolated-worktrees');
+  const candidatePath = path.resolve(transaction.candidate_worktree);
+  if (candidatePath === candidateRoot || !candidatePath.startsWith(`${candidateRoot}${path.sep}`)) {
+    throw new Error('Invalid durable Microverse candidate path.');
+  }
+  return {
+    worktreeDir: candidatePath,
+    liveWorkingDir: transaction.live_working_dir,
+    baseHead: transaction.live_head,
+    liveFingerprint: transaction.live_fingerprint,
+  };
+}
+
+function promoteMicroverseCandidate(
+  sessionDir: string,
+  candidate: MicroverseCandidate,
+  experimentId: string,
+): string[] {
+  const changedPaths = listChangedPathsSince(candidate.worktreeDir, candidate.baseHead);
+  if (changedPaths.length === 0) return [];
+  const liveHead = getHeadSha(candidate.liveWorkingDir);
+  const liveFingerprint = getWorkingTreeFingerprint(candidate.liveWorkingDir);
+  if (liveHead !== candidate.baseHead || liveFingerprint !== candidate.liveFingerprint) {
+    const patchDir = path.join(sessionDir, 'microverse-candidate-patches');
+    fs.mkdirSync(patchDir, { recursive: true, mode: 0o700 });
+    const patchPath = path.join(patchDir, `${experimentId}.patch`);
+    createPatchFromWorktree(candidate.worktreeDir, candidate.baseHead, patchPath);
+    throw new MicroversePromotionDeferredError(
+      `Live workspace changed during ${experimentId}; candidate preserved at ${patchPath} for safe retry.`,
+    );
+  }
+
+  const patchDir = path.join(sessionDir, 'microverse-candidate-patches');
+  fs.mkdirSync(patchDir, { recursive: true, mode: 0o700 });
+  const patchPath = path.join(patchDir, `${experimentId}.patch`);
+  createPatchFromWorktree(candidate.worktreeDir, candidate.baseHead, patchPath);
+  const candidateHead = getHeadSha(candidate.worktreeDir);
+  if (!candidateHead || candidateHead === candidate.baseHead) {
+    throw new Error(`Accepted Microverse candidate ${experimentId} has no committed improvement.`);
+  }
+  fastForwardFromIsolatedCandidate(candidate.liveWorkingDir, candidate.worktreeDir, candidate.baseHead);
+  if (listWorkingTreeDirtyPaths(candidate.liveWorkingDir).length > 0) {
+    throw new Error(`Microverse promotion left an unexpected dirty live workspace for ${experimentId}.`);
+  }
+  return changedPaths;
 }
 
 function clearMicroverseAttemptTransaction(sessionDir: string): void {
@@ -623,13 +779,62 @@ function microverseAttemptHasTerminalOutcome(sessionDir: string): boolean {
 function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: string): string[] {
   const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
   if (!transaction) return [];
-  if (transaction.schema_version !== 1 || !/^exp-\d{4,}$/.test(transaction.experiment_id)
+  if (![1, 2].includes(transaction.schema_version) || !/^exp-\d{4,}$/.test(transaction.experiment_id)
       || !Number.isInteger(transaction.iteration) || !Number.isInteger(transaction.attempt)
       || !transaction.checkpoint || !transaction.metric_state_before) {
     throw new Error('Invalid durable Microverse attempt transaction.');
   }
+  if (transaction.schema_version === 2 && !transactionCandidate(sessionDir, transaction)) {
+    throw new Error('Invalid durable isolated Microverse attempt transaction.');
+  }
   const ledger = readExperimentLedger(sessionDir);
   const experiment = ledger?.experiments.find((entry) => entry.id === transaction.experiment_id) || null;
+  if (transaction.schema_version === 2
+      && (transaction.phase === 'promotion_pending' || transaction.phase === 'promoted')) {
+    const candidate = transactionCandidate(sessionDir, transaction)!;
+    const promotion = transaction.promotion_result;
+    if (!promotion || !transaction.candidate_head) {
+      throw new Error('Invalid durable Microverse promotion transaction.');
+    }
+    const liveHead = getHeadSha(workingDir);
+    if (liveHead !== transaction.candidate_head) {
+      if (transaction.phase === 'promoted') {
+        throw new Error('Promoted Microverse candidate no longer matches the live repository HEAD.');
+      }
+      if (liveHead !== transaction.live_head
+          || getWorkingTreeFingerprint(workingDir) !== transaction.live_fingerprint) {
+        throw new MicroversePromotionDeferredError(
+          `Live workspace still differs from the ${transaction.experiment_id} promotion boundary; candidate remains pending.`,
+        );
+      }
+      promoteMicroverseCandidate(sessionDir, candidate, transaction.experiment_id);
+      atomicWriteJson(microverseAttemptPath(sessionDir), { ...transaction, phase: 'promoted' });
+    }
+    if (experiment && experiment.status === 'running') {
+      completeExperiment(sessionDir, experiment.id, {
+        status: 'accepted',
+        classification: 'improved',
+        resultScore: promotion.result_score,
+        changedPaths: promotion.changed_paths,
+        diffArtifact: promotion.diff_artifact,
+        insight: promotion.insight,
+        verification: promotion.verification,
+      });
+    }
+    const recoveredLedger = readExperimentLedger(sessionDir);
+    writeMetricConvergenceState(sessionDir, promotion.metric_state_after);
+    const manager = new StateManager();
+    manager.update(path.join(sessionDir, 'state.json'), (current) => {
+      current.iteration = Math.max(Number(current.iteration || 0), transaction.iteration);
+      current.loop_stall_count = recoveredLedger?.experiment_stall_count || 0;
+      current.worker_failure_count = recoveredLedger?.worker_failure_count || 0;
+      return current;
+    });
+    writeMetricSummary(sessionDir, promotion.metric_state_after);
+    discardMicroverseCandidate(candidate);
+    clearMicroverseAttemptTransaction(sessionDir);
+    return [];
+  }
   if (experiment && ['accepted', 'rejected', 'invalid'].includes(experiment.status)) {
     if (experiment.status === 'accepted' || experiment.status === 'rejected') {
       const manager = new StateManager();
@@ -642,10 +847,18 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
     }
     const metric = readMetricConvergenceState(sessionDir);
     if (metric) writeMetricSummary(sessionDir, metric);
+    discardMicroverseCandidate(transactionCandidate(sessionDir, transaction));
     clearMicroverseAttemptTransaction(sessionDir);
     return [];
   }
-  revertMetricIterationSafely(sessionDir, workingDir, transaction.checkpoint);
+  const candidate = transactionCandidate(sessionDir, transaction);
+  if (candidate) {
+    discardMicroverseCandidate(candidate);
+  } else {
+    // Backward-compatible recovery for transactions created before isolated
+    // candidate worktrees were introduced.
+    revertMetricIterationSafely(sessionDir, workingDir, transaction.checkpoint);
+  }
   writeMetricConvergenceState(sessionDir, transaction.metric_state_before);
   const reconciled = reconcileRunningExperiments(sessionDir, {
     mode: 'resume',
@@ -672,6 +885,7 @@ function finalizeMicroverseAttemptOnExit(sessionDir: string, exitReason: string)
     });
     const metric = readMetricConvergenceState(sessionDir);
     if (metric) writeMetricSummary(sessionDir, metric);
+    discardMicroverseCandidate(transactionCandidate(sessionDir, transaction));
     clearMicroverseAttemptTransaction(sessionDir);
     return [];
   }
@@ -684,6 +898,7 @@ function finalizeMicroverseAttemptOnExit(sessionDir: string, exitReason: string)
   });
   const metric = readMetricConvergenceState(sessionDir);
   if (metric) writeMetricSummary(sessionDir, metric);
+  if (transaction) discardMicroverseCandidate(transactionCandidate(sessionDir, transaction));
   clearMicroverseAttemptTransaction(sessionDir);
   return reconciled.reconciled_ids;
 }
@@ -1111,7 +1326,21 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       });
       appendRunnerLog(sessionDir, `microverse reset ${resetFailures} prior-run worker failures on relaunch`);
     }
-    const recovered = recoverInterruptedMicroverseAttempt(sessionDir, initialState.working_dir as string);
+    let recovered: string[];
+    try {
+      recovered = recoverInterruptedMicroverseAttempt(sessionDir, initialState.working_dir as string);
+    } catch (error) {
+      if (!(error instanceof MicroversePromotionDeferredError)) throw error;
+      manager.update(statePath, (current) => {
+        current.last_loop_message = error.message;
+        return current;
+      });
+      const finalReason = exitLoopRunnerPhase(manager, statePath, 'workspace_changed');
+      writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), finalReason);
+      appendRunnerLog(sessionDir, error.message);
+      appendRunnerLog(sessionDir, `loop-runner finished: ${finalReason}`);
+      return;
+    }
     if (recovered.length > 0) {
       appendRunnerLog(sessionDir, `microverse restored interrupted attempt checkpoint: ${recovered.join(', ')}`);
     }
@@ -1128,7 +1357,13 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
 
   let exitReason = 'success';
   let thrownError: unknown = null;
-  let pendingMetricIteration: { cwd: string; checkpoint: MetricIterationCheckpoint } | null = null;
+  let promotionDeferred = false;
+  let pendingMetricIteration: {
+    cwd: string;
+    checkpoint: MetricIterationCheckpoint;
+    candidate: MicroverseCandidate | null;
+    experimentId: string | null;
+  } | null = null;
   try {
     while (true) {
       const state = manager.read(statePath);
@@ -1183,21 +1418,41 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       const metricCheckpoint = isMeasuredMicroverse(loopConfig)
         ? captureMetricIterationCheckpoint(state.working_dir as string)
         : null;
-      pendingMetricIteration = metricCheckpoint
-        ? { cwd: state.working_dir as string, checkpoint: metricCheckpoint }
-        : null;
       const iteration = (state.iteration as number) + 1;
       const experiment = metricCheckpoint && currentMetricState
         ? planMicroverseExperiment(sessionDir, loopConfig, iteration, currentMetricState.best.score)
         : null;
+      const candidate = experiment && metricCheckpoint
+        ? createMicroverseCandidate(sessionDir, state.working_dir as string, experiment, metricCheckpoint)
+        : null;
+      const iterationWorkingDir = candidate?.worktreeDir || state.working_dir as string;
+      const iterationBeforeSnapshot = candidate
+        ? captureProgressSnapshot({
+          sessionDir,
+          workingDir: iterationWorkingDir,
+          mode: loopConfig.mode,
+          step: state.step as string | null,
+          currentTicket: state.current_ticket as string | null,
+        })
+        : beforeSnapshot;
+      pendingMetricIteration = metricCheckpoint
+        ? { cwd: iterationWorkingDir, checkpoint: metricCheckpoint, candidate, experimentId: experiment?.id || null }
+        : null;
       if (experiment && metricCheckpoint && currentMetricState) {
-        writeMicroverseAttemptTransaction(sessionDir, experiment, iteration, metricCheckpoint, currentMetricState);
+        writeMicroverseAttemptTransaction(
+          sessionDir,
+          experiment,
+          iteration,
+          metricCheckpoint,
+          currentMetricState,
+          candidate || undefined,
+        );
       }
       const protectedManifest: ProtectedPathManifest | null = metricCheckpoint
-        ? captureProtectedPathManifest(state.working_dir as string, loopConfig.protected_paths)
+        ? captureProtectedPathManifest(iterationWorkingDir, loopConfig.protected_paths)
         : null;
-      const beforeUntrackedFiles = isGitRepo(state.working_dir as string)
-        ? listUntrackedFiles(state.working_dir as string)
+      const beforeUntrackedFiles = isGitRepo(iterationWorkingDir)
+        ? listUntrackedFiles(iterationWorkingDir)
         : [];
       manager.update(statePath, (current) => {
         if (!metricCheckpoint) current.iteration = (current.iteration as number) + 1;
@@ -1217,7 +1472,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         ? writeMicroverseWorkerHandoff({
           sessionDir,
           workerArtifactDir,
-          workingDir: state.working_dir as string,
+          workingDir: iterationWorkingDir,
           iteration,
           loopConfig,
           metricState: currentMetricState,
@@ -1236,12 +1491,12 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           ticketAttempt: iteration,
           phaseAttempt: attemptOrdinal,
         },
-        cwd: state.working_dir as string,
+        cwd: iterationWorkingDir,
         prompt: buildLoopPrompt({
           mode: loopConfig.mode,
           sessionDir,
           workerArtifactDir,
-          workingDir: state.working_dir as string,
+          workingDir: iterationWorkingDir,
           state: manager.read(statePath) as unknown as LoopPromptState,
           loopConfig: {
             ...loopConfig,
@@ -1318,7 +1573,14 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           adoptOrValidateWorkerExperimentPlan(sessionDir, experiment.id, experimentArtifact);
           if (metricCheckpoint && currentMetricState) {
             metricCheckpoint.ownedPaths = [...new Set(experimentArtifact.target_paths)].sort();
-            writeMicroverseAttemptTransaction(sessionDir, experiment, iteration, metricCheckpoint, currentMetricState);
+            writeMicroverseAttemptTransaction(
+              sessionDir,
+              experiment,
+              iteration,
+              metricCheckpoint,
+              currentMetricState,
+              candidate || undefined,
+            );
           }
         } catch (error) {
           workerFailure = 'worker_incomplete';
@@ -1329,14 +1591,16 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         throw new Error(workerFailureDetail);
       }
       if (protectedManifest) {
-        const protectedChanges = changedProtectedPaths(state.working_dir as string, protectedManifest);
+        const protectedChanges = changedProtectedPaths(iterationWorkingDir, protectedManifest);
         if (protectedChanges.length > 0) {
           workerFailure = 'protected_path_tamper';
           workerFailureDetail = `Protected evaluation paths changed: ${protectedChanges.join(', ')}`;
         }
       }
       if (workerFailure && metricCheckpoint && experiment) {
-        revertMetricIterationSafely(sessionDir, state.working_dir as string, metricCheckpoint);
+        archiveMicroverseCandidate(sessionDir, candidate, experiment.id);
+        revertMetricIterationSafely(sessionDir, iterationWorkingDir, metricCheckpoint);
+        discardMicroverseCandidate(candidate);
         pendingMetricIteration = null;
         recordWorkerAttemptFailure(sessionDir, experiment.id, {
           classification: workerFailure,
@@ -1383,16 +1647,16 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       enforceAdvancedLoopScope(
         sessionDir,
         loopConfig,
-        state.working_dir as string,
-        beforeSnapshot,
+        iterationWorkingDir,
+        iterationBeforeSnapshot,
         beforeUntrackedFiles,
       );
 
       autoCommitAdvancedLoopIteration(
         sessionDir,
         loopConfig,
-        state.working_dir as string,
-        beforeSnapshot,
+        iterationWorkingDir,
+        iterationBeforeSnapshot,
         iteration,
         beforeUntrackedFiles,
       );
@@ -1402,14 +1666,17 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           enforceMicroverseExperimentScope(
             sessionDir,
             loopConfig,
-            state.working_dir as string,
-            beforeSnapshot,
+            iterationWorkingDir,
+            iterationBeforeSnapshot,
             beforeUntrackedFiles,
             experimentArtifact,
           );
         } catch (error) {
           if (!(error instanceof PipelineScopeError)) throw error;
           const workerFailureDetail = safeErrorMessage(error);
+          archiveMicroverseCandidate(sessionDir, candidate, experiment.id);
+          revertMetricIterationSafely(sessionDir, iterationWorkingDir, metricCheckpoint);
+          discardMicroverseCandidate(candidate);
           pendingMetricIteration = null;
           recordWorkerAttemptFailure(sessionDir, experiment.id, {
             classification: 'worker_incomplete',
@@ -1456,7 +1723,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           metricResult = processMetricIteration(
             sessionDir,
             loopConfig,
-            state.working_dir as string,
+            iterationWorkingDir,
             metricCheckpoint,
             iteration,
             experiment.id,
@@ -1467,11 +1734,12 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
           const workerFailureDetail = recoverCandidateInducedMetricFailure(
             sessionDir,
             loopConfig,
-            state.working_dir as string,
+            iterationWorkingDir,
             metricCheckpoint,
             currentMetricState,
             error,
           );
+          discardMicroverseCandidate(candidate);
           pendingMetricIteration = null;
           recordWorkerAttemptFailure(sessionDir, experiment.id, {
             classification: 'worker_incomplete',
@@ -1513,6 +1781,25 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       }
 
       if (metricResult && experiment) {
+        if (metricResult.classification === 'improved' && candidate) {
+          persistMicroversePromotion(sessionDir, 'promotion_pending', candidate, metricResult, experimentArtifact);
+          try {
+            promoteMicroverseCandidate(sessionDir, candidate, experiment.id);
+            persistMicroversePromotion(sessionDir, 'promoted', candidate, metricResult, experimentArtifact);
+          } catch (error) {
+            if (!(error instanceof MicroversePromotionDeferredError)) throw error;
+            writeMetricConvergenceState(sessionDir, currentMetricState!);
+            writeMetricSummary(sessionDir, currentMetricState!);
+            manager.update(statePath, (current) => {
+              current.last_loop_message = error.message;
+              return current;
+            });
+            appendRunnerLog(sessionDir, error.message);
+            promotionDeferred = true;
+            exitReason = 'workspace_changed';
+            break;
+          }
+        }
         completeExperiment(sessionDir, experiment.id, {
           status: metricResult.classification === 'improved' ? 'accepted' : 'rejected',
           classification: metricResult.classification,
@@ -1525,6 +1812,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         if (process.env.PICKLE_TEST_MODE === '1' && process.env.PICKLE_TEST_MICROVERSE_THROW_AFTER_COMPLETION === '1') {
           throw new Error('Injected post-completion Microverse failure.');
         }
+        discardMicroverseCandidate(candidate);
         pendingMetricIteration = null;
         writeMetricSummary(sessionDir, metricResult.state);
       }
@@ -1532,7 +1820,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
 
       const afterSnapshot = captureProgressSnapshot({
         sessionDir,
-        workingDir: state.working_dir as string,
+          workingDir: candidate ? candidate.liveWorkingDir : iterationWorkingDir,
         mode: loopConfig.mode,
         step: loopConfig.mode,
         currentTicket: manager.read(statePath).current_ticket as string | null,
@@ -1612,9 +1900,11 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
       thrownError = error;
     }
   } finally {
-    if (pendingMetricIteration && !microverseAttemptHasTerminalOutcome(sessionDir)) {
+    if (!promotionDeferred && pendingMetricIteration && !microverseAttemptHasTerminalOutcome(sessionDir)) {
       try {
+        archiveMicroverseCandidate(sessionDir, pendingMetricIteration.candidate, pendingMetricIteration.experimentId);
         revertMetricIterationSafely(sessionDir, pendingMetricIteration.cwd, pendingMetricIteration.checkpoint);
+        discardMicroverseCandidate(pendingMetricIteration.candidate);
         appendRunnerLog(sessionDir, `microverse iteration rolled back after ${exitReason}`);
       } catch (rollbackError) {
         appendRunnerLog(sessionDir, `microverse rollback failed after ${exitReason}: ${safeErrorMessage(rollbackError)}`);
@@ -1627,7 +1917,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         exitReason = 'error';
       }
     }
-    if (isMeasuredMicroverse(loopConfig)) {
+    if (isMeasuredMicroverse(loopConfig) && !promotionDeferred) {
       try {
         const reconciledIds = finalizeMicroverseAttemptOnExit(sessionDir, exitReason);
         if (reconciledIds.length > 0) {

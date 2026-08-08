@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { recoverableHardReset } from './recoverable-git.js';
-import { listChangedPathsSince } from './git-utils.js';
+import { getWorkingTreeFingerprint, listChangedPathsSince } from './git-utils.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 
 export type MetricDirection = 'higher' | 'lower';
@@ -231,7 +231,7 @@ function repositoryFingerprint(cwd: string): string | null {
     timeout: 30_000,
   });
   if (probe.status !== 0 || String(probe.stdout).trim() !== 'true') return null;
-  return `${runGit(cwd, ['rev-parse', 'HEAD'])}\n${runGit(cwd, ['status', '--porcelain=v1', '-z'])}`;
+  return `${runGit(cwd, ['rev-parse', 'HEAD'])}\n${getWorkingTreeFingerprint(cwd)}`;
 }
 
 export function anchorMetricIterationRecovery(cwd: string, sessionDir: string, sha: string): string {
@@ -266,10 +266,10 @@ export function revertMetricIteration(cwd: string, checkpoint: MetricIterationCh
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    // captureMetricIterationCheckpoint rejects all pre-existing dirt, so every
-    // post-checkpoint path is owned by the candidate attempt. target_paths is a
-    // worker scope declaration, not the rollback ownership boundary.
-    ownedPaths: changedPaths,
+    ownedPaths: changedPaths
+      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
+        candidate === owned || candidate.startsWith(`${owned}/`)
+      ))),
     evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-')}`,
   });

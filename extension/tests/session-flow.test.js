@@ -2145,6 +2145,83 @@ test('microverse measures a numeric metric and commits only an actual improvemen
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
+test('microverse defers accepted promotion when the live fingerprint changes and preserves user work', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  initGitRepo(projectDir);
+  fs.writeFileSync(path.join(projectDir, 'score.txt'), 'a');
+  fs.writeFileSync(path.join(projectDir, 'user.txt'), 'baseline\n');
+  runGit(projectDir, ['add', 'score.txt', 'user.txt']);
+  runGit(projectDir, ['commit', '-m', 'baseline']);
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const experimentId = prompt.match(/Current experiment ID: (exp-\\d+)/)?.[1];
+const artifactPath = prompt.match(/Before modifying the repository, write ([^\\n]+) with keys:/)?.[1]?.trim();
+fs.writeFileSync(artifactPath, JSON.stringify({
+  experiment_id: experimentId,
+  hypothesis: 'isolated candidate',
+  hypothesis_family: 'fake/isolation',
+  differentiator: 'candidate clone',
+  rationale: 'prove guarded promotion',
+  target_paths: ['score.txt'],
+  insight: 'candidate improved',
+  verification: ['score grew'],
+}));
+fs.appendFileSync('score.txt', 'x');
+await new Promise((resolve) => setTimeout(resolve, 750));
+fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>LOOP_COMPLETE</promise>');
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'guard promotion'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'microverse', task: 'grow score safely', metric: 'wc -c < score.txt', direction: 'higher',
+    target: 2, target_relation: 'gte', stall_limit: 2,
+  });
+
+  const child = spawn('node', [path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], {
+    cwd: projectDir,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await waitFor(() => readJsonFile(path.join(sessionDir, 'state.json')).active_child_kind === 'codex', {
+    message: 'loop-runner never entered isolated codex phase',
+  });
+  fs.writeFileSync(path.join(projectDir, 'user.txt'), 'concurrent tracked user work\n');
+  fs.writeFileSync(path.join(projectDir, 'user-note.txt'), 'concurrent untracked user work\n');
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const transaction = readJsonFile(path.join(sessionDir, 'microverse-attempt.json'));
+  assert.equal(state.last_exit_reason, 'workspace_changed');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'a');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'user.txt'), 'utf8'), 'concurrent tracked user work\n');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'user-note.txt'), 'utf8'), 'concurrent untracked user work\n');
+  assert.equal(runGit(projectDir, ['log', '-1', '--format=%s']), 'baseline');
+  assert.equal(fs.existsSync(transaction.candidate_worktree), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-candidate-patches', 'exp-0001.patch')), true);
+
+  fs.writeFileSync(path.join(projectDir, 'user.txt'), 'baseline\n');
+  fs.rmSync(path.join(projectDir, 'user-note.txt'));
+  runNode([path.join(repoRoot, 'bin/loop-runner.js'), sessionDir], { env, cwd: projectDir });
+  const resumed = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(resumed.last_exit_reason, 'success');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'ax');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'user.txt'), 'utf8'), 'baseline\n');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-attempt.json')), false);
+  assert.equal(fs.existsSync(transaction.candidate_worktree), false);
+});
+
 test('microverse runtime target overrides premature LOOP_COMPLETE and stops when satisfied', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-target-owned-');
@@ -3182,7 +3259,7 @@ test('measured microverse restores a durable interrupted repository and metric t
     experiment_id: planned.id,
     iteration: 2,
     attempt: 1,
-    checkpoint: { head: baselineHead, untracked: [] },
+    checkpoint: { head: baselineHead, untracked: [], ownedPaths: ['score.txt'] },
     metric_state_before: metricBefore,
     created_at: '2026-07-18T00:01:00.000Z',
   });
@@ -4776,7 +4853,7 @@ test('loop-runner stalls anatomy-park when the canonical summary stops changing 
   assert.match(runnerLog, /loop-runner finished: stalled/);
 });
 
-test('cancel stops a live loop-runner iteration without rewriting the result as success', async () => {
+test('cancel isolates candidate mutations and preserves concurrent live tracked and untracked user work', async () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -4823,6 +4900,9 @@ setTimeout(() => process.exit(0), 10000);
     return state.active_child_kind === 'codex';
   }, { message: 'loop-runner never entered codex phase' });
 
+  fs.writeFileSync(path.join(projectDir, 'tracked.txt'), 'concurrent user work\n');
+  fs.writeFileSync(path.join(projectDir, 'user-note.txt'), 'preserve me\n');
+
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: projectDir });
 
   const exit = await new Promise((resolve) => {
@@ -4836,9 +4916,11 @@ setTimeout(() => process.exit(0), 10000);
   assert.equal(state.tmux_runner_pid, null);
   assert.equal(state.active_child_pid, null);
   assert.equal(state.step, 'paused');
-  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'concurrent user work\n');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'user-note.txt'), 'utf8'), 'preserve me\n');
   assert.equal(fs.existsSync(path.join(projectDir, 'cancel-artifact.txt')), false);
-  assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
+  assert.match(runGit(projectDir, ['status', '--porcelain']), /tracked\.txt/);
+  assert.match(runGit(projectDir, ['status', '--porcelain']), /user-note\.txt/);
   assert.match(log, /microverse iteration rolled back after cancelled/);
   assert.match(log, /loop-runner finished: cancelled/);
   assert.doesNotMatch(log, /finished: success/);

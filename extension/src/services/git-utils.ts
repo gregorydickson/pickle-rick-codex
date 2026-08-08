@@ -432,6 +432,21 @@ function linkBootstrapArtifacts(repoDir: string, worktreeDir: string): void {
   }
 }
 
+function copyBootstrapArtifacts(repoDir: string, worktreeDir: string): void {
+  for (const relativePath of collectBootstrapArtifacts(repoDir)) {
+    const sourcePath = path.join(repoDir, relativePath);
+    const targetPath = path.join(worktreeDir, relativePath);
+    if (worktreeExists(targetPath)) continue;
+    ensureDir(path.dirname(targetPath));
+    fs.cpSync(sourcePath, targetPath, {
+      recursive: true,
+      dereference: false,
+      force: true,
+      mode: fs.constants.COPYFILE_FICLONE,
+    });
+  }
+}
+
 function copyRepoSnapshot(repoDir: string, worktreeDir: string): void {
   ensureDir(worktreeDir);
   const queue: string[] = ['.'];
@@ -524,6 +539,38 @@ export function createTicketWorktree({ repoDir, sessionDir, ticketId, baseRef = 
   runGit(['worktree', 'add', '--detach', worktreeDir, baseSha], repoDir);
   linkBootstrapArtifacts(repoDir, worktreeDir);
   return { worktreeDir, baseSha };
+}
+
+/** Create a candidate that cannot write through dependency or environment symlinks into the source checkout. */
+export function createIsolatedTicketWorktree(
+  { repoDir, sessionDir, ticketId, baseRef = 'HEAD' }: CreateTicketWorktreeInput,
+): TicketWorktree {
+  if (!hasResolvableHead(repoDir)) {
+    throw new Error('Isolated candidate worktrees require a repository with an existing HEAD.');
+  }
+  const baseSha = runGit(['rev-parse', baseRef], repoDir);
+  const worktreeRoot = ensureDir(path.join(sessionDir, 'isolated-worktrees'));
+  const worktreeDir = path.join(worktreeRoot, `${slugify(ticketId) || 'ticket'}-${baseSha.slice(0, 8)}`);
+  removeExistingWorktree(repoDir, worktreeDir);
+  // A linked worktree shares refs and repository config with the source. A
+  // worker running arbitrary Git commands there could therefore move the live
+  // branch without touching its files. A no-hardlinks local clone gives the
+  // candidate an independent Git control plane as well as an independent tree.
+  runGit(['clone', '--quiet', '--no-hardlinks', '--no-checkout', repoDir, worktreeDir], repoDir, { timeout: 120_000 });
+  runGit(['checkout', '--quiet', '--detach', baseSha], worktreeDir);
+  runGit(['remote', 'remove', 'origin'], worktreeDir);
+  copyBootstrapArtifacts(repoDir, worktreeDir);
+  return { worktreeDir, baseSha };
+}
+
+export function fastForwardFromIsolatedCandidate(
+  liveWorkingDir: string,
+  candidateWorkingDir: string,
+  baseSha: string,
+): void {
+  runGit(['merge-base', '--is-ancestor', baseSha, 'HEAD'], candidateWorkingDir);
+  runGit(['fetch', '--quiet', '--no-tags', candidateWorkingDir, 'HEAD'], liveWorkingDir, { timeout: 120_000 });
+  runGit(['merge', '--ff-only', 'FETCH_HEAD'], liveWorkingDir);
 }
 
 export function removeTicketWorktree(worktreeDir: string): void {

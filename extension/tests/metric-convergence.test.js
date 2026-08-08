@@ -53,6 +53,12 @@ test('measureMetric rejects commands that mutate a git repository', () => {
     () => measureMetric('printf mutation > metric-side-effect.txt; printf 1', { cwd }),
     /must be read-only/,
   );
+
+  fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'already dirty\n');
+  assert.throws(
+    () => measureMetric('printf different-dirty-content > tracked.txt; printf 1', { cwd }),
+    /must be read-only/,
+  );
 });
 
 test('classifyMetric respects direction and tolerance', () => {

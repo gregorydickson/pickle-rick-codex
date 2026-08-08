@@ -12,6 +12,7 @@ import {
   checkPatchApply,
   countCommitsSince,
   createPatchFromWorktree,
+  createIsolatedTicketWorktree,
   createTicketWorktree,
   getWorkingTreeFingerprint,
   isIndexClean,
@@ -92,6 +93,39 @@ test('createTicketWorktree supports repos with an unborn HEAD', () => {
     if (worktreeDir) {
       removeTicketWorktree(worktreeDir);
     }
+  }
+});
+
+test('isolated candidate checkout cannot move source refs or write through bootstrap artifacts', () => {
+  const repoDir = makeTempRoot('pickle-rick-isolated-source-');
+  const sessionDir = makeTempRoot('pickle-rick-isolated-session-');
+  runGit(repoDir, ['init']);
+  runGit(repoDir, ['config', 'user.name', 'Pickle Rick Tests']);
+  runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'base\n');
+  fs.writeFileSync(path.join(repoDir, '.env.local'), 'SOURCE_SECRET=unchanged\n');
+  runGit(repoDir, ['add', 'tracked.txt']);
+  runGit(repoDir, ['commit', '-m', 'base']);
+  const sourceHead = runGit(repoDir, ['rev-parse', 'HEAD']).trim();
+  const sourceBranch = runGit(repoDir, ['symbolic-ref', 'HEAD']).trim();
+  let candidateDir = null;
+
+  try {
+    const candidate = createIsolatedTicketWorktree({ repoDir, sessionDir, ticketId: 'isolated' });
+    candidateDir = candidate.worktreeDir;
+    fs.writeFileSync(path.join(candidateDir, 'tracked.txt'), 'candidate\n');
+    runGit(candidateDir, ['add', 'tracked.txt']);
+    runGit(candidateDir, ['commit', '-m', 'candidate']);
+    const candidateHead = runGit(candidateDir, ['rev-parse', 'HEAD']).trim();
+    runGit(candidateDir, ['update-ref', sourceBranch, candidateHead]);
+    fs.writeFileSync(path.join(candidateDir, '.env.local'), 'SOURCE_SECRET=candidate\n');
+
+    assert.equal(runGit(repoDir, ['rev-parse', sourceBranch]).trim(), sourceHead);
+    assert.equal(runGit(candidateDir, ['remote']).trim(), '');
+    assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'base\n');
+    assert.equal(fs.readFileSync(path.join(repoDir, '.env.local'), 'utf8'), 'SOURCE_SECRET=unchanged\n');
+  } finally {
+    if (candidateDir) removeTicketWorktree(candidateDir);
   }
 });
 
