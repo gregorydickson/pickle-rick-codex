@@ -51,7 +51,7 @@ import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js
 import { runCitadel } from '../services/citadel.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
-import { archiveCitadelRefusalAndResetTickets } from '../services/citadel-remediation.js';
+import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
 
@@ -752,28 +752,39 @@ export async function runSequential(
       finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);
       ownership.assertOwned();
     }
-    exitReason = await runSequentialWithLease(sessionDir, {
-      ...options,
-      onFailure: 'retry',
-      durableOwnershipHeld: true,
-      assertDurableOwnership: ownership.assertOwned,
-      runStartedAtMs,
-      holdActiveForReleaseGate: options.runnerMode !== 'pipeline',
-    }, deps);
-    if (exitReason === 'success' && options.runnerMode !== 'pipeline') {
+    ownership.assertOwned();
+    if (reconcileCitadelRemediation(sessionDir)) {
+      ownership.assertOwned();
+      appendRunnerLog(sessionDir, options.runnerMode || 'pickle', 'Recovered pending Citadel remediation intent.');
+    }
+    while (true) {
+      exitReason = await runSequentialWithLease(sessionDir, {
+        ...options,
+        onFailure: 'retry',
+        durableOwnershipHeld: true,
+        assertDurableOwnership: ownership.assertOwned,
+        runStartedAtMs,
+        holdActiveForReleaseGate: options.runnerMode !== 'pipeline',
+      }, deps);
+      if (exitReason !== 'success' || options.runnerMode === 'pipeline') break;
+
       releaseGateHeld = true;
       ownership.assertOwned();
       const citadelExit = await (deps.runCitadel ?? runCitadel)(sessionDir, {
         assertDurableOwnership: ownership.assertOwned,
       });
       ownership.assertOwned();
-      if (citadelExit !== 'success') {
-        exitReason = citadelExit;
-        ownership.assertOwned();
-        if (citadelExit === 'citadel-blocked') archiveCitadelRefusalAndResetTickets(sessionDir);
+      if (citadelExit === 'citadel-blocked') {
+        const archivePath = enqueueCitadelRemediation(sessionDir);
+        appendRunnerLog(sessionDir, options.runnerMode || 'pickle', `Citadel refusal preserved at ${archivePath}; autonomous remediation enqueued.`);
+        exitReason = 'success';
+        releaseGateHeld = false;
+        continue;
       }
+      exitReason = citadelExit;
       exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
       releaseGateHeld = false;
+      break;
     }
     return exitReason;
   } catch (error) {

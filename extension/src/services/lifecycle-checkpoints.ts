@@ -26,6 +26,7 @@ export function lifecycleContextInputHash(ticket: Ticket, baseHead: string): str
       acceptance_criteria: ticket.acceptance_criteria,
       allowed_paths: ticket.allowed_paths,
       verification: ticket.verification,
+      citadel_remediation: ticket.citadel_remediation,
     },
   });
 }

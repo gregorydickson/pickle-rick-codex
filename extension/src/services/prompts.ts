@@ -220,6 +220,11 @@ export function buildTicketPhasePrompt({
         : 'Detached tmux writable boundary: leave verified ticket changes in the working tree and do not run git add or git commit. The runtime owns scoped staging, commit attribution, and repository advancement after all lifecycle gates pass.'
       : null,
     `Ticket description:\n${ticket.description || 'No description provided.'}`,
+    ticket.citadel_remediation
+      ? `Mandatory Citadel remediation context (preserve every exact finding, affected criterion, ticket, and report path):\n${JSON.stringify(ticket.citadel_remediation, null, 2)}`
+      : ticket.recovery_task
+        ? `Mandatory ticket recovery task:\n${String(ticket.recovery_task)}`
+        : null,
     `Acceptance criteria:\n${(ticket.acceptance_criteria || []).map((item) => `- ${item}`).join('\n')}`,
     `Required acceptance criteria JSON: ${JSON.stringify(ticket.acceptance_criteria || [])}`,
     `Verification commands:\n${(verificationCommands.length > 0 ? verificationCommands : ['npm test']).map((item) => `- ${item}`).join('\n')}`,

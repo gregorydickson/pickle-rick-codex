@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { readPipelineContract, resolveNextPipelinePhase } from '../services/pipeline.js';
 import { PipelineScopeError, resolvePipelineScope } from '../services/pipeline-scope.js';
@@ -10,14 +9,13 @@ import {
   cancelPipelineSession,
   ensurePipelineState,
   finishPipelinePhase,
-  resetPipelineForAutonomousRemediation,
 } from '../services/pipeline-state.js';
 import {
   preparePipelineAnatomyParkPhase,
   preparePipelineLoopPhaseSession,
   preparePipelineSzechuanSaucePhase,
 } from '../services/pipeline-phase-setup.js';
-import { atomicWriteJson, ensureDir, readJsonFile } from '../services/pickle-utils.js';
+import { readJsonFile } from '../services/pickle-utils.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager } from '../services/state-manager.js';
 import { finalizeTerminalState } from '../services/state-terminal.js';
@@ -28,7 +26,9 @@ import { runCitadel } from '../services/citadel.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
-import { readManifest, updateTicketStatus } from '../services/tickets.js';
+import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
+
+export { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
 
 type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSession>[2];
 
@@ -94,51 +94,6 @@ export function pipelineExitFailed(exitReason: string): boolean {
 
 function readSessionExitReason(sessionDir: string): string {
   return (readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {})?.last_exit_reason as string | undefined) || 'error';
-}
-
-export function enqueueCitadelRemediation(sessionDir: string): string {
-  const report = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'citadel-report.json'), null);
-  if (!report) throw new Error('Citadel refusal did not persist a remediation report.');
-  const findings = Array.isArray(report.findings) ? report.findings : [];
-  const summary = findings
-    .map((finding) => String((finding as Record<string, unknown>)?.title || '').trim())
-    .filter(Boolean)
-    .join('; ') || 'Citadel release gate refused the candidate.';
-  const archiveDir = ensureDir(path.join(sessionDir, 'citadel-remediation'));
-  const archivePath = path.join(archiveDir, `citadel-report-${Date.now()}-${crypto.randomUUID()}.json`);
-  atomicWriteJson(archivePath, report);
-
-  const tickets = readManifest(sessionDir).tickets;
-  const affected = tickets.filter((ticket) => String(ticket.status || '').trim().toLowerCase() === 'done');
-  if (affected.length === 0) throw new Error('Citadel refusal has no completed ticket to remediate.');
-  atomicWriteJson(path.join(sessionDir, 'citadel-remediation-pending.json'), {
-    schema_version: 1,
-    archive_path: archivePath,
-    ticket_ids: affected.map((ticket) => ticket.id),
-    summary,
-  });
-  reconcileCitadelRemediation(sessionDir);
-  return archivePath;
-}
-
-export function reconcileCitadelRemediation(sessionDir: string): boolean {
-  const pendingPath = path.join(sessionDir, 'citadel-remediation-pending.json');
-  const pending = readJsonFile<Record<string, unknown>>(pendingPath, null);
-  if (!pending) return false;
-  if (pending.schema_version !== 1 || !Array.isArray(pending.ticket_ids) || typeof pending.summary !== 'string') {
-    throw new Error('Citadel remediation intent is invalid.');
-  }
-  for (const ticketId of pending.ticket_ids) {
-    updateTicketStatus(sessionDir, String(ticketId), {
-      status: 'Todo',
-      recovery_task: `Remediate preserved Citadel findings: ${pending.summary}`,
-      citadel_report: pending.archive_path,
-      citadel_remediation_enqueued_at: new Date().toISOString(),
-    });
-  }
-  resetPipelineForAutonomousRemediation(sessionDir, pending.summary);
-  fs.rmSync(pendingPath, { force: true });
-  return true;
 }
 
 async function runPipelinePhase(

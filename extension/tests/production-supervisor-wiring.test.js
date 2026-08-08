@@ -38,6 +38,7 @@ import { assertSessionOperationAvailable } from '../services/session-operation.j
 import { assertCitadelReleaseApproval, deriveCitadelAcceptanceCriteria, persistCitadelReleaseApproval } from '../services/citadel.js';
 import { PreflightError } from '../services/verification-env.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
+import { buildTicketPhasePrompt } from '../services/prompts.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -324,31 +325,110 @@ test('Citadel approval is invalidated by any later repository commit', async () 
   assert.throws(() => assertCitadelReleaseApproval(sessionDir), /fresh Citadel approval/);
 });
 
-test('standalone mux archives Citadel refusal and schedules ticket remediation', async () => {
-  const { sessionDir } = createAcceptedSession();
+test('standalone mux carries exact Citadel refusal evidence into autonomous remediation and approval', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
   initializePrdDevelopmentPipeline(sessionDir);
   ensureSessionPrdSeal(sessionDir);
+  let ticketRuns = 0;
+  let citadelRuns = 0;
+  let remediationPrompt = '';
   const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
     runTicket: async (dir, ticketId) => {
+      ticketRuns += 1;
+      if (ticketRuns === 2) {
+        const ticket = readManifest(dir).tickets.find((entry) => entry.id === ticketId);
+        assert.ok(ticket);
+        remediationPrompt = buildTicketPhasePrompt({
+          phase: 'implement', ticket, sessionDir: dir, workingDir,
+        });
+      }
       updateTicketStatus(dir, ticketId, { status: 'Done' });
       return { status: 'done', applied: true };
     },
     runCitadel: async (dir) => {
+      citadelRuns += 1;
+      if (citadelRuns > 1) return await approveCitadelFixture(dir);
       writeJson(path.join(dir, 'citadel-report.json'), {
         schema_version: 1,
         verdict: 'block',
         reviewed_range: 'fixture..HEAD',
         acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
-        findings: [{ severity: 'high', title: 'Refused', evidence: 'release defect' }],
+        findings: [{
+          severity: 'high',
+          title: 'Release evidence is incomplete.',
+          evidence: 'AC-RUNTIME-01 has no restart proof.',
+          recommendation: 'Add a restart integration that preserves the refusal evidence.',
+        }],
         generated_at: new Date().toISOString(),
       });
       return 'citadel-blocked';
     },
   });
-  assert.equal(result, 'citadel-blocked');
-  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
-  assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+  assert.equal(result, 'success');
+  assert.equal(ticketRuns, 2);
+  assert.equal(citadelRuns, 2);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  const ticket = readManifest(sessionDir).tickets[0];
+  assert.equal(ticket.status, 'Done');
+  assert.equal(ticket.failure_kind, 'citadel_refused');
+  assert.match(remediationPrompt, /Release evidence is incomplete\./);
+  assert.match(remediationPrompt, /AC-RUNTIME-01 has no restart proof\./);
+  assert.match(remediationPrompt, /Add a restart integration that preserves the refusal evidence\./);
+  assert.match(remediationPrompt, /citadel-report-/);
+  assert.match(remediationPrompt, /The launched runner renews exclusive durable ownership\./);
   assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length, 1);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-current.json')), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('replacement standalone mux reconciles a predecessor Citadel intent before worker dispatch', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const reportPath = path.join(sessionDir, 'citadel-report.json');
+  const archivePath = path.join(sessionDir, 'citadel-remediation', 'citadel-report-predecessor.json');
+  const criteria = deriveCitadelAcceptanceCriteria(sessionDir);
+  const findings = [{
+    severity: 'blocking',
+    title: 'Restart lost the release objection.',
+    evidence: 'The replacement worker received no Citadel evidence.',
+    recommendation: 'Carry the archived report into the next implementation prompt.',
+  }];
+  writeJson(reportPath, { schema_version: 1, verdict: 'block', acceptance_criteria_checked: criteria, findings });
+  writeJson(archivePath, { schema_version: 1, verdict: 'block', acceptance_criteria_checked: criteria, findings });
+  writeJson(path.join(sessionDir, 'citadel-remediation-pending.json'), {
+    schema_version: 2,
+    failure_kind: 'citadel_refused',
+    archive_path: archivePath,
+    report_path: reportPath,
+    ticket_ids: ['R1'],
+    affected_tickets: [{ id: 'R1', acceptance_criteria: ['The launched runner renews exclusive durable ownership.'] }],
+    findings,
+    acceptance_criteria_checked: criteria,
+    summary: 'Restart lost the release objection.',
+    enqueued_at: '2026-08-08T01:00:00.000Z',
+  });
+
+  let remediationPrompt = '';
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async (dir, ticketId) => {
+      const ticket = readManifest(dir).tickets.find((entry) => entry.id === ticketId);
+      assert.ok(ticket);
+      remediationPrompt = buildTicketPhasePrompt({ phase: 'implement', ticket, sessionDir: dir, workingDir });
+      updateTicketStatus(dir, ticketId, { status: 'Done' });
+      return { status: 'done', applied: true };
+    },
+    runCitadel: approveCitadelFixture,
+  });
+
+  assert.equal(result, 'success');
+  assert.match(remediationPrompt, /Restart lost the release objection\./);
+  assert.match(remediationPrompt, /replacement worker received no Citadel evidence\./);
+  assert.match(remediationPrompt, /Carry the archived report into the next implementation prompt\./);
+  assert.match(remediationPrompt, /citadel-report-predecessor\.json/);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-current.json')), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
 });
 
 test('legacy unexpired runner lease is not stolen merely because immutable identity is absent', () => {
@@ -383,6 +463,7 @@ test('Citadel refusal is archived, enqueues remediation, and resets affected pha
   assert.equal(fs.existsSync(archivePath), true);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
   assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+  assert.equal(readManifest(sessionDir).tickets[0].failure_kind, 'citadel_refused');
   const pipeline = readPipelineState(sessionDir);
   assert.equal(pipeline.current_phase, 'pickle');
   assert.equal(pipeline.phase_statuses.pickle, 'todo');

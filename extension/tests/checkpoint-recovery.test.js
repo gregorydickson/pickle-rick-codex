@@ -23,6 +23,12 @@ test('content-addressed context checkpoint reuses only an exact input identity',
   assert.match(written.digest, /^[a-f0-9]{64}$/);
   assert.deepEqual(readLifecycleContextCheckpoint(sessionDir, 'c1', inputHash), written);
   assert.equal(readLifecycleContextCheckpoint(sessionDir, 'c1', lifecycleContextInputHash({ ...ticket, title: 'changed' }, 'abc123')), null);
+  const remediatingHash = lifecycleContextInputHash({
+    ...ticket,
+    citadel_remediation: { failure_kind: 'citadel_refused', findings: [{ title: 'release defect' }] },
+  }, 'abc123');
+  assert.notEqual(remediatingHash, inputHash);
+  assert.equal(readLifecycleContextCheckpoint(sessionDir, 'c1', remediatingHash), null);
 
   const storedPath = path.join(sessionDir, 'worker-lifecycle-checkpoints', 'c1', `${written.digest}.json`);
   const tampered = JSON.parse(fs.readFileSync(storedPath, 'utf8'));
