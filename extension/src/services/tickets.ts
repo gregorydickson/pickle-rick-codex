@@ -1152,7 +1152,22 @@ function materializeTicketFiles(
   replaceManifest: boolean,
 ): string[] {
   recoverInterruptedTicketTransaction(sessionDir);
-  const plan = planTicketMaterialization(sessionDir, manifest);
+  const persisted = readJsonFile<RefinementManifest>(getManifestPath(sessionDir), null);
+  const persistedTicketIds = Array.isArray(persisted?.tickets)
+    ? persisted.tickets.map((ticket, index) => canonicalTicketId(ticket, index))
+    : [];
+  const incomingTicketIds = Array.isArray(manifest?.tickets)
+    ? manifest.tickets.map((ticket, index) => canonicalTicketId(ticket, index))
+    : [];
+  const sameTicketSet = persistedTicketIds.length === incomingTicketIds.length
+    && persistedTicketIds.every((ticketId) => incomingTicketIds.includes(ticketId));
+  // writeTicketFiles materializes the durable manifest; it must never replace a
+  // complete persisted manifest with a caller's partial view. Explicit
+  // restructureTicketFiles remains the replacement API.
+  const authoritativeManifest = !replaceManifest && persisted && !sameTicketSet
+    ? persisted
+    : manifest;
+  const plan = planTicketMaterialization(sessionDir, authoritativeManifest);
   const transactionPaths = [getManifestPath(sessionDir), ...plan.existingTicketPaths, ...plan.ticketPaths];
   return runTicketTransaction(sessionDir, 'materialize-tickets', transactionPaths, () => (
     applyTicketMaterialization(sessionDir, plan, replaceManifest)

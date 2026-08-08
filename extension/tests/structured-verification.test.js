@@ -31,6 +31,25 @@ test('legacy package scripts migrate and unsafe field command is rejected before
   });
 });
 
+test('structured shell steps require safe balanced syntax and reject command substitution', () => {
+  assert.throws(
+    () => normalizeVerificationSteps([{
+      kind: 'shell',
+      script: 'echo `whoami`',
+      justification: 'compatibility fixture',
+    }]),
+    /invalid structured verification step/,
+  );
+  assert.throws(
+    () => normalizeVerificationSteps([{
+      kind: 'shell',
+      script: 'echo "unterminated',
+      justification: 'compatibility fixture',
+    }]),
+    /invalid structured verification step/,
+  );
+});
+
 test('ticket materialization reloads the exact structured verification semantics', () => {
   const sessionDir = makeTempRoot('pickle-structured-ticket-');
   const steps = [

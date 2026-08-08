@@ -106,7 +106,7 @@ test('readManifest and writeTicketFiles normalize uppercase ticket ids and persi
   assert.equal(getTicketById(sessionDir, 'R1')?.id, 'r1');
 });
 
-test('readManifest normalizes verification variants and persists canonical string arrays', () => {
+test('readManifest normalizes verification variants and persists structured steps', () => {
   const sessionDir = makeTempRoot();
   writeManifest(sessionDir, {
     tickets: [
@@ -177,23 +177,28 @@ test('readManifest normalizes verification variants and persists canonical strin
   });
 
   const manifest = readManifest(sessionDir);
+  const npmTest = [{ kind: 'process', executable: 'npm', args: ['test'] }];
+  const npmTestAndLint = [
+    ...npmTest,
+    { kind: 'package_script', manager: 'npm', script: 'lint' },
+  ];
   assert.deepEqual(manifest.tickets.map((ticket) => ticket.verification), [
-    ['npm test'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
+    npmTest,
+    npmTestAndLint,
+    npmTestAndLint,
+    npmTestAndLint,
+    npmTestAndLint,
     [],
     [],
   ]);
 
   const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
   assert.deepEqual(persisted.tickets.map((ticket) => ticket.verification), [
-    ['npm test'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
-    ['npm test', 'npm run lint'],
+    npmTest,
+    npmTestAndLint,
+    npmTestAndLint,
+    npmTestAndLint,
+    npmTestAndLint,
     [],
     [],
   ]);

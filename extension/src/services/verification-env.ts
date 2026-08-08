@@ -628,7 +628,7 @@ function structuredStep(value: unknown): VerificationStep | null {
     if (typeof value.script !== 'string' || !value.script.trim()
       || typeof value.justification !== 'string' || !value.justification.trim()) return null;
     const syntax = legacyCommandSyntax(value.script);
-    if (!syntax.balanced && !value.script.includes('`')) return null;
+    if (!syntax.balanced) return null;
     return { kind: 'shell', script: value.script.trim(), justification: value.justification.trim(), ...(cwd ? { cwd } : {}) };
   }
   return null;
