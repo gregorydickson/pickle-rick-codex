@@ -2126,6 +2126,28 @@ test('spawn-morty fails fast on invalid verification manifests before worker exe
   assert.equal(fs.existsSync(path.join(sessionDir, 'r1.research.last-message.txt')), false);
 });
 
+test('spawn-morty rejects structured destructive verification before implementation starts', () => {
+  const dataRoot = makeTempRoot();
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'unsafe structured verification'], {
+    env,
+    cwd: repoRoot,
+  }).trim();
+  writePreflightManifest(sessionDir, null, [{
+    kind: 'process', executable: 'git', args: ['reset', '--hard', 'HEAD'],
+  }]);
+
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], { env, cwd: repoRoot }),
+    /git reset is not permitted in verification/,
+  );
+  assert.equal(fs.existsSync(path.join(sessionDir, 'r1.research.last-message.txt')), false);
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  assert.equal(ticket?.status, 'Todo');
+});
+
 test('spawn-morty infers sibling roots from repo wrapper verification commands', () => {
   const dataRoot = makeTempRoot();
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');

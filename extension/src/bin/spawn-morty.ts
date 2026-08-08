@@ -80,6 +80,7 @@ import {
 } from '../services/ticket-completion-evidence.js';
 import {
   assertTicketVerificationReady,
+  assertVerificationStepSafe,
   isPreflightError,
   isVerificationContractError,
   normalizeVerificationSteps,
@@ -556,6 +557,7 @@ interface RunVerificationCommandOptions {
   env: Record<string, string | undefined>;
   isCancelled: () => boolean;
   onExit: () => void;
+  allowedRoots?: string[];
 }
 
 async function runVerificationCommand({
@@ -567,10 +569,11 @@ async function runVerificationCommand({
   env,
   isCancelled,
   onExit,
+  allowedRoots = [],
 }: RunVerificationCommandOptions): Promise<void> {
+  const stepCwd = assertVerificationStepSafe(step, { cwd, allowedRoots });
   const descriptor = verificationStepCommand(step);
   const command = descriptor.display;
-  const stepCwd = step.cwd ? path.resolve(cwd, step.cwd) : cwd;
   return await new Promise<void>((resolve, reject) => {
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
@@ -802,7 +805,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
   }
-  const verificationSteps = normalizeVerificationSteps(manifestTicket.verification, {
+  let verificationSteps = normalizeVerificationSteps(manifestTicket.verification, {
     verify: manifestTicket.verify,
     cwd: workingDir,
   });
@@ -927,6 +930,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           step, cwd: workingDir, timeoutMs: config.defaults.worker_timeout_seconds * 1000,
           manager, statePath, env: verificationReady.env, isCancelled: shouldCancel,
           onExit: clearActiveChildIfOwned,
+          allowedRoots: [sessionDir],
         });
         assertOwnership();
       } catch (error) {
@@ -952,7 +956,15 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       // the index signature ConfigVerificationInput models, so widen via unknown.
       config: config as unknown as ConfigVerificationInput,
       cwd: workingDir,
+      allowedRoots: [sessionDir],
     });
+    if (verificationStepIdentity(verificationReady.steps) !== verificationStepIdentity(verificationSteps)) {
+      throw new VerificationContractError({
+        ticketId: normalizedTicketId,
+        message: 'runtime verification representation differs from the preflight-validated manifest',
+      });
+    }
+    verificationSteps = verificationReady.steps;
     if (isGitRepo(workingDir) && isWorkingTreeDirty(workingDir)) {
       throw new Error('pre-existing-dirt: worker requires a completely clean working tree; commit, stash, or remove existing tracked and untracked changes first');
     }

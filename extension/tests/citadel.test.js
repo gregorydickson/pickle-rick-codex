@@ -94,6 +94,19 @@ test('Citadel rejects an absolute verification cwd before it can mutate the rele
   assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
 });
 
+test('Citadel rejects destructive structured verification before spawning it', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('Checks are read-only.');
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{
+      acceptance_criteria: ['Checks are read-only.'],
+      verification: [{ kind: 'process', executable: 'git', args: ['clean', '-fdx'] }],
+    }],
+  }));
+
+  await assert.rejects(() => runCitadel(sessionDir), /git clean is not permitted in verification/);
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
+});
+
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({
     reviewed_range: 'abc..HEAD',

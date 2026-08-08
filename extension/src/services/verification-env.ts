@@ -348,13 +348,196 @@ function executableExists(executable: string, cwd: string, env: Record<string, s
   });
 }
 
+function realpathContained(candidate: string, roots: string[]): boolean {
+  let resolvedCandidate: string;
+  try {
+    resolvedCandidate = fs.realpathSync(candidate);
+  } catch {
+    return false;
+  }
+  return roots.some((root) => {
+    try {
+      const resolvedRoot = fs.realpathSync(root);
+      const relative = path.relative(resolvedRoot, resolvedCandidate);
+      return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+    } catch {
+      return false;
+    }
+  });
+}
+
+function executableBasename(executable: string): string {
+  return path.basename(executable).toLowerCase();
+}
+
+function gitSubcommand(args: string[]): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--') return null;
+    if (['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env'].includes(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--git-dir=') || arg.startsWith('--work-tree=') || arg.startsWith('--namespace=')
+      || arg.startsWith('--config-env=') || arg.startsWith('-c=')) continue;
+    if (arg.startsWith('-')) continue;
+    return arg.toLowerCase();
+  }
+  return null;
+}
+
+function shellWrapperScript(executable: string, args: string[]): string | null {
+  if (!new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']).has(executableBasename(executable))) return null;
+  const commandIndex = args.findIndex((arg) => /^-[^-]*c[^-]*$/.test(arg));
+  return commandIndex >= 0 ? args[commandIndex + 1] || '' : null;
+}
+
+function packageInvocationArgs(manager: string, args: string[], cwd: string): { cwd: string; commandArgs: string[] } {
+  let packageCwd = cwd;
+  let index = 0;
+  const cwdFlags = manager === 'npm' ? new Set(['--prefix']) : new Set(['--dir', '-C', '--cwd']);
+  while (index < args.length) {
+    const arg = args[index];
+    if (cwdFlags.has(arg) && args[index + 1]) {
+      packageCwd = path.resolve(cwd, args[index + 1]);
+      index += 2;
+      continue;
+    }
+    const cwdAssignment = [...cwdFlags].find((flag) => arg.startsWith(`${flag}=`));
+    if (cwdAssignment) {
+      packageCwd = path.resolve(cwd, arg.slice(cwdAssignment.length + 1));
+      index += 1;
+      continue;
+    }
+    if (['--filter', '--workspace', '-w'].includes(arg) && args[index + 1]) {
+      index += 2;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+  return { cwd: packageCwd, commandArgs: args.slice(index) };
+}
+
+function processPolicyViolation(executable: string, args: string[], stepCwd?: string): string | null {
+  const base = executableBasename(executable);
+  if (['rm', 'mv', 'cp', 'dd', 'truncate', 'touch', 'mkdir', 'rmdir', 'ln', 'install', 'tee',
+    'chmod', 'chown', 'kill', 'pkill', 'killall', 'sudo', 'doas', 'mount', 'umount', 'reboot', 'shutdown'].includes(base)) {
+    return `${base} is not permitted in verification`;
+  }
+  if (base === 'git') {
+    const subcommand = gitSubcommand(args);
+    const safeGitCommands = new Set([
+      'diff', 'status', 'log', 'show', 'rev-parse', 'ls-files', 'grep', 'cat-file', 'merge-base',
+      'name-rev', 'describe', 'for-each-ref', 'check-ignore', 'version', 'help',
+    ]);
+    if (subcommand && !safeGitCommands.has(subcommand)) {
+      return `git ${subcommand} is not permitted in verification`;
+    }
+  }
+  if (base === 'busybox' && args.length > 0) {
+    return processPolicyViolation(args[0], args.slice(1), stepCwd);
+  }
+  if (base === 'env') {
+    let index = 0;
+    while (index < args.length && (args[index].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(args[index]))) index += 1;
+    if (args[index]) return processPolicyViolation(args[index], args.slice(index + 1), stepCwd);
+  }
+  if (stepCwd && ['npm', 'pnpm', 'yarn'].includes(base)) {
+    const invocation = packageInvocationArgs(base, args, stepCwd);
+    const commandArgs = invocation.commandArgs;
+    if (['install', 'i', 'ci', 'uninstall', 'remove', 'publish', 'pack'].includes(commandArgs[0])) {
+      return `${base} ${commandArgs[0]} is not permitted in verification`;
+    }
+    if (['exec', 'x', 'dlx'].includes(commandArgs[0]) && commandArgs[1]) {
+      return processPolicyViolation(commandArgs[1], commandArgs.slice(2), invocation.cwd);
+    }
+    const runIndex = commandArgs[0] === 'run' ? 1 : 0;
+    const script = commandArgs[runIndex];
+    if (script && !script.startsWith('-')) {
+      return packageScriptPolicyViolation({
+        kind: 'package_script', manager: base as 'npm' | 'pnpm' | 'yarn', script,
+        ...(commandArgs.length > runIndex + 1 ? { args: commandArgs.slice(runIndex + 1).filter((arg) => arg !== '--') } : {}),
+      }, invocation.cwd);
+    }
+  }
+  const wrapperScript = shellWrapperScript(executable, args);
+  if (wrapperScript !== null && (!wrapperScript || violatesShellVerificationPolicy(wrapperScript))) {
+    return 'shell wrapper contains a command forbidden by verification policy';
+  }
+  return null;
+}
+
+function packageScriptPolicyViolation(step: Extract<VerificationStep, { kind: 'package_script' }>, stepCwd: string): string | null {
+  if (!/^[A-Za-z0-9_@./:-]+$/.test(step.script) || step.script.startsWith('-')) {
+    return `invalid package script name: ${step.script}`;
+  }
+  const scripts = readPackageJson(stepCwd)?.scripts;
+  if (!scripts || typeof scripts[step.script] !== 'string') return `package script does not exist: ${step.script}`;
+  for (const name of [`pre${step.script}`, step.script, `post${step.script}`]) {
+    const script = scripts[name];
+    if (typeof script === 'string' && violatesShellVerificationPolicy(script)) {
+      return `package lifecycle script ${name} contains a command forbidden by verification policy`;
+    }
+  }
+  return null;
+}
+
+export function assertVerificationStepSafe(
+  step: VerificationStep,
+  { cwd, allowedRoots = [] }: { cwd: string; allowedRoots?: string[] },
+): string {
+  const stepCwd = step.cwd ? path.resolve(cwd, step.cwd) : cwd;
+  const roots = [cwd, ...allowedRoots];
+  if (!realpathContained(stepCwd, roots)) {
+    throw new VerificationContractError({
+      command: verificationStepCommand(step).display,
+      message: `verification cwd is missing or escapes repository/session roots: ${step.cwd || stepCwd}`,
+    });
+  }
+  if (step.kind === 'process' && ['npm', 'pnpm', 'yarn'].includes(executableBasename(step.executable))) {
+    const invocationCwd = packageInvocationArgs(executableBasename(step.executable), step.args, stepCwd).cwd;
+    if (!realpathContained(invocationCwd, roots)) {
+      throw new VerificationContractError({
+        command: verificationStepCommand(step).display,
+        message: `package verification cwd escapes repository/session roots: ${invocationCwd}`,
+      });
+    }
+  }
+  const violation = step.kind === 'shell'
+    ? (violatesShellVerificationPolicy(step.script) ? 'shell command is forbidden by verification policy' : null)
+    : step.kind === 'package_script'
+      ? packageScriptPolicyViolation(step, stepCwd)
+      : processPolicyViolation(step.executable, step.args, stepCwd);
+  if (violation) {
+    throw new VerificationContractError({ command: verificationStepCommand(step).display, message: violation });
+  }
+  return fs.realpathSync(stepCwd);
+}
+
 function verificationCommandDiagnostics(
-  ticket: TicketVerificationInput | null | undefined,
+  steps: VerificationStep[],
   cwd: string,
+  allowedRoots: string[],
   env: Record<string, string | undefined>,
 ): PreflightDiagnostic[] {
   const diagnostics: PreflightDiagnostic[] = [];
-  for (const command of ticketVerificationCommands(ticket)) {
+  for (const step of steps) {
+    const command = verificationStepCommand(step).display;
+    let stepCwd: string;
+    try {
+      stepCwd = assertVerificationStepSafe(step, { cwd, allowedRoots });
+    } catch (error) {
+      diagnostics.push({
+        kind: 'preflight-invalid-verification',
+        name: command,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     if (hasUnquotedGlob(command)) {
       diagnostics.push({
         kind: 'preflight-unsafe-glob',
@@ -363,9 +546,10 @@ function verificationCommandDiagnostics(
       });
       continue;
     }
-    for (const segment of splitShellSegments(command)) {
+    const commandSegments = step.kind === 'shell' ? splitShellSegments(step.script) : [command];
+    for (const segment of commandSegments) {
       const executable = commandExecutable(segment);
-      if (!executable || executableExists(executable, cwd, env)) continue;
+      if (!executable || executableExists(executable, stepCwd, env)) continue;
       diagnostics.push({
         kind: 'preflight-missing-executable',
         name: executable,
@@ -590,7 +774,7 @@ function rewriteScopedVitestStepFromTokens(tokens: string[], cwd: string | undef
 }
 
 function rewriteStructuredScopedVitestStep(step: VerificationStep, cwd: string | undefined): VerificationStep {
-  const effectiveCwd = step.cwd || cwd;
+  const effectiveCwd = step.cwd && cwd ? path.resolve(cwd, step.cwd) : (step.cwd || cwd);
   if (!effectiveCwd || step.kind === 'shell') return step;
   if (step.kind === 'process') {
     return rewriteScopedVitestStepFromTokens([step.executable, ...step.args], effectiveCwd) || step;
@@ -637,7 +821,7 @@ function legacyCommandSyntax(command: string): { balanced: boolean; shell: boole
       continue;
     }
     if (char === "'" || char === '"') quote = char;
-    else if ('|;<>()$'.includes(char)) shell = true;
+    else if ('&|;<>()$'.includes(char) || char === '*' || char === '?' || char === '[') shell = true;
   }
   return { balanced: quote === null, shell };
 }
@@ -645,20 +829,24 @@ function legacyCommandSyntax(command: string): { balanced: boolean; shell: boole
 function violatesShellVerificationPolicy(script: string): boolean {
   const unquoted = maskQuotedShellSyntax(script);
   if (/\$\s*\(/.test(unquoted) || /(^|[^<])>(?!>)/.test(unquoted)) return true;
-  if (/(?:^|[;&|()]\s*)(?:sudo|doas|kill|pkill|killall|chmod|chown|rm|mv)\b/.test(unquoted)) return true;
-  if (/(?:^|[;&|()]\s*)git\s+(?:reset|clean|checkout|restore|stash|add|commit)\b/.test(unquoted)) return true;
+  const boundary = '(?:^|[;&|()\\n]\\s*|\\b(?:then|do|else|elif)\\s+)';
+  if (new RegExp(`${boundary}(?:sudo|doas|kill|pkill|killall|chmod|chown|rm|mv)\\b`).test(unquoted)) return true;
+  if (new RegExp(`${boundary}git\\b[^;&|()\\n]*\\b(?:reset|clean|checkout|restore|stash|add|commit)\\b`).test(unquoted)) return true;
   return /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sh|bash|zsh)\b/.test(unquoted);
 }
 
 function structuredStep(value: unknown): VerificationStep | null {
   if (!isPlainObject(value) || typeof value.kind !== 'string') return null;
-  const cwd = typeof value.cwd === 'string' && value.cwd.trim() ? value.cwd.trim() : undefined;
+  if ('cwd' in value && (typeof value.cwd !== 'string' || !value.cwd.trim())) return null;
+  const cwd = typeof value.cwd === 'string' ? value.cwd.trim() : undefined;
   if (value.kind === 'process') {
+    if (Object.keys(value).some((key) => !['kind', 'executable', 'args', 'cwd'].includes(key))) return null;
     if (typeof value.executable !== 'string' || !value.executable.trim() || !Array.isArray(value.args)
       || value.args.some((arg) => typeof arg !== 'string')) return null;
     return { kind: 'process', executable: value.executable.trim(), args: [...value.args] as string[], ...(cwd ? { cwd } : {}) };
   }
   if (value.kind === 'package_script') {
+    if (Object.keys(value).some((key) => !['kind', 'manager', 'script', 'args', 'cwd'].includes(key))) return null;
     if (!['npm', 'pnpm', 'yarn'].includes(String(value.manager)) || typeof value.script !== 'string' || !value.script.trim()
       || (value.args !== undefined && (!Array.isArray(value.args) || value.args.some((arg) => typeof arg !== 'string')))) return null;
     return {
@@ -670,6 +858,7 @@ function structuredStep(value: unknown): VerificationStep | null {
     };
   }
   if (value.kind === 'shell') {
+    if (Object.keys(value).some((key) => !['kind', 'script', 'justification', 'cwd'].includes(key))) return null;
     if (typeof value.script !== 'string' || !value.script.trim()
       || typeof value.justification !== 'string' || !value.justification.trim()) return null;
     const syntax = legacyCommandSyntax(value.script);
@@ -744,12 +933,14 @@ export function verificationStepIdentity(steps: VerificationStep[]): string {
 
 export function normalizeVerificationCommands(value: unknown, options: NormalizeVerificationCommandsOptions = {}): string[] {
   const parsed = parseMaybeJson(value);
-  const structured = Array.isArray(parsed) && parsed.some((entry) => isPlainObject(entry) && 'kind' in entry);
-  if (structured) {
-    return parsed.map((entry) => {
+  const structuredSource = Array.isArray(parsed)
+    ? parsed
+    : (isPlainObject(parsed) && Array.isArray(parsed.steps) ? parsed.steps : null);
+  if (structuredSource?.some((entry) => isPlainObject(entry) && 'kind' in entry)) {
+    return structuredSource.map((entry) => {
       const step = structuredStep(entry);
       if (!step) throw new VerificationContractError({ message: `invalid structured verification step: ${JSON.stringify(entry)}` });
-      return verificationStepCommand(step).display;
+      return verificationStepCommand(rewriteStructuredScopedVitestStep(step, options.cwd)).display;
     });
   }
   const commands = normalizeVerificationValue(value);
@@ -1093,11 +1284,13 @@ export function resolveVerificationEnv({
   config,
   ambientEnv = process.env,
   cwd = process.cwd(),
+  allowedRoots = [],
 }: {
   ticket: TicketVerificationInput | null | undefined;
   config: ConfigVerificationInput | null | undefined;
   ambientEnv?: NodeJS.ProcessEnv;
   cwd?: string;
+  allowedRoots?: string[];
 }): VerificationEnvResult {
   const contract = resolveTicketVerificationContract({ ticket, config });
 
@@ -1116,9 +1309,10 @@ export function resolveVerificationEnv({
   const diagnostics = (contract?.required || [])
     .map((entry) => validateRequirement(entry.name, entry.format, env[entry.name]))
     .filter((d): d is PreflightDiagnostic => d !== null);
-  diagnostics.push(...verificationCommandDiagnostics(ticket, cwd, env));
+  const steps = normalizeVerificationSteps(ticket?.verification, { verify: ticket?.verify, cwd });
+  diagnostics.push(...verificationCommandDiagnostics(steps, cwd, allowedRoots, env));
 
-  return { contract, env, diagnostics, steps: normalizeVerificationSteps(ticket?.verification, { verify: ticket?.verify, cwd }) };
+  return { contract, env, diagnostics, steps };
 }
 
 export function assertTicketVerificationReady({
@@ -1126,13 +1320,15 @@ export function assertTicketVerificationReady({
   config,
   ambientEnv = process.env,
   cwd = process.cwd(),
+  allowedRoots = [],
 }: {
   ticket: TicketVerificationInput | null | undefined;
   config: ConfigVerificationInput | null | undefined;
   ambientEnv?: NodeJS.ProcessEnv;
   cwd?: string;
+  allowedRoots?: string[];
 }): VerificationEnvResult {
-  const resolved = resolveVerificationEnv({ ticket, config, ambientEnv, cwd });
+  const resolved = resolveVerificationEnv({ ticket, config, ambientEnv, cwd, allowedRoots });
   const first = resolved.diagnostics[0];
   if (first) {
     throw new PreflightError({

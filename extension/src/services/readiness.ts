@@ -318,6 +318,7 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
             config: loadConfig() as unknown as ConfigVerificationInput,
             ambientEnv: options.env || process.env,
             cwd: workingDir,
+            allowedRoots: [resolvedSessionDir],
           });
         } catch (error) {
           findings.push(finding('error', 'verification-preflight-failed', `${ticketId}: ${error instanceof Error ? error.message : String(error)}`));

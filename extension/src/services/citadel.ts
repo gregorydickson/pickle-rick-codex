@@ -11,7 +11,12 @@ import { StateManager } from './state-manager.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
-import { normalizeVerificationSteps, verificationStepCommand, verificationStepIdentity } from './verification-env.js';
+import {
+  assertVerificationStepSafe,
+  normalizeVerificationSteps,
+  verificationStepCommand,
+  verificationStepIdentity,
+} from './verification-env.js';
 import type { VerificationStep } from '../types/index.js';
 
 export type CitadelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -397,6 +402,8 @@ interface CitadelCheckDescriptor {
   args: string[];
   cwd?: string;
   skipped?: boolean;
+  verificationStep?: VerificationStep;
+  allowedRoots?: string[];
 }
 
 export function resolveCitadelCheckCwd(workingDir: string, requestedCwd: string): string {
@@ -411,7 +418,11 @@ export function resolveCitadelCheckCwd(workingDir: string, requestedCwd: string)
   return candidate;
 }
 
-function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: VerificationStep[]): CitadelCheckDescriptor[] {
+function citadelCheckDescriptors(
+  workingDir: string,
+  sessionDir: string,
+  ticketVerificationSteps: VerificationStep[],
+): CitadelCheckDescriptor[] {
   const packageChecks = ['typecheck', 'lint', 'test']
     .map((script) => packageCheckDescriptor(workingDir, script));
   const repositoryCheck: CitadelCheckDescriptor = {
@@ -421,11 +432,25 @@ function citadelCheckDescriptors(workingDir: string, ticketVerificationSteps: Ve
   };
   const ticketChecks = ticketVerificationSteps.map((step): CitadelCheckDescriptor => {
     const command = verificationStepCommand(step);
+    let stepCwd: string;
+    try {
+      stepCwd = assertVerificationStepSafe(step, { cwd: workingDir, allowedRoots: [sessionDir] });
+    } catch (error) {
+      if (error instanceof Error && /verification cwd|package verification cwd/.test(error.message)) {
+        throw new Error(
+          `Citadel verification cwd escapes the isolated release worktree or session root: ${step.cwd || workingDir}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     return {
       command: command.display,
       executable: command.executable,
       args: command.args,
-      ...(step.cwd ? { cwd: resolveCitadelCheckCwd(workingDir, step.cwd) } : {}),
+      cwd: stepCwd,
+      verificationStep: step,
+      allowedRoots: [sessionDir],
     };
   });
   return [...packageChecks, repositoryCheck, ...ticketChecks];
@@ -452,6 +477,12 @@ async function runMonitoredCitadelCheck(
     return { command: descriptor.command, status: 'skipped', exit_code: null, output: 'script not defined' };
   }
   if (options.isCancelled()) throw new CitadelChecksCancelledError();
+  if (descriptor.verificationStep) {
+    descriptor.cwd = assertVerificationStepSafe(descriptor.verificationStep, {
+      cwd: workingDir,
+      allowedRoots: descriptor.allowedRoots,
+    });
+  }
   return await new Promise<CitadelCheckResult>((resolve, reject) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -518,11 +549,12 @@ async function runMonitoredCitadelCheck(
 
 async function runCitadelChecksMonitored(
   workingDir: string,
+  sessionDir: string,
   ticketVerificationSteps: VerificationStep[],
   options: CitadelCheckRunOptions,
 ): Promise<CitadelCheckResult[]> {
   const results: CitadelCheckResult[] = [];
-  for (const descriptor of citadelCheckDescriptors(workingDir, ticketVerificationSteps)) {
+  for (const descriptor of citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps)) {
     results.push(await runMonitoredCitadelCheck(descriptor, workingDir, options));
   }
   return results;
@@ -721,6 +753,7 @@ export async function runCitadel(
     assertOwnership();
     checks = await runCitadelChecksMonitored(
       citadelWorkingDir,
+      sessionDir,
       verificationStepsFromManifest(sessionDir, citadelWorkingDir),
       {
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,

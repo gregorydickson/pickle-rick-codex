@@ -30,7 +30,13 @@ import {
   writeRefinementAcceptance,
 } from './refinement-artifacts.js';
 import { recoverInterruptedTicketTransaction } from './ticket-transaction.js';
-import { assertTicketVerificationReady, normalizeVerificationCommands, type PreflightError } from './verification-env.js';
+import {
+  assertTicketVerificationReady,
+  assertVerificationStepSafe,
+  normalizeVerificationSteps,
+  verificationStepCommand,
+  type PreflightError,
+} from './verification-env.js';
 import { loadConfig } from './config.js';
 import { nowIso, readJsonFile } from './pickle-utils.js';
 import type {
@@ -39,6 +45,7 @@ import type {
   VerificationBaselineCommandMap,
   VerificationBaselineEntry,
   VerificationBaselines,
+  VerificationStep,
 } from '../types/index.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from './session-prd-seal.js';
@@ -101,8 +108,9 @@ interface ExitMuxRunnerPhaseOptions {
 }
 
 interface CaptureBaselineResultInput {
-  command: string;
+  step: VerificationStep;
   cwd: string;
+  allowedRoots: string[];
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
 }
@@ -190,13 +198,17 @@ function buildBootstrapSetupArgs({
 }
 
 function captureVerificationBaselineResult({
-  command,
+  step,
   cwd,
+  allowedRoots,
   env,
   timeoutMs,
 }: CaptureBaselineResultInput): VerificationBaselineEntry {
-  const result = spawnSync(process.env.SHELL || 'zsh', ['-lc', command], {
-    cwd,
+  const descriptor = verificationStepCommand(step);
+  const command = descriptor.display;
+  const stepCwd = assertVerificationStepSafe(step, { cwd, allowedRoots });
+  const result = spawnSync(descriptor.executable, descriptor.args, {
+    cwd: stepCwd,
     env,
     encoding: 'utf8',
     timeout: timeoutMs,
@@ -236,32 +248,35 @@ function capturePipelineVerificationBaselines(
     if (!isRunnableTicketStatus(ticket?.status)) {
       continue;
     }
-    const verificationCommands = normalizeVerificationCommands(ticket?.verification, {
+    const verificationSteps = normalizeVerificationSteps(ticket?.verification, {
       verify: ticket?.verify,
       cwd: workingDir,
     });
-    if (verificationCommands.length === 0) {
+    if (verificationSteps.length === 0) {
       continue;
     }
     const verificationReady = assertTicketVerificationReady({
       ticket: {
         ...ticket,
-        verification: verificationCommands,
+        verification: verificationSteps,
       },
       // Config is a valid verification input at runtime; ConfigDefaults lacks
       // the index signature ConfigVerificationInput models, so widen via unknown.
       config: config as unknown as ConfigVerificationInput,
       cwd: workingDir,
+      allowedRoots: [sessionDir],
     });
     byTicket[ticket.id] ??= { ...(existing.by_ticket?.[ticket.id] || {}) };
-    for (const command of verificationCommands) {
+    for (const step of verificationReady.steps) {
+      const command = verificationStepCommand(step).display;
       const scope = buildVerificationCommandScope(command, workingDir);
       if (byTicket[ticket.id][scope.key]) {
         continue;
       }
       const baseline = captureVerificationBaselineResult({
-        command,
+        step,
         cwd: workingDir,
+        allowedRoots: [sessionDir],
         env: verificationReady.env,
         timeoutMs,
       });
@@ -473,6 +488,7 @@ export async function ensureBootstrapSessionReady(
       ticket: nextTicket,
       config: loadConfig() as unknown as ConfigVerificationInput,
       cwd: (manager.read(statePath).working_dir as string | undefined) || process.cwd(),
+      allowedRoots: [sessionDir],
     });
   }
 
