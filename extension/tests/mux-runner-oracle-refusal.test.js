@@ -1,10 +1,10 @@
 // @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeExecutable, writeJson } from './helpers.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
 import { StateManager } from '../services/state-manager.js';
@@ -769,6 +769,127 @@ test('mux-runner repairs a missing dependency before implementation dispatch', a
   assert.deepEqual(events, ['orphan']);
   assert.deepEqual(readManifest(sessionDir).tickets[0].depends_on, []);
   assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
+});
+
+test('mixed runnable and cyclic work completes independent work before production graph repair', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('mixed dependency graph task');
+  const binDir = makeTempRoot('dependency-mixed-bin-');
+  createFakeCodex(binDir);
+  const fakeEnv = prependPath(binDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      { id: 'independent', title: 'Independent', status: 'Todo', depends_on: [], acceptance_criteria: ['Independent runs.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['independent.txt'] },
+      { id: 'a', title: 'A', status: 'Todo', depends_on: ['b'], acceptance_criteria: ['A runs.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['a.txt'] },
+      { id: 'b', title: 'B', status: 'Todo', depends_on: ['a'], acceptance_criteria: ['B runs.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['b.txt'] },
+    ],
+  });
+  const calls = [];
+  const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    runTicket: async (dir, ticketId) => {
+      calls.push(ticketId);
+      updateTicketStatus(dir, ticketId, { status: 'Done' });
+      return { status: 'done', applied: true };
+    },
+  }), { PATH: fakeEnv.PATH, PICKLE_TEST_MODE: '1' });
+  assert.equal(reason, 'success', readRunnerLog(sessionDir));
+  assert.deepEqual(calls, ['independent', 'a', 'b']);
+  assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
+});
+
+test('malformed dependency field shapes route through production graph repair before dispatch', async () => {
+  for (const [label, malformed] of [['object', { ticket_id: 'root' }], ['number', 7], ['mixed-array', ['root', 7]]]) {
+    const { dataRoot, sessionDir } = createSessionWithTodoTicket(`malformed ${label} dependency`);
+    const binDir = makeTempRoot(`dependency-malformed-${label}-`);
+    createFakeCodex(binDir);
+    const fakeEnv = prependPath(binDir);
+    writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+      tickets: [{ id: 'root', title: 'Root', status: 'Todo', depends_on: malformed, acceptance_criteria: ['Root runs after repair.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['root.txt'] }],
+    });
+    const calls = [];
+    const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+      runTicket: async (dir, ticketId) => {
+        calls.push(ticketId);
+        updateTicketStatus(dir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    }), { PATH: fakeEnv.PATH, PICKLE_TEST_MODE: '1' });
+    assert.equal(reason, 'success', `${label}: ${readRunnerLog(sessionDir)}`);
+    assert.deepEqual(calls, ['root'], label);
+    assert.deepEqual(readManifest(sessionDir).tickets[0].depends_on, [], label);
+  }
+});
+
+test('malicious dependency worker drift is restored, quarantined, and never accepted', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('malicious dependency repair');
+  const workingDir = String(new StateManager().read(path.join(sessionDir, 'state.json')).working_dir);
+  const protectedRepoFile = path.join(workingDir, 'protected.txt');
+  fs.writeFileSync(protectedRepoFile, 'original\n');
+  execFileSync('git', ['init', '-q'], { cwd: workingDir });
+  execFileSync('git', ['add', 'protected.txt'], { cwd: workingDir });
+  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline'], { cwd: workingDir });
+  const originalHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      { id: 'orphan', title: 'Orphan', status: 'Todo', depends_on: ['missing'], acceptance_criteria: ['Repair safely.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'] },
+      { id: 'independent', title: 'Independent', status: 'Done', depends_on: [], acceptance_criteria: ['Stay complete.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['independent.txt'], completion_commit: 'abc123' },
+    ],
+  });
+  const binDir = makeTempRoot('dependency-malicious-bin-');
+  writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const prompt = fs.readFileSync(0, 'utf8');
+const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
+const graph = JSON.parse(value('Current ticket graph JSON: '));
+const target = value('Target ticket ID: ');
+fs.writeFileSync(process.env.MALICIOUS_REPO_FILE, 'poisoned\\n');
+execFileSync('git', ['add', 'protected.txt'], { cwd: process.env.MALICIOUS_REPO_ROOT });
+execFileSync('git', ['-c', 'user.name=Poison', '-c', 'user.email=poison@example.invalid', 'commit', '-qm', 'poison'], { cwd: process.env.MALICIOUS_REPO_ROOT });
+const manifest = JSON.parse(fs.readFileSync(process.env.MALICIOUS_MANIFEST, 'utf8'));
+manifest.tickets.find((ticket) => ticket.id === 'independent').status = 'Todo';
+fs.writeFileSync(process.env.MALICIOUS_MANIFEST, JSON.stringify(manifest, null, 2));
+fs.writeFileSync(value('Dependency repair artifact path: '), JSON.stringify({ schema_version: 1, target_ticket_id: target, manifest_sha256: value('Authoritative manifest SHA-256: '), prd_seal_sha256: value('Authoritative PRD seal SHA-256: '), tickets: graph.map((ticket) => ticket.ticket_id === target ? { ...ticket, depends_on: [] } : ticket), rationale: 'valid artifact plus forbidden drift' }));
+console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
+`);
+  const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    runTicket: async () => { throw new Error('implementation must not run'); },
+  }), { ...prependPath(binDir), MALICIOUS_REPO_FILE: protectedRepoFile, MALICIOUS_REPO_ROOT: workingDir, MALICIOUS_MANIFEST: path.join(sessionDir, 'refinement_manifest.json') });
+  assert.equal(reason, 'dependency_repair_scheduled');
+  assert.equal(fs.readFileSync(protectedRepoFile, 'utf8'), 'original\n');
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim(), originalHead);
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: workingDir, encoding: 'utf8' }), '');
+  const independent = readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'independent');
+  assert.equal(independent.status, 'Done');
+  assert.equal(independent.completion_commit, 'abc123');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-quarantine.json')), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-current.json')), false);
+});
+
+test('invalid dependency artifact yields one durable nonterminal attempt per invocation', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('invalid dependency artifact');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), { tickets: [{ id: 'orphan', title: 'Orphan', status: 'Todo', depends_on: ['missing'], acceptance_criteria: ['Repair.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'] }] });
+  const binDir = makeTempRoot('dependency-invalid-artifact-bin-');
+  const invocationLog = path.join(binDir, 'invocations.log');
+  writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+const prompt = fs.readFileSync(0, 'utf8');
+const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
+const graph = JSON.parse(value('Current ticket graph JSON: '));
+const target = value('Target ticket ID: ');
+fs.appendFileSync(process.env.INVALID_ARTIFACT_INVOCATIONS, '1\\n');
+fs.writeFileSync(value('Dependency repair artifact path: '), JSON.stringify({ schema_version: 1, target_ticket_id: target, manifest_sha256: value('Authoritative manifest SHA-256: '), prd_seal_sha256: value('Authoritative PRD seal SHA-256: '), tickets: graph.map((ticket) => ticket.ticket_id === target ? { ...ticket, depends_on: [] } : ticket), rationale: 'invalid extra field', extra: true }));
+console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
+`);
+  const runOnce = () => withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    runTicket: async () => { throw new Error('implementation must not run'); },
+  }), { ...prependPath(binDir), INVALID_ARTIFACT_INVOCATIONS: invocationLog });
+  assert.equal(await runOnce(), 'dependency_repair_scheduled');
+  assert.equal(fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length, 1);
+  assert.equal(await runOnce(), 'dependency_repair_scheduled');
+  assert.equal(fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length, 2);
+  const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'orphan');
+  assert.equal(new Set(strategies.map((epoch) => epoch.strategyHash)).size, 2);
+  assert.ok(new StateManager().read(path.join(sessionDir, 'state.json')).history.filter((event) => event.step === 'dependency_repair_wakeup_persisted').length >= 2);
 });
 
 test('unresolved dependency repair persists one nonterminal wakeup and resumes with a novel production strategy', async () => {

@@ -60,7 +60,11 @@ import {
 } from '../services/citadel-remediation.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
-import { repairTicketDependencyContract } from '../services/dependency-contract-repair.js';
+import {
+  inspectTicketDependencyGraph,
+  repairTicketDependencyContract,
+  type DependencyGraphInspection,
+} from '../services/dependency-contract-repair.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -174,6 +178,7 @@ async function runSequentialWithLease(
     appendRunnerLog(sessionDir, runnerMode, 'resumed obsolete strategy-exhaustion stop through autonomous escalation');
   }
 
+  let dependencyInspection = inspectTicketDependencyGraph(sessionDir);
   let summary;
   try {
     summary = summarizeTickets(sessionDir);
@@ -203,41 +208,81 @@ async function runSequentialWithLease(
   }
   let scheduledDiagnosticTicketId: string | null = null;
   let scheduledDiagnosticTask: string | null = null;
+  const scheduleDependencyDiagnostic = (
+    currentSummary: typeof summary,
+    inspection: DependencyGraphInspection,
+  ): boolean => {
+    const selected = inspection.repair_ticket_ids.find((ticketId) => currentSummary.tickets.some((ticket) => (
+      normalizeTicketId(ticket.id, ticket.id) === ticketId
+      && !['done', 'skipped'].includes(String(ticket.status || '').trim().toLowerCase())
+    )));
+    if (!selected) return false;
+    scheduledDiagnosticTicketId = selected;
+    scheduledDiagnosticTask = 'repair-dependency-or-contract-blockage';
+    updateTicketStatus(sessionDir, selected, {
+      status: 'Todo',
+      recovery_task: scheduledDiagnosticTask,
+      recovery_scheduled_at: new Date().toISOString(),
+      recovery_dependency_findings: inspection.findings,
+    });
+    appendRunnerLog(sessionDir, runnerMode, `scheduled dependency graph contract repair for ${selected}: ${inspection.findings.join('; ')}`);
+    return true;
+  };
+  const persistDependencyWakeup = (ticketId: string, findings: string[], reason: string): void => {
+    updateTicketStatus(sessionDir, ticketId, {
+      status: 'Todo',
+      recovery_task: 'repair-dependency-or-contract-blockage',
+      recovery_wakeup_at: new Date().toISOString(),
+      recovery_unresolved_dependencies: findings,
+      dependency_repair_failure: reason,
+    });
+    manager.update(statePath, (current) => {
+      appendHistory(current, 'dependency_repair_wakeup_persisted', ticketId);
+      return current;
+    });
+    exitReason = 'dependency_repair_scheduled';
+    appendRunnerLog(sessionDir, runnerMode, `dependency graph repair for ${ticketId} scheduled a durable wakeup: ${reason}`);
+  };
   if (!summary.total) {
     exitReason = 'no_tickets';
     appendRunnerLog(sessionDir, runnerMode, 'no tickets found in refinement manifest');
   } else if (!summary.runnable.length) {
     if (summary.done !== summary.total && failureMode === 'retry') {
-      const repairing = new Set(summary.tickets
-        .filter((candidate) => String(candidate.status).toLowerCase() === 'blocked')
-        .map((candidate) => candidate.id));
-      const dependencyReadyRepairing = new Set(summary.tickets
-        .filter((candidate) => (
-          repairing.has(candidate.id)
-          && areTicketDependenciesSatisfied(candidate, summary.tickets)
-        ))
-        .map((candidate) => candidate.id));
-      const decision = planSchedulerContinuity(
-        summary.tickets,
-        dependencyReadyRepairing.size > 0 ? dependencyReadyRepairing : repairing,
-      );
-      if (decision.kind === 'diagnostic' && decision.ticketId !== 'pipeline') {
-        scheduledDiagnosticTicketId = normalizeTicketId(decision.ticketId, decision.ticketId);
-        const diagnosticTicket = summary.tickets.find((ticket) => (
-          normalizeTicketId(ticket.id, ticket.id) === scheduledDiagnosticTicketId
-        ));
-        scheduledDiagnosticTask = diagnosticTicket
-          && unresolvedTicketDependencies(diagnosticTicket, summary.tickets).length > 0
-          ? 'repair-dependency-or-contract-blockage'
-          : decision.task;
-        updateTicketStatus(sessionDir, decision.ticketId, {
-          status: 'Todo',
-          recovery_task: scheduledDiagnosticTask,
-          recovery_scheduled_at: new Date().toISOString(),
-        });
-        appendRunnerLog(sessionDir, runnerMode, `all tickets blocked; scheduled ${scheduledDiagnosticTask} for ${decision.ticketId}`);
+      if (dependencyInspection.findings.length > 0
+        && scheduleDependencyDiagnostic(summary, dependencyInspection)) {
+        appendRunnerLog(sessionDir, runnerMode, 'all tickets blocked by an invalid dependency graph; scheduled dedicated graph repair');
       } else {
-        exitReason = 'no_tickets';
+        const repairing = new Set(summary.tickets
+          .filter((candidate) => String(candidate.status).toLowerCase() === 'blocked')
+          .map((candidate) => candidate.id));
+        const dependencyReadyRepairing = new Set(summary.tickets
+          .filter((candidate) => (
+            repairing.has(candidate.id)
+            && areTicketDependenciesSatisfied(candidate, summary.tickets)
+          ))
+          .map((candidate) => candidate.id));
+        const decision = planSchedulerContinuity(
+          summary.tickets,
+          dependencyReadyRepairing.size > 0 ? dependencyReadyRepairing : repairing,
+        );
+        if (decision.kind === 'diagnostic' && decision.ticketId !== 'pipeline') {
+          scheduledDiagnosticTicketId = normalizeTicketId(decision.ticketId, decision.ticketId);
+          const diagnosticTicket = summary.tickets.find((ticket) => (
+            normalizeTicketId(ticket.id, ticket.id) === scheduledDiagnosticTicketId
+          ));
+          scheduledDiagnosticTask = diagnosticTicket
+            && unresolvedTicketDependencies(diagnosticTicket, summary.tickets).length > 0
+            ? 'repair-dependency-or-contract-blockage'
+            : decision.task;
+          updateTicketStatus(sessionDir, decision.ticketId, {
+            status: 'Todo',
+            recovery_task: scheduledDiagnosticTask,
+            recovery_scheduled_at: new Date().toISOString(),
+          });
+          appendRunnerLog(sessionDir, runnerMode, `all tickets blocked; scheduled ${scheduledDiagnosticTask} for ${decision.ticketId}`);
+        } else {
+          exitReason = 'no_tickets';
+        }
       }
     } else {
       exitReason = summary.done === summary.total ? 'success' : 'no_tickets';
@@ -256,20 +301,28 @@ async function runSequentialWithLease(
   );
   if (scheduledDiagnosticTicketId) pendingTicketIds.add(scheduledDiagnosticTicketId);
   const repairingTicketIds = new Set<string>();
-  while (pendingTicketIds.size > 0 && exitReason === 'success') {
+  ticketLoop: while (pendingTicketIds.size > 0 && exitReason === 'success') {
     options.assertDurableOwnership?.();
     const currentSummary = summarizeTickets(sessionDir);
+    dependencyInspection = inspectTicketDependencyGraph(sessionDir);
+    const invalidDependencyTickets = new Set(dependencyInspection.repair_ticket_ids);
     const runnable = (candidate: typeof currentSummary.tickets[number]): boolean => (
       pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
       && (
         scheduledDiagnosticTicketId === normalizeTicketId(candidate.id, candidate.id)
-        || areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
+        || (!invalidDependencyTickets.has(normalizeTicketId(candidate.id, candidate.id))
+          && areTicketDependenciesSatisfied(candidate, currentSummary.tickets))
       )
     );
     const ticket = currentSummary.tickets.find((candidate) => (
       runnable(candidate) && !repairingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
     )) || currentSummary.tickets.find(runnable);
     if (!ticket) {
+      if (failureMode === 'retry' && dependencyInspection.findings.length > 0
+        && scheduleDependencyDiagnostic(currentSummary, dependencyInspection)) {
+        pendingTicketIds.add(scheduledDiagnosticTicketId!);
+        continue;
+      }
       failedTicketId = [...pendingTicketIds][0] || null;
       exitReason = 'error';
       const unresolved = currentSummary.tickets
@@ -584,41 +637,33 @@ async function runSequentialWithLease(
           if (!startAutomaticRecoveryEpoch('all-blocked diagnostic repair', 'failure')) {
             throw new Error('diagnostic-repair-strategy-unavailable');
           }
-          if (scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage') {
+          const dependencyDiagnostic = scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage';
+          if (dependencyDiagnostic) {
             await repairDependencyContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
           } else {
             await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
           }
           pendingContractRepair = false;
+          appendRunnerLog(sessionDir, runnerMode, `executed diagnostic contract repair for ${ticket.id}`);
+          if (dependencyDiagnostic) {
+            const repairedSummary = summarizeTickets(sessionDir);
+            const repairedInspection = inspectTicketDependencyGraph(sessionDir);
+            if (repairedInspection.findings.length > 0) {
+              persistDependencyWakeup(ticket.id, repairedInspection.findings, 'validated worker result left an invalid dependency graph');
+              break;
+            }
+            scheduledDiagnosticTicketId = null;
+            scheduledDiagnosticTask = null;
+            pendingTicketIds.add(normalizeTicketId(ticket.id, ticket.id));
+            for (const candidate of repairedSummary.tickets) {
+              if (!['done', 'skipped', 'blocked'].includes(String(candidate.status || '').trim().toLowerCase())) {
+                pendingTicketIds.add(normalizeTicketId(candidate.id, candidate.id));
+              }
+            }
+            continue ticketLoop;
+          }
           scheduledDiagnosticTicketId = null;
           scheduledDiagnosticTask = null;
-          appendRunnerLog(sessionDir, runnerMode, `executed diagnostic contract repair for ${ticket.id}`);
-          const repairedSummary = summarizeTickets(sessionDir);
-          const repairedTicket = repairedSummary.tickets.find((candidate) => (
-            normalizeTicketId(candidate.id, candidate.id) === normalizeTicketId(ticket.id, ticket.id)
-          ));
-          if (!repairedTicket || !areTicketDependenciesSatisfied(repairedTicket, repairedSummary.tickets)) {
-            const unresolved = repairedTicket
-              ? unresolvedTicketDependencies(repairedTicket, repairedSummary.tickets)
-              : ['ticket missing after diagnostic repair'];
-            updateTicketStatus(sessionDir, ticket.id, {
-              status: 'Todo',
-              recovery_task: 'repair-dependency-or-contract-blockage',
-              recovery_wakeup_at: new Date().toISOString(),
-              recovery_unresolved_dependencies: unresolved,
-            });
-            manager.update(statePath, (current) => {
-              appendHistory(current, 'dependency_repair_wakeup_persisted', ticket.id);
-              return current;
-            });
-            exitReason = 'dependency_repair_scheduled';
-            appendRunnerLog(
-              sessionDir,
-              runnerMode,
-              `diagnostic repair for ${ticket.id} left unresolved dependencies (${unresolved.join(', ')}); persisted autonomous wakeup`,
-            );
-            break;
-          }
         }
         appendRunnerLog(
           sessionDir,
@@ -678,6 +723,14 @@ async function runSequentialWithLease(
         if (cancelled) {
           exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} stopped: ${exitReason}`);
+          break;
+        }
+        if (scheduledDiagnosticTicketId === normalizeTicketId(ticket.id, ticket.id)
+          && scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage') {
+          const failureMessage = error instanceof Error ? error.message : String(error);
+          decideRecovery('worker_failure', `dependency repair failed: ${failureMessage}`, error);
+          const inspection = inspectTicketDependencyGraph(sessionDir);
+          persistDependencyWakeup(ticket.id, inspection.findings.length > 0 ? inspection.findings : [failureMessage], failureMessage);
           break;
         }
         if (isPreflightError(error)) {
