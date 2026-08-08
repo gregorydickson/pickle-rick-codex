@@ -1537,7 +1537,9 @@ test('mux-runner refreshes the run timer instead of inheriting stale session sta
   assert.equal(state.step, 'complete');
   assert.equal(state.start_time_epoch, 1);
   assert.ok(Number(state.run_start_time_epoch) > 1);
-  assert.equal(fs.readFileSync(countPath, 'utf8'), '8');
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '7');
+  const simplify = readJsonFile(path.join(sessionDir, 'worker-lifecycle', 'r1', 'simplify.json'));
+  assert.equal(simplify.skipped, true);
 
   const output = runNode([path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], {
     env,
@@ -3834,14 +3836,16 @@ for (const [name, extraEnv, expectedTitle] of [
   });
 }
 
-test('Citadel blocks when no deterministic project check executes', () => {
+test('Citadel runs the repository whitespace check when no project script exists', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
+  const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  createFakeCodex(fakeBin);
   initGitRepo(projectDir);
   fs.writeFileSync(path.join(projectDir, 'baseline.txt'), 'baseline\n');
   runGit(projectDir, ['add', 'baseline.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
-  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'Citadel unavailable checks'], {
     env,
     cwd: projectDir,
@@ -3850,13 +3854,12 @@ test('Citadel blocks when no deterministic project check executes', () => {
     tickets: [{ acceptance_criteria: ['A deterministic release check executes.'] }],
   });
 
-  assert.throws(
-    () => runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir }),
-    /Command failed/,
-  );
+  runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir });
+  const checks = readJsonFile(path.join(sessionDir, 'citadel-checks.json')).checks;
   const report = readJsonFile(path.join(sessionDir, 'citadel-report.json'));
-  assert.equal(report.verdict, 'block');
-  assert.match(report.findings[0].title, /deterministic gate unavailable/i);
+  assert.deepEqual(checks.map((check) => check.status), ['skipped', 'skipped', 'skipped', 'passed']);
+  assert.equal(checks.at(-1).command, 'git diff --check');
+  assert.equal(report.verdict, 'approve');
 });
 
 test('Citadel cancellation reaps a mutating deterministic check and restores the clean checkpoint', async () => {
@@ -3864,9 +3867,10 @@ test('Citadel cancellation reaps a mutating deterministic check and restores the
   const projectDir = makeTempRoot('pickle-rick-project-');
   initGitRepo(projectDir);
   fs.writeFileSync(path.join(projectDir, 'tracked.txt'), 'baseline\n');
+  const enteredPath = path.join(dataRoot, 'citadel-check-entered');
   fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({
     scripts: {
-      test: `node -e ${JSON.stringify("const fs=require('node:fs');fs.writeFileSync('tracked.txt','mutated\\n');setInterval(()=>{},1000)")}`,
+      test: `node -e ${JSON.stringify(`const fs=require('node:fs');fs.writeFileSync('tracked.txt','mutated\\n');fs.writeFileSync(${JSON.stringify(enteredPath)},'entered\\n');setInterval(()=>{},1000)`)}`,
     },
   }));
   runGit(projectDir, ['add', 'tracked.txt', 'package.json']);
@@ -3889,7 +3893,7 @@ test('Citadel cancellation reaps a mutating deterministic check and restores the
   await waitFor(() => {
     const state = readJsonFile(statePath);
     return state.active_child_kind === 'citadel-check'
-      && fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8') === 'mutated\n';
+      && fs.existsSync(enteredPath);
   }, { message: 'Citadel deterministic check did not enter its mutating phase' });
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: projectDir });
   await new Promise((resolve, reject) => {
@@ -3902,6 +3906,7 @@ test('Citadel cancellation reaps a mutating deterministic check and restores the
   assert.equal(state.active_child_pid, null);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(fs.readFileSync(enteredPath, 'utf8'), 'entered\n');
 });
 
 test('pickle-pipeline honors immutable skip flags', () => {
