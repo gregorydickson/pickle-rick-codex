@@ -245,6 +245,10 @@ if (prompt.includes('You are the autonomous Citadel finding attribution repair w
   const contextPath = extractPathAfter('Isolated read-only attribution context: ');
   const artifactPath = extractPathAfter('Write the attribution artifact to: ');
   const context = JSON.parse(fs.readFileSync(contextPath, 'utf8'));
+  const attributionDelayMs = Number(process.env.FAKE_ATTRIBUTION_DELAY_MS || '0');
+  if (attributionDelayMs > 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attributionDelayMs);
+  }
   const mutateSession = process.env.FAKE_ATTRIBUTION_MUTATE_SESSION || '';
   if (mutateSession) {
     const liveManifestPath = path.join(mutateSession, 'refinement_manifest.json');

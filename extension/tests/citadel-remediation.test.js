@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createFakeCodex, makeTempRoot, prependPath, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, waitFor, writeJson } from './helpers.js';
 import {
   enqueueCitadelRemediation,
   enqueueCitadelRemediationResult,
@@ -12,6 +12,8 @@ import {
   reconcileCitadelRemediation,
 } from '../services/citadel-remediation.js';
 import { readManifest } from '../services/tickets.js';
+import { DurableOwnershipDrainError, isDurableOwnershipDrainError } from '../services/durable-runtime.js';
+import { StateManager } from '../services/state-manager.js';
 
 function ticket(id, ownedPath, criterion, dependsOn = []) {
   return {
@@ -297,6 +299,108 @@ test('malicious attribution worker cannot mutate live tickets while returning a 
   assert.notEqual(invocation.cwd, sessionDir);
   assert.equal(invocation.args.includes('--add-dir'), false);
   assert.doesNotMatch(invocation.prompt, new RegExp(sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+test('operator cancellation dominates an in-flight attribution repair and cannot restore its lease', async () => {
+  const sessionDir = multiTicketSession();
+  const workingDir = makeTempRoot('citadel-attribution-cancel-repo-');
+  const statePath = path.join(sessionDir, 'state.json');
+  const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+  writeJson(statePath, {
+    schema_version: 1,
+    active: true,
+    working_dir: workingDir,
+    worker_timeout_seconds: 30,
+    history: [],
+  });
+  writeJson(logicalPath, {
+    schema_version: 1,
+    pipeline_id: path.basename(sessionDir),
+    control_state: 'autonomous_execution',
+    terminal_state: null,
+    prd_seal_hash: 'a'.repeat(64),
+    lease: {
+      owner_id: `runner:${process.pid}:attribution-cancel-test`,
+      token: 'cancel-test-token',
+      generation: 1,
+      acquired_at: new Date().toISOString(),
+      renewed_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    },
+    lease_generation: 1,
+    executor_restart_count: 0,
+    events: [],
+  });
+  writeJson(path.join(sessionDir, 'citadel-report.json'), {
+    schema_version: 1,
+    verdict: 'block',
+    acceptance_criteria_checked: [],
+    findings: [{ severity: 'high', title: 'Concurrent cancellation finding.', evidence: 'Attribution is ambiguous.' }],
+  });
+  assert.equal(enqueueCitadelRemediationResult(sessionDir).kind, 'attribution_repair_scheduled');
+
+  const binDir = makeTempRoot('citadel-attribution-cancel-bin-');
+  const invocationLog = path.join(sessionDir, 'fake-attribution-cancel-invocations.jsonl');
+  createFakeCodex(binDir);
+  const prior = {
+    PATH: process.env.PATH,
+    PICKLE_TEST_MODE: process.env.PICKLE_TEST_MODE,
+    FAKE_ATTRIBUTION_DELAY_MS: process.env.FAKE_ATTRIBUTION_DELAY_MS,
+    FAKE_CODEX_INVOCATION_LOG: process.env.FAKE_CODEX_INVOCATION_LOG,
+  };
+  Object.assign(process.env, prependPath(binDir, {
+    PICKLE_TEST_MODE: '1',
+    FAKE_ATTRIBUTION_DELAY_MS: '500',
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+  }));
+
+  try {
+    const repair = repairCitadelAttribution(sessionDir, {
+      timeoutMs: 10_000,
+      assertDurableOwnership: () => {
+        const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8'));
+        if (logical.terminal_state === 'cancelled' || logical.lease === null) {
+          throw new DurableOwnershipDrainError('operator cancellation drained durable ownership');
+        }
+      },
+    });
+    await waitFor(() => fs.existsSync(invocationLog) && fs.readFileSync(invocationLog, 'utf8').includes(
+      'autonomous Citadel finding attribution repair worker',
+    ));
+    new StateManager().update(statePath, (state) => {
+      state.active = false;
+      state.last_exit_reason = 'cancelled';
+      state.cancel_requested_at = new Date().toISOString();
+      return state;
+    });
+    const logicalManager = new StateManager();
+    logicalManager.acquireLock(logicalPath);
+    try {
+      const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8'));
+      logical.terminal_state = 'cancelled';
+      logical.lease = null;
+      writeJson(logicalPath, logical);
+    } finally {
+      logicalManager.releaseLock(logicalPath);
+    }
+    await assert.rejects(repair, (error) => isDurableOwnershipDrainError(error));
+  } finally {
+    for (const [key, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8'));
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.ok(state.cancel_requested_at);
+  assert.equal(logical.terminal_state, 'cancelled');
+  assert.equal(logical.lease, null);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-attribution-repair-current.json')), false);
+  assert.notEqual(state.last_exit_reason, 'citadel_attribution_repair_scheduled');
 });
 
 test('schema-2 pending remediation migrates durably on restart without widening its ticket slice', () => {

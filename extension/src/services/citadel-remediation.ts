@@ -9,7 +9,7 @@ import { resetPipelineForAutonomousRemediation } from './pipeline-state.js';
 import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { normalizeTicketScopePath, resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
-import { isDurableOwnershipDrainError } from './durable-runtime.js';
+import { DurableOwnershipDrainError, isDurableOwnershipDrainError } from './durable-runtime.js';
 import { normalizeTicketId, readManifest, ticketDependencyIds, updateTicketStatus } from './tickets.js';
 import type { Ticket } from '../types/index.js';
 
@@ -73,6 +73,17 @@ interface AuthoritativeSnapshotEntry {
   content: string | null;
   fingerprint: string;
   mode: number | null;
+}
+
+interface ControlDominance {
+  cancelled: boolean;
+  lease_released: boolean;
+  reasons: string[];
+}
+
+interface AuthoritativeDriftResult {
+  detail: string | null;
+  control: ControlDominance;
 }
 
 interface TicketAttribution {
@@ -622,12 +633,98 @@ function restoreAuthoritativeEntry(entry: AuthoritativeSnapshotEntry): void {
   if (entry.mode !== null) fs.chmodSync(entry.absolute_path, entry.mode);
 }
 
+function mergeControlDominance(left: ControlDominance, right: ControlDominance): ControlDominance {
+  return {
+    cancelled: left.cancelled || right.cancelled,
+    lease_released: left.lease_released || right.lease_released,
+    reasons: [...new Set([...left.reasons, ...right.reasons])],
+  };
+}
+
+function readControlDominance(
+  sessionDir: string,
+  snapshot: AuthoritativeSnapshotEntry[],
+  repairStartedAtMs: number,
+): ControlDominance {
+  const state = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), {});
+  const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+  const logical = readJsonFile<Record<string, unknown>>(logicalPath, null);
+  const baselineLogicalEntry = snapshot.find((entry) => entry.relative_path === 'logical-pipeline.json');
+  const baselineLogical = baselineLogicalEntry?.content
+    ? JSON.parse(baselineLogicalEntry.content) as Record<string, unknown> : null;
+  const cancellationAtMs = Date.parse(String(state?.cancel_requested_at || ''));
+  const stateCancelled = state?.last_exit_reason === 'cancelled'
+    || (Number.isFinite(cancellationAtMs) && cancellationAtMs >= repairStartedAtMs);
+  const logicalCancelled = logical?.terminal_state === 'cancelled';
+  const leaseReleased = Boolean(
+    baselineLogical?.lease && logical && logical.lease === null,
+  );
+  const reasons = [
+    ...(stateCancelled ? ['state-cancelled'] : []),
+    ...(logicalCancelled ? ['logical-pipeline-cancelled'] : []),
+    ...(leaseReleased ? ['logical-pipeline-lease-released'] : []),
+  ];
+  return { cancelled: stateCancelled || logicalCancelled, lease_released: leaseReleased, reasons };
+}
+
+function restoreAuthoritativeEntryCancellationSafe(
+  sessionDir: string,
+  entry: AuthoritativeSnapshotEntry,
+  snapshot: AuthoritativeSnapshotEntry[],
+  repairStartedAtMs: number,
+  observed: ControlDominance,
+): ControlDominance {
+  let control = mergeControlDominance(observed, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
+  if (entry.relative_path === 'state.json') {
+    const manager = new StateManager();
+    manager.update(entry.absolute_path, (current) => {
+      const cancellationAtMs = Date.parse(String(current.cancel_requested_at || ''));
+      if (control.cancelled || current.last_exit_reason === 'cancelled'
+        || (Number.isFinite(cancellationAtMs) && cancellationAtMs >= repairStartedAtMs)) {
+        control = mergeControlDominance(control, {
+          cancelled: true, lease_released: false, reasons: ['state-cancelled'],
+        });
+        return current;
+      }
+      return JSON.parse(entry.content || '{}') as typeof current;
+    });
+    return mergeControlDominance(control, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
+  }
+  if (entry.relative_path === 'logical-pipeline.json') {
+    const manager = new StateManager();
+    manager.acquireLock(entry.absolute_path);
+    try {
+      const current = readJsonFile<Record<string, unknown>>(entry.absolute_path, null);
+      if (control.cancelled || control.lease_released
+        || current?.terminal_state === 'cancelled' || (current && current.lease === null)) {
+        control = mergeControlDominance(control, {
+          cancelled: current?.terminal_state === 'cancelled',
+          lease_released: Boolean(current && current.lease === null),
+          reasons: [
+            ...(current?.terminal_state === 'cancelled' ? ['logical-pipeline-cancelled'] : []),
+            ...(current && current.lease === null ? ['logical-pipeline-lease-released'] : []),
+          ],
+        });
+        return control;
+      }
+      restoreAuthoritativeEntry(entry);
+    } finally {
+      manager.releaseLock(entry.absolute_path);
+    }
+    return mergeControlDominance(control, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
+  }
+  restoreAuthoritativeEntry(entry);
+  return mergeControlDominance(control, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
+}
+
 function quarantineAndRestoreAuthoritativeDrift(
   sessionDir: string,
   intent: CitadelAttributionRepairIntent,
   snapshot: AuthoritativeSnapshotEntry[],
   candidateArtifactPath: string,
-): string | null {
+  repairStartedAtMs: number,
+): AuthoritativeDriftResult {
+  let control = readControlDominance(sessionDir, snapshot, repairStartedAtMs);
   const drift = snapshot.flatMap((entry) => {
     const exists = fs.existsSync(entry.absolute_path);
     const content = exists ? fs.readFileSync(entry.absolute_path, 'utf8') : null;
@@ -635,7 +732,8 @@ function quarantineAndRestoreAuthoritativeDrift(
       .update(normalizedAuthoritativeContent(entry.relative_path, content)).digest('hex');
     return fingerprint === entry.fingerprint ? [] : [{ entry, content, fingerprint }];
   });
-  if (drift.length === 0) return null;
+  control = mergeControlDominance(control, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
+  if (drift.length === 0) return { detail: null, control };
   const quarantineDir = ensureDir(path.join(
     sessionDir,
     'citadel-attribution-quarantine',
@@ -655,8 +753,15 @@ function quarantineAndRestoreAuthoritativeDrift(
       ? fs.readFileSync(candidateArtifactPath).toString('base64') : null,
     quarantined_at: new Date().toISOString(),
   });
-  for (const { entry } of drift) restoreAuthoritativeEntry(entry);
+  for (const { entry } of drift) {
+    control = restoreAuthoritativeEntryCancellationSafe(
+      sessionDir, entry, snapshot, repairStartedAtMs, control,
+    );
+  }
+  control = mergeControlDominance(control, readControlDominance(sessionDir, snapshot, repairStartedAtMs));
   const unresolved = drift.filter(({ entry }) => {
+    if ((control.cancelled || control.lease_released)
+      && ['state.json', 'logical-pipeline.json'].includes(entry.relative_path)) return false;
     const content = fs.existsSync(entry.absolute_path) ? fs.readFileSync(entry.absolute_path, 'utf8') : null;
     return crypto.createHash('sha256').update(normalizedAuthoritativeContent(entry.relative_path, content)).digest('hex')
       !== entry.fingerprint;
@@ -664,7 +769,10 @@ function quarantineAndRestoreAuthoritativeDrift(
   if (unresolved.length > 0) {
     throw new Error(`citadel-attribution-authoritative-restore-failed: ${unresolved.map(({ entry }) => entry.relative_path).join(', ')}`);
   }
-  return `citadel-attribution-authoritative-drift: ${drift.map(({ entry }) => entry.relative_path).join(', ')}; quarantined at ${quarantineDir}`;
+  return {
+    detail: `citadel-attribution-authoritative-drift: ${drift.map(({ entry }) => entry.relative_path).join(', ')}; quarantined at ${quarantineDir}`,
+    control,
+  };
 }
 
 export async function repairCitadelAttribution(
@@ -760,19 +868,25 @@ export async function repairCitadelAttribution(
           workerError ||= error;
         }
       }
-      let driftDetail: string | null = null;
       try {
-        driftDetail = quarantineAndRestoreAuthoritativeDrift(
-          sessionDir, intent, authoritativeSnapshot, candidateArtifactPath,
+        const driftResult = quarantineAndRestoreAuthoritativeDrift(
+          sessionDir, intent, authoritativeSnapshot, candidateArtifactPath, repairStartedAtMs,
         );
-        if (driftDetail) throw new Error(driftDetail);
+        if (driftResult.control.cancelled || driftResult.control.lease_released) {
+          if (isDurableOwnershipDrainError(workerError)) throw workerError;
+          throw new DurableOwnershipDrainError(
+            `Citadel attribution repair yielded to ${driftResult.control.reasons.join(', ') || 'cancelled durable control'}`,
+          );
+        }
+        if (driftResult.detail) throw new Error(driftResult.detail);
         if (workerError) throw workerError;
+        options.assertDurableOwnership?.();
         if (!result) throw new Error('Citadel attribution repair did not return a worker result.');
         assertCodexSucceeded(result, 'Citadel attribution repair failed');
         artifactValue = readAttributionArtifact(candidateArtifactPath);
       } catch (error) {
         fs.rmSync(candidateDir, { recursive: true, force: true });
-        if (isDurableOwnershipDrainError(error) && !driftDetail) throw error;
+        if (isDurableOwnershipDrainError(error)) throw error;
         const detail = error instanceof Error ? error.message : String(error);
         const persisted = persistAttributionFailure(sessionDir, intent, detail);
         return {
