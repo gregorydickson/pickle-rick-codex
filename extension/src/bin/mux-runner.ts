@@ -244,7 +244,10 @@ async function runSequentialWithLease(
     const currentSummary = summarizeTickets(sessionDir);
     const runnable = (candidate: typeof currentSummary.tickets[number]): boolean => (
       pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
-      && areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
+      && (
+        scheduledDiagnosticTicketId === normalizeTicketId(candidate.id, candidate.id)
+        || areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
+      )
     );
     const ticket = currentSummary.tickets.find((candidate) => (
       runnable(candidate) && !repairingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
@@ -561,13 +564,39 @@ async function runSequentialWithLease(
           options.assertDurableOwnership?.();
         }
         if (scheduledDiagnosticTicketId === normalizeTicketId(ticket.id, ticket.id)) {
-          if (!activeStrategy && !startAutomaticRecoveryEpoch('all-blocked diagnostic repair', 'failure')) {
+          if (!startAutomaticRecoveryEpoch('all-blocked diagnostic repair', 'failure')) {
             throw new Error('diagnostic-repair-strategy-unavailable');
           }
           await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
           pendingContractRepair = false;
           scheduledDiagnosticTicketId = null;
           appendRunnerLog(sessionDir, runnerMode, `executed diagnostic contract repair for ${ticket.id}`);
+          const repairedSummary = summarizeTickets(sessionDir);
+          const repairedTicket = repairedSummary.tickets.find((candidate) => (
+            normalizeTicketId(candidate.id, candidate.id) === normalizeTicketId(ticket.id, ticket.id)
+          ));
+          if (!repairedTicket || !areTicketDependenciesSatisfied(repairedTicket, repairedSummary.tickets)) {
+            const unresolved = repairedTicket
+              ? unresolvedTicketDependencies(repairedTicket, repairedSummary.tickets)
+              : ['ticket missing after diagnostic repair'];
+            updateTicketStatus(sessionDir, ticket.id, {
+              status: 'Todo',
+              recovery_task: 'repair-dependency-or-contract-blockage',
+              recovery_wakeup_at: new Date().toISOString(),
+              recovery_unresolved_dependencies: unresolved,
+            });
+            manager.update(statePath, (current) => {
+              appendHistory(current, 'dependency_repair_wakeup_persisted', ticket.id);
+              return current;
+            });
+            exitReason = 'dependency_repair_scheduled';
+            appendRunnerLog(
+              sessionDir,
+              runnerMode,
+              `diagnostic repair for ${ticket.id} left unresolved dependencies (${unresolved.join(', ')}); persisted autonomous wakeup`,
+            );
+            break;
+          }
         }
         appendRunnerLog(
           sessionDir,
@@ -869,6 +898,7 @@ export function muxRunnerExitFailed(exitReason: string): boolean {
     || exitReason === 'circuit_open'
     || exitReason === 'recovery_exhausted'
     || exitReason === 'recovery_required'
+    || exitReason === 'dependency_repair_scheduled'
     || exitReason === 'citadel-blocked'
     || String(exitReason).startsWith('preflight-')
   );

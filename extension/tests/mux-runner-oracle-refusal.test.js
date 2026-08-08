@@ -535,6 +535,7 @@ test('adaptive recovery permits success on the final budgeted attempt', async ()
 test('mux-runner CLI treats recovery blocks as failures', () => {
   assert.equal(muxRunnerExitFailed('recovery_exhausted'), true);
   assert.equal(muxRunnerExitFailed('recovery_required'), true);
+  assert.equal(muxRunnerExitFailed('dependency_repair_scheduled'), true);
   assert.equal(muxRunnerExitFailed('success'), false);
 });
 
@@ -682,6 +683,116 @@ test('mux-runner repairs a dependency-ready prerequisite when every ticket is bl
   assert.deepEqual(calls, ['root']);
   assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
   assert.match(readRunnerLog(sessionDir), /executed diagnostic contract repair for root/);
+});
+
+test('mux-runner persists a cyclic dependency diagnostic and completes after restart repair', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('cyclic dependency repair task');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'a', title: 'Cycle A', description: 'Depends on B.',
+        acceptance_criteria: ['Cycle is repaired before implementation.'],
+        verification: ['node -e "process.exit(0)"'], allowed_paths: ['a.txt'],
+        priority: 'P1', status: 'Todo', depends_on: ['b'],
+      },
+      {
+        id: 'b', title: 'Cycle B', description: 'Depends on A.',
+        acceptance_criteria: ['A completes first after repair.'],
+        verification: ['node -e "process.exit(0)"'], allowed_paths: ['b.txt'],
+        priority: 'P1', status: 'Todo', depends_on: ['a'],
+      },
+    ],
+  });
+  const calls = [];
+  let repairs = 0;
+
+  const firstReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketVerificationContract: async () => {
+        repairs += 1;
+        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+      },
+      runTicket: async (_dir, ticketId) => {
+        calls.push(ticketId);
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(firstReason, 'dependency_repair_scheduled');
+  assert.equal(repairs, 1);
+  assert.deepEqual(calls, []);
+  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  assert.equal(persisted.tickets[0].recovery_task, 'repair-dependency-or-contract-blockage');
+  assert.deepEqual(persisted.tickets[0].recovery_unresolved_dependencies, ['b']);
+  const wakeupState = new StateManager().read(path.join(sessionDir, 'state.json'));
+  assert.equal(wakeupState.last_exit_reason, 'dependency_repair_scheduled');
+  assert.ok(wakeupState.history.some((event) => event.step === 'dependency_repair_wakeup_persisted'));
+  assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
+
+  const secondReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketVerificationContract: async () => {
+        repairs += 1;
+        const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+        manifest.tickets.find((ticket) => ticket.id === 'a').depends_on = [];
+        writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
+        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+      },
+      runTicket: async (_dir, ticketId) => {
+        calls.push(ticketId);
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(secondReason, 'success', readRunnerLog(sessionDir));
+  assert.equal(repairs, 2);
+  assert.deepEqual(calls, ['a', 'b']);
+  const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'a');
+  assert.equal(strategies.length, 2);
+  assert.equal(new Set(strategies.map((epoch) => epoch.strategyHash)).size, 2);
+});
+
+test('mux-runner repairs a missing dependency before implementation dispatch', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('missing dependency repair task');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'orphan', title: 'Orphan ticket', description: 'References a missing prerequisite.',
+      acceptance_criteria: ['Missing dependency is repaired before implementation.'],
+      verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'],
+      priority: 'P1', status: 'Todo', depends_on: ['missing'],
+    }],
+  });
+  const events = [];
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketVerificationContract: async () => {
+        events.push('repair');
+        const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+        manifest.tickets[0].depends_on = [];
+        writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
+        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+      },
+      runTicket: async (_dir, ticketId) => {
+        events.push(`implement:${ticketId}`);
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success', readRunnerLog(sessionDir));
+  assert.deepEqual(events, ['repair', 'implement:orphan']);
+  assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
 });
 
 test('mux-runner records verification command failures as typed verification recovery', async () => {
