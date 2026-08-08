@@ -10,8 +10,10 @@ import {
   runCitadel,
   runCitadelChecks,
   recoverCitadelStartCommit,
+  persistCitadelReleaseApproval,
   validateCitadelReport,
 } from '../services/citadel.js';
+import { writePrdSeal } from '../services/prd-seal.js';
 import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot, writeExecutable } from './helpers.js';
 
@@ -42,6 +44,23 @@ function makeCitadelLifecycleSession(criterion) {
     tickets: [{ acceptance_criteria: [criterion] }],
   }));
   return { cwd, sessionDir };
+}
+
+function sealCitadelSession(sessionDir, cwd, id, text) {
+  const prd = '# Approved release PRD\n';
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
+  writePrdSeal(sessionDir, {
+    prd,
+    repository: { identity: 'fixture@HEAD', working_directory: cwd, execution_base_policy: 'sealed release' },
+    acceptance_criteria: [{ id, text }],
+    scope_and_ownership: {},
+    dependencies_and_external_prerequisites: [],
+    risk: [],
+    decision_precedence: [],
+    preservation_and_rollback: {},
+    completion_definition: {},
+    release_gates: [],
+  });
 }
 
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
@@ -129,6 +148,46 @@ test('deriveCitadelAcceptanceCriteria prefers refined ticket criteria and falls 
     ],
   }));
   assert.deepEqual(deriveCitadelAcceptanceCriteria(sessionDir), ['Ticket criterion one', 'Ticket criterion two']);
+});
+
+test('sealed acceptance IDs and exact text override weaker manifest paraphrases and fail closed on drift', () => {
+  const sealed = makeCitadelLifecycleSession('Security is handled.');
+  sealCitadelSession(
+    sealed.sessionDir,
+    sealed.cwd,
+    'AC-SECURE-07',
+    'Every privileged operation rejects an expired immutable owner identity.',
+  );
+  const exact = 'AC-SECURE-07: Every privileged operation rejects an expired immutable owner identity.';
+  const reviewedRange = `${execFileSync('git', ['rev-parse', 'HEAD'], { cwd: sealed.cwd, encoding: 'utf8' }).trim()}..HEAD`;
+  assert.deepEqual(deriveCitadelAcceptanceCriteria(sealed.sessionDir), [exact]);
+  assert.throws(() => validateCitadelReport({
+    reviewed_range: reviewedRange,
+    findings: [],
+    acceptance_criteria_checked: ['Security is handled.'],
+  }, reviewedRange,
+  deriveCitadelAcceptanceCriteria(sealed.sessionDir)), /coverage is incomplete.*AC-SECURE-07/);
+  assert.throws(() => persistCitadelReleaseApproval(sealed.sessionDir, {
+    schema_version: 1,
+    verdict: 'approve',
+    reviewed_range: reviewedRange,
+    acceptance_criteria_checked: ['Security is handled.'],
+    findings: [],
+    generated_at: new Date().toISOString(),
+  }), /coverage is incomplete.*AC-SECURE-07/);
+
+  const tampered = makeCitadelLifecycleSession('Legacy fallback.');
+  sealCitadelSession(tampered.sessionDir, tampered.cwd, 'AC-SECURE-07', 'Exact sealed text.');
+  const sealPath = path.join(tampered.sessionDir, 'prd.lock.json');
+  const rawSeal = JSON.parse(fs.readFileSync(sealPath, 'utf8'));
+  rawSeal.acceptance_criteria[0].text = 'Weaker replacement.';
+  fs.writeFileSync(sealPath, JSON.stringify(rawSeal));
+  assert.throws(() => deriveCitadelAcceptanceCriteria(tampered.sessionDir), /semantic hash/);
+
+  const driftedPrd = makeCitadelLifecycleSession('Legacy fallback.');
+  sealCitadelSession(driftedPrd.sessionDir, driftedPrd.cwd, 'AC-SECURE-07', 'Exact sealed text.');
+  fs.appendFileSync(path.join(driftedPrd.sessionDir, 'prd.md'), '\nUnapproved semantic drift.\n');
+  assert.throws(() => deriveCitadelAcceptanceCriteria(driftedPrd.sessionDir), /does not match the approved seal/);
 });
 
 test('deriveCitadelAcceptanceCriteria ignores malformed tickets and respects PRD section boundaries', () => {
@@ -347,6 +406,19 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
   const originalPath = process.env.PATH;
   process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
   try {
+    const sealed = makeCitadelLifecycleSession('Weaker manifest paraphrase.');
+    sealCitadelSession(
+      sealed.sessionDir,
+      sealed.cwd,
+      'AC-SECURE-07',
+      'Every privileged operation rejects an expired immutable owner identity.',
+    );
+    assert.equal(await runCitadel(sealed.sessionDir), 'success');
+    const sealedReport = JSON.parse(fs.readFileSync(path.join(sealed.sessionDir, 'citadel-report.json'), 'utf8'));
+    assert.deepEqual(sealedReport.acceptance_criteria_checked, [
+      'AC-SECURE-07: Every privileged operation rejects an expired immutable owner identity.',
+    ]);
+
     const approved = makeCitadelLifecycleSession('approved release evidence');
     assert.equal(await runCitadel(approved.sessionDir), 'success');
     const approvedReport = JSON.parse(fs.readFileSync(path.join(approved.sessionDir, 'citadel-report.json'), 'utf8'));

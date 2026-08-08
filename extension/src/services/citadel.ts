@@ -8,6 +8,7 @@ import { getHeadSha, getWorkingTreeFingerprint, listChangedPathsSince, listWorki
 import { recoverableHardReset } from './recoverable-git.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
+import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
 import { normalizeVerificationSteps, verificationStepCommand, verificationStepIdentity } from './verification-env.js';
@@ -83,6 +84,18 @@ function criteriaFromManifest(sessionDir: string): string[] {
   }));
 }
 
+function criteriaFromSeal(sessionDir: string): string[] | null {
+  const sealPath = path.join(sessionDir, 'prd.lock.json');
+  if (!fs.existsSync(sealPath)) return null;
+  const seal = readPrdSeal(sessionDir);
+  const prdPath = path.join(sessionDir, 'prd.md');
+  if (!fs.existsSync(prdPath)) {
+    throw new Error('Citadel cannot validate prd.lock.json because the sealed prd.md is missing.');
+  }
+  assertPrdSealMatchesPrd(seal, fs.readFileSync(prdPath, 'utf8'));
+  return seal.acceptance_criteria.map((criterion) => `${criterion.id}: ${criterion.text}`);
+}
+
 function verificationStepsFromManifest(sessionDir: string, workingDir: string): VerificationStep[] {
   const manifest = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'refinement_manifest.json'), null);
   if (!Array.isArray(manifest?.tickets)) return [];
@@ -127,8 +140,11 @@ function criteriaFromPrd(markdown: string): string[] {
   return uniqueCriteria(criteria);
 }
 
-/** Ticket criteria are authoritative after refinement; a PRD section is the standalone fallback. */
+/** A validated PRD seal is authoritative. Legacy unsealed sessions retain the
+ * historical manifest-first, PRD-second fallback. */
 export function deriveCitadelAcceptanceCriteria(sessionDir: string): string[] {
+  const sealedCriteria = criteriaFromSeal(sessionDir);
+  if (sealedCriteria !== null) return sealedCriteria;
   const manifestCriteria = criteriaFromManifest(sessionDir);
   if (manifestCriteria.length > 0) return manifestCriteria;
   for (const name of ['prd_refined.md', 'prd.md']) {
@@ -238,11 +254,11 @@ export function validateCitadelReport(
       .map((entry) => entry.trim())
       .filter(Boolean)
     : [];
-  const expected = uniqueCriteria(expectedAcceptanceCriteria);
+  const expected = uniqueStrings(expectedAcceptanceCriteria);
   if (expected.length === 0) {
     throw new Error('Invalid Citadel evidence: the session declares no acceptance criteria.');
   }
-  const checked = new Set(acceptanceCriteria.map(normalizeCriterion));
+  const checked = new Set(acceptanceCriteria);
   const missing = expected.filter((criterion) => !checked.has(criterion));
   if (missing.length > 0) {
     throw new Error(`Invalid Citadel report: acceptance criteria coverage is incomplete; missing: ${missing.join(' | ')}`);
