@@ -36,6 +36,10 @@ export interface InstalledRuntimeMigration {
   content_hash: string;
 }
 
+export interface PrepareLiveSessionMigrationOptions {
+  forceVerificationContractRepair?: boolean;
+}
+
 function sha256(value: string | Buffer): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
@@ -108,19 +112,25 @@ function malformedVerificationForTicket(sessionDir: string, ticketId: string): b
   return serialized.includes('`') || /--(?:testPathPattern|testNamePattern)=[^\s"']*[|]/.test(serialized);
 }
 
-function deriveResumeCheckpoint(sessionDir: string, state: Record<string, unknown>): SessionResumeCheckpoint {
+function deriveResumeCheckpoint(
+  sessionDir: string,
+  state: Record<string, unknown>,
+  options: PrepareLiveSessionMigrationOptions = {},
+): SessionResumeCheckpoint {
   const ticketId = typeof state.current_ticket === 'string' && state.current_ticket ? state.current_ticket : null;
   const reusePhases = ticketId ? approvedLifecyclePhases(sessionDir, ticketId) : [];
   const malformed = Boolean(ticketId && malformedVerificationForTicket(sessionDir, ticketId));
   const verificationFailure = state.failure_kind === 'verification-contract-failed'
     || state.failure_kind === 'verification_contract_failed';
   const history = Array.isArray(state.history) ? state.history : [];
-  if (malformed || verificationFailure) {
+  if (options.forceVerificationContractRepair || malformed || verificationFailure) {
     return {
       ticket_id: ticketId,
       phase: 'verification_contract_repair',
       reuse_phases: reusePhases,
-      reason: malformed ? 'legacy verification requires structured contract repair' : 'persisted verification contract failure',
+      reason: options.forceVerificationContractRepair
+        ? 'legacy session adoption requires structured verification contract repair'
+        : malformed ? 'legacy verification requires structured contract repair' : 'persisted verification contract failure',
       history_length: history.length,
     };
   }
@@ -133,7 +143,7 @@ function deriveResumeCheckpoint(sessionDir: string, state: Record<string, unknow
   };
 }
 
-function salvageRefs(workingDir: string, sessionId: string): string[] {
+export function listSessionSalvageRefs(workingDir: string, sessionId: string): string[] {
   try {
     return execFileSync('git', ['for-each-ref', '--format=%(refname):%(objectname)', `refs/pickle/salvage/${sessionId}`, `refs/pickle/salvage-history/${sessionId}`], {
       cwd: workingDir,
@@ -172,6 +182,7 @@ export function prepareLiveSessionMigration(
   sourceRuntime: InstalledRuntimeDescriptor,
   targetRuntime: InstalledRuntimeDescriptor,
   now = new Date(),
+  options: PrepareLiveSessionMigrationOptions = {},
 ): InstalledRuntimeMigration {
   const state = readJson(path.join(sessionDir, 'state.json'));
   if (!state) throw new Error('Live session migration requires a valid state.json.');
@@ -187,9 +198,9 @@ export function prepareLiveSessionMigration(
     target_runtime: targetRuntime,
     session_schema: sessionSchema,
     session_was_active: true as const,
-    resume_checkpoint: deriveResumeCheckpoint(sessionDir, state),
+    resume_checkpoint: deriveResumeCheckpoint(sessionDir, state, options),
     preserved_artifacts: stableInventory(sessionDir),
-    salvage_refs: salvageRefs(String(state.working_dir || ''), path.basename(sessionDir)),
+    salvage_refs: listSessionSalvageRefs(String(state.working_dir || ''), path.basename(sessionDir)),
     created_at: now.toISOString(),
   };
   const migration = { ...payload, content_hash: sha256(canonicalize(payload)) };
@@ -213,7 +224,7 @@ export function verifyLiveSessionMigration(sessionDir: string, migration: Instal
     }
   }
   const state = readJson(path.join(sessionDir, 'state.json'));
-  const refs = salvageRefs(String(state?.working_dir || ''), path.basename(sessionDir));
+  const refs = listSessionSalvageRefs(String(state?.working_dir || ''), path.basename(sessionDir));
   if (migration.salvage_refs.some((ref) => !refs.includes(ref))) throw new Error('Live session migration lost salvage refs.');
 }
 

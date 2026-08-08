@@ -48,6 +48,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.match(output, /Installed Pickle Rick persona and skills into:/);
   assert.match(output, new RegExp(`node ${escapeRegex(canonicalInstallRoot)}/extension/bin/setup\\.js`));
   assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'bin', 'setup.js')));
+  assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'bin', 'adopt-legacy-session.js')));
   assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'bin', 'tmux-monitor.sh')));
   assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'services', 'pickle-utils.js')));
   assert.ok(fs.existsSync(path.join(installRoot, 'extension', 'src', 'bin', 'spawn-morty.ts')));
@@ -62,6 +63,7 @@ test('install.sh copies the runtime and installs the global persona and skills',
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.codex', 'hooks', 'hooks.template.json')));
   assert.ok(fs.existsSync(path.join(installRoot, '.pickle-rick-runtime')));
+  assert.ok(fs.existsSync(path.join(installRoot, '.runtime-descriptor.json')));
   assert.ok(fs.existsSync(path.join(installRoot, 'images', 'pickle-rick.png')));
   assert.equal(fs.existsSync(path.join(installRoot, 'tests')), false);
   assert.ok(fs.existsSync(path.join(codexHome, 'AGENTS.md')));

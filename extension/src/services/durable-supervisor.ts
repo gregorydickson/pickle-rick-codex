@@ -214,6 +214,7 @@ function replayJournal(events: LogicalPipelineEvent[]): Omit<LogicalPipelineStat
         executorRestartCount += 1;
         break;
       case 'checkpoint_recorded':
+      case 'legacy_session_adopted':
       case 'runtime_handoff_requested':
         break;
       case 'runtime_handoff_aborted':
@@ -364,6 +365,32 @@ export function beginAutonomousExecution(sessionDir: string, options: ClockOptio
     state.control_state = 'autonomous_execution';
     state.prd_seal_hash = seal.semantic_hash;
     appendEvent(state, 'prd_sealed', { semantic_hash: seal.semantic_hash }, options.nowMs ?? Date.now());
+  });
+}
+
+export function recordLegacySessionAdoption(
+  sessionDir: string,
+  details: {
+    migration_content_hash: string;
+    source_runtime: InstalledRuntimeDescriptor;
+    target_runtime: InstalledRuntimeDescriptor;
+    resume_checkpoint: Record<string, unknown>;
+    legacy_owner: Record<string, unknown>;
+  },
+  options: ClockOptions = {},
+): LogicalPipelineState {
+  requireNonEmpty(details.migration_content_hash, 'legacy adoption migration hash');
+  validateRuntime(details.source_runtime);
+  validateRuntime(details.target_runtime);
+  return mutate(sessionDir, (state) => {
+    if (state.control_state !== 'autonomous_execution' || state.terminal_state !== null) {
+      throw new Error('Legacy adoption requires nonterminal autonomous execution.');
+    }
+    if (state.lease !== null) throw new Error('Legacy adoption cannot fabricate or replace a source lease.');
+    if (state.events.some((event) => event.kind === 'legacy_session_adopted')) {
+      throw new Error('Legacy session has already been adopted.');
+    }
+    appendEvent(state, 'legacy_session_adopted', { ...details }, options.nowMs ?? Date.now());
   });
 }
 

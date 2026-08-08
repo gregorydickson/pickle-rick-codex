@@ -10,6 +10,7 @@ enable_hooks=0
 project_is_source=0
 runtime_is_installed_source=0
 repo_is_checkout=0
+adopt_session=""
 
 require_command() {
   local command_name="$1"
@@ -35,6 +36,7 @@ usage() {
 Usage:
   bash install.sh
   bash install.sh --project /path/to/project
+  bash install.sh --adopt-session /path/to/legacy/session
 
 The former --enable-hooks option is rejected until the installed Codex hook
 event, payload, decision, and trust contracts have authenticated validation.
@@ -310,6 +312,15 @@ while [[ $# -gt 0 ]]; do
       enable_hooks=1
       shift
       ;;
+    --adopt-session)
+      adopt_session="${2:-}"
+      if [[ -z "$adopt_session" ]]; then
+        echo "Missing value for --adopt-session" >&2
+        usage >&2
+        exit 1
+      fi
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -326,6 +337,9 @@ repo_root="$(canonicalize_path "$repo_root")"
 codex_home="$(canonicalize_path "$codex_home")"
 agents_home="$(canonicalize_path "$agents_home")"
 target_root="$(canonicalize_path "$target_root")"
+if [[ -n "$adopt_session" ]]; then
+  adopt_session="$(canonicalize_path "$adopt_session")"
+fi
 assert_safe_install_roots
 
 if [[ "$enable_hooks" -eq 1 ]]; then
@@ -362,6 +376,21 @@ if [[ "$runtime_is_installed_source" -eq 0 && "${PICKLE_INSTALL_SKIP_BUILD:-0}" 
   ( cd "$repo_root/extension" && npx tsc )
   # tsc does not emit .sh; stage shell assets from src/scripts/ into the compiled bin/.
   bash "$repo_root/extension/scripts/copy-shell-assets.sh"
+fi
+
+if [[ -n "$adopt_session" ]]; then
+  if [[ "$runtime_is_installed_source" -eq 1 ]]; then
+    echo "Cannot adopt a legacy session from the same installed runtime tree; use a validated source checkout." >&2
+    exit 1
+  fi
+  if [[ ! -f "$repo_root/extension/bin/adopt-legacy-session.js" ]]; then
+    echo "Legacy adoption CLI is missing from the validated target build." >&2
+    exit 1
+  fi
+  node "$repo_root/extension/bin/adopt-legacy-session.js" prepare \
+    --session-dir "$adopt_session" \
+    --source-runtime-root "$target_root" \
+    --target-runtime-root "$repo_root"
 fi
 
 mkdir -p "$target_root"
@@ -404,6 +433,7 @@ touch "$target_root/.pickle-rick-runtime"
 if [[ "$runtime_is_installed_source" -eq 0 || "$repo_is_checkout" -eq 0 ]]; then
   render_runtime_root_in_tree "$target_root" "$target_root" "sessions,activity"
 fi
+node "$target_root/extension/bin/write-runtime-descriptor.js" "$target_root" >/dev/null
 
 install_skill_tree "$agents_home/skills" "$target_root"
 install_legacy_codex_skill_links "$agents_home/skills" "$codex_home/skills"
@@ -412,6 +442,12 @@ merge_managed_markdown "$target_root/AGENTS.md" "$codex_home/AGENTS.md" "agents"
 if [[ -n "$project_dir" && "$project_is_source" -eq 0 ]]; then
   install_skill_tree "$project_dir/.agents/skills" "$target_root"
   merge_managed_markdown "$target_root/AGENTS.md" "$project_dir/AGENTS.md" "agents" "$project_dir/.codex/pickle-rick-backups"
+fi
+
+if [[ -n "$adopt_session" ]]; then
+  node "$target_root/extension/bin/adopt-legacy-session.js" launch \
+    --session-dir "$adopt_session" \
+    --target-runtime-root "$target_root"
 fi
 
 echo "Installed Pickle Rick Codex runtime to:"

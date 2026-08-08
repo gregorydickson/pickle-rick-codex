@@ -53,6 +53,7 @@ import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import { archiveCitadelRefusalAndResetTickets } from '../services/citadel-remediation.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
+import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -250,7 +251,7 @@ async function runSequentialWithLease(
     let activeRecoveryEpoch = priorTicketStrategies.length;
     let latestFailureDomain: FailureDomain = 'infrastructure';
     let latestFailureRoute: FailureRoute = recoveryRoute('infrastructure');
-    let pendingContractRepair = false;
+    let pendingContractRepair = legacyContractRepairPending(sessionDir, ticket.id);
     let yieldToScheduler = false;
 
     const selectRecoveryStrategy = (
@@ -520,6 +521,7 @@ async function runSequentialWithLease(
         if (pendingContractRepair) {
           options.assertDurableOwnership?.();
           await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          markLegacyContractRepairComplete(sessionDir);
           pendingContractRepair = false;
           options.assertDurableOwnership?.();
         }
