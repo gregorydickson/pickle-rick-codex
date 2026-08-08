@@ -46,12 +46,13 @@ import {
   type RecoveryStrategyEpoch,
 } from '../services/productive-autonomy.js';
 import { isVerificationCommandError, repairTicketVerificationContract, runTicket } from './spawn-morty.js';
-import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
 import { runCitadel } from '../services/citadel.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import { archiveCitadelRefusalAndResetTickets } from '../services/citadel-remediation.js';
+import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -61,6 +62,7 @@ interface RunSequentialOptions {
   assertDurableOwnership?: () => void;
   handoffRequestId?: string;
   targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
+  holdActiveForReleaseGate?: boolean;
   [key: string]: unknown;
 }
 
@@ -268,8 +270,7 @@ async function runSequentialWithLease(
           return null;
         }
         if (executionAction === 'restart_executor') {
-          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} requested a supervised executor restart`);
-          return null;
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} selected an isolated worker executor restart`);
         }
         pendingContractRepair = executionAction === 'repair_contract';
         recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: route.invalidate.length });
@@ -285,6 +286,13 @@ async function runSequentialWithLease(
         activeStrategyHash = strategy.strategyHash;
         activeStrategy = strategy;
         activeRecoveryEpoch = strategy.sequence;
+        if (executionAction === 'reconstruct_workspace') {
+          const reconstructedTicket = reconstructWorkspaceFromDurableCheckpoint(
+            sessionDir,
+            options.assertDurableOwnership,
+          );
+          appendRunnerLog(sessionDir, runnerMode, `reconstructed durable workspace checkpoint for ${reconstructedTicket}`);
+        }
         return strategy;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -573,6 +581,11 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       } catch (error) {
+        if (isDurableOwnershipDrainError(error)) {
+          exitReason = 'runtime_handoff';
+          appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} drained for runtime handoff`);
+          break;
+        }
         const cancelled = manager.read(statePath).active === false;
         if (cancelled) {
           exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
@@ -590,6 +603,7 @@ async function runSequentialWithLease(
                 break;
               }
               await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+              pendingContractRepair = false;
               appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight routed to autonomous contract repair`);
               continue;
             }
@@ -610,6 +624,7 @@ async function runSequentialWithLease(
                 break;
               }
               await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+              pendingContractRepair = false;
               appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract routed to autonomous contract repair`);
               continue;
             }
@@ -668,13 +683,16 @@ async function runSequentialWithLease(
     }
   }
 
-  const finalReason = exitMuxRunnerPhase(manager, statePath, {
-    exitReason,
-    failedTicketId,
-    deferTerminalState: runnerMode === 'pipeline',
-  });
+  const holdActiveForReleaseGate = options.holdActiveForReleaseGate === true && exitReason === 'success';
+  const finalReason = holdActiveForReleaseGate
+    ? exitReason
+    : exitMuxRunnerPhase(manager, statePath, {
+      exitReason,
+      failedTicketId,
+      deferTerminalState: runnerMode === 'pipeline',
+    });
 
-  if (finalReason === 'success') {
+  if (finalReason === 'success' && !holdActiveForReleaseGate) {
     logActivity({
       event: 'epic_completed',
       source: 'pickle',
@@ -721,6 +739,7 @@ export async function runSequential(
   }
   let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
   let exitReason = 'error';
+  let releaseGateHeld = false;
   try {
     ownership = startDurableRuntimeOwnership(sessionDir, {
       handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
@@ -737,8 +756,10 @@ export async function runSequential(
       durableOwnershipHeld: true,
       assertDurableOwnership: ownership.assertOwned,
       runStartedAtMs,
+      holdActiveForReleaseGate: options.runnerMode !== 'pipeline',
     }, deps);
     if (exitReason === 'success' && options.runnerMode !== 'pipeline') {
+      releaseGateHeld = true;
       ownership.assertOwned();
       const citadelExit = await (deps.runCitadel ?? runCitadel)(sessionDir, {
         assertDurableOwnership: ownership.assertOwned,
@@ -749,8 +770,19 @@ export async function runSequential(
         ownership.assertOwned();
         if (citadelExit === 'citadel-blocked') archiveCitadelRefusalAndResetTickets(sessionDir);
       }
+      exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+      releaseGateHeld = false;
     }
     return exitReason;
+  } catch (error) {
+    if (isDurableOwnershipDrainError(error)) {
+      exitReason = 'runtime_handoff';
+      return exitReason;
+    }
+    if (releaseGateHeld) {
+      exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason: 'error' });
+    }
+    throw error;
   } finally {
     try {
       ownership?.finish(exitReason);

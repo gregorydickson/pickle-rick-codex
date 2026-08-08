@@ -9,7 +9,7 @@ import {
   requestRuntimeHandoff,
   type InstalledRuntimeDescriptor,
 } from '../services/durable-supervisor.js';
-import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
+import { prepareLiveSessionHandoffCheckpoint } from '../services/live-session-migration.js';
 
 interface HandoffSpec {
   session_dir: string;
@@ -22,12 +22,15 @@ interface HandoffSpec {
 
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
 
-function pendingRequestId(sessionDir: string, target: InstalledRuntimeDescriptor): string | null {
+export function pendingRequestId(sessionDir: string, target: InstalledRuntimeDescriptor): string | null {
   const state = readLogicalPipeline(sessionDir);
   const completed = new Set(state.events.filter((event) => event.kind === 'runtime_handoff_completed')
     .map((event) => String(event.details.request_id)));
+  const aborted = new Set(state.events.filter((event) => event.kind === 'runtime_handoff_aborted')
+    .map((event) => String(event.details.request_id)));
   return [...state.events].reverse().find((event) => event.kind === 'runtime_handoff_requested'
     && !completed.has(String(event.details.request_id))
+    && !aborted.has(String(event.details.request_id))
     && JSON.stringify(event.details.target_runtime) === JSON.stringify(target))?.details.request_id as string | null ?? null;
 }
 
@@ -36,14 +39,14 @@ export function runRuntimeHandoff(specPath: string): void {
   const sessionDir = path.resolve(spec.session_dir);
   let requestId = pendingRequestId(sessionDir, spec.target_runtime);
   if (!requestId) {
-    const migration = prepareLiveSessionMigration(sessionDir, spec.source_runtime, spec.target_runtime);
+    const checkpoint = prepareLiveSessionHandoffCheckpoint(sessionDir, spec.source_runtime, spec.target_runtime);
     requestId = requestRuntimeHandoff(
       sessionDir,
       spec.source_owner_id,
       spec.source_token,
       spec.source_runtime,
       spec.target_runtime,
-      { ...migration.resume_checkpoint },
+      { ...checkpoint },
     );
     releaseRuntimeHandoffLease(sessionDir, spec.source_owner_id, spec.source_token, requestId);
   }

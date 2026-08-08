@@ -18,6 +18,7 @@ import {
   terminateLogicalPipeline,
   watchdogRecoverSupervisor,
 } from '../services/durable-supervisor.js';
+import { pendingRequestId } from '../bin/runtime-handoff.js';
 
 const blueRuntime = { runtime_id: 'blue', version: '1.0.0', build_hash: 'a'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
 const greenRuntime = { runtime_id: 'green', version: '2.0.0', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 2 };
@@ -155,6 +156,24 @@ test('released handoff aborts after target timeout and restores autonomous takeo
   assert.equal(abortExpiredRuntimeHandoff(sessionDir, 1_000, { nowMs: 4_100 }), true);
   assert.equal(acquireSupervisorLease(sessionDir, { ownerId: 'blue-recovered', ttlMs: 5_000, nowMs: 4_101 }).owner_id, 'blue-recovered');
   assert.throws(() => acceptRuntimeHandoff(sessionDir, requestId, 'late-green', 5_000, greenRuntime, { nowMs: 4_102 }), /aborted/);
+});
+
+test('handoff retry ignores an aborted request for the same target runtime', () => {
+  const sessionDir = createAutonomousPipeline('blue-green-aborted-retry-');
+  const firstBlue = acquireSupervisorLease(sessionDir, { ownerId: 'blue-1', ttlMs: 5_000, nowMs: 3_000 });
+  const abortedRequest = requestRuntimeHandoff(
+    sessionDir, firstBlue.owner_id, firstBlue.token, blueRuntime, greenRuntime, { phase: 'implement' }, { nowMs: 3_100 },
+  );
+  releaseRuntimeHandoffLease(sessionDir, firstBlue.owner_id, firstBlue.token, abortedRequest, { nowMs: 3_200 });
+  assert.equal(abortExpiredRuntimeHandoff(sessionDir, 1_000, { nowMs: 4_200 }), true);
+  assert.equal(pendingRequestId(sessionDir, greenRuntime), null);
+
+  const secondBlue = acquireSupervisorLease(sessionDir, { ownerId: 'blue-2', ttlMs: 5_000, nowMs: 4_201 });
+  const liveRequest = requestRuntimeHandoff(
+    sessionDir, secondBlue.owner_id, secondBlue.token, blueRuntime, greenRuntime, { phase: 'verify' }, { nowMs: 4_202 },
+  );
+  assert.notEqual(liveRequest, abortedRequest);
+  assert.equal(pendingRequestId(sessionDir, greenRuntime), liveRequest);
 });
 
 test('handoff timeout recovers when source dies before releasing its expired lease', () => {

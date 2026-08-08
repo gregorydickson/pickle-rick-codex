@@ -254,6 +254,7 @@ if (prompt.includes('You are the autonomous verification contract repair worker'
   lastMessage = '<promise>CONTRACT_REPAIR_COMPLETE</promise>';
 } else if (prompt.includes('You are the Citadel release reviewer')) {
   const reportPath = extractPathAfter('Citadel report path: ');
+  const reviewedRange = extractPathAfter('Review git range: ');
   const criteriaLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Required acceptance criteria '));
   const expectedCriteria = criteriaLine ? JSON.parse(criteriaLine.slice(criteriaLine.indexOf(': ') + 2)) : [];
   if (!reportPath) {
@@ -263,7 +264,7 @@ if (prompt.includes('You are the autonomous verification contract repair worker'
   fs.writeFileSync(reportPath, JSON.stringify({
     schema_version: 1,
     verdict: process.env.FAKE_CITADEL_VERDICT || 'approve',
-    reviewed_range: 'fake..HEAD',
+    reviewed_range: reviewedRange,
     acceptance_criteria_checked: process.env.FAKE_CITADEL_INCOMPLETE_COVERAGE === '1'
       ? expectedCriteria.slice(0, Math.max(0, expectedCriteria.length - 1))
       : expectedCriteria,

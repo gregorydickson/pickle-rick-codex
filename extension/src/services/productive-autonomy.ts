@@ -272,17 +272,10 @@ export function resolveAutonomousRecovery(input: {
   return typedRecoveryRoute(classifyAutonomousFailure(input));
 }
 
-export type RecoveryExecutionAction = 'repair_contract' | 'retry_worker' | 'restart_executor' | 'request_prd_revision';
+export type RecoveryExecutionAction = RecoveryHandler;
 
 export function recoveryExecutionAction(route: FailureRoute): RecoveryExecutionAction {
-  if (route.schedulerState === 'prd_revision_required' || route.handler === 'request_prd_revision') {
-    return 'request_prd_revision';
-  }
-  if (route.handler === 'repair_contract') return 'repair_contract';
-  if (route.handler === 'restart_executor') return 'restart_executor';
-  // The remaining specialized handlers execute through the worker lifecycle;
-  // their exact handler and checkpoint invalidation are persisted in strategy.
-  return 'retry_worker';
+  return route.schedulerState === 'prd_revision_required' ? 'request_prd_revision' : route.handler;
 }
 
 export function materialStrategyHash(input: RecoveryStrategyInput): string {

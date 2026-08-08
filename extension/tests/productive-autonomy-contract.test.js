@@ -39,7 +39,7 @@ test('every declared autonomous failure has a typed recovery policy', () => {
     assert.ok(route.handler);
     assert.ok(Array.isArray(route.invalidate));
     assert.ok(Array.isArray(route.preserve));
-    assert.ok(recoveryExecutionAction(route));
+    assert.equal(recoveryExecutionAction(route), route.handler);
   }
   assert.equal(classifyAutonomousFailure({ kind: 'verification_contract' }), 'contract_invalid');
   assert.equal(classifyAutonomousFailure({ kind: 'worker_transport' }), 'worker_transport');

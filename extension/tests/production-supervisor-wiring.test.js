@@ -7,12 +7,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import { runSequential } from '../bin/mux-runner.js';
-import { enqueueCitadelRemediation } from '../bin/pipeline-runner.js';
+import { enqueueCitadelRemediation, parsePipelineHandoffOptions } from '../bin/pipeline-runner.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
-import { acquireSupervisorLease, readLogicalPipeline } from '../services/durable-supervisor.js';
+import {
+  acceptRuntimeHandoff,
+  acquireSupervisorLease,
+  readLogicalPipeline,
+  releaseRuntimeHandoffLease,
+  requestRuntimeHandoff,
+} from '../services/durable-supervisor.js';
 import { readPrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from '../services/session-prd-seal.js';
 import {
+  beginRefinementRepositoryAdvance,
   refreshAcceptedRefinementRepositoryIdentity,
   writeRefinementAcceptance,
 } from '../services/refinement-artifacts.js';
@@ -27,11 +34,24 @@ import { readManifest, updateTicketStatus } from '../services/tickets.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import { captureSpawnedProcessIdentity, inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
 import { StateManager } from '../services/state-manager.js';
+import { assertSessionOperationAvailable } from '../services/session-operation.js';
 import { assertCitadelReleaseApproval, deriveCitadelAcceptanceCriteria, persistCitadelReleaseApproval } from '../services/citadel.js';
+import { PreflightError } from '../services/verification-env.js';
+import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
+
+test('pipeline runner decodes and forwards green runtime handoff arguments', () => {
+  const targetRuntime = {
+    runtime_id: 'green', version: '2.0.0', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 2,
+  };
+  assert.deepEqual(parsePipelineHandoffOptions([
+    '--handoff-request=request-42',
+    `--target-runtime=${Buffer.from(JSON.stringify(targetRuntime)).toString('base64url')}`,
+  ]), { handoffRequestId: 'request-42', targetRuntime });
+});
 
 function createAcceptedSession(status = 'Todo') {
   const workingDir = makeTempRoot('production-supervisor-repo-');
@@ -166,11 +186,60 @@ test('sealed runner ignores skip/abort choices and completes through autonomous 
         ? { status: 'incomplete', applied: false, reason: 'retry autonomously' }
         : { status: 'done', applied: true };
     },
-    runCitadel: approveCitadelFixture,
+    runCitadel: async (dir) => {
+      const state = new StateManager().read(path.join(dir, 'state.json'));
+      assert.equal(state.active, true, 'standalone mux must remain active through Citadel');
+      assert.equal(state.last_exit_reason, null, 'success is not recorded before Citadel approval');
+      assert.equal(readLogicalPipeline(dir).terminal_state, null);
+      return await approveCitadelFixture(dir);
+    },
   });
   assert.equal(result, 'success');
   assert.equal(calls, 2);
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  assert.equal(new StateManager().read(path.join(sessionDir, 'state.json')).last_exit_reason, 'success');
+});
+
+test('immediate preflight contract repair is not repeated on the next attempt', async () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  let attempts = 0;
+  let repairs = 0;
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new PreflightError({ kind: 'preflight-tool-missing', message: 'fixture tool is unavailable' });
+      }
+      return { status: 'done', applied: false };
+    },
+    repairTicketVerificationContract: async () => {
+      repairs += 1;
+      return [{ kind: 'process', command: process.execPath, args: ['--version'] }];
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(result, 'success');
+  assert.equal(attempts, 2);
+  assert.equal(repairs, 1);
+});
+
+test('workspace reconstruction restores only the journaled ticket boundary', () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  updateTicketStatus(sessionDir, 'R1', { status: 'In Progress' });
+  beginRefinementRepositoryAdvance({ sessionDir, workingDir, ticketId: 'R1', requiresCleanCommit: true });
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'In Progress');
+  fs.appendFileSync(path.join(workingDir, 'README.md'), 'unsafe worker mutation\n');
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'In Progress');
+  const ticketId = reconstructWorkspaceFromDurableCheckpoint(sessionDir);
+  assert.equal(ticketId, 'R1');
+  assert.equal(git(workingDir, ['status', '--porcelain']), '');
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+  assert.throws(
+    () => reconstructWorkspaceFromDurableCheckpoint(sessionDir),
+    /missing-durable-checkpoint/,
+  );
 });
 
 test('replacement runner reaps an identity-matched detached child before redispatch', async () => {
@@ -200,6 +269,42 @@ test('replacement runner reaps an identity-matched detached child before redispa
   });
   assert.equal(result, 'success');
   assert.equal(childWasGoneAtDispatch, true);
+});
+
+test('long active worker drains promptly when blue releases for green handoff', async () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  let workerStarted;
+  const started = new Promise((resolve) => { workerStarted = resolve; });
+  const run = runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async (_dir, _ticketId, options) => {
+      workerStarted();
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        options.assertDurableOwnership();
+      }
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  await started;
+  const blue = readLogicalPipeline(sessionDir).lease;
+  assert.ok(blue);
+  const blueRuntime = { runtime_id: 'blue', version: '1.0.0', build_hash: 'a'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
+  const greenRuntime = { runtime_id: 'green', version: '2.0.0', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 2 };
+  const requestId = requestRuntimeHandoff(
+    sessionDir, blue.owner_id, blue.token, blueRuntime, greenRuntime, { phase: 'implement' },
+  );
+  releaseRuntimeHandoffLease(sessionDir, blue.owner_id, blue.token, requestId);
+  const before = Date.now();
+  assert.equal(await run, 'runtime_handoff');
+  assert.ok(Date.now() - before < 2_000, 'blue worker did not drain promptly');
+  assert.doesNotThrow(() => assertSessionOperationAvailable(sessionDir));
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+  assert.equal(
+    acceptRuntimeHandoff(sessionDir, requestId, 'green-fixture', 60_000, greenRuntime).lease.owner_id,
+    'green-fixture',
+  );
 });
 
 test('Citadel approval is invalidated by any later repository commit', async () => {

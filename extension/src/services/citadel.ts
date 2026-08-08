@@ -552,11 +552,20 @@ export async function runCitadel(
   sessionDir: string,
   options: { assertDurableOwnership?: () => void } = {},
 ): Promise<'success' | 'citadel-blocked' | 'cancelled'> {
-  const assertOwnership = (): void => options.assertDurableOwnership?.();
+  let ownershipDrainError: unknown = null;
+  const assertOwnership = (): void => {
+    if (ownershipDrainError) throw ownershipDrainError;
+    options.assertDurableOwnership?.();
+  };
   assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const state = manager.read(statePath);
+  const shouldCancel = (): boolean => {
+    const current = manager.read(statePath);
+    if (current.last_exit_reason === 'cancelled' || Boolean(current.cancel_requested_at)) return true;
+    try { assertOwnership(); return false; } catch (error) { ownershipDrainError = error; return true; }
+  };
   const workingDir = String(state.working_dir || '');
   if (!workingDir) {
     throw new Error('Citadel requires a git-backed session with a persisted working_dir.');
@@ -605,10 +614,7 @@ export async function runCitadel(
       verificationStepsFromManifest(sessionDir, workingDir),
       {
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
-        isCancelled: () => {
-          const current = manager.read(path.join(sessionDir, 'state.json'));
-          return current.last_exit_reason === 'cancelled' || Boolean(current.cancel_requested_at);
-        },
+        isCancelled: shouldCancel,
         onSpawn: (child, command) => {
           manager.update(path.join(sessionDir, 'state.json'), (current) => {
             current.active_child_pid = child.pid;
@@ -620,6 +626,7 @@ export async function runCitadel(
           });
         },
         onExit: () => {
+          if (ownershipDrainError) return;
           manager.update(path.join(sessionDir, 'state.json'), (current) => {
             current.active_child_pid = null;
             current.active_child_kind = null;
@@ -633,8 +640,12 @@ export async function runCitadel(
     );
     assertOwnership();
   } catch (error) {
+    if (error instanceof CitadelChecksCancelledError) {
+      assertOwnership();
+      restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
+      return 'cancelled';
+    }
     const restored = restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'deterministic-check');
-    if (error instanceof CitadelChecksCancelledError) return 'cancelled';
     if (restored) {
       throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.', { cause: error });
     }
@@ -704,23 +715,23 @@ export async function runCitadel(
           return current;
         });
       },
-      cancelCheck: () => {
-        const current = manager.read(path.join(sessionDir, 'state.json'));
-        return current.last_exit_reason === 'cancelled' || Boolean(current.cancel_requested_at);
-      },
+      cancelCheck: shouldCancel,
     });
     assertOwnership();
   } catch (error) {
+    assertOwnership();
     reviewerError = error;
   } finally {
-    manager.update(path.join(sessionDir, 'state.json'), (current) => {
-      current.active_child_pid = null;
-      current.active_child_kind = null;
-      current.active_child_command = null;
-      current.active_child_identity = null;
-      current.active_child_controller_pid = null;
-      return current;
-    });
+    if (!ownershipDrainError) {
+      manager.update(path.join(sessionDir, 'state.json'), (current) => {
+        current.active_child_pid = null;
+        current.active_child_kind = null;
+        current.active_child_command = null;
+        current.active_child_identity = null;
+        current.active_child_controller_pid = null;
+        return current;
+      });
+    }
   }
   if (restoreMutatedCitadelCheckpoint(workingDir, sessionDir, checkpointHead, checkpointFingerprint, 'reviewer')) {
     throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);

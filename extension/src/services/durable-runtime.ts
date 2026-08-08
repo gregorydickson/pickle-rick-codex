@@ -18,6 +18,17 @@ import {
 
 export const DEFAULT_SUPERVISOR_LEASE_TTL_MS = 60_000;
 
+export class DurableOwnershipDrainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DurableOwnershipDrainError';
+  }
+}
+
+export function isDurableOwnershipDrainError(error: unknown): error is DurableOwnershipDrainError {
+  return error instanceof DurableOwnershipDrainError;
+}
+
 export interface DurableRuntimeOwnership {
   readonly ownerId: string;
   lease(): SupervisorLease;
@@ -104,12 +115,12 @@ export function startDurableRuntimeOwnership(
   timer.unref();
 
   const assertOwned = (): void => {
-    if (renewalError) throw new Error(`Durable supervisor lease renewal failed: ${renewalError.message}`, { cause: renewalError });
+    if (renewalError) throw new DurableOwnershipDrainError(`Durable supervisor lease renewal failed: ${renewalError.message}`);
     const state = readLogicalPipeline(sessionDir);
     if (!state.lease || state.lease.owner_id !== ownerId || state.lease.token !== activeLease.token) {
-      throw new Error('Durable supervisor lease ownership changed during execution.');
+      throw new DurableOwnershipDrainError('Durable supervisor lease ownership changed during execution.');
     }
-    if (Date.parse(state.lease.expires_at) <= Date.now()) throw new Error('Durable supervisor lease expired during execution.');
+    if (Date.parse(state.lease.expires_at) <= Date.now()) throw new DurableOwnershipDrainError('Durable supervisor lease expired during execution.');
     activeLease = state.lease;
   };
 
@@ -121,7 +132,10 @@ export function startDurableRuntimeOwnership(
       if (finished) return;
       finished = true;
       clearInterval(timer);
-      if (readLogicalPipeline(sessionDir).control_state === 'prd_revision_required') return;
+      const current = readLogicalPipeline(sessionDir);
+      if (current.control_state === 'prd_revision_required') return;
+      if (exitReason === 'runtime_handoff'
+        && (!current.lease || current.lease.owner_id !== ownerId || current.lease.token !== activeLease.token)) return;
       assertOwned();
       if (exitReason === 'success') {
         terminateLogicalPipeline(sessionDir, 'completed', { ownerId, token: activeLease.token });

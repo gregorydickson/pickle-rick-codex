@@ -545,6 +545,8 @@ interface RunVerificationCommandOptions {
   manager: StateManager;
   statePath: string;
   env: Record<string, string | undefined>;
+  isCancelled: () => boolean;
+  onExit: () => void;
 }
 
 async function runVerificationCommand({
@@ -554,6 +556,8 @@ async function runVerificationCommand({
   manager,
   statePath,
   env,
+  isCancelled,
+  onExit,
 }: RunVerificationCommandOptions): Promise<void> {
   const descriptor = verificationStepCommand(step);
   const command = descriptor.display;
@@ -588,11 +592,7 @@ async function runVerificationCommand({
     const cleanup = (): void => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (cancelTimer) clearInterval(cancelTimer);
-      updateActiveChild(statePath, manager, {
-        active_child_pid: null,
-        active_child_kind: null,
-        active_child_command: null,
-      });
+      onExit();
     };
 
     const settle = (handler: (value?: unknown) => void, value?: unknown): void => {
@@ -614,7 +614,7 @@ async function runVerificationCommand({
     }, timeoutMs);
 
     cancelTimer = setInterval(() => {
-      if (!isSessionCancelled(manager, statePath)) return;
+      if (!isCancelled()) return;
       if (child.exitCode === null && child.signalCode === null) {
         forcedByCancel = true;
         terminateChild(child, 'SIGTERM');
@@ -630,7 +630,7 @@ async function runVerificationCommand({
     child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
     child.on('error', (error) => settle(reject, error));
     child.on('close', (code) => {
-      if (forcedByCancel || isSessionCancelled(manager, statePath)) {
+      if (forcedByCancel || isCancelled()) {
         settle(reject, new CancellationError());
         return;
       }
@@ -679,10 +679,18 @@ export async function repairTicketVerificationContract(
   ticketId: string,
   options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; diagnosticOnly?: boolean; assertDurableOwnership?: () => void } = {},
 ): Promise<VerificationStep[]> {
-  const assertOwnership = (): void => options.assertDurableOwnership?.();
-  assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
+  let ownershipDrainError: unknown = null;
+  const assertOwnership = (): void => {
+    if (ownershipDrainError) throw ownershipDrainError;
+    options.assertDurableOwnership?.();
+  };
+  const shouldCancel = (): boolean => {
+    if (isSessionCancelled(manager, statePath)) return true;
+    try { assertOwnership(); return false; } catch (error) { ownershipDrainError = error; return true; }
+  };
+  assertOwnership();
   const state = manager.read(statePath);
   const workingDir = String(state.working_dir || '');
   const normalizedTicketId = normalizeTicketId(ticketId, ticketId);
@@ -717,11 +725,13 @@ export async function repairTicketVerificationContract(
       outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [sessionDir], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CONTRACT_REPAIR_COMPLETE') || hasPromiseToken(lastMessage, 'CONTRACT_REPAIR_COMPLETE'),
       onSpawn: (child) => updateActiveChild(statePath, manager, { active_child_pid: child.pid, active_child_kind: 'codex', active_child_command: 'contract-repair' }),
-      cancelCheck: () => isSessionCancelled(manager, statePath),
+      cancelCheck: shouldCancel,
     });
     assertOwnership();
   } finally {
-    updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
+    if (!ownershipDrainError) {
+      updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
+    }
   }
   assertCodexSucceeded(result, `Verification contract repair failed for ${normalizedTicketId}`);
   const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
@@ -752,7 +762,11 @@ export async function repairTicketVerificationContract(
 }
 
 export async function runTicket(sessionDir: string, ticketId: string, options: RunTicketOptions = {}): Promise<RunTicketResult> {
-  const assertOwnership = (): void => options.assertDurableOwnership?.();
+  let ownershipDrainError: unknown = null;
+  const assertOwnership = (): void => {
+    if (ownershipDrainError) throw ownershipDrainError;
+    options.assertDurableOwnership?.();
+  };
   assertOwnership();
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
@@ -763,6 +777,18 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   const tmuxMode = Boolean(state.tmux_mode);
   const runnerMode = options.runnerMode || null;
   const normalizedTicketId = normalizeTicketId(ticketId, String(ticketId || 'ticket'));
+  const shouldCancel = (): boolean => {
+    if (isSessionCancelled(manager, statePath)) return true;
+    try { assertOwnership(); return false; } catch (error) { ownershipDrainError = error; return true; }
+  };
+  const clearActiveChildIfOwned = (): void => {
+    if (ownershipDrainError) return;
+    updateActiveChild(statePath, manager, {
+      active_child_pid: null,
+      active_child_kind: null,
+      active_child_command: null,
+    });
+  };
   const manifestTicket = manifest.tickets.find((ticket) => normalizeTicketId(ticket.id, ticket.id) === normalizedTicketId);
   if (!manifestTicket) {
     throw new Error(`Ticket not found: ${ticketId}`);
@@ -888,9 +914,14 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       if (isSessionCancelled(manager, statePath)) throw new CancellationError();
       const command = verificationStepCommand(step).display;
       try {
-        await runVerificationCommand({ step, cwd: workingDir, timeoutMs: config.defaults.worker_timeout_seconds * 1000, manager, statePath, env: verificationReady.env });
+        await runVerificationCommand({
+          step, cwd: workingDir, timeoutMs: config.defaults.worker_timeout_seconds * 1000,
+          manager, statePath, env: verificationReady.env, isCancelled: shouldCancel,
+          onExit: clearActiveChildIfOwned,
+        });
         assertOwnership();
       } catch (error) {
+        assertOwnership();
         if (error instanceof VerificationCommandError) {
           const remainingFailures = subtractBaselineFailures(sessionDir, normalizedTicketId, command, workingDir, error.failures);
           if (remainingFailures.length === 0) continue;
@@ -956,17 +987,13 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         workingDir,
         config.defaults.worker_timeout_seconds * 1000,
         {
-          isCancelled: () => isSessionCancelled(manager, statePath),
+          isCancelled: shouldCancel,
           onSpawn: (pid, command) => updateActiveChild(statePath, manager, {
             active_child_pid: pid,
             active_child_kind: 'quality-baseline',
             active_child_command: command,
           }),
-          onExit: () => updateActiveChild(statePath, manager, {
-            active_child_pid: null,
-            active_child_kind: null,
-            active_child_command: null,
-          }),
+          onExit: clearActiveChildIfOwned,
         },
       );
       assertOwnership();
@@ -1099,7 +1126,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
                 active_child_command: phase,
               });
             },
-            cancelCheck: () => isSessionCancelled(manager, statePath),
+            cancelCheck: shouldCancel,
           });
           modelResult = result;
           assertOwnership();
@@ -1164,11 +1191,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
               outcome: modelOutcome,
             });
           }
-          updateActiveChild(statePath, manager, {
-            active_child_pid: null,
-            active_child_kind: null,
-            active_child_command: null,
-          });
+          clearActiveChildIfOwned();
           fs.rmSync(candidateRoot, { recursive: true, force: true });
           try { fs.rmdirSync(candidateParent); } catch { /* another phase candidate still exists */ }
         }
@@ -1218,17 +1241,13 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       qualityBaseline,
       config.defaults.worker_timeout_seconds * 1000,
       {
-        isCancelled: () => isSessionCancelled(manager, statePath),
+        isCancelled: shouldCancel,
         onSpawn: (pid, command) => updateActiveChild(statePath, manager, {
           active_child_pid: pid,
           active_child_kind: 'quality-gate',
           active_child_command: command,
         }),
-        onExit: () => updateActiveChild(statePath, manager, {
-          active_child_pid: null,
-          active_child_kind: null,
-          active_child_command: null,
-        }),
+        onExit: clearActiveChildIfOwned,
       },
     );
     assertOwnership();
@@ -1329,6 +1348,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     }
     return finalizeRefusal(false, decision);
   } catch (error) {
+    if (ownershipDrainError) throw ownershipDrainError;
     let handledError: unknown = error;
     let rollbackFailed = false;
     if (mutationBoundary) {

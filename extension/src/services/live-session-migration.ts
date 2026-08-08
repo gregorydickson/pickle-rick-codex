@@ -153,6 +153,20 @@ function validateRuntime(runtime: InstalledRuntimeDescriptor, sessionSchema: num
   }
 }
 
+export function prepareLiveSessionHandoffCheckpoint(
+  sessionDir: string,
+  sourceRuntime: InstalledRuntimeDescriptor,
+  targetRuntime: InstalledRuntimeDescriptor,
+): SessionResumeCheckpoint {
+  const state = readJson(path.join(sessionDir, 'state.json'));
+  if (!state || state.active !== true) throw new Error('Live session handoff requires an active session.');
+  const sessionSchema = Number(state.schema_version ?? 1);
+  if (!Number.isInteger(sessionSchema) || sessionSchema < 1) throw new Error('Live session has an invalid schema version.');
+  validateRuntime(sourceRuntime, sessionSchema);
+  validateRuntime(targetRuntime, sessionSchema);
+  return deriveResumeCheckpoint(sessionDir, state);
+}
+
 export function prepareLiveSessionMigration(
   sessionDir: string,
   sourceRuntime: InstalledRuntimeDescriptor,

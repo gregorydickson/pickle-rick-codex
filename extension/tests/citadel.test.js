@@ -188,6 +188,33 @@ test('runCitadelChecks deduplicates and records declared ticket verification com
   assert.match(checks[4].output, /ticket failed/);
 });
 
+test('Citadel cooperatively terminates a long deterministic check after lease loss', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('The handoff drains Citadel.');
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: 'node -e "setTimeout(() => {}, 10000)"' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'long check fixture'], { cwd });
+  const statePath = path.join(sessionDir, 'state.json');
+  new StateManager().update(statePath, (state) => {
+    state.start_commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+    return state;
+  });
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => runCitadel(sessionDir, {
+      assertDurableOwnership: () => {
+        if (Date.now() - startedAt > 200) throw new Error('fixture lease ownership changed');
+      },
+    }),
+    /fixture lease ownership changed/,
+  );
+  assert.ok(Date.now() - startedAt < 3_000, 'Citadel did not drain its child promptly');
+  const state = new StateManager().read(statePath);
+  assert.ok(Number.isInteger(state.active_child_pid), 'stale owner must preserve the child recovery identity for green');
+  assert.ok(state.active_child_identity);
+});
+
 test('Citadel repository fingerprint detects commits and staged index changes', () => {
   const cwd = makeTempRoot('pickle-citadel-fingerprint-');
   execFileSync('git', ['init', '-q'], { cwd });

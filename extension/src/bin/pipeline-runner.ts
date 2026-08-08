@@ -26,7 +26,8 @@ import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
 import { runCitadel } from '../services/citadel.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
-import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import { readManifest, updateTicketStatus } from '../services/tickets.js';
 
 type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSession>[2];
@@ -34,6 +35,8 @@ type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSessio
 interface RunPipelineOptions {
   onFailure?: string;
   assertDurableOwnership?: () => void;
+  handoffRequestId?: string;
+  targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
   [key: string]: unknown;
 }
 
@@ -55,6 +58,15 @@ function parseLaunchOwnerPid(argv: string[]): number | null {
 function parseRunStartedAtMs(argv: string[]): number | null {
   const value = Number(argv.find((arg) => arg.startsWith('--run-started-at='))?.split('=')[1]);
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export function parsePipelineHandoffOptions(argv: string[]): Pick<RunPipelineOptions, 'handoffRequestId' | 'targetRuntime'> {
+  const handoffRequestId = argv.find((arg) => arg.startsWith('--handoff-request='))?.split('=')[1];
+  const encoded = argv.find((arg) => arg.startsWith('--target-runtime='))?.split('=')[1];
+  return {
+    handoffRequestId,
+    targetRuntime: encoded ? JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) : undefined,
+  };
 }
 
 function appendRunnerLog(sessionDir: string, message: string): void {
@@ -316,13 +328,27 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
   let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
   let exitReason = 'error';
   try {
-    ownership = startDurableRuntimeOwnership(sessionDir);
+    ownership = startDurableRuntimeOwnership(sessionDir, {
+      handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
+      targetRuntime: options.targetRuntime,
+    });
+    if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
+      ownership.assertOwned();
+      finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);
+      ownership.assertOwned();
+    }
     exitReason = await runPipelineWithLease(sessionDir, {
       ...options,
       onFailure: 'retry',
       assertDurableOwnership: ownership.assertOwned,
     }, runStartedAtMs);
     return exitReason;
+  } catch (error) {
+    if (isDurableOwnershipDrainError(error)) {
+      exitReason = 'runtime_handoff';
+      return exitReason;
+    }
+    throw error;
   } finally {
     try {
       ownership?.finish(exitReason);
@@ -341,6 +367,7 @@ async function main(argv: string[]): Promise<void> {
     onFailure: parseFailureMode(argv),
     launchOwnerPid: parseLaunchOwnerPid(argv),
     runStartedAtMs: parseRunStartedAtMs(argv),
+    ...parsePipelineHandoffOptions(argv),
   });
   if (pipelineExitFailed(exitReason)) {
     process.exitCode = 1;

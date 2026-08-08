@@ -16,7 +16,7 @@ import {
   resetGitIndex,
   stagePaths,
 } from './git-utils.js';
-import { enrichRefinementManifest, readManifest, updateTicketStatus } from './tickets.js';
+import { enrichRefinementManifest, normalizeTicketId, normalizeTicketStatus, readManifest, updateTicketStatus } from './tickets.js';
 import { recoverableHardReset } from './recoverable-git.js';
 import { StateManager } from './state-manager.js';
 import type { RefinementManifest } from '../types/index.js';
@@ -493,9 +493,9 @@ export function inspectRefinementRepositoryAdvance(
   const rawManifest = readJsonFile<RefinementManifest>(path.join(sessionDir, 'refinement_manifest.json'), null);
   const ticket = rawManifest
     ? enrichRefinementManifest(structuredClone(rawManifest)).manifest.tickets
-      .find((entry) => entry.id === advance.ticket_id)
+      .find((entry) => normalizeTicketId(entry.id, entry.id) === normalizeTicketId(advance.ticket_id, advance.ticket_id))
     : null;
-  if (!ticket || ticket.status !== 'In Progress') {
+  if (!ticket || normalizeTicketStatus(ticket.status) !== 'in progress') {
     return { recoverable: false, reason: 'the durable boundary has no In Progress owner' };
   }
   const currentIdentity = refinementRepositoryIdentity(workingDir, sessionDir);
@@ -580,8 +580,10 @@ export function reconcileVerifiedRefinementRepositoryAdvance(
     throw new Error('Refinement repository advance does not start at the accepted repository boundary.');
   }
   const manifest = readManifest(sessionDir);
-  const ticket = manifest.tickets.find((entry) => entry.id === advance.ticket_id);
-  if (!ticket || ticket.status !== 'In Progress') {
+  const ticket = manifest.tickets.find((entry) => (
+    normalizeTicketId(entry.id, entry.id) === normalizeTicketId(advance.ticket_id, advance.ticket_id)
+  ));
+  if (!ticket || normalizeTicketStatus(ticket.status) !== 'in progress') {
     throw new Error(`Refinement repository advance is not owned by an In Progress ticket: ${advance.ticket_id}.`);
   }
   const statePath = path.join(sessionDir, 'state.json');
