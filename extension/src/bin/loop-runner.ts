@@ -577,10 +577,10 @@ function revertMetricIterationSafely(
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    ownedPaths: changedPaths
-      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
-        candidate === owned || candidate.startsWith(`${owned}/`)
-      ))),
+    // A metric checkpoint is captured only after a completely clean-tree gate.
+    // Every subsequent change therefore belongs to this attempt, including
+    // mutations made before the worker can publish its declared target paths.
+    ownedPaths: changedPaths,
     evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${session}`,
     log: (message) => appendRunnerLog(sessionDir, message),

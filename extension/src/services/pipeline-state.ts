@@ -1020,6 +1020,7 @@ export function cancelPipelineSession(
     finalizeTerminalStateObject(sessionState, { exitReason: options.exitReason || 'cancelled' });
     sessionState.cancel_requested_at = cancelledAt;
     sessionState.pipeline_mode = true;
+    sessionState.step = 'paused';
     appendHistoryEntry(sessionState, 'inactive', (sessionState.current_ticket as string | null) || undefined);
   }, options);
 }

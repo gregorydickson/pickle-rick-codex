@@ -229,6 +229,7 @@ test('cancelPipelineSession updates pipeline-state.json and mirrors the interrup
     szechuan: false,
   });
   assert.equal(result.state.last_exit_reason, 'cancelled');
+  assert.equal(result.state.step, 'paused');
   assert.equal(pipelineState.current_phase, 'anatomy-park');
   assert.equal(pipelineState.current_phase_index, 1);
   assert.equal(pipelineState.phase_statuses['anatomy-park'], 'cancelled');

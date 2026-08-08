@@ -266,10 +266,10 @@ export function revertMetricIteration(cwd: string, checkpoint: MetricIterationCh
     sessionDir,
     targetHead: checkpoint.head,
     operation: 'microverse-revert',
-    ownedPaths: changedPaths
-      .filter((candidate) => (checkpoint.ownedPaths || []).some((owned) => (
-        candidate === owned || candidate.startsWith(`${owned}/`)
-      ))),
+    // captureMetricIterationCheckpoint rejects all pre-existing dirt, so every
+    // post-checkpoint path is owned by the candidate attempt. target_paths is a
+    // worker scope declaration, not the rollback ownership boundary.
+    ownedPaths: changedPaths,
     evidencePaths: changedPaths,
     headRecoveryRef: `refs/pickle/microverse-recovery/${path.basename(sessionDir).replace(/[^a-zA-Z0-9._-]/g, '-')}`,
   });
