@@ -62,7 +62,10 @@ import {
   type ExperimentClassification,
   type MicroverseExperimentRecord,
 } from '../services/experiment-ledger.js';
-import { archiveMicroverseExperiment } from '../services/microverse-experiment-archive.js';
+import {
+  archiveMicroverseExperiment,
+  type ArchivedMicroverseExperiment,
+} from '../services/microverse-experiment-archive.js';
 import { writeMicroverseWorkerHandoff } from '../services/microverse-handoff.js';
 import {
   captureProtectedPathManifest,
@@ -732,8 +735,8 @@ function archiveMicroverseCandidate(
   sessionDir: string,
   candidate: MicroverseCandidate | null,
   experimentId: string | null,
-): void {
-  if (!candidate || !experimentId || !fs.existsSync(candidate.worktreeDir)) return;
+): ArchivedMicroverseExperiment | null {
+  if (!candidate || !experimentId || !fs.existsSync(candidate.worktreeDir)) return null;
   try {
     if (process.env.PICKLE_TEST_MODE === '1' && process.env.PICKLE_TEST_MICROVERSE_ARCHIVE_FAIL === '1') {
       throw new Error('Injected isolated candidate archive failure.');
@@ -764,6 +767,7 @@ function archiveMicroverseCandidate(
         },
       } satisfies MicroverseAttemptTransaction);
     }
+    return archived;
   } catch (error) {
     const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
     if (transaction?.experiment_id === experimentId) {
@@ -969,7 +973,7 @@ function recoverInterruptedMicroverseAttempt(sessionDir: string, workingDir: str
     // Backward-compatible recovery for transactions created before isolated
     // candidate worktrees were introduced.
     const legacyCheckpoint = transaction.schema_version === 1
-        && !Array.isArray(transaction.checkpoint.ownedPaths)
+        && (!Array.isArray(transaction.checkpoint.ownedPaths) || transaction.checkpoint.ownedPaths.length === 0)
       ? {
         ...transaction.checkpoint,
         ownedPaths: listChangedPathsSince(workingDir, transaction.checkpoint.head),
@@ -1104,21 +1108,17 @@ function processMetricIteration(
   checkpoint: MetricIterationCheckpoint,
   iteration: number,
   experimentId: string,
+  archivedEvidence: ArchivedMicroverseExperiment | null,
 ): { classification: Exclude<MetricClassification, 'baseline'>; state: MetricConvergenceState; changedPaths: string[]; diffArtifact: string | null } {
   const currentState = readMetricConvergenceState(sessionDir);
   if (!currentState) throw new Error('Microverse metric state disappeared during an iteration.');
   const attemptedHead = getHeadSha(workingDir) || checkpoint.head;
   const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
   const repositoryChanged = attemptedHead !== checkpoint.head || dirtyPaths.length > 0;
-  const evidence = repositoryChanged
-    ? archiveMicroverseExperiment({
-      workingDir,
-      sessionDir,
-      experimentId,
-      baseRef: checkpoint.head,
-      excludeUntrackedPaths: checkpoint.untracked,
-    })
-    : null;
+  const evidence = repositoryChanged ? archivedEvidence : null;
+  if (repositoryChanged && !evidence) {
+    throw new Error(`Microverse candidate ${experimentId} has no verified durable archive.`);
+  }
   let measurement;
   try {
     measurement = measureMetric(currentState.command, {
@@ -1853,9 +1853,9 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         }
       }
 
-      if (metricCheckpoint && experiment && candidate) {
-        archiveMicroverseCandidate(sessionDir, candidate, experiment.id);
-      }
+      const candidateEvidence = metricCheckpoint && experiment && candidate
+        ? archiveMicroverseCandidate(sessionDir, candidate, experiment.id)
+        : null;
       let metricResult: ReturnType<typeof processMetricIteration> | null = null;
       if (metricCheckpoint && experiment && currentMetricState) {
         try {
@@ -1866,6 +1866,7 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
             metricCheckpoint,
             iteration,
             experiment.id,
+            candidateEvidence,
           );
         } catch (error) {
           if (!(error instanceof PostWorkerMetricMeasurementError)) throw error;

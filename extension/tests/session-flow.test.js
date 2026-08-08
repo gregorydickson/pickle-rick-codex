@@ -2301,6 +2301,8 @@ test('microverse resume finalizes an already-promoted candidate beneath an unrel
   );
   const transaction = readJsonFile(path.join(sessionDir, 'microverse-attempt.json'));
   assert.equal(transaction.phase, 'promoted');
+  const receiptBytes = fs.readFileSync(path.join(sessionDir, transaction.archive_receipt.artifact));
+  assert.equal(crypto.createHash('sha256').update(receiptBytes).digest('hex'), transaction.archive_receipt.sha256);
   assert.equal(fs.readFileSync(path.join(projectDir, 'score.txt'), 'utf8'), 'ax');
 
   fs.writeFileSync(path.join(projectDir, 'user-descendant.txt'), 'preserve descendant\n');
@@ -3354,7 +3356,7 @@ test('measured microverse restores a durable interrupted repository and metric t
     experiment_id: planned.id,
     iteration: 2,
     attempt: 1,
-    checkpoint: { head: baselineHead, untracked: [] },
+    checkpoint: { head: baselineHead, untracked: [], ownedPaths: [] },
     metric_state_before: metricBefore,
     created_at: '2026-07-18T00:01:00.000Z',
   });
