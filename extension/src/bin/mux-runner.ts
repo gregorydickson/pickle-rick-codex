@@ -201,7 +201,16 @@ async function runSequentialWithLease(
       const repairing = new Set(summary.tickets
         .filter((candidate) => String(candidate.status).toLowerCase() === 'blocked')
         .map((candidate) => candidate.id));
-      const decision = planSchedulerContinuity(summary.tickets, repairing);
+      const dependencyReadyRepairing = new Set(summary.tickets
+        .filter((candidate) => (
+          repairing.has(candidate.id)
+          && areTicketDependenciesSatisfied(candidate, summary.tickets)
+        ))
+        .map((candidate) => candidate.id));
+      const decision = planSchedulerContinuity(
+        summary.tickets,
+        dependencyReadyRepairing.size > 0 ? dependencyReadyRepairing : repairing,
+      );
       if (decision.kind === 'diagnostic' && decision.ticketId !== 'pipeline') {
         scheduledDiagnosticTicketId = normalizeTicketId(decision.ticketId, decision.ticketId);
         updateTicketStatus(sessionDir, decision.ticketId, {

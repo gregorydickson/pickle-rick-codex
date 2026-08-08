@@ -597,6 +597,59 @@ test('mux-runner schedules diagnostic work instead of terminating when all ticke
   assert.match(readRunnerLog(sessionDir), /executed diagnostic contract repair/);
 });
 
+test('mux-runner repairs a dependency-ready prerequisite when every ticket is blocked', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('blocked dependency graph repair task');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      {
+        id: 'dependent',
+        title: 'Blocked dependent',
+        description: 'Must not implement before its prerequisite.',
+        acceptance_criteria: ['The prerequisite remains required.'],
+        verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['dependent.txt'],
+        priority: 'P1',
+        status: 'Blocked',
+        depends_on: ['root'],
+      },
+      {
+        id: 'root',
+        title: 'Blocked prerequisite',
+        description: 'Can be repaired without violating dependency order.',
+        acceptance_criteria: ['Repair executes before implementation.'],
+        verification: ['node -e "process.exit(0)"'],
+        allowed_paths: ['root.txt'],
+        priority: 'P1',
+        status: 'Blocked',
+      },
+    ],
+  });
+  const repairs = [];
+  const calls = [];
+
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketVerificationContract: async (_dir, ticketId) => {
+        repairs.push(ticketId);
+        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+      },
+      runTicket: async (_dir, ticketId) => {
+        calls.push(ticketId);
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+
+  assert.equal(finalReason, 'success', readRunnerLog(sessionDir));
+  assert.deepEqual(repairs, ['root']);
+  assert.deepEqual(calls, ['root']);
+  assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
+  assert.match(readRunnerLog(sessionDir), /executed diagnostic contract repair for root/);
+});
+
 test('mux-runner records verification command failures as typed verification recovery', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('typed verification failure task');
   let calls = 0;
