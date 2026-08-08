@@ -1,6 +1,7 @@
 // @tier: integration
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -138,8 +139,23 @@ test('Microverse archive-cap abort preserves attempted iteration and exits non-s
     /destructive-archive-cap-exceeded/,
   );
   assert.equal(git(projectDir, ['rev-parse', 'HEAD']), baseline);
-  assert.match(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), /attempted Microverse mutation/);
-  assert.equal(git(projectDir, ['status', '--porcelain']), 'M tracked.txt');
+  assert.equal(fs.readFileSync(path.join(projectDir, 'tracked.txt'), 'utf8'), 'baseline\n');
+  assert.equal(git(projectDir, ['status', '--porcelain']), '');
+  const transactionPath = path.join(sessionDir, 'microverse-attempt.json');
+  const transaction = readJsonFile(transactionPath);
+  assert.equal(transaction.phase, 'quarantined');
+  assert.match(transaction.quarantine_reason, /destructive-archive-cap-exceeded/);
+  assert.equal(fs.existsSync(transaction.candidate_worktree), true);
+  assert.equal(
+    fs.readFileSync(path.join(transaction.candidate_worktree, 'tracked.txt'), 'utf8'),
+    'baseline\nattempted Microverse mutation\n',
+  );
+  assert.equal(git(transaction.candidate_worktree, ['status', '--porcelain']), 'M tracked.txt');
+  const archiveBytes = fs.readFileSync(path.join(sessionDir, transaction.archive_receipt.artifact));
+  assert.equal(
+    crypto.createHash('sha256').update(archiveBytes).digest('hex'),
+    transaction.archive_receipt.sha256,
+  );
   const state = readJsonFile(path.join(sessionDir, 'state.json'));
   const log = fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8');
   assert.equal(state.last_exit_reason, 'error');

@@ -2074,7 +2074,19 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         revertMetricIterationSafely(sessionDir, pendingMetricIteration.cwd, pendingMetricIteration.checkpoint);
         appendRunnerLog(sessionDir, `microverse iteration rolled back after ${exitReason}`);
       } catch (rollbackError) {
-        if (rollbackError instanceof MicroverseCandidateArchiveError) promotionDeferred = true;
+        if (pendingMetricIteration?.candidate) {
+          promotionDeferred = true;
+          const transaction = readJsonFile<MicroverseAttemptTransaction>(microverseAttemptPath(sessionDir), null);
+          if (transaction?.schema_version === 2) {
+            atomicWriteJson(microverseAttemptPath(sessionDir), {
+              ...transaction,
+              phase: 'quarantined',
+              quarantine_reason: safeErrorMessage(rollbackError),
+            } satisfies MicroverseAttemptTransaction);
+          }
+        } else if (rollbackError instanceof MicroverseCandidateArchiveError) {
+          promotionDeferred = true;
+        }
         appendRunnerLog(sessionDir, `microverse rollback failed after ${exitReason}: ${safeErrorMessage(rollbackError)}`);
         thrownError = thrownError
           ? new AggregateError(
