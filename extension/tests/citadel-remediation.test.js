@@ -4,7 +4,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
-import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
+import {
+  enqueueCitadelRemediation,
+  enqueueCitadelRemediationResult,
+  reconcileCitadelAttributionRepair,
+  reconcileCitadelRemediation,
+} from '../services/citadel-remediation.js';
 import { readManifest } from '../services/tickets.js';
 
 function ticket(id, ownedPath, criterion, dependsOn = []) {
@@ -81,7 +86,7 @@ test('Citadel remediation resets one attributed ticket and true dependents only'
     'src/affected.ts does not satisfy the affected criterion.');
 });
 
-test('ambiguous Citadel attribution preserves refusal evidence and completed tickets', () => {
+test('ambiguous Citadel attribution schedules durable repair without resetting tickets', () => {
   const sessionDir = multiTicketSession();
   const report = {
     schema_version: 1,
@@ -90,12 +95,79 @@ test('ambiguous Citadel attribution preserves refusal evidence and completed tic
     findings: [{ severity: 'high', title: 'Cross-cutting concern.', evidence: 'The release proof is incomplete.' }],
   };
   writeJson(path.join(sessionDir, 'citadel-report.json'), report);
-  assert.throws(() => enqueueCitadelRemediation(sessionDir), /attribution is ambiguous.*archived/);
+  const result = enqueueCitadelRemediationResult(sessionDir);
+  assert.equal(result.kind, 'attribution_repair_scheduled');
+  assert.deepEqual(result.candidate_ticket_ids, ['affected', 'independent', 'dependent']);
   assert.deepEqual(readManifest(sessionDir).tickets.map((entry) => entry.status), ['Done', 'Done', 'Done']);
-  const blocked = JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-remediation-attribution-blocked.json'), 'utf8'));
-  assert.equal(blocked.failure_kind, 'citadel_attribution_ambiguous');
-  assert.deepEqual(JSON.parse(fs.readFileSync(blocked.archive_path, 'utf8')), report);
+  const repair = JSON.parse(fs.readFileSync(result.repair_intent_path, 'utf8'));
+  assert.equal(repair.schema_version, 2);
+  assert.equal(repair.failure_kind, 'citadel_attribution_repair_required');
+  assert.equal(repair.status, 'pending');
+  assert.match(repair.repair_task, /Attribute each preserved blocking finding/);
+  assert.deepEqual(repair.candidate_ticket_ids, ['affected', 'independent', 'dependent']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(repair.archive_path, 'utf8')), report);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+
+  const archiveCount = fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length;
+  const resumed = enqueueCitadelRemediationResult(sessionDir);
+  assert.equal(resumed.kind, 'attribution_repair_scheduled');
+  assert.equal(resumed.archive_path, result.archive_path);
+  assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length, archiveCount);
+  assert.deepEqual(reconcileCitadelAttributionRepair(sessionDir), repair);
+});
+
+test('Citadel attribution resolves criterion IDs and ticket-owned paths without explicit ticket ids', () => {
+  const sessionDir = multiTicketSession();
+  const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  manifest.tickets[0].acceptance_criteria = ['AC-AFFECTED: Affected behavior remains correct.'];
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
+  writeJson(path.join(sessionDir, 'citadel-report.json'), {
+    schema_version: 1,
+    verdict: 'block',
+    acceptance_criteria_checked: [],
+    findings: [{
+      severity: 'high',
+      title: 'Affected implementation violates its contract.',
+      evidence: 'The affected implementation is incomplete.',
+      acceptance_criteria: ['AC-AFFECTED'],
+      paths: ['src/affected.ts'],
+    }],
+  });
+
+  const result = enqueueCitadelRemediationResult(sessionDir);
+  assert.equal(result.kind, 'remediation_enqueued');
+  assert.deepEqual(result.ticket_ids, ['affected', 'dependent']);
+  assert.deepEqual(readManifest(sessionDir).tickets.map((entry) => entry.status), ['Todo', 'Done', 'Todo']);
+});
+
+test('legacy ambiguous attribution state migrates to restart-safe typed repair intent', () => {
+  const sessionDir = multiTicketSession();
+  const archivePath = path.join(sessionDir, 'citadel-remediation', 'ambiguous-report.json');
+  const report = {
+    schema_version: 1,
+    verdict: 'block',
+    findings: [{ severity: 'high', title: 'Cross-cutting concern.', evidence: 'Proof is incomplete.' }],
+    acceptance_criteria_checked: [],
+  };
+  writeJson(archivePath, report);
+  writeJson(path.join(sessionDir, 'citadel-remediation-attribution-blocked.json'), {
+    schema_version: 1,
+    failure_kind: 'citadel_attribution_ambiguous',
+    archive_path: archivePath,
+    report_path: path.join(sessionDir, 'citadel-report.json'),
+    findings: report.findings,
+    acceptance_criteria_checked: [],
+    reason: 'finding 1 cannot be attributed to exactly one completed ticket',
+    recorded_at: '2026-08-08T01:00:00.000Z',
+  });
+
+  assert.equal(reconcileCitadelRemediation(sessionDir), false);
+  const migrated = reconcileCitadelAttributionRepair(sessionDir);
+  assert.equal(migrated.schema_version, 2);
+  assert.equal(migrated.failure_kind, 'citadel_attribution_repair_required');
+  assert.deepEqual(migrated.candidate_ticket_ids, ['affected', 'independent', 'dependent']);
+  assert.equal(migrated.archive_path, archivePath);
+  assert.deepEqual(readManifest(sessionDir).tickets.map((entry) => entry.status), ['Done', 'Done', 'Done']);
 });
 
 test('schema-2 pending remediation migrates durably on restart without widening its ticket slice', () => {
