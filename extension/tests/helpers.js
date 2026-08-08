@@ -241,7 +241,23 @@ function writeLifecycleArtifact(phase) {
   }
 }
 
-if (prompt.includes('You are the autonomous verification contract repair worker')) {
+if (prompt.includes('You are the autonomous ticket dependency graph contract repair worker')) {
+  const artifactPath = extractPathAfter('Dependency repair artifact path: ');
+  const targetTicketId = extractPathAfter('Target ticket ID: ');
+  const graphLine = prompt.split('\\n').find((candidate) => candidate.startsWith('Current ticket graph JSON: '));
+  const graph = graphLine ? JSON.parse(graphLine.slice('Current ticket graph JSON: '.length)) : [];
+  const repaired = graph.map((ticket) => ticket.ticket_id === targetTicketId
+    ? { ...ticket, depends_on: [] }
+    : ticket);
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    schema_version: 1,
+    target_ticket_id: targetTicketId,
+    tickets: repaired,
+    rationale: 'remove the target invalid dependency edge while preserving every ticket contract',
+  }, null, 2));
+  lastMessage = '<promise>DEPENDENCY_REPAIR_COMPLETE</promise>';
+} else if (prompt.includes('You are the autonomous verification contract repair worker')) {
   const artifactPath = extractPathAfter('Contract repair artifact path: ');
   const ticketId = extractPathAfter('Ticket ID: ');
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });

@@ -55,6 +55,7 @@ import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-sessi
 import { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
+import { repairTicketDependencyContract } from '../services/dependency-contract-repair.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -71,6 +72,7 @@ interface RunSequentialOptions {
 interface RunSequentialDeps {
   runTicket?: typeof runTicket;
   repairTicketVerificationContract?: typeof repairTicketVerificationContract;
+  repairTicketDependencyContract?: typeof repairTicketDependencyContract;
   runCitadel?: typeof runCitadel;
 }
 
@@ -143,6 +145,7 @@ async function runSequentialWithLease(
 ): Promise<string> {
   const runTicketFn = deps.runTicket ?? runTicket;
   const repairContractFn = deps.repairTicketVerificationContract ?? repairTicketVerificationContract;
+  const repairDependencyContractFn = deps.repairTicketDependencyContract ?? repairTicketDependencyContract;
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
   const failureMode = options.durableOwnershipHeld === true ? 'retry' : options.onFailure || 'abort';
@@ -193,6 +196,7 @@ async function runSequentialWithLease(
     summary = summarizeTickets(sessionDir);
   }
   let scheduledDiagnosticTicketId: string | null = null;
+  let scheduledDiagnosticTask: string | null = null;
   if (!summary.total) {
     exitReason = 'no_tickets';
     appendRunnerLog(sessionDir, runnerMode, 'no tickets found in refinement manifest');
@@ -213,12 +217,19 @@ async function runSequentialWithLease(
       );
       if (decision.kind === 'diagnostic' && decision.ticketId !== 'pipeline') {
         scheduledDiagnosticTicketId = normalizeTicketId(decision.ticketId, decision.ticketId);
+        const diagnosticTicket = summary.tickets.find((ticket) => (
+          normalizeTicketId(ticket.id, ticket.id) === scheduledDiagnosticTicketId
+        ));
+        scheduledDiagnosticTask = diagnosticTicket
+          && unresolvedTicketDependencies(diagnosticTicket, summary.tickets).length > 0
+          ? 'repair-dependency-or-contract-blockage'
+          : decision.task;
         updateTicketStatus(sessionDir, decision.ticketId, {
           status: 'Todo',
-          recovery_task: decision.task,
+          recovery_task: scheduledDiagnosticTask,
           recovery_scheduled_at: new Date().toISOString(),
         });
-        appendRunnerLog(sessionDir, runnerMode, `all tickets blocked; scheduled ${decision.task} for ${decision.ticketId}`);
+        appendRunnerLog(sessionDir, runnerMode, `all tickets blocked; scheduled ${scheduledDiagnosticTask} for ${decision.ticketId}`);
       } else {
         exitReason = 'no_tickets';
       }
@@ -567,9 +578,14 @@ async function runSequentialWithLease(
           if (!startAutomaticRecoveryEpoch('all-blocked diagnostic repair', 'failure')) {
             throw new Error('diagnostic-repair-strategy-unavailable');
           }
-          await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          if (scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage') {
+            await repairDependencyContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          } else {
+            await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          }
           pendingContractRepair = false;
           scheduledDiagnosticTicketId = null;
+          scheduledDiagnosticTask = null;
           appendRunnerLog(sessionDir, runnerMode, `executed diagnostic contract repair for ${ticket.id}`);
           const repairedSummary = summarizeTickets(sessionDir);
           const repairedTicket = repairedSummary.tickets.find((candidate) => (
@@ -898,7 +914,6 @@ export function muxRunnerExitFailed(exitReason: string): boolean {
     || exitReason === 'circuit_open'
     || exitReason === 'recovery_exhausted'
     || exitReason === 'recovery_required'
-    || exitReason === 'dependency_repair_scheduled'
     || exitReason === 'citadel-blocked'
     || String(exitReason).startsWith('preflight-')
   );

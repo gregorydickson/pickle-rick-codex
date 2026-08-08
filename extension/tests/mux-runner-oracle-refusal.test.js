@@ -4,11 +4,11 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, repoRoot, runNode, writeJson } from './helpers.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
 import { StateManager } from '../services/state-manager.js';
-import { updateTicketStatus } from '../services/tickets.js';
+import { readManifest, updateTicketStatus } from '../services/tickets.js';
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { WorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 import { VerificationCommandError } from '../bin/spawn-morty.js';
@@ -59,16 +59,16 @@ function readTicket(sessionDir) {
   return parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
 }
 
-async function withDataRoot(dataRoot, fn) {
-  const previous = process.env.PICKLE_DATA_ROOT;
-  process.env.PICKLE_DATA_ROOT = dataRoot;
+async function withDataRoot(dataRoot, fn, environment = {}) {
+  const overrides = { PICKLE_DATA_ROOT: dataRoot, ...environment };
+  const previous = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, overrides);
   try {
     return await fn();
   } finally {
-    if (previous === undefined) {
-      delete process.env.PICKLE_DATA_ROOT;
-    } else {
-      process.env.PICKLE_DATA_ROOT = previous;
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
   }
 }
@@ -532,10 +532,10 @@ test('adaptive recovery permits success on the final budgeted attempt', async ()
   assert.match(readRunnerLog(sessionDir), /completed ticket r1/);
 });
 
-test('mux-runner CLI treats recovery blocks as failures', () => {
+test('mux-runner CLI treats terminal recovery blocks as failures and dependency wakeups as nonterminal', () => {
   assert.equal(muxRunnerExitFailed('recovery_exhausted'), true);
   assert.equal(muxRunnerExitFailed('recovery_required'), true);
-  assert.equal(muxRunnerExitFailed('dependency_repair_scheduled'), true);
+  assert.equal(muxRunnerExitFailed('dependency_repair_scheduled'), false);
   assert.equal(muxRunnerExitFailed('success'), false);
 });
 
@@ -685,15 +685,18 @@ test('mux-runner repairs a dependency-ready prerequisite when every ticket is bl
   assert.match(readRunnerLog(sessionDir), /executed diagnostic contract repair for root/);
 });
 
-test('mux-runner persists a cyclic dependency diagnostic and completes after restart repair', async () => {
+test('mux-runner production dependency worker repairs a cycle before implementation', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('cyclic dependency repair task');
+  const binDir = makeTempRoot('dependency-repair-bin-');
+  createFakeCodex(binDir);
+  const fakeEnv = prependPath(binDir);
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
       {
         id: 'a', title: 'Cycle A', description: 'Depends on B.',
         acceptance_criteria: ['Cycle is repaired before implementation.'],
         verification: ['node -e "process.exit(0)"'], allowed_paths: ['a.txt'],
-        priority: 'P1', status: 'Todo', depends_on: ['b'],
+        priority: 'P1', status: 'Todo', depends_on: ['b'], custom_contract: { owner: 'alpha' },
       },
       {
         id: 'b', title: 'Cycle B', description: 'Depends on A.',
@@ -703,64 +706,43 @@ test('mux-runner persists a cyclic dependency diagnostic and completes after res
       },
     ],
   });
+  const originalA = readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'a');
   const calls = [];
-  let repairs = 0;
-
-  const firstReason = await withDataRoot(dataRoot, () => runSequential(
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
     sessionDir,
     { onFailure: 'retry', runnerMode: 'pickle' },
     {
-      repairTicketVerificationContract: async () => {
-        repairs += 1;
-        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
-      },
-      runTicket: async (_dir, ticketId) => {
-        calls.push(ticketId);
-        return { status: 'done', applied: true };
-      },
-    },
-  ));
-
-  assert.equal(firstReason, 'dependency_repair_scheduled');
-  assert.equal(repairs, 1);
-  assert.deepEqual(calls, []);
-  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
-  assert.equal(persisted.tickets[0].recovery_task, 'repair-dependency-or-contract-blockage');
-  assert.deepEqual(persisted.tickets[0].recovery_unresolved_dependencies, ['b']);
-  const wakeupState = new StateManager().read(path.join(sessionDir, 'state.json'));
-  assert.equal(wakeupState.last_exit_reason, 'dependency_repair_scheduled');
-  assert.ok(wakeupState.history.some((event) => event.step === 'dependency_repair_wakeup_persisted'));
-  assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
-
-  const secondReason = await withDataRoot(dataRoot, () => runSequential(
-    sessionDir,
-    { onFailure: 'retry', runnerMode: 'pickle' },
-    {
-      repairTicketVerificationContract: async () => {
-        repairs += 1;
-        const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
-        manifest.tickets.find((ticket) => ticket.id === 'a').depends_on = [];
-        writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
-        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
-      },
       runTicket: async (_dir, ticketId) => {
         calls.push(ticketId);
         updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
         return { status: 'done', applied: true };
       },
     },
-  ));
+  ), { PATH: fakeEnv.PATH, PICKLE_TEST_MODE: '1' });
 
-  assert.equal(secondReason, 'success', readRunnerLog(sessionDir));
-  assert.equal(repairs, 2);
+  assert.equal(finalReason, 'success', readRunnerLog(sessionDir));
   assert.deepEqual(calls, ['a', 'b']);
   const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'a');
-  assert.equal(strategies.length, 2);
-  assert.equal(new Set(strategies.map((epoch) => epoch.strategyHash)).size, 2);
+  assert.equal(strategies.length, 1);
+  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  const repairedA = persisted.tickets.find((ticket) => ticket.id === 'a');
+  assert.deepEqual(repairedA.depends_on, []);
+  assert.equal(repairedA.description, originalA.description);
+  assert.deepEqual(repairedA.acceptance_criteria, originalA.acceptance_criteria);
+  assert.deepEqual(repairedA.verification, originalA.verification);
+  assert.deepEqual(repairedA.allowed_paths, originalA.allowed_paths);
+  assert.deepEqual(repairedA.custom_contract, originalA.custom_contract);
+  const transactionLedger = JSON.parse(fs.readFileSync(path.join(sessionDir, 'ticket-transaction-ledger.json'), 'utf8'));
+  assert.equal(transactionLedger.active, null);
+  assert.equal(transactionLedger.history.at(-1).status, 'committed');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-current.json')), true);
 });
 
 test('mux-runner repairs a missing dependency before implementation dispatch', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('missing dependency repair task');
+  const binDir = makeTempRoot('dependency-repair-bin-');
+  createFakeCodex(binDir);
+  const fakeEnv = prependPath(binDir);
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [{
       id: 'orphan', title: 'Orphan ticket', description: 'References a missing prerequisite.',
@@ -775,24 +757,64 @@ test('mux-runner repairs a missing dependency before implementation dispatch', a
     sessionDir,
     { onFailure: 'retry', runnerMode: 'pickle' },
     {
-      repairTicketVerificationContract: async () => {
-        events.push('repair');
-        const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
-        manifest.tickets[0].depends_on = [];
-        writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
-        return [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
-      },
       runTicket: async (_dir, ticketId) => {
-        events.push(`implement:${ticketId}`);
+        events.push(ticketId);
         updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
         return { status: 'done', applied: true };
       },
     },
-  ));
+  ), { PATH: fakeEnv.PATH, PICKLE_TEST_MODE: '1' });
 
   assert.equal(finalReason, 'success', readRunnerLog(sessionDir));
-  assert.deepEqual(events, ['repair', 'implement:orphan']);
+  assert.deepEqual(events, ['orphan']);
+  assert.deepEqual(readManifest(sessionDir).tickets[0].depends_on, []);
   assert.doesNotMatch(readRunnerLog(sessionDir), /no dependency-runnable ticket remains/);
+});
+
+test('unresolved dependency repair persists one nonterminal wakeup and resumes with a novel production strategy', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('dependency wakeup restart task');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'orphan', title: 'Orphan', description: 'Missing dependency.',
+      acceptance_criteria: ['The dependency repair is durable.'],
+      verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'],
+      priority: 'P1', status: 'Todo', depends_on: ['missing'],
+    }],
+  });
+  let implementations = 0;
+  const firstReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      repairTicketDependencyContract: async () => [],
+      runTicket: async () => { implementations += 1; return { status: 'done', applied: true }; },
+    },
+  ));
+  assert.equal(firstReason, 'dependency_repair_scheduled');
+  assert.equal(muxRunnerExitFailed(firstReason), false);
+  assert.equal(implementations, 0);
+  assert.ok(new StateManager().read(path.join(sessionDir, 'state.json')).history
+    .some((event) => event.step === 'dependency_repair_wakeup_persisted'));
+
+  const binDir = makeTempRoot('dependency-repair-bin-');
+  createFakeCodex(binDir);
+  const fakeEnv = prependPath(binDir);
+  const secondReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async (_dir, ticketId) => {
+        implementations += 1;
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ), { PATH: fakeEnv.PATH, PICKLE_TEST_MODE: '1' });
+  assert.equal(secondReason, 'success');
+  assert.equal(implementations, 1);
+  const strategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === 'orphan');
+  assert.equal(strategies.length, 2);
+  assert.equal(new Set(strategies.map((epoch) => epoch.strategyHash)).size, 2);
 });
 
 test('mux-runner records verification command failures as typed verification recovery', async () => {
