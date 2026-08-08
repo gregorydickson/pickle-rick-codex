@@ -462,6 +462,78 @@ test('mux-runner chooses dependency-runnable work even when the manifest is not 
   assert.deepEqual(calls, ['root', 'dependent']);
 });
 
+test('mux-runner schedules diagnostic work instead of terminating when all tickets are blocked', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('all blocked repair task');
+  updateTicketStatus(sessionDir, 'r1', { status: 'Blocked', failure_reason: 'contract needs repair' });
+  let calls = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 1);
+  assert.match(readRunnerLog(sessionDir), /all tickets blocked; scheduled diagnose-and-select-material-repair-strategy/);
+});
+
+test('mux-runner yields a repairing ticket to independent dependency-ready work', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('scheduler continuity task');
+  const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  manifest.tickets.push({
+    ...manifest.tickets[0],
+    id: 'r2',
+    title: 'Independent ticket',
+    allowed_paths: ['independent.txt'],
+    status: 'Todo',
+  });
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
+  const calls = [];
+  let r1Attempts = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async (_dir, ticketId) => {
+        calls.push(ticketId);
+        if (ticketId === 'r1' && r1Attempts++ === 0) throw new Error('transient worker transport');
+        updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+  assert.equal(finalReason, 'success');
+  assert.deepEqual(calls, ['r1', 'r2', 'r1']);
+});
+
+test('mux-runner turns an iteration threshold into a strategy epoch instead of terminal exhaustion', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('iteration strategy transition task');
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.iteration = 2;
+  state.max_iterations = 2;
+  writeJson(statePath, state);
+  let calls = 0;
+  const finalReason = await withDataRoot(dataRoot, () => runSequential(
+    sessionDir,
+    { onFailure: 'retry', runnerMode: 'pickle' },
+    {
+      runTicket: async () => {
+        calls += 1;
+        return { status: 'done', applied: true };
+      },
+    },
+  ));
+  assert.equal(finalReason, 'success');
+  assert.equal(calls, 1);
+  const strategies = JSON.parse(fs.readFileSync(path.join(sessionDir, 'recovery-strategies.json'), 'utf8'));
+  assert.equal(strategies.epochs[0].trigger, 'time_threshold');
+});
+
 test('mux-runner refuses to overlap another live session operation', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('operation lease task');
   const manager = new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });

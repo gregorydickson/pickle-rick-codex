@@ -10,6 +10,7 @@ import { StateManager } from '../services/state-manager.js';
 import type { PersistedState } from '../services/state-manager.js';
 import { getTicketById, summarizeTickets } from '../services/tickets.js';
 import { normalizeVerificationCommands } from '../services/verification-env.js';
+import { executionTelemetrySummary, readRecoveryStrategyEpochs } from '../services/productive-autonomy.js';
 import type { PipelineContract, PipelineState, ParsedTicket, Ticket } from '../types/index.js';
 
 interface PipelineMetadata {
@@ -134,6 +135,11 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
   const currentLabel = currentTicket
     ? `${currentTicket.id} - ${currentTicket.title}`
     : ((state.current_ticket as string | undefined) || 'none');
+  const telemetry = executionTelemetrySummary(sessionDir);
+  const strategies = readRecoveryStrategyEpochs(sessionDir);
+  const currentStrategy = state.current_ticket
+    ? [...strategies].reverse().find((epoch) => epoch.ticketId === state.current_ticket)
+    : strategies.at(-1);
 
   return [
     `Active: ${state.active ? 'Yes' : 'No'}`,
@@ -146,6 +152,13 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
     pipeline?.bootstrapPrd ? `Pipeline PRD: ${pipeline.bootstrapPrd}` : null,
     pipeline?.target ? `Pipeline Target: ${pipeline.target}` : null,
     `Iteration: ${state.iteration} / ${formatIterationLimit(state.max_iterations)}`,
+    `Ticket Attempts: ${telemetry.ticketAttempts}`,
+    `Phase Attempts: ${telemetry.phaseAttempts}`,
+    `Recovery Epochs: ${telemetry.recoveryEpochs}`,
+    currentStrategy ? `Recovery Strategy: ${currentStrategy.materialApproach} (${currentStrategy.strategyHash.slice(0, 12)})` : null,
+    `Work: productive ${telemetry.productiveWork} | discarded ${telemetry.discardedWork}`,
+    `Model Time: ${formatDuration(Math.floor(telemetry.durationMs / 1000))}`,
+    `Model Tokens: in ${telemetry.inputTokens} | cached ${telemetry.cachedInputTokens} | out ${telemetry.outputTokens} | failed calls ${telemetry.failedCalls}`,
     `Ticket: ${currentLabel}`,
     `Tickets: queued ${summary.queued} | done ${summary.done} | blocked ${summary.blocked} | skipped ${summary.skipped}`,
     nextTicket ? `Next Verification: ${ticketVerification(nextTicket)}` : null,

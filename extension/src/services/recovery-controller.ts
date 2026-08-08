@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeErrorSignature } from './circuit-breaker.js';
 import { atomicWriteJson } from './pickle-utils.js';
+import type { FailureDomain, RecoveryHandler } from './productive-autonomy.js';
 import type { WorkerLifecycleArtifact, WorkerLifecyclePhase } from './worker-lifecycle.js';
 
 export type TicketFailureKind =
@@ -52,6 +53,11 @@ export interface TicketRecoveryEvent {
   lineage_occurrences?: number;
   /** Monotonic recovery failures consumed by this ticket. */
   ticket_failure_count?: number;
+  failure_domain?: FailureDomain;
+  recovery_handler?: RecoveryHandler;
+  invalidated_checkpoints?: string[];
+  preserved_checkpoints?: string[];
+  strategy_hash?: string | null;
   recorded_at: string;
 }
 
@@ -252,6 +258,13 @@ export function recordTicketRecoveryFailure(input: {
   ticketId: string;
   failureKind: TicketFailureKind;
   identity: TicketRecoveryFailureIdentity;
+  route?: {
+    domain: FailureDomain;
+    handler: RecoveryHandler;
+    invalidate: string[];
+    preserve: string[];
+  };
+  strategyHash?: string | null;
 }): TicketRecoveryEvent {
   const history = readRecoveryHistory(input.sessionDir);
   const previous = [...history.events].reverse().find((event) => event.ticket_id === input.ticketId) || null;
@@ -270,6 +283,11 @@ export function recordTicketRecoveryFailure(input: {
     consecutive_same_lineage: changedLineage ? 1 : previous.consecutive_same_lineage + 1,
     lineage_occurrences: lineageOccurrences,
     ticket_failure_count: priorTicketEvents.length + 1,
+    failure_domain: input.route?.domain,
+    recovery_handler: input.route?.handler,
+    invalidated_checkpoints: input.route ? [...input.route.invalidate] : undefined,
+    preserved_checkpoints: input.route ? [...input.route.preserve] : undefined,
+    strategy_hash: input.strategyHash ?? null,
     recorded_at: new Date().toISOString(),
   };
   const next: TicketRecoveryHistory = { schema_version: 1, events: [...history.events, event] };
@@ -359,6 +377,11 @@ export function decideTicketRecovery(input: TicketRecoveryInput): TicketRecovery
   const failureExitReason = input.failureExitReason || 'error';
   if (input.circuitOpen) {
     return { action: 'abort', exitReason: 'circuit_open', reason: 'circuit breaker is OPEN' };
+  }
+  if (input.failureMode === 'retry' && (input.failureKind === 'preflight' || input.failureKind === 'verification_contract')) {
+    return input.adaptiveExhausted
+      ? { action: 'abort', exitReason: input.adaptiveExitReason || 'recovery_exhausted', reason: 'contract repair strategy transition required' }
+      : { action: 'retry', exitReason: null, reason: 'autonomous contract repair remains active' };
   }
   if (input.failureKind === 'preflight' || input.failureKind === 'verification_contract') {
     return { action: 'abort', exitReason: failureExitReason, reason: `${input.failureKind} failures are not retryable` };

@@ -441,6 +441,10 @@ test('status command shows ticket counts, title, verification, and last failure'
   assert.match(output, /Next Verification: npm test && npm run lint/);
   assert.match(output, /Last Failure: verification failed/);
   assert.match(output, /Iteration: 4 \/ unlimited/);
+  assert.match(output, /Ticket Attempts: 0/);
+  assert.match(output, /Phase Attempts: 0/);
+  assert.match(output, /Recovery Epochs: 0/);
+  assert.match(output, /Work: productive 0 \| discarded 0/);
 });
 
 test('status renders pipeline metadata without regressing non-pipeline sessions', () => {

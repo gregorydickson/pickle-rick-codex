@@ -30,6 +30,17 @@ import {
 } from '../services/recovery-controller.js';
 import { isWorkerLifecycleRefusalError } from '../services/worker-lifecycle.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
+import {
+  beginRecoveryStrategyEpoch,
+  classifyFailure,
+  executionTelemetrySummary,
+  nextMaterialApproach,
+  planSchedulerContinuity,
+  readRecoveryStrategyEpochs,
+  recordExecutionTelemetry,
+  recoveryRoute,
+  type FailureDomain,
+} from '../services/productive-autonomy.js';
 import { runTicket } from './spawn-morty.js';
 
 interface RunSequentialOptions {
@@ -108,11 +119,30 @@ async function runSequentialWithLease(
   });
 
   const summary = summarizeTickets(sessionDir);
+  let scheduledDiagnosticTicketId: string | null = null;
   if (!summary.total) {
     exitReason = 'no_tickets';
     appendRunnerLog(sessionDir, runnerMode, 'no tickets found in refinement manifest');
   } else if (!summary.runnable.length) {
-    exitReason = summary.done === summary.total ? 'success' : 'no_tickets';
+    if (summary.done !== summary.total && failureMode === 'retry') {
+      const repairing = new Set(summary.tickets
+        .filter((candidate) => String(candidate.status).toLowerCase() === 'blocked')
+        .map((candidate) => candidate.id));
+      const decision = planSchedulerContinuity(summary.tickets, repairing);
+      if (decision.kind === 'diagnostic' && decision.ticketId !== 'pipeline') {
+        scheduledDiagnosticTicketId = normalizeTicketId(decision.ticketId, decision.ticketId);
+        updateTicketStatus(sessionDir, decision.ticketId, {
+          status: 'Todo',
+          recovery_task: decision.task,
+          recovery_scheduled_at: new Date().toISOString(),
+        });
+        appendRunnerLog(sessionDir, runnerMode, `all tickets blocked; scheduled ${decision.task} for ${decision.ticketId}`);
+      } else {
+        exitReason = 'no_tickets';
+      }
+    } else {
+      exitReason = summary.done === summary.total ? 'success' : 'no_tickets';
+    }
     appendRunnerLog(
       sessionDir,
       runnerMode,
@@ -125,12 +155,17 @@ async function runSequentialWithLease(
       .filter((ticket) => !['done', 'skipped', 'blocked'].includes(String(ticket.status || '').trim().toLowerCase()))
       .map((ticket) => normalizeTicketId(ticket.id, ticket.id)),
   );
+  if (scheduledDiagnosticTicketId) pendingTicketIds.add(scheduledDiagnosticTicketId);
+  const repairingTicketIds = new Set<string>();
   while (pendingTicketIds.size > 0 && exitReason === 'success') {
     const currentSummary = summarizeTickets(sessionDir);
-    const ticket = currentSummary.tickets.find((candidate) => (
+    const runnable = (candidate: typeof currentSummary.tickets[number]): boolean => (
       pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
       && areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
-    ));
+    );
+    const ticket = currentSummary.tickets.find((candidate) => (
+      runnable(candidate) && !repairingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
+    )) || currentSummary.tickets.find(runnable);
     if (!ticket) {
       failedTicketId = [...pendingTicketIds][0] || null;
       exitReason = 'error';
@@ -141,9 +176,10 @@ async function runSequentialWithLease(
       break;
     }
     pendingTicketIds.delete(normalizeTicketId(ticket.id, ticket.id));
+    repairingTicketIds.delete(normalizeTicketId(ticket.id, ticket.id));
 
     const ticketStopReason = shouldStop(manager.read(statePath));
-    if (ticketStopReason) {
+    if (ticketStopReason && failureMode !== 'retry') {
       exitReason = ticketStopReason;
       appendRunnerLog(sessionDir, runnerMode, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
       break;
@@ -159,18 +195,38 @@ async function runSequentialWithLease(
       config.defaults.circuit_breaker.same_error_threshold,
     );
     const ticketFailureLimit = MAX_ADAPTIVE_TICKET_FAILURES;
+    let activeStrategyHash: string | null = null;
+    let activeRecoveryEpoch = readRecoveryStrategyEpochs(sessionDir)
+      .filter((epoch) => epoch.ticketId === ticket.id).length;
+    let latestFailureDomain: FailureDomain = 'infrastructure';
+    let yieldToScheduler = false;
 
-    const startAutomaticRecoveryEpoch = (reason: string): boolean => {
+    const startAutomaticRecoveryEpoch = (
+      reason: string,
+      trigger: 'failure' | 'retry_threshold' | 'time_threshold' | 'circuit_threshold' = 'retry_threshold',
+    ): boolean => {
       try {
+        const route = recoveryRoute(latestFailureDomain);
+        const priorEpochs = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticket.id).length;
+        const strategy = beginRecoveryStrategyEpoch(sessionDir, {
+          ticketId: ticket.id,
+          domain: latestFailureDomain,
+          handler: route.handler,
+          checkpoint: route.invalidate[0] || 'executor',
+          constraints: [reason],
+          materialApproach: nextMaterialApproach(latestFailureDomain, priorEpochs),
+        }, trigger);
         const authorization = authorizeTicketRecoveryEpoch(sessionDir, ticket.id, {
           authorizedBy: 'runner',
           reason,
         });
+        activeStrategyHash = strategy.strategyHash;
+        activeRecoveryEpoch = strategy.sequence;
         resetCircuitBreaker(sessionDir, `automatic recovery epoch ${authorization.sequence} for ${ticket.id}`);
         appendRunnerLog(
           sessionDir,
           runnerMode,
-          `ticket ${ticket.id} ${reason}; continuing in automatic recovery epoch ${authorization.sequence}`,
+          `ticket ${ticket.id} ${reason}; continuing in automatic recovery epoch ${authorization.sequence} strategy=${strategy.strategyHash}`,
         );
         return true;
       } catch (error) {
@@ -184,6 +240,16 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} could not start an automatic recovery epoch: ${detail}`);
         return false;
       }
+    };
+
+    const renewThresholdWindow = (reason: string): void => {
+      manager.update(statePath, (current) => {
+        markRunStart(current);
+        if (reason === 'max_iterations' && Number(current.max_iterations) > 0) {
+          current.max_iterations = Number(current.iteration || 0) + Number(current.max_iterations);
+        }
+        return current;
+      });
     };
 
     const decideRecovery = (
@@ -203,6 +269,12 @@ async function runSequentialWithLease(
           evidencePath: refusal?.artifactPath || null,
           remediationIdentity: refusal?.remediationIdentity || null,
         });
+        latestFailureDomain = classifyFailure({
+          kind: failureKind,
+          phase: refusal?.phase || manager.read(statePath).step as string | undefined,
+          message,
+        });
+        const route = recoveryRoute(latestFailureDomain);
         let event;
         try {
           event = recordTicketRecoveryFailure({
@@ -210,6 +282,8 @@ async function runSequentialWithLease(
             ticketId: ticket.id,
             failureKind,
             identity,
+            route,
+            strategyHash: activeStrategyHash,
           });
         } catch (historyError) {
           const reason = historyError instanceof Error ? historyError.message : String(historyError);
@@ -228,6 +302,11 @@ async function runSequentialWithLease(
           identity.signature,
         );
         const ticketFailureCount = getTicketRecoveryUsage(sessionDir, ticket.id).ticketFailureCount;
+        yieldToScheduler = currentSummary.tickets.some((candidate) => (
+          normalizeTicketId(candidate.id, candidate.id) !== normalizeTicketId(ticket.id, ticket.id)
+          && pendingTicketIds.has(normalizeTicketId(candidate.id, candidate.id))
+          && areTicketDependenciesSatisfied(candidate, currentSummary.tickets)
+        ));
         const lineageExhausted = config.defaults.circuit_breaker.enabled
           && lineageOccurrences >= unchangedLimit;
         adaptiveExhausted = lineageExhausted || ticketFailureCount >= ticketFailureLimit;
@@ -261,7 +340,7 @@ async function runSequentialWithLease(
         const reason = adaptiveExitReason === 'recovery_exhausted'
           ? `exhausted durable recovery budget ${ticketFailureLimit}/${ticketFailureLimit}`
           : `exhausted recovery lineage window ${unchangedLimit}/${unchangedLimit}`;
-        if (!startAutomaticRecoveryEpoch(reason)) {
+        if (!startAutomaticRecoveryEpoch(reason, adaptiveExitReason === 'circuit_open' ? 'circuit_threshold' : 'retry_threshold')) {
           return {
             action: 'abort' as const,
             exitReason: 'recovery_required',
@@ -287,6 +366,14 @@ async function runSequentialWithLease(
       const latestState = manager.read(statePath);
       const stopReason = shouldStop(latestState);
       if (stopReason) {
+        if (
+          failureMode === 'retry'
+          && (stopReason === 'max_time' || stopReason === 'max_iterations')
+          && startAutomaticRecoveryEpoch(`crossed ${stopReason} strategy threshold`, 'time_threshold')
+        ) {
+          renewThresholdWindow(stopReason);
+          continue;
+        }
         exitReason = stopReason;
         appendRunnerLog(sessionDir, runnerMode, `stopping during ticket ${ticket.id}: ${stopReason}`);
         break;
@@ -331,6 +418,7 @@ async function runSequentialWithLease(
       }
 
       attempts += 1;
+      const attemptStartedAt = Date.now();
       try {
         appendRunnerLog(
           sessionDir,
@@ -342,6 +430,21 @@ async function runSequentialWithLease(
           runnerMode,
         });
         if (result.status === 'done') {
+          recordExecutionTelemetry(sessionDir, {
+            ticket_id: ticket.id,
+            phase: 'ticket',
+            ticket_attempt: attempts,
+            phase_attempt: attempts,
+            recovery_epoch: activeRecoveryEpoch,
+            strategy_hash: activeStrategyHash,
+            outcome: 'success',
+            duration_ms: Date.now() - attemptStartedAt,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            productive_work: result.applied ? 1 : 0,
+            discarded_work: 0,
+          });
           scrubTicketWorkerMessages(sessionDir, normalizeTicketId(ticket.id, ticket.id));
           ticket.status = 'Done';
           appendRunnerLog(sessionDir, runnerMode, `completed ticket ${ticket.id}`);
@@ -352,8 +455,30 @@ async function runSequentialWithLease(
         // ticket is only ever marked Done when the oracle accepted it.
         appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} not completed: oracle refusal ${result.reason ?? result.status}`);
         const refusalMessage = `oracle refusal ${result.reason ?? result.status}`;
+        recordExecutionTelemetry(sessionDir, {
+          ticket_id: ticket.id,
+          phase: 'promote',
+          ticket_attempt: attempts,
+          phase_attempt: attempts,
+          recovery_epoch: activeRecoveryEpoch,
+          strategy_hash: activeStrategyHash,
+          outcome: 'failed',
+          duration_ms: Date.now() - attemptStartedAt,
+          input_tokens: 0,
+          cached_input_tokens: 0,
+          output_tokens: 0,
+          productive_work: 0,
+          discarded_work: result.applied ? 1 : 0,
+        });
         const recovery = decideRecovery('oracle_refusal', refusalMessage);
         if (recovery.action === 'retry') {
+          if (yieldToScheduler) {
+            const normalized = normalizeTicketId(ticket.id, ticket.id);
+            pendingTicketIds.add(normalized);
+            repairingTicketIds.add(normalized);
+            appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} entered repair; yielding to dependency-ready work`);
+            break;
+          }
           continue;
         }
         if (recovery.action === 'skip') {
@@ -368,6 +493,21 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} aborting on ${ticket.id}`);
         break;
       } catch (error) {
+        recordExecutionTelemetry(sessionDir, {
+          ticket_id: ticket.id,
+          phase: String(manager.read(statePath).step || 'ticket'),
+          ticket_attempt: attempts,
+          phase_attempt: attempts,
+          recovery_epoch: activeRecoveryEpoch,
+          strategy_hash: activeStrategyHash,
+          outcome: manager.read(statePath).active === false ? 'cancelled' : 'failed',
+          duration_ms: Date.now() - attemptStartedAt,
+          input_tokens: 0,
+          cached_input_tokens: 0,
+          output_tokens: 0,
+          productive_work: 0,
+          discarded_work: 1,
+        });
         const cancelled = manager.read(statePath).active === false;
         if (cancelled) {
           exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
@@ -375,12 +515,38 @@ async function runSequentialWithLease(
           break;
         }
         if (isPreflightError(error)) {
+          if (failureMode === 'retry') {
+            const recovery = decideRecovery('preflight', (error as Error).message, error);
+            if (recovery.action === 'retry') {
+              if (yieldToScheduler) {
+                const normalized = normalizeTicketId(ticket.id, ticket.id);
+                pendingTicketIds.add(normalized);
+                repairingTicketIds.add(normalized);
+                break;
+              }
+              appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight routed to autonomous contract repair`);
+              continue;
+            }
+          }
           failedTicketId = ticket.id;
           exitReason = (error as { kind: string }).kind;
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} preflight blocked: ${(error as Error).message}`);
           break;
         }
         if (isVerificationContractError(error)) {
+          if (failureMode === 'retry') {
+            const recovery = decideRecovery('verification_contract', (error as Error).message, error);
+            if (recovery.action === 'retry') {
+              if (yieldToScheduler) {
+                const normalized = normalizeTicketId(ticket.id, ticket.id);
+                pendingTicketIds.add(normalized);
+                repairingTicketIds.add(normalized);
+                break;
+              }
+              appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract routed to autonomous contract repair`);
+              continue;
+            }
+          }
           failedTicketId = ticket.id;
           exitReason = (error as { kind: string }).kind;
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} verification contract blocked: ${(error as Error).message}`);
@@ -391,6 +557,13 @@ async function runSequentialWithLease(
         const failureMessage = error instanceof Error ? error.message : String(error);
         const recovery = decideRecovery('worker_failure', failureMessage, error);
         if (recovery.action === 'retry') {
+          if (yieldToScheduler) {
+            const normalized = normalizeTicketId(ticket.id, ticket.id);
+            pendingTicketIds.add(normalized);
+            repairingTicketIds.add(normalized);
+            appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} entered repair; yielding to dependency-ready work`);
+            break;
+          }
           continue;
         }
         if (recovery.action === 'skip') {
@@ -427,6 +600,12 @@ async function runSequentialWithLease(
   }
 
   appendRunnerLog(sessionDir, runnerMode, `${runnerLabel} finished: ${finalReason}`);
+  const telemetry = executionTelemetrySummary(sessionDir);
+  appendRunnerLog(
+    sessionDir,
+    runnerMode,
+    `telemetry ticket_attempts=${telemetry.ticketAttempts} phase_attempts=${telemetry.phaseAttempts} recovery_epochs=${telemetry.recoveryEpochs} productive=${telemetry.productiveWork} discarded=${telemetry.discardedWork}`,
+  );
   return finalReason;
 }
 
