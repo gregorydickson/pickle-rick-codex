@@ -95,9 +95,19 @@ function buildOwnedSnapshot(
   const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-owned-recovery-'));
   const indexPath = path.join(temporaryDir, 'index');
   const env = { GIT_INDEX_FILE: indexPath };
+  const repoRoot = fs.realpathSync(git(workingDir, ['rev-parse', '--show-toplevel']));
   try {
     git(workingDir, ['read-tree', currentHead], env);
     for (const ownedPath of ownedPaths) {
+      let existsInWorktree = true;
+      try { fs.lstatSync(path.join(repoRoot, ownedPath)); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') existsInWorktree = false;
+        else throw error;
+      }
+      const existsInCurrentHead = git(workingDir, ['ls-tree', '-z', currentHead, '--', ownedPath]).length > 0;
+      // A rename source absent from both the attempted commit and worktree is
+      // already represented correctly by the temp index seeded from currentHead.
+      if (!existsInWorktree && !existsInCurrentHead) continue;
       git(workingDir, ['add', '-A', '--', ownedPath], env);
     }
     const tree = git(workingDir, ['write-tree'], env);

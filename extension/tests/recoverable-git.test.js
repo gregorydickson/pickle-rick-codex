@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DestructiveGitSafetyError, recoverableHardReset } from '../services/recoverable-git.js';
+import { listChangedPathsSince } from '../services/git-utils.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -103,4 +104,39 @@ test('recoverable hard reset aborts when the recovery ref cannot be anchored', (
   assert.equal(git(cwd, ['rev-parse', 'HEAD']), attempted);
   assert.equal(fs.readFileSync(path.join(cwd, 'unrelated.txt'), 'utf8'), 'injected tracked work\n');
   assert.equal(fs.readFileSync(path.join(cwd, 'injected.txt'), 'utf8'), 'injected untracked work\n');
+});
+
+test('path-scoped recovery restores both sides of a committed rename with unusual names', () => {
+  const cwd = repo();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-recovery-rename-'));
+  const baseline = git(cwd, ['rev-parse', 'HEAD']);
+  const source = 'old odd [name].txt';
+  const destination = 'new odd [name].txt';
+  const unrelatedUntracked = 'user odd [draft].txt';
+  fs.writeFileSync(path.join(cwd, source), 'rename evidence\n');
+  git(cwd, ['add', source]);
+  git(cwd, ['commit', '-m', 'add rename source']);
+  const renameBaseline = git(cwd, ['rev-parse', 'HEAD']);
+  git(cwd, ['mv', source, destination]);
+  git(cwd, ['commit', '-m', 'rename attempt']);
+  fs.writeFileSync(path.join(cwd, 'unrelated.txt'), 'injected unrelated work\n');
+  fs.writeFileSync(path.join(cwd, unrelatedUntracked), 'injected untracked work\n');
+
+  const changed = listChangedPathsSince(cwd, renameBaseline);
+  assert.ok(changed.includes(source));
+  assert.ok(changed.includes(destination));
+  recoverableHardReset({
+    workingDir: cwd,
+    sessionDir,
+    targetHead: renameBaseline,
+    operation: 'rename-reset',
+    ownedPaths: changed.filter((candidate) => candidate === source || candidate === destination),
+  });
+
+  assert.notEqual(git(cwd, ['rev-parse', 'HEAD']), baseline);
+  assert.equal(git(cwd, ['rev-parse', 'HEAD']), renameBaseline);
+  assert.equal(fs.readFileSync(path.join(cwd, source), 'utf8'), 'rename evidence\n');
+  assert.equal(fs.existsSync(path.join(cwd, destination)), false);
+  assert.equal(fs.readFileSync(path.join(cwd, 'unrelated.txt'), 'utf8'), 'injected unrelated work\n');
+  assert.equal(fs.readFileSync(path.join(cwd, unrelatedUntracked), 'utf8'), 'injected untracked work\n');
 });
