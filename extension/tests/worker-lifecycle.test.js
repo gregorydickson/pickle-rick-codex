@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile } from '../services/pickle-utils.js';
+import { beginRecoveryStrategyEpoch, readUnresolvedRecoveryStrategyEpochs } from '../services/productive-autonomy.js';
 import {
   WORKER_LIFECYCLE_PHASES,
   WorkerLifecycleRefusalError,
@@ -116,6 +117,10 @@ test('worker lifecycle persists eight validated phases and reads approved resear
     FAKE_LIFECYCLE_PROMPT_LOG: promptLog,
   });
   const { projectDir, sessionDir, baseline } = setupLifecycleRun(env);
+  beginRecoveryStrategyEpoch(sessionDir, {
+    ticketId: 'r1', domain: 'review', handler: 'remediate_candidate', checkpoint: 'implement',
+    constraints: ['prior refusal'], materialApproach: 'apply-review-findings-to-candidate',
+  }, 'failure');
 
   runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir });
 
@@ -151,6 +156,7 @@ test('worker lifecycle persists eight validated phases and reads approved resear
   }
   assert.equal(fs.existsSync(path.join(sessionDir, 'refinement-repository-advance.json')), false);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');
+  assert.deepEqual(readUnresolvedRecoveryStrategyEpochs(sessionDir, 'r1'), []);
 });
 
 test('low-risk lifecycle records a policy skip without invoking simplification', () => {
@@ -246,6 +252,10 @@ test('deterministic verification fails immediately after implement before review
   manifest.tickets[0].verification = [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(23)'] }];
   writeJson(manifestPath, manifest);
   acceptTestRefinement(sessionDir, projectDir);
+  beginRecoveryStrategyEpoch(sessionDir, {
+    ticketId: 'r1', domain: 'verification', handler: 'repair_verification', checkpoint: 'implement',
+    constraints: ['verification failed'], materialApproach: 'isolate-failing-obligation',
+  }, 'failure');
 
   assert.throws(
     () => runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], { env, cwd: projectDir }),
@@ -262,6 +272,7 @@ test('deterministic verification fails immediately after implement before review
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
   assert.notEqual(ticket.status, 'Done');
   assert.equal(ticket.frontmatter.completion_commit, undefined);
+  assert.equal(readUnresolvedRecoveryStrategyEpochs(sessionDir, 'r1').length, 1);
 });
 
 test('worker completion source encodes the literal implement<verify<review<conformance<quality<promote trace', () => {

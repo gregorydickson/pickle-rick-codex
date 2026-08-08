@@ -88,7 +88,7 @@ import {
   verificationStepCommand,
   VerificationContractError,
 } from '../services/verification-env.js';
-import type { RecoveryStrategyEpoch } from '../services/productive-autonomy.js';
+import { recordRecoveryStrategyProgress, type RecoveryStrategyEpoch } from '../services/productive-autonomy.js';
 import {
   buildVerificationFailureSet,
   isPipelineSession,
@@ -877,6 +877,15 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       },
     });
     clearRejectedCandidateCheckpoint(sessionDir, normalizedTicketId);
+    try {
+      recordRecoveryStrategyProgress(sessionDir, normalizedTicketId, 'ticket completion passed deterministic verification and completion evidence');
+    } catch (error) {
+      appendRunnerLog(
+        sessionDir,
+        runnerMode,
+        `ticket ${normalizedTicketId} completed but recovery strategy progress could not be recorded: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     try {
       logActivity({
         event: 'ticket_completed',

@@ -75,6 +75,15 @@ export interface RecoveryStrategyEpoch extends RecoveryStrategyInput {
 interface RecoveryStrategyJournal {
   schema_version: 1;
   epochs: RecoveryStrategyEpoch[];
+  progress?: RecoveryStrategyProgress[];
+}
+
+export interface RecoveryStrategyProgress {
+  sequence: number;
+  ticketId: string;
+  afterEpochSequence: number;
+  evidence: string;
+  recordedAt: string;
 }
 
 export interface ExecutionTelemetryEvent {
@@ -305,18 +314,48 @@ export function materialStrategyHash(input: RecoveryStrategyInput): string {
   return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
+function readRecoveryStrategyJournal(sessionDir: string): RecoveryStrategyJournal {
+  const journal = readJournal<RecoveryStrategyJournal>(strategyPath(sessionDir), { schema_version: 1, epochs: [] });
+  if (journal.schema_version !== 1 || !Array.isArray(journal.epochs) || (journal.progress !== undefined && !Array.isArray(journal.progress))) {
+    throw new Error('recovery-strategy-corrupt');
+  }
+  for (let index = 0; index < journal.epochs.length; index += 1) {
+    const epoch = journal.epochs[index];
+    if (!epoch || epoch.sequence !== index + 1 || typeof epoch.ticketId !== 'string'
+      || !/^[0-9a-f]{64}$/.test(String(epoch.strategyHash || ''))) throw new Error('recovery-strategy-corrupt');
+  }
+  const progressBoundaries = new Map<string, number>();
+  for (let index = 0; index < (journal.progress || []).length; index += 1) {
+    const event = journal.progress![index];
+    const boundary = journal.epochs.find((epoch) => epoch.sequence === event?.afterEpochSequence);
+    const previousBoundary = progressBoundaries.get(event?.ticketId || '') || 0;
+    if (!event || event.sequence !== index + 1 || typeof event.ticketId !== 'string' || !event.ticketId.trim()
+      || !boundary || boundary.ticketId !== event.ticketId || typeof event.evidence !== 'string' || !event.evidence.trim()
+      || event.afterEpochSequence <= previousBoundary
+      || typeof event.recordedAt !== 'string' || !Number.isFinite(Date.parse(event.recordedAt))) {
+      throw new Error('recovery-strategy-corrupt');
+    }
+    progressBoundaries.set(event.ticketId, event.afterEpochSequence);
+  }
+  return journal;
+}
+
 export function beginRecoveryStrategyEpoch(
   sessionDir: string,
   input: RecoveryStrategyInput,
   trigger: RecoveryStrategyEpoch['trigger'],
 ): RecoveryStrategyEpoch {
   const filePath = strategyPath(sessionDir);
-  const journal = readJournal<RecoveryStrategyJournal>(filePath, { schema_version: 1, epochs: [] });
-  if (journal.schema_version !== 1 || !Array.isArray(journal.epochs)) throw new Error('recovery-strategy-corrupt');
+  const journal = readRecoveryStrategyJournal(sessionDir);
   const strategyHash = materialStrategyHash(input);
-  const previous = [...journal.epochs].reverse().find((epoch) => epoch.ticketId === input.ticketId);
-  if (previous?.strategyHash === strategyHash) {
-    throw new Error(`recovery-strategy-not-novel: ticket ${input.ticketId} repeated ${strategyHash}`);
+  const progressBoundary = [...(journal.progress || [])]
+    .reverse()
+    .find((event) => event.ticketId === input.ticketId)?.afterEpochSequence ?? 0;
+  const unresolved = journal.epochs.filter((epoch) => (
+    epoch.ticketId === input.ticketId && epoch.sequence > progressBoundary
+  ));
+  if (unresolved.some((epoch) => epoch.strategyHash === strategyHash)) {
+    throw new Error(`recovery-strategy-not-novel: ticket ${input.ticketId} reused unresolved strategy ${strategyHash}`);
   }
   const epoch: RecoveryStrategyEpoch = {
     ...input,
@@ -325,12 +364,44 @@ export function beginRecoveryStrategyEpoch(
     startedAt: new Date().toISOString(),
     trigger,
   };
-  atomicWriteJson(filePath, { schema_version: 1, epochs: [...journal.epochs, epoch] });
+  atomicWriteJson(filePath, { ...journal, schema_version: 1, epochs: [...journal.epochs, epoch] });
   return epoch;
 }
 
 export function readRecoveryStrategyEpochs(sessionDir: string): RecoveryStrategyEpoch[] {
-  return readJournal<RecoveryStrategyJournal>(strategyPath(sessionDir), { schema_version: 1, epochs: [] }).epochs;
+  return readRecoveryStrategyJournal(sessionDir).epochs;
+}
+
+export function readUnresolvedRecoveryStrategyEpochs(sessionDir: string, ticketId: string): RecoveryStrategyEpoch[] {
+  const journal = readRecoveryStrategyJournal(sessionDir);
+  const boundary = [...(journal.progress || [])]
+    .reverse()
+    .find((event) => event.ticketId === ticketId)?.afterEpochSequence ?? 0;
+  return journal.epochs.filter((epoch) => epoch.ticketId === ticketId && epoch.sequence > boundary);
+}
+
+export function recordRecoveryStrategyProgress(
+  sessionDir: string,
+  ticketId: string,
+  evidence: string,
+): RecoveryStrategyProgress | null {
+  const filePath = strategyPath(sessionDir);
+  const journal = readRecoveryStrategyJournal(sessionDir);
+  const latestEpoch = [...journal.epochs].reverse().find((epoch) => epoch.ticketId === ticketId);
+  if (!latestEpoch) return null;
+  const prior = [...(journal.progress || [])].reverse().find((event) => event.ticketId === ticketId);
+  if (prior && prior.afterEpochSequence >= latestEpoch.sequence) return prior;
+  const event: RecoveryStrategyProgress = {
+    sequence: (journal.progress || []).length + 1,
+    ticketId,
+    afterEpochSequence: latestEpoch.sequence,
+    evidence: evidence.trim() || 'verified ticket completion',
+    recordedAt: new Date().toISOString(),
+  };
+  atomicWriteJson(filePath, { ...journal, schema_version: 1, progress: [...(journal.progress || []), event] });
+  const persisted = readRecoveryStrategyJournal(sessionDir).progress?.at(-1);
+  if (!persisted || JSON.stringify(persisted) !== JSON.stringify(event)) throw new Error('recovery-strategy-corrupt');
+  return persisted;
 }
 
 export function nextMaterialApproach(domain: FailureDomain, priorEpochs: number): string {

@@ -9,9 +9,12 @@ import {
   classifyAutonomousFailure,
   classifyFailure,
   executionTelemetrySummary,
+  materialStrategyHash,
   nextMaterialApproach,
   planSchedulerContinuity,
   readRecoveryStrategyEpochs,
+  readUnresolvedRecoveryStrategyEpochs,
+  recordRecoveryStrategyProgress,
   recordExecutionControlTelemetry,
   recordExecutionTelemetry,
   recordUnexpectedNoncompletionTermination,
@@ -112,6 +115,56 @@ test('strategy epochs reject consecutive identity and produce three materially d
 
   assert.equal(new Set([first.strategyHash, second.strategyHash, third.strategyHash]).size, 3);
   assert.equal(readRecoveryStrategyEpochs(sessionDir).length, 3);
+});
+
+test('strategy epochs reject A-B-A reuse across restart until verified progress resets the lineage', () => {
+  const sessionDir = makeTempRoot('pickle-strategy-lineage-');
+  const base = {
+    ticketId: 'r1', domain: 'review', handler: 'remediate_candidate', checkpoint: 'implement',
+    constraints: ['same unresolved refusal'],
+  };
+  const strategyA = { ...base, materialApproach: 'approach-a' };
+  const strategyB = { ...base, materialApproach: 'approach-b' };
+  const firstA = beginRecoveryStrategyEpoch(sessionDir, strategyA, 'failure');
+  beginRecoveryStrategyEpoch(sessionDir, strategyB, 'retry_threshold');
+
+  beginRecoveryStrategyEpoch(sessionDir, { ...strategyA, ticketId: 'r2' }, 'failure');
+  recordRecoveryStrategyProgress(sessionDir, 'r2', 'unrelated ticket completed');
+
+  assert.throws(
+    () => beginRecoveryStrategyEpoch(sessionDir, strategyA, 'circuit_threshold'),
+    new RegExp(`reused unresolved strategy ${firstA.strategyHash}`),
+  );
+  assert.deepEqual(readUnresolvedRecoveryStrategyEpochs(sessionDir, 'r1').map((epoch) => epoch.strategyHash), [
+    firstA.strategyHash,
+    materialStrategyHash(strategyB),
+  ]);
+
+  const progress = recordRecoveryStrategyProgress(sessionDir, 'r1', 'ticket completed after deterministic verification');
+  assert.equal(progress?.afterEpochSequence, 2);
+  assert.deepEqual(readUnresolvedRecoveryStrategyEpochs(sessionDir, 'r1'), []);
+  const reusedA = beginRecoveryStrategyEpoch(sessionDir, strategyA, 'failure');
+  assert.equal(reusedA.strategyHash, firstA.strategyHash);
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'recovery-strategies.json'), 'utf8'));
+  assert.deepEqual(persisted.progress.map((event) => event.ticketId), ['r2', 'r1']);
+  assert.equal(readRecoveryStrategyEpochs(sessionDir).length, 4);
+});
+
+test('strategy progress history fails closed when a persisted reset boundary is corrupt', () => {
+  const sessionDir = makeTempRoot('pickle-strategy-corrupt-progress-');
+  beginRecoveryStrategyEpoch(sessionDir, {
+    ticketId: 'r1', domain: 'review', handler: 'remediate_candidate', checkpoint: 'implement',
+    constraints: ['refusal'], materialApproach: 'approach-a',
+  }, 'failure');
+  const journalPath = path.join(sessionDir, 'recovery-strategies.json');
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  journal.progress = [{
+    sequence: 1, ticketId: 'r1', afterEpochSequence: 99, evidence: 'invented progress',
+    recordedAt: new Date().toISOString(),
+  }];
+  fs.writeFileSync(journalPath, JSON.stringify(journal));
+  assert.throws(() => readRecoveryStrategyEpochs(sessionDir), /recovery-strategy-corrupt/);
 });
 
 test('scheduler continues independent work and emits diagnostic work when all tickets repair', () => {

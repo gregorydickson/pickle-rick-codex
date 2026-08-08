@@ -36,7 +36,7 @@ import {
   executionTelemetrySummary,
   nextMaterialApproach,
   planSchedulerContinuity,
-  readRecoveryStrategyEpochs,
+  readUnresolvedRecoveryStrategyEpochs,
   recordExecutionControlTelemetry,
   recoveryRoute,
   recoveryExecutionAction,
@@ -159,7 +159,7 @@ async function runSequentialWithLease(
     if (!invalidTicket?.id) throw error;
     const ticketId = normalizeTicketId(String(invalidTicket.id), 'contract-repair');
     const route = recoveryRoute('contract');
-    const priorEpochs = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticketId).length;
+    const priorEpochs = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticketId).length;
     const strategy = beginRecoveryStrategyEpoch(sessionDir, {
       ticketId, domain: 'contract', handler: route.handler, checkpoint: route.invalidate[0] || 'prepare',
       constraints: [(error as Error).message], materialApproach: nextMaterialApproach('contract', priorEpochs),
@@ -245,7 +245,7 @@ async function runSequentialWithLease(
       config.defaults.circuit_breaker.same_error_threshold,
     );
     const ticketFailureLimit = MAX_ADAPTIVE_TICKET_FAILURES;
-    const priorTicketStrategies = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticket.id);
+    const priorTicketStrategies = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticket.id);
     let activeStrategy: RecoveryStrategyEpoch | null = priorTicketStrategies.at(-1) || null;
     let activeStrategyHash: string | null = activeStrategy?.strategyHash || null;
     let activeRecoveryEpoch = priorTicketStrategies.length;
@@ -275,7 +275,7 @@ async function runSequentialWithLease(
         }
         pendingContractRepair = executionAction === 'repair_contract';
         recordExecutionControlTelemetry(sessionDir, { checkpoints_invalidated: route.invalidate.length });
-        const priorEpochs = readRecoveryStrategyEpochs(sessionDir).filter((epoch) => epoch.ticketId === ticket.id).length;
+        const priorEpochs = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticket.id).length;
         const strategy = beginRecoveryStrategyEpoch(sessionDir, {
           ticketId: ticket.id,
           domain: latestFailureDomain,
