@@ -115,6 +115,36 @@ test('structured verification realpath-confines cwd to repository and session ro
   }
 });
 
+test('shell verification confines cd and pushd transitions while preserving in-repo directory changes', () => {
+  const root = makeTempRoot('pickle-verification-shell-cwd-');
+  const repo = path.join(root, 'repo');
+  const inside = path.join(repo, 'inside');
+  const outside = path.join(root, 'outside');
+  fs.mkdirSync(inside, { recursive: true });
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(repo, 'escape-link'));
+  for (const script of [
+    'cd inside && node --version',
+    'pushd inside && node --version && popd',
+  ]) {
+    assert.doesNotThrow(() => ready({
+      id: 'safe-shell-cwd', verification: [{ kind: 'shell', script, justification: 'multi-command verification' }],
+    }, repo));
+  }
+  for (const script of [
+    'cd ../outside && node --version',
+    `cd ${outside} && node --version`,
+    'pushd escape-link && node --version',
+  ]) {
+    assert.throws(() => ready({
+      id: 'unsafe-shell-cwd', verification: [{ kind: 'shell', script, justification: 'multi-command verification' }],
+    }, repo), /escapes repository\/session roots|dynamic or implicit cwd/);
+  }
+  assert.throws(() => assertVerificationStepSafe({
+    kind: 'shell', script: 'cd "$DYNAMIC_ROOT" && node --version', justification: 'multi-command verification',
+  }, { cwd: repo }), /dynamic or implicit cwd/);
+});
+
 test('structured process policy rejects destructive executables, git mutations, and shell wrappers', () => {
   const repo = makeTempRoot('pickle-verification-process-');
   const forbidden = [
@@ -125,6 +155,7 @@ test('structured process policy rejects destructive executables, git mutations, 
     { executable: 'git', args: ['stash', 'push'] },
     { executable: '/bin/bash', args: ['-lc', 'rm -rf build'] },
     { executable: '/usr/bin/env', args: ['bash', '-c', 'git reset --hard HEAD'] },
+    { executable: '/usr/bin/env', args: ['-S', 'bash -c "rm -rf build"'] },
   ];
   for (const command of forbidden) {
     assert.throws(
@@ -139,6 +170,35 @@ test('structured process policy rejects destructive executables, git mutations, 
       { kind: 'process', executable: process.execPath, args: ['-e', 'process.exit(0)', 'rm -rf is inert argv'] },
       { kind: 'process', executable: 'git', args: ['diff', '--check'] },
     ],
+  }, repo));
+});
+
+test('shell and package lifecycle policy unwraps command and env before destructive checks', () => {
+  const repo = makeTempRoot('pickle-verification-shell-wrapper-');
+  for (const script of [
+    'command rm -rf build',
+    'command -p rm -rf build',
+    'env rm -rf build',
+    'command git reset --hard HEAD',
+    'if true; then command rm -rf build; fi',
+    '{ command rm -rf build; }',
+  ]) {
+    assert.throws(() => ready({
+      id: 'unsafe-wrapper', verification: [{ kind: 'shell', script, justification: 'legacy verification' }],
+    }, repo), /invalid structured verification step|forbidden by verification policy|not permitted in verification/);
+  }
+
+  const packagePath = path.join(repo, 'package.json');
+  for (const script of ['command rm -rf build', 'env git reset --hard HEAD', 'cd ../outside && node --version']) {
+    fs.writeFileSync(packagePath, JSON.stringify({ scripts: { test: script } }));
+    assert.throws(() => ready({
+      id: 'unsafe-package-wrapper', verification: [{ kind: 'package_script', manager: 'npm', script: 'test' }],
+    }, repo), /package lifecycle script test.*(?:not permitted|escapes repository\/session roots)/);
+  }
+  fs.writeFileSync(packagePath, JSON.stringify({ scripts: { test: 'node --version' } }));
+  assert.doesNotThrow(() => ready({
+    id: 'safe-command-query',
+    verification: [{ kind: 'shell', script: 'command -v node', justification: 'resolve verifier' }],
   }, repo));
 });
 
@@ -158,6 +218,28 @@ test('package verification validates script existence and lifecycle bodies befor
   }
   fs.writeFileSync(packagePath, JSON.stringify({ scripts: { pretest: 'git clean -fdx', test: 'node --version' } }));
   assert.throws(() => assertVerificationStepSafe(safe, { cwd: repo }), /pretest.*forbidden/);
+});
+
+test('package-manager cwd flags are contained regardless of placement and forwarded flags remain argv', () => {
+  const root = makeTempRoot('pickle-verification-package-flags-');
+  const repo = path.join(root, 'repo');
+  const outside = path.join(root, 'outside');
+  fs.mkdirSync(repo);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ scripts: { test: 'node --version' } }));
+  fs.writeFileSync(path.join(outside, 'package.json'), JSON.stringify({ scripts: { test: 'node --version' } }));
+  for (const step of [
+    { kind: 'process', executable: 'npm', args: ['--prefix', outside, 'run', 'test'] },
+    { kind: 'process', executable: 'npm', args: ['run', '--prefix', outside, 'test'] },
+    { kind: 'process', executable: 'npm', args: ['run', 'test', '--prefix', outside] },
+    { kind: 'process', executable: 'pnpm', args: ['run', 'test', '--dir', outside] },
+    { kind: 'process', executable: 'yarn', args: ['run', 'test', '--cwd', outside] },
+  ]) {
+    assert.throws(() => assertVerificationStepSafe(step, { cwd: repo }), /package verification cwd escapes/);
+  }
+  assert.doesNotThrow(() => assertVerificationStepSafe({
+    kind: 'process', executable: 'npm', args: ['run', 'test', '--', '--prefix', '../outside'],
+  }, { cwd: repo }));
 });
 
 test('structured verification rejects malformed fields and control-word shell mutations', () => {

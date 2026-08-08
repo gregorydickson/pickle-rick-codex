@@ -276,7 +276,7 @@ function splitShellSegments(command: string): string[] {
       current += char + command[++index];
       continue;
     }
-    if (char === ';' || char === '\n' || char === '|' || (char === '&' && next === '&')) {
+    if (char === ';' || char === '\n' || char === '|' || char === '&' || char === '(' || char === ')') {
       if (current.trim()) segments.push(current.trim());
       current = '';
       if ((char === '|' && next === '|') || (char === '&' && next === '&')) index += 1;
@@ -310,12 +310,16 @@ function hasUnquotedGlob(command: string): boolean {
   return false;
 }
 
-const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'printf', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
-const SHELL_RESERVED_WITHOUT_COMMAND = new Set(['for', 'select', 'case', 'done', 'fi', 'esac', 'in', 'function', '{', '}']);
-const SHELL_RESERVED_COMMAND_PREFIXES = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', 'time']);
+const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'command', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'popd', 'printf', 'pushd', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
+const SHELL_RESERVED_WITHOUT_COMMAND = new Set(['for', 'select', 'case', 'done', 'fi', 'esac', 'in', 'function', '}']);
+const SHELL_RESERVED_COMMAND_PREFIXES = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', 'time', '{']);
 
 function commandExecutable(segment: string): string | null {
-  const tokens = tokenizeShellWords(segment);
+  return shellCommandDescriptor(segment)?.executable || null;
+}
+
+function shellCommandDescriptor(segment: string): { executable: string; args: string[] } | null {
+  let tokens = tokenizeShellWords(segment);
   let index = 0;
   if (SHELL_RESERVED_WITHOUT_COMMAND.has(tokens[index])) return null;
   while (SHELL_RESERVED_COMMAND_PREFIXES.has(tokens[index])) {
@@ -327,10 +331,24 @@ function commandExecutable(segment: string): string | null {
   }
   while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
   while (['command', 'env', 'exec'].includes(tokens[index])) {
+    const wrapper = tokens[index];
     index += 1;
-    while (index < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index]) || tokens[index].startsWith('-'))) index += 1;
+    if (wrapper === 'command') {
+      while (tokens[index]?.startsWith('-')) {
+        if (/[vV]/.test(tokens[index])) return { executable: 'command', args: tokens.slice(index) };
+        index += 1;
+      }
+    }
+    if (wrapper === 'env') {
+      const envArgs = unwrapEnvCommand(tokens.slice(index));
+      if (!envArgs) return { executable: 'env', args: tokens.slice(index) };
+      tokens = envArgs;
+      index = 0;
+      continue;
+    }
+    while (index < tokens.length && tokens[index] === '--') index += 1;
   }
-  return tokens[index] || null;
+  return tokens[index] ? { executable: tokens[index], args: tokens.slice(index + 1) } : null;
 }
 
 function executableExists(executable: string, cwd: string, env: Record<string, string | undefined>): boolean {
@@ -394,13 +412,15 @@ function shellWrapperScript(executable: string, args: string[]): string | null {
 
 function packageInvocationArgs(manager: string, args: string[], cwd: string): { cwd: string; commandArgs: string[] } {
   let packageCwd = cwd;
-  let index = 0;
   const cwdFlags = manager === 'npm' ? new Set(['--prefix']) : new Set(['--dir', '-C', '--cwd']);
-  while (index < args.length) {
-    const arg = args[index];
-    if (cwdFlags.has(arg) && args[index + 1]) {
-      packageCwd = path.resolve(cwd, args[index + 1]);
-      index += 2;
+  const commandArgs: string[] = [];
+  const separatorIndex = args.indexOf('--');
+  const managerArgs = separatorIndex >= 0 ? args.slice(0, separatorIndex) : args;
+  for (let index = 0; index < managerArgs.length; index += 1) {
+    const arg = managerArgs[index];
+    if (cwdFlags.has(arg) && managerArgs[index + 1]) {
+      packageCwd = path.resolve(cwd, managerArgs[index + 1]);
+      index += 1;
       continue;
     }
     const cwdAssignment = [...cwdFlags].find((flag) => arg.startsWith(`${flag}=`));
@@ -409,20 +429,47 @@ function packageInvocationArgs(manager: string, args: string[], cwd: string): { 
       index += 1;
       continue;
     }
-    if (['--filter', '--workspace', '-w'].includes(arg) && args[index + 1]) {
-      index += 2;
-      continue;
-    }
-    if (arg.startsWith('-')) {
+    if (['--filter', '--workspace', '-w'].includes(arg) && managerArgs[index + 1]) {
       index += 1;
       continue;
     }
-    break;
+    commandArgs.push(arg);
   }
-  return { cwd: packageCwd, commandArgs: args.slice(index) };
+  while (commandArgs[0]?.startsWith('-')) commandArgs.shift();
+  if (separatorIndex >= 0) commandArgs.push('--', ...args.slice(separatorIndex + 1));
+  return { cwd: packageCwd, commandArgs };
 }
 
-function processPolicyViolation(executable: string, args: string[], stepCwd?: string): string | null {
+function unwrapEnvCommand(args: string[]): string[] | null {
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === '--') return args.slice(index + 1);
+    if (arg === '-S' || arg === '--split-string') {
+      const split = args[index + 1];
+      return split ? [...tokenizeShellWords(split), ...args.slice(index + 2)] : null;
+    }
+    if (arg.startsWith('--split-string=')) {
+      return [...tokenizeShellWords(arg.slice('--split-string='.length)), ...args.slice(index + 1)];
+    }
+    if (['-u', '--unset', '-C', '--chdir'].includes(arg)) {
+      index += 2;
+      continue;
+    }
+    if (arg.startsWith('--unset=') || arg.startsWith('--chdir=')) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) {
+      index += 1;
+      continue;
+    }
+    return args.slice(index);
+  }
+  return null;
+}
+
+function processPolicyViolation(executable: string, args: string[], stepCwd?: string, roots: string[] = []): string | null {
   const base = executableBasename(executable);
   if (['rm', 'mv', 'cp', 'dd', 'truncate', 'touch', 'mkdir', 'rmdir', 'ln', 'install', 'tee',
     'chmod', 'chown', 'kill', 'pkill', 'killall', 'sudo', 'doas', 'mount', 'umount', 'reboot', 'shutdown'].includes(base)) {
@@ -439,21 +486,23 @@ function processPolicyViolation(executable: string, args: string[], stepCwd?: st
     }
   }
   if (base === 'busybox' && args.length > 0) {
-    return processPolicyViolation(args[0], args.slice(1), stepCwd);
+    return processPolicyViolation(args[0], args.slice(1), stepCwd, roots);
   }
   if (base === 'env') {
-    let index = 0;
-    while (index < args.length && (args[index].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(args[index]))) index += 1;
-    if (args[index]) return processPolicyViolation(args[index], args.slice(index + 1), stepCwd);
+    const command = unwrapEnvCommand(args);
+    if (command?.[0]) return processPolicyViolation(command[0], command.slice(1), stepCwd, roots);
   }
   if (stepCwd && ['npm', 'pnpm', 'yarn'].includes(base)) {
     const invocation = packageInvocationArgs(base, args, stepCwd);
     const commandArgs = invocation.commandArgs;
+    if (roots.length > 0 && !realpathContained(invocation.cwd, roots)) {
+      return `package verification cwd escapes repository/session roots: ${invocation.cwd}`;
+    }
     if (['install', 'i', 'ci', 'uninstall', 'remove', 'publish', 'pack'].includes(commandArgs[0])) {
       return `${base} ${commandArgs[0]} is not permitted in verification`;
     }
     if (['exec', 'x', 'dlx'].includes(commandArgs[0]) && commandArgs[1]) {
-      return processPolicyViolation(commandArgs[1], commandArgs.slice(2), invocation.cwd);
+      return processPolicyViolation(commandArgs[1], commandArgs.slice(2), invocation.cwd, roots);
     }
     const runIndex = commandArgs[0] === 'run' ? 1 : 0;
     const script = commandArgs[runIndex];
@@ -461,7 +510,7 @@ function processPolicyViolation(executable: string, args: string[], stepCwd?: st
       return packageScriptPolicyViolation({
         kind: 'package_script', manager: base as 'npm' | 'pnpm' | 'yarn', script,
         ...(commandArgs.length > runIndex + 1 ? { args: commandArgs.slice(runIndex + 1).filter((arg) => arg !== '--') } : {}),
-      }, invocation.cwd);
+      }, invocation.cwd, roots);
     }
   }
   const wrapperScript = shellWrapperScript(executable, args);
@@ -471,7 +520,11 @@ function processPolicyViolation(executable: string, args: string[], stepCwd?: st
   return null;
 }
 
-function packageScriptPolicyViolation(step: Extract<VerificationStep, { kind: 'package_script' }>, stepCwd: string): string | null {
+function packageScriptPolicyViolation(
+  step: Extract<VerificationStep, { kind: 'package_script' }>,
+  stepCwd: string,
+  roots: string[] = [],
+): string | null {
   if (!/^[A-Za-z0-9_@./:-]+$/.test(step.script) || step.script.startsWith('-')) {
     return `invalid package script name: ${step.script}`;
   }
@@ -479,8 +532,11 @@ function packageScriptPolicyViolation(step: Extract<VerificationStep, { kind: 'p
   if (!scripts || typeof scripts[step.script] !== 'string') return `package script does not exist: ${step.script}`;
   for (const name of [`pre${step.script}`, step.script, `post${step.script}`]) {
     const script = scripts[name];
-    if (typeof script === 'string' && violatesShellVerificationPolicy(script)) {
-      return `package lifecycle script ${name} contains a command forbidden by verification policy`;
+    const violation = typeof script === 'string'
+      ? shellPolicyViolation(script, roots.length > 0 ? { cwd: stepCwd, roots } : undefined)
+      : null;
+    if (violation) {
+      return `package lifecycle script ${name} ${violation}`;
     }
   }
   return null;
@@ -508,10 +564,10 @@ export function assertVerificationStepSafe(
     }
   }
   const violation = step.kind === 'shell'
-    ? (violatesShellVerificationPolicy(step.script) ? 'shell command is forbidden by verification policy' : null)
+    ? shellPolicyViolation(step.script, { cwd: stepCwd, roots })
     : step.kind === 'package_script'
-      ? packageScriptPolicyViolation(step, stepCwd)
-      : processPolicyViolation(step.executable, step.args, stepCwd);
+      ? packageScriptPolicyViolation(step, stepCwd, roots)
+      : processPolicyViolation(step.executable, step.args, stepCwd, roots);
   if (violation) {
     throw new VerificationContractError({ command: verificationStepCommand(step).display, message: violation });
   }
@@ -826,13 +882,58 @@ function legacyCommandSyntax(command: string): { balanced: boolean; shell: boole
   return { balanced: quote === null, shell };
 }
 
-function violatesShellVerificationPolicy(script: string): boolean {
+function shellPolicyViolation(
+  script: string,
+  containment?: { cwd: string; roots: string[] },
+): string | null {
   const unquoted = maskQuotedShellSyntax(script);
-  if (/\$\s*\(/.test(unquoted) || /(^|[^<])>(?!>)/.test(unquoted)) return true;
+  if (/\$\s*\(/.test(unquoted) || /(^|[^<])>(?!>)/.test(unquoted)) {
+    return 'contains command substitution or output redirection forbidden by verification policy';
+  }
   const boundary = '(?:^|[;&|()\\n]\\s*|\\b(?:then|do|else|elif)\\s+)';
-  if (new RegExp(`${boundary}(?:sudo|doas|kill|pkill|killall|chmod|chown|rm|mv)\\b`).test(unquoted)) return true;
-  if (new RegExp(`${boundary}git\\b[^;&|()\\n]*\\b(?:reset|clean|checkout|restore|stash|add|commit)\\b`).test(unquoted)) return true;
-  return /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sh|bash|zsh)\b/.test(unquoted);
+  if (new RegExp(`${boundary}(?:sudo|doas|kill|pkill|killall|chmod|chown|rm|mv)\\b`).test(unquoted)
+    || new RegExp(`${boundary}git\\b[^;&|()\\n]*\\b(?:reset|clean|checkout|restore|stash|add|commit)\\b`).test(unquoted)
+    || /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sh|bash|zsh)\b/.test(unquoted)) {
+    return 'contains a command forbidden by verification policy';
+  }
+
+  let currentCwd = containment?.cwd || '';
+  const directoryStack: string[] = [];
+  for (const segment of splitShellSegments(script)) {
+    const descriptor = shellCommandDescriptor(segment);
+    if (!descriptor) continue;
+    const executable = executableBasename(descriptor.executable);
+    if (['cd', 'pushd'].includes(executable)) {
+      if (!containment) continue;
+      const args = descriptor.args[0] === '--' ? descriptor.args.slice(1) : descriptor.args;
+      const target = args.find((arg) => !arg.startsWith('-'));
+      if (!target || target === '-' || /[$`~]/.test(target)) {
+        return `${executable} uses a dynamic or implicit cwd forbidden by verification policy`;
+      }
+      const nextCwd = path.resolve(currentCwd, target);
+      if (!realpathContained(nextCwd, containment.roots)) {
+        return `${executable} escapes repository/session roots: ${target}`;
+      }
+      if (executable === 'pushd') directoryStack.push(currentCwd);
+      currentCwd = fs.realpathSync(nextCwd);
+      continue;
+    }
+    if (executable === 'popd') {
+      if (!containment) continue;
+      if (directoryStack.length === 0) {
+        return 'popd has no statically validated in-scope directory';
+      }
+      currentCwd = directoryStack.pop()!;
+      continue;
+    }
+    const violation = processPolicyViolation(descriptor.executable, descriptor.args, currentCwd || undefined, containment?.roots || []);
+    if (violation) return `contains ${violation}`;
+  }
+  return null;
+}
+
+function violatesShellVerificationPolicy(script: string): boolean {
+  return shellPolicyViolation(script) !== null;
 }
 
 function structuredStep(value: unknown): VerificationStep | null {
