@@ -48,6 +48,25 @@ test('structured shell steps require safe balanced syntax and reject command sub
     }]),
     /invalid structured verification step/,
   );
+  for (const script of ['echo $(whoami)', 'rm -rf build', 'git reset --hard HEAD', 'echo changed > result.txt']) {
+    assert.throws(
+      () => normalizeVerificationSteps([{
+        kind: 'shell',
+        script,
+        justification: 'compatibility fixture',
+      }]),
+      /invalid structured verification step/,
+    );
+  }
+  assert.deepEqual(normalizeVerificationSteps([{
+    kind: 'shell',
+    script: 'for file in src/*.ts; do test -f "$file"; done',
+    justification: 'legacy loop cannot be represented as one process',
+  }]), [{
+    kind: 'shell',
+    script: 'for file in src/*.ts; do test -f "$file"; done',
+    justification: 'legacy loop cannot be represented as one process',
+  }]);
 });
 
 test('ticket materialization reloads the exact structured verification semantics', () => {

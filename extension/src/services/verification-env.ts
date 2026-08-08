@@ -605,6 +605,14 @@ function legacyCommandSyntax(command: string): { balanced: boolean; shell: boole
   return { balanced: quote === null, shell };
 }
 
+function violatesShellVerificationPolicy(script: string): boolean {
+  const unquoted = maskQuotedShellSyntax(script);
+  if (/\$\s*\(/.test(unquoted) || /(^|[^<])>(?!>)/.test(unquoted)) return true;
+  if (/(?:^|[;&|()]\s*)(?:sudo|doas|kill|pkill|killall|chmod|chown|rm|mv)\b/.test(unquoted)) return true;
+  if (/(?:^|[;&|()]\s*)git\s+(?:reset|clean|checkout|restore|stash|add|commit)\b/.test(unquoted)) return true;
+  return /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sh|bash|zsh)\b/.test(unquoted);
+}
+
 function structuredStep(value: unknown): VerificationStep | null {
   if (!isPlainObject(value) || typeof value.kind !== 'string') return null;
   const cwd = typeof value.cwd === 'string' && value.cwd.trim() ? value.cwd.trim() : undefined;
@@ -628,7 +636,7 @@ function structuredStep(value: unknown): VerificationStep | null {
     if (typeof value.script !== 'string' || !value.script.trim()
       || typeof value.justification !== 'string' || !value.justification.trim()) return null;
     const syntax = legacyCommandSyntax(value.script);
-    if (!syntax.balanced) return null;
+    if (!syntax.balanced || violatesShellVerificationPolicy(value.script)) return null;
     return { kind: 'shell', script: value.script.trim(), justification: value.justification.trim(), ...(cwd ? { cwd } : {}) };
   }
   return null;
