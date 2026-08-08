@@ -54,8 +54,23 @@ interface WorkerFence {
   repo_files: FileSnapshot[];
   repo_index: FileSnapshot;
   session_files: FileSnapshot[];
+  state_file: FileSnapshot;
   state: Record<string, unknown>;
 }
+
+interface DependencyRepairTransaction {
+  schema_version: 1;
+  status: 'prepared';
+  ticket_id: string;
+  strategy_hash: string | null;
+  manifest_before: RefinementManifest;
+  manifest_sha256: string;
+  prd_seal_sha256: string;
+  artifact: DependencyRepairArtifact;
+  prepared_at: string;
+}
+
+const DEPENDENCY_TRANSACTION_FILE = 'dependency-repair-transaction.json';
 
 function canonicalId(ticket: Ticket): string {
   return normalizeTicketId(ticket.id, ticket.id);
@@ -79,6 +94,22 @@ function manifestIdentity(sessionDir: string): string {
 function sealIdentity(sessionDir: string): string {
   const sealPath = path.join(sessionDir, 'prd.lock.json');
   return fs.existsSync(sealPath) ? sha256(fs.readFileSync(sealPath)) : sha256('unsealed');
+}
+
+function sealedDependencyRows(sessionDir: string, expectedIds: string[]): DependencyRepairRow[] | null {
+  if (!fs.existsSync(path.join(sessionDir, 'prd.lock.json'))) return null;
+  const seal = readPrdSeal(sessionDir);
+  const value = seal.dependencies_and_external_prerequisites;
+  if (!Array.isArray(value)) throw new Error('dependency-repair-sealed-contract-invalid: dependency contract is not an array');
+  try {
+    return validateGraphRows(value.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+      const record = entry as Record<string, unknown>;
+      return { ticket_id: record.ticket_id, depends_on: record.depends_on };
+    }), expectedIds);
+  } catch (error) {
+    throw new Error(`dependency-repair-sealed-contract-invalid: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
 }
 
 function own(record: Record<string, unknown>, key: string): boolean {
@@ -318,6 +349,7 @@ function logicalState(value: Record<string, unknown>): Record<string, unknown> {
 }
 
 function captureWorkerFence(sessionDir: string, workingDir: string): WorkerFence {
+  const stateFile = snapshotFile(path.join(sessionDir, 'state.json'));
   return {
     repo_is_git: isGitRepo(workingDir),
     repo_head: getHeadSha(workingDir),
@@ -326,6 +358,7 @@ function captureWorkerFence(sessionDir: string, workingDir: string): WorkerFence
     repo_files: repositoryFilePaths(workingDir).map(snapshotFile),
     repo_index: snapshotFile(repositoryIndexPath(workingDir)),
     session_files: protectedSessionPaths(sessionDir).filter((file) => path.basename(file) !== 'state.json').map(snapshotFile),
+    state_file: stateFile,
     state: logicalState(new StateManager().read(path.join(sessionDir, 'state.json'))),
   };
 }
@@ -341,37 +374,50 @@ function fenceDrift(sessionDir: string, workingDir: string, fence: WorkerFence):
       && Buffer.compare(current.content || Buffer.alloc(0), snapshot.content || Buffer.alloc(0)) === 0;
     if (!same) drift.push(path.relative(sessionDir, snapshot.file_path));
   }
-  const currentState = logicalState(new StateManager().read(path.join(sessionDir, 'state.json')));
-  if (JSON.stringify(currentState) !== JSON.stringify(fence.state)) drift.push('state.json');
+  try {
+    const currentState = logicalState(new StateManager().read(path.join(sessionDir, 'state.json')));
+    if (JSON.stringify(currentState) !== JSON.stringify(fence.state)) drift.push('state.json');
+  } catch {
+    drift.push('state.json');
+  }
   return [...new Set(drift)];
 }
 
 function restoreWorkerFence(sessionDir: string, workingDir: string, fence: WorkerFence): void {
+  const errors: unknown[] = [];
+  const attempt = (operation: () => void): void => {
+    try { operation(); } catch (error) { errors.push(error); }
+  };
   const original = new Set(fence.repo_files.map((entry) => entry.file_path));
-  for (const current of repositoryFilePaths(workingDir)) {
-    if (!original.has(current)) fs.rmSync(current, { force: true });
-  }
-  fence.repo_files.forEach(restoreFile);
-  if (fence.repo_is_git) restoreFile(fence.repo_index);
-  if (fence.repo_is_git && fence.repo_symbolic_head) {
-    execFileSync('git', ['symbolic-ref', 'HEAD', fence.repo_symbolic_head], { cwd: workingDir, stdio: 'ignore' });
-    execFileSync('git', ['update-ref', fence.repo_symbolic_head, fence.repo_head], { cwd: workingDir, stdio: 'ignore' });
-  } else if (fence.repo_is_git) {
-    execFileSync('git', ['update-ref', '--no-deref', 'HEAD', fence.repo_head], { cwd: workingDir, stdio: 'ignore' });
-  }
-  fence.session_files.forEach(restoreFile);
-  const manager = new StateManager();
-  manager.update(path.join(sessionDir, 'state.json'), (current) => {
-    const cancellation = current.cancel_requested_at;
-    const cancelled = current.last_exit_reason === 'cancelled';
-    const restored = structuredClone(fence.state);
-    if (cancelled) {
-      restored.active = false;
-      restored.last_exit_reason = 'cancelled';
-      restored.cancel_requested_at = cancellation;
+  attempt(() => {
+    for (const current of repositoryFilePaths(workingDir)) {
+      if (!original.has(current)) fs.rmSync(current, { force: true });
     }
-    return restored;
   });
+  fence.repo_files.forEach((snapshot) => attempt(() => restoreFile(snapshot)));
+  if (fence.repo_is_git) attempt(() => restoreFile(fence.repo_index));
+  if (fence.repo_is_git && fence.repo_symbolic_head) {
+    attempt(() => execFileSync('git', ['symbolic-ref', 'HEAD', fence.repo_symbolic_head!], { cwd: workingDir, stdio: 'ignore' }));
+    attempt(() => execFileSync('git', ['update-ref', fence.repo_symbolic_head!, fence.repo_head], { cwd: workingDir, stdio: 'ignore' }));
+  } else if (fence.repo_is_git) {
+    attempt(() => execFileSync('git', ['update-ref', '--no-deref', 'HEAD', fence.repo_head], { cwd: workingDir, stdio: 'ignore' }));
+  }
+  fence.session_files.forEach((snapshot) => attempt(() => restoreFile(snapshot)));
+  attempt(() => restoreFile(fence.state_file));
+  if (errors.length > 0) throw new AggregateError(errors, 'dependency-repair-fence-restore-failed');
+}
+
+function boundedCandidateEvidence(filePath: string): Record<string, unknown> {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { kind: 'unsafe-file', size: stat.size, symlink: stat.isSymbolicLink() };
+    }
+    if (stat.size > 64 * 1024) return { kind: 'oversize', size: stat.size };
+    return { kind: 'content', size: stat.size, content_base64: fs.readFileSync(filePath).toString('base64') };
+  } catch (error) {
+    return { kind: 'unreadable', detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function readDependencyArtifact(filePath: string): Record<string, unknown> {
@@ -385,6 +431,64 @@ function readDependencyArtifact(filePath: string): Record<string, unknown> {
     if (error instanceof SyntaxError) throw new Error('dependency-repair-invalid-artifact: malformed JSON', { cause: error });
     throw error;
   }
+}
+
+function dependencyTransactionPath(sessionDir: string): string {
+  return path.join(sessionDir, DEPENDENCY_TRANSACTION_FILE);
+}
+
+function persistDependencyRepairEvidence(
+  sessionDir: string,
+  transaction: DependencyRepairTransaction,
+  graph: DependencyRepairRow[],
+): void {
+  const durableArtifactPath = path.join(sessionDir, 'dependency-repairs', `${transaction.ticket_id}.json`);
+  atomicWriteJson(durableArtifactPath, transaction.artifact);
+  atomicWriteJson(path.join(sessionDir, 'dependency-repair-current.json'), {
+    schema_version: 1,
+    ticket_id: transaction.ticket_id,
+    strategy_hash: transaction.strategy_hash,
+    artifact_path: durableArtifactPath,
+    manifest_sha256: transaction.manifest_sha256,
+    prd_seal_sha256: transaction.prd_seal_sha256,
+    graph,
+    repaired_at: new Date().toISOString(),
+  });
+}
+
+export function reconcileDependencyRepairTransaction(sessionDir: string): 'completed' | 'rolled_back' | null {
+  const transactionPath = dependencyTransactionPath(sessionDir);
+  const transaction = readJsonFile<DependencyRepairTransaction>(transactionPath, null);
+  if (!transaction) return null;
+  if (transaction.schema_version !== 1 || transaction.status !== 'prepared'
+    || typeof transaction.ticket_id !== 'string' || !transaction.ticket_id
+    || !transaction.manifest_before || !Array.isArray(transaction.manifest_before.tickets)
+    || !transaction.artifact || typeof transaction.artifact !== 'object') {
+    throw new Error('dependency-repair-transaction-corrupt');
+  }
+  assertSealCurrent(sessionDir);
+  if (transaction.prd_seal_sha256 !== sealIdentity(sessionDir)) {
+    throw new Error('dependency-repair-transaction-seal-drift');
+  }
+  const manifest = readManifest(sessionDir);
+  const expectedIds = transaction.manifest_before.tickets.map(canonicalId);
+  const desiredRows = validateGraphRows(transaction.artifact.tickets, expectedIds);
+  const currentInspection = inspectTicketDependencyGraph(sessionDir);
+  if (currentInspection.findings.length === 0
+    && JSON.stringify(currentInspection.rows) === JSON.stringify(desiredRows)) {
+    const sealedRows = sealedDependencyRows(sessionDir, expectedIds);
+    if (sealedRows && JSON.stringify(sealedRows) !== JSON.stringify(desiredRows)) {
+      throw new Error('dependency-repair-transaction-sealed-contract-mismatch');
+    }
+    persistDependencyRepairEvidence(sessionDir, transaction, desiredRows);
+    fs.rmSync(transactionPath, { force: true });
+    return 'completed';
+  }
+  if (sha256(JSON.stringify(manifest)) !== sha256(JSON.stringify(transaction.manifest_before))) {
+    restructureTicketFiles(sessionDir, transaction.manifest_before);
+  }
+  fs.rmSync(transactionPath, { force: true });
+  return 'rolled_back';
 }
 
 export function applyTicketDependencyRepairArtifact(
@@ -417,6 +521,10 @@ export function applyTicketDependencyRepairArtifact(
   }
   const rows = validateGraphRows(artifact.tickets, expectedIds);
   const originalRows = inspection.rows;
+  const sealedRows = sealedDependencyRows(sessionDir, expectedIds);
+  if (sealedRows && JSON.stringify(rows) !== JSON.stringify(sealedRows)) {
+    throw new Error('dependency-repair-invalid-artifact: repaired graph does not match the sealed dependency contract');
+  }
   const repairIds = new Set(inspection.repair_ticket_ids);
   if (!repairIds.has(normalizedTarget)) {
     throw new Error('dependency-repair-invalid-artifact: target is not finding-owned');
@@ -466,7 +574,12 @@ export function applyTicketDependencyRepairArtifact(
 export async function repairTicketDependencyContract(
   sessionDir: string,
   ticketId: string,
-  options: { strategy?: RecoveryStrategyEpoch | null; timeoutMs?: number; assertDurableOwnership?: () => void } = {},
+  options: {
+    strategy?: RecoveryStrategyEpoch | null;
+    timeoutMs?: number;
+    assertDurableOwnership?: () => void;
+    afterMaterialization?: () => void;
+  } = {},
 ): Promise<DependencyRepairRow[]> {
   const manager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
@@ -481,10 +594,10 @@ export async function repairTicketDependencyContract(
   const candidateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-dependency-repair-'));
   const artifactPath = path.join(candidateDir, 'dependency-repair.json');
   const lastMessagePath = path.join(candidateDir, 'last-message.txt');
-  const durableArtifactPath = path.join(sessionDir, 'dependency-repairs', `${normalizedTicketId}.json`);
   assertSealCurrent(sessionDir);
   const expectedManifestIdentity = manifestIdentity(sessionDir);
   const expectedSealIdentity = sealIdentity(sessionDir);
+  const authorizedSealedRows = sealedDependencyRows(sessionDir, manifest.tickets.map(canonicalId));
   const prompt = [
     'You are the autonomous ticket dependency graph contract repair worker.',
     `Isolated candidate workspace: ${candidateDir}`,
@@ -495,13 +608,16 @@ export async function repairTicketDependencyContract(
     `Current ticket graph JSON: ${JSON.stringify(inspection.rows)}`,
     `Finding-owned ticket IDs JSON: ${JSON.stringify(inspection.repair_ticket_ids)}`,
     `Dependency contract findings JSON: ${JSON.stringify(inspection.findings)}`,
+    `Authorized sealed dependency graph JSON: ${JSON.stringify(authorizedSealedRows)}`,
     `Immutable ticket acceptance criteria JSON: ${acceptanceIdentity(manifest.tickets)}`,
     options.strategy
       ? `Mandatory material repair strategy: ${options.strategy.materialApproach}; strategy hash ${options.strategy.strategyHash}.`
       : 'Mandatory material repair strategy: repair-dependency-or-contract-blockage.',
     'Repair only the depends_on graph. Every ticket must appear exactly once. Use only existing ticket ids, remove cycles and missing/self dependencies, and preserve the smallest valid dependency ordering justified by the sealed PRD.',
     'Do not modify repository files, ticket acceptance criteria, scope, verification, status, or any other ticket field.',
-    'Preserve depends_on exactly for every ticket outside the finding-owned ticket IDs.',
+    authorizedSealedRows
+      ? 'The output graph must exactly equal the authorized sealed dependency graph; this is reconstruction, not semantic revision.'
+      : 'Preserve depends_on exactly for every ticket outside the finding-owned ticket IDs.',
     'Write one exact JSON object with schema_version: 1, target_ticket_id, manifest_sha256, prd_seal_sha256, tickets: [{ticket_id, depends_on: string[]}], and a non-empty rationale. Do not add fields or coerce values.',
     'Return <promise>DEPENDENCY_REPAIR_COMPLETE</promise> after writing the artifact.',
   ].join('\n\n');
@@ -533,29 +649,51 @@ export async function repairTicketDependencyContract(
   } catch (error) {
     workerError = error;
   } finally {
-    manager.update(statePath, (current) => {
-      current.active_child_pid = null;
-      current.active_child_kind = null;
-      current.active_child_command = null;
-      current.active_child_identity = null;
-      current.active_child_controller_pid = null;
-      return current;
-    });
-    const drift = fenceDrift(sessionDir, workingDir, fence);
+    const drift = (() => {
+      try {
+        return fenceDrift(sessionDir, workingDir, fence);
+      } catch (error) {
+        return [`fence-inspection-failed: ${error instanceof Error ? error.message : String(error)}`];
+      }
+    })();
     if (drift.length > 0) {
-      const candidateArtifact = fs.existsSync(artifactPath) ? fs.readFileSync(artifactPath, 'utf8').slice(0, 64 * 1024) : null;
-      restoreWorkerFence(sessionDir, workingDir, fence);
+      const candidateArtifact = boundedCandidateEvidence(artifactPath);
+      let restoreFailure: string | null = null;
+      try {
+        restoreWorkerFence(sessionDir, workingDir, fence);
+      } catch (error) {
+        restoreFailure = error instanceof Error ? error.message : String(error);
+      }
       const quarantinePath = path.join(sessionDir, 'dependency-repair-quarantine.json');
-      atomicWriteJson(quarantinePath, {
-        schema_version: 1,
-        ticket_id: normalizedTicketId,
-        reason: 'dependency-repair-isolation-violation',
-        drift,
-        candidate_artifact: candidateArtifact,
-        quarantined_at: new Date().toISOString(),
-      });
+      try {
+        atomicWriteJson(quarantinePath, {
+          schema_version: 1,
+          ticket_id: normalizedTicketId,
+          reason: 'dependency-repair-isolation-violation',
+          drift,
+          restore_failure: restoreFailure,
+          candidate_artifact: candidateArtifact,
+          quarantined_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        restoreFailure ||= `quarantine failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
       fs.rmSync(candidateDir, { recursive: true, force: true });
-      isolationError = new Error(`dependency-repair-isolation-violation: ${drift.join(', ')}`);
+      isolationError = new Error(`dependency-repair-isolation-violation: ${drift.join(', ')}${restoreFailure ? `; ${restoreFailure}` : ''}`);
+    } else {
+      try {
+        manager.update(statePath, (current) => {
+          current.active_child_pid = null;
+          current.active_child_kind = null;
+          current.active_child_command = null;
+          current.active_child_identity = null;
+          current.active_child_controller_pid = null;
+          return current;
+        });
+      } catch (error) {
+        try { restoreWorkerFence(sessionDir, workingDir, fence); } catch { /* surfaced below */ }
+        isolationError = new Error(`dependency-repair-state-cleanup-failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
   if (isolationError) throw isolationError;
@@ -563,19 +701,23 @@ export async function repairTicketDependencyContract(
   if (!result) throw new Error('dependency-repair-worker-result-missing');
   try {
     assertCodexSucceeded(result, `Dependency graph contract repair failed for ${normalizedTicketId}`);
-    const artifact = readDependencyArtifact(artifactPath);
-    const repaired = applyTicketDependencyRepairArtifact(sessionDir, normalizedTicketId, artifact);
-    atomicWriteJson(durableArtifactPath, artifact);
-    atomicWriteJson(path.join(sessionDir, 'dependency-repair-current.json'), {
+    const artifact = readDependencyArtifact(artifactPath) as unknown as DependencyRepairArtifact;
+    const transaction: DependencyRepairTransaction = {
       schema_version: 1,
+      status: 'prepared',
       ticket_id: normalizedTicketId,
       strategy_hash: options.strategy?.strategyHash || null,
-      artifact_path: durableArtifactPath,
+      manifest_before: manifest,
       manifest_sha256: expectedManifestIdentity,
       prd_seal_sha256: expectedSealIdentity,
-      graph: repaired,
-      repaired_at: new Date().toISOString(),
-    });
+      artifact,
+      prepared_at: new Date().toISOString(),
+    };
+    atomicWriteJson(dependencyTransactionPath(sessionDir), transaction);
+    const repaired = applyTicketDependencyRepairArtifact(sessionDir, normalizedTicketId, artifact);
+    options.afterMaterialization?.();
+    persistDependencyRepairEvidence(sessionDir, transaction, repaired);
+    fs.rmSync(dependencyTransactionPath(sessionDir), { force: true });
     return repaired;
   } finally {
     fs.rmSync(candidateDir, { recursive: true, force: true });

@@ -892,6 +892,66 @@ console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
   assert.ok(new StateManager().read(path.join(sessionDir, 'state.json')).history.filter((event) => event.step === 'dependency_repair_wakeup_persisted').length >= 2);
 });
 
+test('exhausted dependency recovery still performs one bounded worker attempt before durable wakeup', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('dependency threshold wakeup');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), { tickets: [{ id: 'orphan', title: 'Orphan', status: 'Todo', depends_on: ['missing'], acceptance_criteria: ['Repair.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'] }] });
+  const identity = buildTicketRecoveryFailureIdentity({ failureKind: 'worker_failure', message: 'dependency repair failed' });
+  for (let index = 0; index < 25; index += 1) {
+    recordTicketRecoveryFailure({ sessionDir, ticketId: 'orphan', failureKind: 'worker_failure', identity });
+  }
+  writeJson(path.join(sessionDir, 'circuit_breaker.json'), { state: 'OPEN' });
+  let repairs = 0;
+  const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    repairTicketDependencyContract: async () => {
+      repairs += 1;
+      throw new Error('still invalid after bounded attempt');
+    },
+    runTicket: async () => { throw new Error('implementation must not run'); },
+  }));
+  assert.equal(reason, 'dependency_repair_scheduled');
+  assert.equal(repairs, 1);
+});
+
+test('hostile dependency artifact cannot preempt restoration of corrupt live state and manifest', async () => {
+  for (const artifactMode of ['symlink', 'oversize']) {
+    const { dataRoot, sessionDir } = createSessionWithTodoTicket(`dependency ${artifactMode} fence`);
+    writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+      tickets: [
+        { id: 'orphan', title: 'Orphan', status: 'Todo', depends_on: ['missing'], acceptance_criteria: ['Repair safely.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'] },
+        { id: 'independent', title: 'Independent', status: 'Done', depends_on: [], acceptance_criteria: ['Stay complete.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['independent.txt'], completion_commit: 'checkpoint' },
+      ],
+    });
+    const originalState = fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8');
+    const binDir = makeTempRoot(`dependency-${artifactMode}-bin-`);
+    writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const prompt = fs.readFileSync(0, 'utf8');
+const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
+fs.writeFileSync(process.env.HOSTILE_MANIFEST, '{"poisoned":true}');
+fs.writeFileSync(process.env.HOSTILE_STATE, '{');
+const artifact = value('Dependency repair artifact path: ');
+if (process.env.HOSTILE_MODE === 'symlink') fs.symlinkSync(path.dirname(artifact), artifact);
+else { const fd = fs.openSync(artifact, 'w'); fs.ftruncateSync(fd, 2 * 1024 * 1024); fs.closeSync(fd); }
+console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
+`);
+    const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+      runTicket: async () => { throw new Error('implementation must not run'); },
+    }), {
+      ...prependPath(binDir), HOSTILE_MODE: artifactMode,
+      HOSTILE_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
+      HOSTILE_STATE: path.join(sessionDir, 'state.json'),
+    });
+    assert.equal(reason, 'dependency_repair_scheduled', artifactMode);
+    assert.doesNotMatch(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /poisoned/, artifactMode);
+    const restoredState = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+    assert.equal(JSON.parse(originalState).working_dir, restoredState.working_dir, artifactMode);
+    assert.equal(readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'independent').completion_commit, 'checkpoint');
+    const quarantine = JSON.parse(fs.readFileSync(path.join(sessionDir, 'dependency-repair-quarantine.json'), 'utf8'));
+    assert.equal(quarantine.candidate_artifact.kind, artifactMode === 'symlink' ? 'unsafe-file' : 'oversize');
+  }
+});
+
 test('unresolved dependency repair persists one nonterminal wakeup and resumes with a novel production strategy', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('dependency wakeup restart task');
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {

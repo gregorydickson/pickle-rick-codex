@@ -62,6 +62,7 @@ import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace
 import { legacyContractRepairPending, markLegacyContractRepairComplete } from '../services/legacy-session-adoption.js';
 import {
   inspectTicketDependencyGraph,
+  reconcileDependencyRepairTransaction,
   repairTicketDependencyContract,
   type DependencyGraphInspection,
 } from '../services/dependency-contract-repair.js';
@@ -176,6 +177,11 @@ async function runSequentialWithLease(
   });
   if (resumeStrategyExhaustionAfterUpgrade(manager, statePath)) {
     appendRunnerLog(sessionDir, runnerMode, 'resumed obsolete strategy-exhaustion stop through autonomous escalation');
+  }
+
+  const reconciledDependencyTransaction = reconcileDependencyRepairTransaction(sessionDir);
+  if (reconciledDependencyTransaction) {
+    appendRunnerLog(sessionDir, runnerMode, `dependency repair transaction ${reconciledDependencyTransaction} before scheduler dispatch`);
   }
 
   let dependencyInspection = inspectTicketDependencyGraph(sessionDir);
@@ -571,6 +577,8 @@ async function runSequentialWithLease(
 
     while (attempts < maxAttempts) {
       const latestState = manager.read(statePath);
+      const dependencyDiagnosticAttempt = scheduledDiagnosticTicketId === normalizeTicketId(ticket.id, ticket.id)
+        && scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage';
       const stopReason = shouldStop(latestState);
       if (stopReason) {
         if (
@@ -585,7 +593,8 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `stopping during ticket ${ticket.id}: ${stopReason}`);
         break;
       }
-      if (config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
+      if (!dependencyDiagnosticAttempt
+        && config.defaults.circuit_breaker.enabled && !canExecute(loadCircuitState(sessionDir))) {
         if (failureMode === 'retry' && startAutomaticRecoveryEpoch('reached an OPEN circuit strategy boundary')) {
           continue;
         }
@@ -594,7 +603,7 @@ async function runSequentialWithLease(
         appendRunnerLog(sessionDir, runnerMode, `refusing ticket ${ticket.id}: circuit breaker is OPEN`);
         break;
       }
-      if (failureMode === 'retry') {
+      if (failureMode === 'retry' && !dependencyDiagnosticAttempt) {
         try {
           const usage = getTicketRecoveryUsage(sessionDir, ticket.id);
           const lineageExhausted = config.defaults.circuit_breaker.enabled
