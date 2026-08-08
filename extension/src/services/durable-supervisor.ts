@@ -30,6 +30,21 @@ export interface SupervisorLease {
   expires_at: string;
 }
 
+export interface InstalledRuntimeDescriptor {
+  runtime_id: string;
+  version: string;
+  build_hash: string;
+  min_state_schema: number;
+  max_state_schema: number;
+}
+
+export interface RuntimeHandoffResult {
+  request_id: string;
+  lease: SupervisorLease;
+  resume_checkpoint: Record<string, unknown>;
+  state: LogicalPipelineState;
+}
+
 export interface LogicalPipelineEvent {
   sequence: number;
   event_id: string;
@@ -180,7 +195,18 @@ function replayJournal(events: LogicalPipelineEvent[]): Omit<LogicalPipelineStat
         executorRestartCount += 1;
         break;
       case 'checkpoint_recorded':
+      case 'runtime_handoff_requested':
         break;
+      case 'runtime_handoff_released':
+        lease = null;
+        break;
+      case 'runtime_handoff_completed': {
+        const eventLease = validateLease(event.details.lease);
+        if (!eventLease) throw new Error('runtime_handoff_completed must persist its lease.');
+        lease = eventLease;
+        leaseGeneration = eventLease.generation;
+        break;
+      }
       case 'pipeline_completed':
         terminalState = 'completed';
         lease = null;
@@ -418,6 +444,30 @@ export function renewSupervisorLease(sessionDir: string, options: RenewLeaseOpti
   return renewed;
 }
 
+function assertLeaseFence(
+  state: LogicalPipelineState,
+  ownerId: string,
+  token: string,
+  nowMs: number,
+): SupervisorLease {
+  const lease = state.lease;
+  if (!lease || lease.owner_id !== ownerId || lease.token !== token) {
+    throw new Error('Supervisor lease fence rejected stale ownership.');
+  }
+  if (Date.parse(lease.expires_at) <= nowMs) throw new Error('Expired supervisor lease fence.');
+  return lease;
+}
+
+export function assertSupervisorLeaseFence(
+  sessionDir: string,
+  ownerId: string,
+  token: string,
+  options: ClockOptions = {},
+): SupervisorLease {
+  const state = readLogicalPipeline(sessionDir);
+  return assertLeaseFence(state, ownerId, token, options.nowMs ?? Date.now());
+}
+
 export function recordSupervisorCheckpoint(
   sessionDir: string,
   ownerId: string,
@@ -427,14 +477,127 @@ export function recordSupervisorCheckpoint(
 ): LogicalPipelineState {
   return mutate(sessionDir, (state) => {
     const nowMs = options.nowMs ?? Date.now();
-    if (!state.lease || state.lease.owner_id !== ownerId || state.lease.token !== token) {
-      throw new Error('Only the active supervisor lease may checkpoint.');
-    }
-    if (Date.parse(state.lease.expires_at) <= nowMs) {
-      throw new Error('Expired supervisor lease cannot checkpoint.');
+    try {
+      assertLeaseFence(state, ownerId, token, nowMs);
+    } catch (error) {
+      throw new Error(`Only the active supervisor lease may checkpoint: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
     appendEvent(state, 'checkpoint_recorded', { checkpoint }, nowMs);
   });
+}
+
+function validateRuntime(runtime: InstalledRuntimeDescriptor): void {
+  requireNonEmpty(runtime.runtime_id, 'runtime.runtime_id');
+  requireNonEmpty(runtime.version, 'runtime.version');
+  requireNonEmpty(runtime.build_hash, 'runtime.build_hash');
+  if (!Number.isInteger(runtime.min_state_schema) || !Number.isInteger(runtime.max_state_schema)
+    || runtime.min_state_schema < 1 || runtime.max_state_schema < runtime.min_state_schema) {
+    throw new Error('Invalid installed runtime state-schema compatibility range.');
+  }
+}
+
+function handoffRequest(state: LogicalPipelineState, requestId: string): LogicalPipelineEvent {
+  const request = [...state.events].reverse().find((event) => (
+    event.kind === 'runtime_handoff_requested' && event.details.request_id === requestId
+  ));
+  if (!request) throw new Error(`Unknown runtime handoff request: ${requestId}.`);
+  if (state.events.some((event) => event.kind === 'runtime_handoff_completed' && event.details.request_id === requestId)) {
+    throw new Error(`Runtime handoff request already completed: ${requestId}.`);
+  }
+  return request;
+}
+
+export function requestRuntimeHandoff(
+  sessionDir: string,
+  ownerId: string,
+  token: string,
+  sourceRuntime: InstalledRuntimeDescriptor,
+  targetRuntime: InstalledRuntimeDescriptor,
+  checkpoint: Record<string, unknown>,
+  options: ClockOptions = {},
+): string {
+  validateRuntime(sourceRuntime);
+  validateRuntime(targetRuntime);
+  const requestId = crypto.randomUUID();
+  mutate(sessionDir, (state) => {
+    const nowMs = options.nowMs ?? Date.now();
+    const lease = assertLeaseFence(state, ownerId, token, nowMs);
+    const completed = new Set(state.events
+      .filter((event) => event.kind === 'runtime_handoff_completed')
+      .map((event) => String(event.details.request_id)));
+    if (state.events.some((event) => event.kind === 'runtime_handoff_requested'
+      && !completed.has(String(event.details.request_id)))) {
+      throw new Error('A runtime handoff request is already pending.');
+    }
+    appendEvent(state, 'runtime_handoff_requested', {
+      request_id: requestId,
+      source_runtime: sourceRuntime,
+      target_runtime: targetRuntime,
+      checkpoint,
+      lease_generation: lease.generation,
+    }, nowMs);
+  });
+  return requestId;
+}
+
+export function releaseRuntimeHandoffLease(
+  sessionDir: string,
+  ownerId: string,
+  token: string,
+  requestId: string,
+  options: ClockOptions = {},
+): LogicalPipelineState {
+  return mutate(sessionDir, (state) => {
+    const nowMs = options.nowMs ?? Date.now();
+    const lease = assertLeaseFence(state, ownerId, token, nowMs);
+    handoffRequest(state, requestId);
+    appendEvent(state, 'runtime_handoff_released', {
+      request_id: requestId,
+      owner_id: ownerId,
+      lease_generation: lease.generation,
+    }, nowMs);
+    state.lease = null;
+  });
+}
+
+export function acceptRuntimeHandoff(
+  sessionDir: string,
+  requestId: string,
+  ownerId: string,
+  ttlMs: number,
+  targetRuntime: InstalledRuntimeDescriptor,
+  options: ClockOptions = {},
+): RuntimeHandoffResult {
+  validateRuntime(targetRuntime);
+  let lease: SupervisorLease | null = null;
+  let checkpoint: Record<string, unknown> | null = null;
+  const state = mutate(sessionDir, (current) => {
+    const nowMs = options.nowMs ?? Date.now();
+    const request = handoffRequest(current, requestId);
+    if (canonicalize(request.details.target_runtime) !== canonicalize(targetRuntime)) {
+      throw new Error('Target runtime does not match the durable handoff request.');
+    }
+    if (current.lease && Date.parse(current.lease.expires_at) > nowMs) {
+      throw new Error(`Runtime handoff is fenced by live owner ${current.lease.owner_id}.`);
+    }
+    if (current.lease) {
+      appendEvent(current, 'executor_lost', { owner_id: current.lease.owner_id, reason: 'expired_lease' }, nowMs);
+      current.executor_restart_count += 1;
+    }
+    checkpoint = request.details.checkpoint as Record<string, unknown>;
+    const generation = current.lease_generation + 1;
+    lease = createLease(ownerId, ttlMs, generation, nowMs);
+    current.lease = lease;
+    current.lease_generation = generation;
+    appendEvent(current, 'runtime_handoff_completed', {
+      request_id: requestId,
+      target_runtime: targetRuntime,
+      resume_checkpoint: checkpoint,
+      lease,
+    }, nowMs);
+  });
+  if (!lease || !checkpoint) throw new Error('Runtime handoff did not produce a lease and checkpoint.');
+  return { request_id: requestId, lease, resume_checkpoint: checkpoint, state };
 }
 
 function latestCheckpoint(state: LogicalPipelineState): Record<string, unknown> | null {
