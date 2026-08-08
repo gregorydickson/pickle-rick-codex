@@ -819,13 +819,18 @@ test('malformed dependency field shapes route through production graph repair be
   }
 });
 
-test('malicious dependency worker drift is restored, quarantined, and never accepted', async () => {
-  const { dataRoot, sessionDir } = createSessionWithTodoTicket('malicious dependency repair');
+test('malicious dependency drift quarantines session mutation without rolling back concurrent user git work', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('concurrent dependency repair');
   const workingDir = String(new StateManager().read(path.join(sessionDir, 'state.json')).working_dir);
-  const protectedRepoFile = path.join(workingDir, 'protected.txt');
-  fs.writeFileSync(protectedRepoFile, 'original\n');
+  const trackedFile = path.join(workingDir, 'tracked.txt');
+  const stagedFile = path.join(workingDir, 'staged.txt');
+  const committedFile = path.join(workingDir, 'committed.txt');
+  const untrackedFile = path.join(workingDir, 'user-untracked.txt');
+  fs.writeFileSync(trackedFile, 'original tracked\n');
+  fs.writeFileSync(stagedFile, 'original staged\n');
+  fs.writeFileSync(committedFile, 'original committed\n');
   execFileSync('git', ['init', '-q'], { cwd: workingDir });
-  execFileSync('git', ['add', 'protected.txt'], { cwd: workingDir });
+  execFileSync('git', ['add', 'tracked.txt', 'staged.txt', 'committed.txt'], { cwd: workingDir });
   execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline'], { cwd: workingDir });
   const originalHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -835,33 +840,56 @@ test('malicious dependency worker drift is restored, quarantined, and never acce
     ],
   });
   const binDir = makeTempRoot('dependency-malicious-bin-');
+  const readyPath = path.join(binDir, 'ready');
+  const continuePath = path.join(binDir, 'continue');
   writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
 const prompt = fs.readFileSync(0, 'utf8');
 const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
 const graph = JSON.parse(value('Current ticket graph JSON: '));
 const target = value('Target ticket ID: ');
-fs.writeFileSync(process.env.MALICIOUS_REPO_FILE, 'poisoned\\n');
-execFileSync('git', ['add', 'protected.txt'], { cwd: process.env.MALICIOUS_REPO_ROOT });
-execFileSync('git', ['-c', 'user.name=Poison', '-c', 'user.email=poison@example.invalid', 'commit', '-qm', 'poison'], { cwd: process.env.MALICIOUS_REPO_ROOT });
+fs.writeFileSync(process.env.CONCURRENT_READY, 'ready');
+while (!fs.existsSync(process.env.CONCURRENT_CONTINUE)) await new Promise((resolve) => setTimeout(resolve, 10));
 const manifest = JSON.parse(fs.readFileSync(process.env.MALICIOUS_MANIFEST, 'utf8'));
 manifest.tickets.find((ticket) => ticket.id === 'independent').status = 'Todo';
 fs.writeFileSync(process.env.MALICIOUS_MANIFEST, JSON.stringify(manifest, null, 2));
 fs.writeFileSync(value('Dependency repair artifact path: '), JSON.stringify({ schema_version: 1, target_ticket_id: target, manifest_sha256: value('Authoritative manifest SHA-256: '), prd_seal_sha256: value('Authoritative PRD seal SHA-256: '), tickets: graph.map((ticket) => ticket.ticket_id === target ? { ...ticket, depends_on: [] } : ticket), rationale: 'valid artifact plus forbidden drift' }));
 console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
 `);
-  const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+  const run = withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
     runTicket: async () => { throw new Error('implementation must not run'); },
-  }), { ...prependPath(binDir), MALICIOUS_REPO_FILE: protectedRepoFile, MALICIOUS_REPO_ROOT: workingDir, MALICIOUS_MANIFEST: path.join(sessionDir, 'refinement_manifest.json') });
+  }), {
+    ...prependPath(binDir), CONCURRENT_READY: readyPath, CONCURRENT_CONTINUE: continuePath,
+    MALICIOUS_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
+  });
+  while (!fs.existsSync(readyPath)) await new Promise((resolve) => setTimeout(resolve, 10));
+  execFileSync('git', ['switch', '-qc', 'user/concurrent-work'], { cwd: workingDir });
+  fs.writeFileSync(committedFile, 'user committed\n');
+  execFileSync('git', ['add', 'committed.txt'], { cwd: workingDir });
+  execFileSync('git', ['-c', 'user.name=User', '-c', 'user.email=user@example.invalid', 'commit', '-qm', 'user commit'], { cwd: workingDir });
+  const concurrentHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
+  fs.writeFileSync(trackedFile, 'user tracked\n');
+  fs.writeFileSync(stagedFile, 'user staged\n');
+  execFileSync('git', ['add', 'staged.txt'], { cwd: workingDir });
+  fs.writeFileSync(untrackedFile, 'user untracked\n');
+  fs.writeFileSync(continuePath, 'continue');
+  const reason = await run;
   assert.equal(reason, 'dependency_repair_scheduled');
-  assert.equal(fs.readFileSync(protectedRepoFile, 'utf8'), 'original\n');
-  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim(), originalHead);
-  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: workingDir, encoding: 'utf8' }), '');
-  const independent = readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'independent');
-  assert.equal(independent.status, 'Done');
-  assert.equal(independent.completion_commit, 'abc123');
-  assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-quarantine.json')), true);
+  assert.notEqual(concurrentHead, originalHead);
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim(), concurrentHead);
+  assert.equal(execFileSync('git', ['branch', '--show-current'], { cwd: workingDir, encoding: 'utf8' }).trim(), 'user/concurrent-work');
+  assert.equal(fs.readFileSync(trackedFile, 'utf8'), 'user tracked\n');
+  assert.equal(fs.readFileSync(stagedFile, 'utf8'), 'user staged\n');
+  assert.equal(fs.readFileSync(untrackedFile, 'utf8'), 'user untracked\n');
+  const status = execFileSync('git', ['status', '--porcelain'], { cwd: workingDir, encoding: 'utf8' });
+  assert.match(status, / M tracked\.txt/);
+  assert.match(status, /M  staged\.txt/);
+  assert.match(status, /\?\? user-untracked\.txt/);
+  assert.match(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /"status": "Todo"/);
+  const quarantine = JSON.parse(fs.readFileSync(path.join(sessionDir, 'dependency-repair-quarantine.json'), 'utf8'));
+  assert.equal(quarantine.repository.attribution, 'ambiguous-preserved');
+  assert.equal(quarantine.repository.recovery, 'none');
+  assert.equal(quarantine.repository.after.head, concurrentHead);
   assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-current.json')), false);
 });
 
@@ -912,7 +940,7 @@ test('exhausted dependency recovery still performs one bounded worker attempt be
   assert.equal(repairs, 1);
 });
 
-test('hostile dependency artifact cannot preempt restoration of corrupt live state and manifest', async () => {
+test('hostile dependency artifact capture stays bounded without overwriting corrupt authoritative state', async () => {
   for (const artifactMode of ['symlink', 'oversize']) {
     const { dataRoot, sessionDir } = createSessionWithTodoTicket(`dependency ${artifactMode} fence`);
     writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
@@ -921,7 +949,6 @@ test('hostile dependency artifact cannot preempt restoration of corrupt live sta
         { id: 'independent', title: 'Independent', status: 'Done', depends_on: [], acceptance_criteria: ['Stay complete.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['independent.txt'], completion_commit: 'checkpoint' },
       ],
     });
-    const originalState = fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8');
     const binDir = makeTempRoot(`dependency-${artifactMode}-bin-`);
     writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -935,21 +962,69 @@ if (process.env.HOSTILE_MODE === 'symlink') fs.symlinkSync(path.dirname(artifact
 else { const fd = fs.openSync(artifact, 'w'); fs.ftruncateSync(fd, 2 * 1024 * 1024); fs.closeSync(fd); }
 console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
 `);
-    const reason = await withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
-      runTicket: async () => { throw new Error('implementation must not run'); },
-    }), {
-      ...prependPath(binDir), HOSTILE_MODE: artifactMode,
-      HOSTILE_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
-      HOSTILE_STATE: path.join(sessionDir, 'state.json'),
-    });
-    assert.equal(reason, 'dependency_repair_scheduled', artifactMode);
-    assert.doesNotMatch(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /poisoned/, artifactMode);
-    const restoredState = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
-    assert.equal(JSON.parse(originalState).working_dir, restoredState.working_dir, artifactMode);
-    assert.equal(readManifest(sessionDir).tickets.find((ticket) => ticket.id === 'independent').completion_commit, 'checkpoint');
+    await assert.rejects(
+      () => withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+        runTicket: async () => { throw new Error('implementation must not run'); },
+      }), {
+        ...prependPath(binDir), HOSTILE_MODE: artifactMode,
+        HOSTILE_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
+        HOSTILE_STATE: path.join(sessionDir, 'state.json'),
+      }),
+      /State file must contain a JSON object/,
+      artifactMode,
+    );
+    assert.equal(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'), '{', artifactMode);
+    assert.match(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /poisoned/, artifactMode);
     const quarantine = JSON.parse(fs.readFileSync(path.join(sessionDir, 'dependency-repair-quarantine.json'), 'utf8'));
     assert.equal(quarantine.candidate_artifact.kind, artifactMode === 'symlink' ? 'unsafe-file' : 'oversize');
+    assert.match(quarantine.cleanup_failure, /State file must contain a JSON object/);
   }
+});
+
+test('cancellation during malicious dependency drift remains terminal and emits no repair wakeup', async () => {
+  const { dataRoot, sessionDir } = createSessionWithTodoTicket('dependency cancellation fence');
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [
+      { id: 'orphan', title: 'Orphan', status: 'Todo', depends_on: ['missing'], acceptance_criteria: ['Repair safely.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['orphan.txt'] },
+      { id: 'independent', title: 'Independent', status: 'Done', depends_on: [], acceptance_criteria: ['Stay complete.'], verification: ['node -e "process.exit(0)"'], allowed_paths: ['independent.txt'], completion_commit: 'cancel-checkpoint' },
+    ],
+  });
+  const statePath = path.join(sessionDir, 'state.json');
+  const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+  writeJson(logicalPath, { lease: { token: 'live-before-cancel' } });
+  const binDir = makeTempRoot('dependency-cancel-bin-');
+  const readyPath = path.join(binDir, 'ready');
+  writeExecutable(path.join(binDir, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(process.env.CANCEL_MANIFEST, '{"poisoned":true}');
+fs.writeFileSync(process.env.CANCEL_READY, 'ready');
+await new Promise(() => {});
+`);
+  const run = withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    runTicket: async () => { throw new Error('implementation must not run'); },
+  }), {
+    ...prependPath(binDir), CANCEL_READY: readyPath,
+    CANCEL_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
+  });
+  while (!fs.existsSync(readyPath)) await new Promise((resolve) => setTimeout(resolve, 10));
+  new StateManager().update(statePath, (state) => {
+    state.active = false;
+    state.last_exit_reason = 'cancelled';
+    state.cancel_requested_at = new Date().toISOString();
+    return state;
+  });
+  writeJson(logicalPath, { lease: null, release_marker: 'concurrent-cancel' });
+
+  assert.equal(await run, 'cancelled');
+  const state = new StateManager().read(statePath);
+  assert.equal(state.active, false);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.ok(state.cancel_requested_at);
+  assert.equal(state.history.filter((event) => event.step === 'dependency_repair_wakeup_persisted').length, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(logicalPath, 'utf8')), { lease: null, release_marker: 'concurrent-cancel' });
+  assert.match(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /poisoned/);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'dependency-repair-quarantine.json')), true);
+  assert.equal(fs.existsSync(path.join(sessionDir, '.session-operation.lock')), false);
 });
 
 test('unresolved dependency repair persists one nonterminal wakeup and resumes with a novel production strategy', async () => {

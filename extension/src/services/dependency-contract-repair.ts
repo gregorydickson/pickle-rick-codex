@@ -51,10 +51,8 @@ interface WorkerFence {
   repo_head: string;
   repo_symbolic_head: string | null;
   repo_fingerprint: string;
-  repo_files: FileSnapshot[];
-  repo_index: FileSnapshot;
+  repo_status: string;
   session_files: FileSnapshot[];
-  state_file: FileSnapshot;
   state: Record<string, unknown>;
 }
 
@@ -282,49 +280,20 @@ function snapshotFile(filePath: string): FileSnapshot {
   }
 }
 
-function restoreFile(snapshot: FileSnapshot): void {
-  if (!snapshot.existed) {
-    fs.rmSync(snapshot.file_path, { force: true });
-    return;
-  }
-  fs.mkdirSync(path.dirname(snapshot.file_path), { recursive: true });
-  fs.rmSync(snapshot.file_path, { force: true });
-  if (snapshot.symlink !== null) fs.symlinkSync(snapshot.symlink, snapshot.file_path);
-  else fs.writeFileSync(snapshot.file_path, snapshot.content || Buffer.alloc(0), { mode: snapshot.mode || 0o600 });
-}
-
 function gitOutput(workingDir: string, args: string[]): string {
   return execFileSync('git', args, { cwd: workingDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function repositoryFilePaths(workingDir: string): string[] {
-  if (!isGitRepo(workingDir)) {
-    const files: string[] = [];
-    const walk = (directory: string): void => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        if (entry.name === '.git') continue;
-        const candidate = path.join(directory, entry.name);
-        if (entry.isDirectory()) walk(candidate);
-        else files.push(candidate);
-      }
-    };
-    walk(workingDir);
-    return files;
-  }
-  return gitOutput(workingDir, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'])
-    .split('\0').filter(Boolean).map((relative) => path.join(workingDir, relative));
-}
-
-function repositoryIndexPath(workingDir: string): string {
-  if (!isGitRepo(workingDir)) return path.join(workingDir, '.git', 'index');
-  const value = gitOutput(workingDir, ['rev-parse', '--git-path', 'index']).trim();
-  return path.isAbsolute(value) ? value : path.resolve(workingDir, value);
+function repositoryStatus(workingDir: string): string {
+  return isGitRepo(workingDir)
+    ? gitOutput(workingDir, ['status', '--porcelain=v1', '--untracked-files=all'])
+    : '';
 }
 
 function protectedSessionPaths(sessionDir: string): string[] {
   const fixed = [
     'prd.md', 'prd.lock.json', 'refinement_manifest.json', 'state.json',
-    'logical-pipeline.json', 'pipeline-state.json', 'ticket-transaction-ledger.json',
+    'ticket-transaction-ledger.json',
   ].map((file) => path.join(sessionDir, file));
   const ticketFiles: string[] = [];
   const walk = (directory: string): void => {
@@ -349,16 +318,13 @@ function logicalState(value: Record<string, unknown>): Record<string, unknown> {
 }
 
 function captureWorkerFence(sessionDir: string, workingDir: string): WorkerFence {
-  const stateFile = snapshotFile(path.join(sessionDir, 'state.json'));
   return {
     repo_is_git: isGitRepo(workingDir),
     repo_head: getHeadSha(workingDir),
     repo_symbolic_head: getSymbolicHead(workingDir),
     repo_fingerprint: getWorkingTreeFingerprint(workingDir),
-    repo_files: repositoryFilePaths(workingDir).map(snapshotFile),
-    repo_index: snapshotFile(repositoryIndexPath(workingDir)),
+    repo_status: repositoryStatus(workingDir),
     session_files: protectedSessionPaths(sessionDir).filter((file) => path.basename(file) !== 'state.json').map(snapshotFile),
-    state_file: stateFile,
     state: logicalState(new StateManager().read(path.join(sessionDir, 'state.json'))),
   };
 }
@@ -383,53 +349,126 @@ function fenceDrift(sessionDir: string, workingDir: string, fence: WorkerFence):
   return [...new Set(drift)];
 }
 
-function restoreWorkerFence(sessionDir: string, workingDir: string, fence: WorkerFence): void {
-  const errors: unknown[] = [];
-  const attempt = (operation: () => void): void => {
-    try { operation(); } catch (error) { errors.push(error); }
-  };
-  const original = new Set(fence.repo_files.map((entry) => entry.file_path));
-  attempt(() => {
-    for (const current of repositoryFilePaths(workingDir)) {
-      if (!original.has(current)) fs.rmSync(current, { force: true });
+function cleanupWorkerState(
+  manager: StateManager,
+  statePath: string,
+  cancelledByMonitor: boolean,
+  workerChildPid: number | null,
+): { cancelled: boolean } {
+  manager.acquireLock(statePath);
+  try {
+    const current = manager.read(statePath);
+    const cancelled = cancelledByMonitor || current.active === false;
+    if (workerChildPid !== null
+      && current.active_child_pid === workerChildPid
+      && current.active_child_controller_pid === process.pid
+      && current.active_child_command === 'dependency-repair') {
+      current.active_child_pid = null;
+      current.active_child_kind = null;
+      current.active_child_command = null;
+      current.active_child_identity = null;
+      current.active_child_controller_pid = null;
     }
-  });
-  fence.repo_files.forEach((snapshot) => attempt(() => restoreFile(snapshot)));
-  if (fence.repo_is_git) attempt(() => restoreFile(fence.repo_index));
-  if (fence.repo_is_git && fence.repo_symbolic_head) {
-    attempt(() => execFileSync('git', ['symbolic-ref', 'HEAD', fence.repo_symbolic_head!], { cwd: workingDir, stdio: 'ignore' }));
-    attempt(() => execFileSync('git', ['update-ref', fence.repo_symbolic_head!, fence.repo_head], { cwd: workingDir, stdio: 'ignore' }));
-  } else if (fence.repo_is_git) {
-    attempt(() => execFileSync('git', ['update-ref', '--no-deref', 'HEAD', fence.repo_head], { cwd: workingDir, stdio: 'ignore' }));
+    atomicWriteJson(statePath, current);
+    return { cancelled };
+  } finally {
+    manager.releaseLock(statePath);
   }
-  fence.session_files.forEach((snapshot) => attempt(() => restoreFile(snapshot)));
-  attempt(() => restoreFile(fence.state_file));
-  if (errors.length > 0) throw new AggregateError(errors, 'dependency-repair-fence-restore-failed');
+}
+
+function repositoryFenceEvidence(workingDir: string, fence: WorkerFence): Record<string, unknown> {
+  try {
+    return {
+      attribution: 'ambiguous-preserved',
+      recovery: 'none',
+      before: {
+        head: fence.repo_head,
+        symbolic_head: fence.repo_symbolic_head,
+        fingerprint: fence.repo_fingerprint,
+        status: fence.repo_status,
+      },
+      after: {
+        head: getHeadSha(workingDir),
+        symbolic_head: getSymbolicHead(workingDir),
+        fingerprint: getWorkingTreeFingerprint(workingDir),
+        status: repositoryStatus(workingDir),
+      },
+    };
+  } catch (error) {
+    return {
+      attribution: 'ambiguous-preserved', recovery: 'none',
+      inspection_error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 function boundedCandidateEvidence(filePath: string): Record<string, unknown> {
+  let descriptor: number | null = null;
   try {
     const stat = fs.lstatSync(filePath);
     if (!stat.isFile() || stat.isSymbolicLink()) {
       return { kind: 'unsafe-file', size: stat.size, symlink: stat.isSymbolicLink() };
     }
     if (stat.size > 64 * 1024) return { kind: 'oversize', size: stat.size };
-    return { kind: 'content', size: stat.size, content_base64: fs.readFileSync(filePath).toString('base64') };
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.ino !== stat.ino || opened.dev !== stat.dev || opened.size !== stat.size) {
+      return { kind: 'changed-during-capture', size: opened.size };
+    }
+    const content = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytes = fs.readSync(descriptor, content, offset, content.length - offset, offset);
+      if (bytes === 0) break;
+      offset += bytes;
+    }
+    if (offset !== content.length) return { kind: 'changed-during-capture', size: opened.size, bytes_read: offset };
+    return { kind: 'content', size: opened.size, content_base64: content.toString('base64') };
   } catch (error) {
     return { kind: 'unreadable', detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (descriptor !== null) try { fs.closeSync(descriptor); } catch { /* best effort */ }
   }
 }
 
-function readDependencyArtifact(filePath: string): Record<string, unknown> {
-  const stat = fs.lstatSync(filePath);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 1024 * 1024) {
-    throw new Error('dependency-repair-invalid-artifact: artifact must be a regular file no larger than 1 MiB');
+function authoritativeDriftEvidence(sessionDir: string, drift: string[]): Record<string, unknown> {
+  const evidence: Record<string, unknown> = {};
+  for (const entry of drift) {
+    if (entry.startsWith('repository-') || entry.startsWith('fence-inspection-failed')) continue;
+    const candidate = path.resolve(sessionDir, entry);
+    if (!candidate.startsWith(`${path.resolve(sessionDir)}${path.sep}`)) continue;
+    evidence[entry] = boundedCandidateEvidence(candidate);
   }
+  return evidence;
+}
+
+function readDependencyArtifact(filePath: string): Record<string, unknown> {
+  let descriptor: number | null = null;
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 1024 * 1024) {
+      throw new Error('dependency-repair-invalid-artifact: artifact must be a regular file no larger than 1 MiB');
+    }
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.ino !== stat.ino || opened.dev !== stat.dev
+      || opened.size !== stat.size || opened.size <= 0 || opened.size > 1024 * 1024) {
+      throw new Error('dependency-repair-invalid-artifact: artifact changed during no-follow validation');
+    }
+    const content = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytes = fs.readSync(descriptor, content, offset, content.length - offset, offset);
+      if (bytes === 0) break;
+      offset += bytes;
+    }
+    if (offset !== content.length) throw new Error('dependency-repair-invalid-artifact: artifact changed while reading');
+    return JSON.parse(content.toString('utf8')) as Record<string, unknown>;
   } catch (error) {
     if (error instanceof SyntaxError) throw new Error('dependency-repair-invalid-artifact: malformed JSON', { cause: error });
     throw error;
+  } finally {
+    if (descriptor !== null) try { fs.closeSync(descriptor); } catch { /* best effort */ }
   }
 }
 
@@ -625,6 +664,7 @@ export async function repairTicketDependencyContract(
   let result;
   let workerError: unknown = null;
   let isolationError: Error | null = null;
+  let workerChildPid: number | null = null;
   const fence = captureWorkerFence(sessionDir, workingDir);
   try {
     result = await runCodexExecMonitored({
@@ -636,7 +676,8 @@ export async function repairTicketDependencyContract(
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'DEPENDENCY_REPAIR_COMPLETE')
         || hasPromiseToken(lastMessage, 'DEPENDENCY_REPAIR_COMPLETE'),
       onSpawn: (child) => manager.update(statePath, (current) => {
-        current.active_child_pid = child.pid;
+        workerChildPid = Number(child.pid);
+        current.active_child_pid = workerChildPid;
         current.active_child_kind = 'codex';
         current.active_child_command = 'dependency-repair';
         current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
@@ -656,42 +697,39 @@ export async function repairTicketDependencyContract(
         return [`fence-inspection-failed: ${error instanceof Error ? error.message : String(error)}`];
       }
     })();
+    const repositoryDrift = drift.some((entry) => entry.startsWith('repository-'));
     if (drift.length > 0) {
       const candidateArtifact = boundedCandidateEvidence(artifactPath);
-      let restoreFailure: string | null = null;
+      let cleanupFailure: string | null = null;
+      let stateCleanup: { cancelled: boolean } | null = null;
       try {
-        restoreWorkerFence(sessionDir, workingDir, fence);
+        stateCleanup = cleanupWorkerState(manager, statePath, result?.cancelled === true, workerChildPid);
       } catch (error) {
-        restoreFailure = error instanceof Error ? error.message : String(error);
+        cleanupFailure = error instanceof Error ? error.message : String(error);
       }
       const quarantinePath = path.join(sessionDir, 'dependency-repair-quarantine.json');
       try {
         atomicWriteJson(quarantinePath, {
           schema_version: 1,
           ticket_id: normalizedTicketId,
-          reason: 'dependency-repair-isolation-violation',
+          reason: 'dependency-repair-unattributed-authoritative-drift',
           drift,
-          restore_failure: restoreFailure,
+          cleanup_failure: cleanupFailure,
           candidate_artifact: candidateArtifact,
+          authoritative_drift: authoritativeDriftEvidence(sessionDir, drift),
+          repository: repositoryDrift ? repositoryFenceEvidence(workingDir, fence) : null,
+          state_cleanup: stateCleanup,
           quarantined_at: new Date().toISOString(),
         });
       } catch (error) {
-        restoreFailure ||= `quarantine failed: ${error instanceof Error ? error.message : String(error)}`;
+        cleanupFailure ||= `quarantine failed: ${error instanceof Error ? error.message : String(error)}`;
       }
       fs.rmSync(candidateDir, { recursive: true, force: true });
-      isolationError = new Error(`dependency-repair-isolation-violation: ${drift.join(', ')}${restoreFailure ? `; ${restoreFailure}` : ''}`);
+      isolationError = new Error(`dependency-repair-unattributed-authoritative-drift: ${drift.join(', ')}${cleanupFailure ? `; ${cleanupFailure}` : ''}`);
     } else {
       try {
-        manager.update(statePath, (current) => {
-          current.active_child_pid = null;
-          current.active_child_kind = null;
-          current.active_child_command = null;
-          current.active_child_identity = null;
-          current.active_child_controller_pid = null;
-          return current;
-        });
+        cleanupWorkerState(manager, statePath, result?.cancelled === true, workerChildPid);
       } catch (error) {
-        try { restoreWorkerFence(sessionDir, workingDir, fence); } catch { /* surfaced below */ }
         isolationError = new Error(`dependency-repair-state-cleanup-failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
@@ -713,12 +751,26 @@ export async function repairTicketDependencyContract(
       artifact,
       prepared_at: new Date().toISOString(),
     };
-    atomicWriteJson(dependencyTransactionPath(sessionDir), transaction);
-    const repaired = applyTicketDependencyRepairArtifact(sessionDir, normalizedTicketId, artifact);
-    options.afterMaterialization?.();
-    persistDependencyRepairEvidence(sessionDir, transaction, repaired);
-    fs.rmSync(dependencyTransactionPath(sessionDir), { force: true });
-    return repaired;
+    manager.acquireLock(statePath);
+    try {
+      const current = manager.read(statePath);
+      if (current.active === false) throw new Error('dependency-repair-cancelled-before-apply');
+      options.assertDurableOwnership?.();
+      if (manifestIdentity(sessionDir) !== expectedManifestIdentity) {
+        throw new Error('dependency-repair-authoritative-manifest-drift-before-apply');
+      }
+      if (sealIdentity(sessionDir) !== expectedSealIdentity) {
+        throw new Error('dependency-repair-authoritative-seal-drift-before-apply');
+      }
+      atomicWriteJson(dependencyTransactionPath(sessionDir), transaction);
+      const repaired = applyTicketDependencyRepairArtifact(sessionDir, normalizedTicketId, artifact);
+      options.afterMaterialization?.();
+      persistDependencyRepairEvidence(sessionDir, transaction, repaired);
+      fs.rmSync(dependencyTransactionPath(sessionDir), { force: true });
+      return repaired;
+    } finally {
+      manager.releaseLock(statePath);
+    }
   } finally {
     fs.rmSync(candidateDir, { recursive: true, force: true });
   }
