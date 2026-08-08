@@ -2,14 +2,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
-import { recordModelCallTelemetry } from './productive-autonomy.js';
+import { finalizeModelCallTelemetry, reserveModelCallTelemetry } from './productive-autonomy.js';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
 import {
   collectCodexToolCalls,
   detectOutputFormat,
   extractAssistantContent,
-  extractCodexUsage,
+  inspectCodexUsage,
 } from './classifier-utils.js';
 import type {
   CodexExecOptions,
@@ -116,6 +116,8 @@ async function runSpawnedCommand({
   successCheck,
   successSignalGraceMs = 750,
   successPollMs = 250,
+  awaitUsageOnSuccess = false,
+  usageCompletionGraceMs = 5_000,
   cleanupPaths = [],
   onSpawn,
   cancelCheck,
@@ -215,12 +217,15 @@ async function runSpawnedCommand({
 
     const armSuccessTermination = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
+      const usage = inspectCodexUsage(currentStdout());
+      const graceMs = awaitUsageOnSuccess && !usage.reported && !usage.turnCompleted
+        ? usageCompletionGraceMs : successSignalGraceMs;
       successGraceTimer = setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) {
           forcedAfterSuccess = true;
           scheduleTermination('SIGTERM', 'SIGKILL');
         }
-      }, successSignalGraceMs);
+      }, graceMs);
     };
 
     const observeProgress = (): void => {
@@ -310,6 +315,7 @@ async function runSpawnedCommand({
         const stderr = currentStderr();
         const message = readLastMessage(outputLastMessagePath);
         const outputFormat = detectOutputFormat(stdout);
+        const usage = inspectCodexUsage(stdout);
         finalize({
           exitCode: forcedByCancel
             ? 130
@@ -323,7 +329,8 @@ async function runSpawnedCommand({
           timedOut: forcedByTimeout,
           durationMs: Date.now() - startedAt,
           lastMessage: message,
-          usage: extractCodexUsage(stdout) as CodexUsage,
+          usage: usage.usage as CodexUsage,
+          usageReported: usage.reported,
           terminatedAfterSuccess: forcedAfterSuccess,
           cancelled: forcedByCancel,
           outputFormat,
@@ -426,37 +433,51 @@ export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpaw
     cleanupPaths: options.cleanupPaths,
     onSpawn: options.onSpawn,
     cancelCheck: options.cancelCheck,
+    awaitUsageOnSuccess: args.includes('--json'),
   });
 }
 
 export async function runCodexExecMonitored(options: CodexExecOptions): Promise<CodexSpawnResult> {
   const { command, args } = buildCodexExecInvocation(options);
-  const result = await runSpawnedCommand({
-    command,
-    args,
-    cwd: options.cwd,
-    input: options.prompt,
-    timeoutMs: options.timeoutMs,
-    env: options.env,
-    outputLastMessagePath: options.outputLastMessagePath,
-    progressArtifactPaths: options.progressArtifactPaths,
-    successCheck: options.successCheck,
-    successSignalGraceMs: options.successSignalGraceMs,
-    successPollMs: options.successPollMs,
-    cleanupPaths: options.cleanupPaths,
-    onSpawn: options.onSpawn,
-    cancelCheck: options.cancelCheck,
-  });
-  if (options.telemetry) {
-    recordModelCallTelemetry(options.telemetry.sessionDir, {
-      ticketId: options.telemetry.ticketId,
-      phase: options.telemetry.phase,
-      ticketAttempt: options.telemetry.ticketAttempt ?? 1,
-      phaseAttempt: options.telemetry.phaseAttempt ?? 1,
-      recoveryEpoch: options.telemetry.recoveryEpoch,
-      strategyHash: options.telemetry.strategyHash,
-      result,
+  const telemetryStartedAt = Date.now();
+  const reservation = options.telemetry
+    ? reserveModelCallTelemetry(options.telemetry.sessionDir, options.telemetry) : null;
+  let result: CodexSpawnResult;
+  try {
+    result = await runSpawnedCommand({
+      command,
+      args,
+      cwd: options.cwd,
+      input: options.prompt,
+      timeoutMs: options.timeoutMs,
+      env: options.env,
+      outputLastMessagePath: options.outputLastMessagePath,
+      progressArtifactPaths: options.progressArtifactPaths,
+      successCheck: options.successCheck,
+      successSignalGraceMs: options.successSignalGraceMs,
+      successPollMs: options.successPollMs,
+      cleanupPaths: options.cleanupPaths,
+      onSpawn: options.onSpawn,
+      cancelCheck: options.cancelCheck,
+      awaitUsageOnSuccess: args.includes('--json'),
     });
+  } catch (error) {
+    if (options.telemetry && reservation) {
+      finalizeModelCallTelemetry(options.telemetry.sessionDir, reservation, {
+        result: {
+          command, args, exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error),
+          timedOut: false, durationMs: Date.now() - telemetryStartedAt, lastMessage: '',
+          usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+          usageReported: false, terminatedAfterSuccess: false, cancelled: false,
+          outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+        },
+        outcome: 'failed',
+      });
+    }
+    throw error;
+  }
+  if (options.telemetry && reservation) {
+    finalizeModelCallTelemetry(options.telemetry.sessionDir, reservation, { result });
   }
   return result;
 }

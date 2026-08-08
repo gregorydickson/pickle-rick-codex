@@ -9,7 +9,10 @@ import {
   executionTelemetrySummary,
   recordExecutionControlTelemetry,
 } from '../services/productive-autonomy.js';
+import { fileURLToPath } from 'node:url';
 import { makeTempRoot, repoRoot } from './helpers.js';
+
+const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
 function fakeCodex(runtimeDir) {
   const executable = path.join(runtimeDir, 'codex-telemetry');
@@ -72,6 +75,79 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   assert.equal(summary.cacheCreationInputTokens, 16);
   assert.equal(summary.outputTokens, 12);
   assert.equal(summary.durationMs, success.durationMs + failed.durationMs + timedOut.durationMs + cancelled.durationMs);
+  const events = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events;
+  assert.deepEqual(events.map((event) => event.model_attempt_id), [1, 2, 3, 4]);
+  assert.deepEqual(events.map((event) => event.ticket_attempt), [2, 2, 2, 2]);
+  assert.deepEqual(events.map((event) => event.phase_attempt), [1, 1, 1, 1]);
+});
+
+test('installed-runtime JSONL retains terminal usage and allocates durable Citadel ordinals across calls', async () => {
+  const sessionDir = makeTempRoot('pickle-installed-codex-telemetry-');
+  const runtimeDir = makeTempRoot('pickle-installed-codex-bin-');
+  const executable = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const lines = fs.readFileSync(process.env.INSTALLED_CODEX_FIXTURE, 'utf8').trim().split('\\n');
+process.stdout.write(lines.slice(0, -1).join('\\n') + '\\n');
+setTimeout(() => process.stdout.write(lines.at(-1) + '\\n'), 900);
+`, { mode: 0o755 });
+  fs.chmodSync(executable, 0o755);
+  const invokeInstalled = async () => await runCodexExecMonitored({
+    command: executable,
+    prompt: 'citadel',
+    timeoutMs: 4_000,
+    env: { INSTALLED_CODEX_FIXTURE: path.join(fixtures, 'codex-exec-installed-0.147.jsonl') },
+    successCheck: ({ assistantContent }) => assistantContent.includes('CITADEL_COMPLETE'),
+    telemetry: { sessionDir, ticketId: 'citadel', phase: 'citadel' },
+  });
+
+  const first = await invokeInstalled();
+  const second = await invokeInstalled();
+  for (const result of [first, second]) {
+    assert.equal(result.usageReported, true);
+    assert.deepEqual(result.usage, {
+      input_tokens: 17861,
+      output_tokens: 5,
+      cache_creation_input_tokens: 7,
+      cache_read_input_tokens: 9984,
+    });
+  }
+  const journal = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8'));
+  assert.deepEqual(journal.events.map((event) => event.model_attempt_id), [1, 2]);
+  assert.deepEqual(journal.events.map((event) => event.ticket_attempt), [1, 2]);
+  assert.deepEqual(journal.events.map((event) => event.phase_attempt), [1, 2]);
+  assert.deepEqual(journal.events.map((event) => event.input_tokens), [17861, 17861]);
+  assert.deepEqual(journal.events.map((event) => event.telemetry_status), ['reported', 'reported']);
+  assert.equal(journal.next_model_attempt_id, 3);
+});
+
+test('completed Codex call without usage persists typed telemetry unavailability instead of zero tokens', async () => {
+  const sessionDir = makeTempRoot('pickle-unavailable-codex-telemetry-');
+  const executable = path.join(makeTempRoot('pickle-unavailable-codex-bin-'), 'codex');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+process.stdout.write([
+  JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '<promise>DONE</promise>' } }),
+  JSON.stringify({ type: 'turn.completed' }),
+].join('\\n'));
+`, { mode: 0o755 });
+  fs.chmodSync(executable, 0o755);
+  const result = await runCodexExecMonitored({
+    command: executable,
+    prompt: '',
+    timeoutMs: 2_000,
+    successCheck: ({ assistantContent }) => assistantContent.includes('<promise>DONE</promise>'),
+    telemetry: { sessionDir, ticketId: 'citadel', phase: 'citadel' },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.usageReported, false);
+  const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
+  assert.equal(event.outcome, 'success');
+  assert.equal(event.telemetry_status, 'telemetry_unavailable');
+  assert.equal(event.telemetry_failure, 'completed_without_usage');
+  assert.equal(event.input_tokens, null);
+  assert.equal(event.cached_input_tokens, null);
+  assert.equal(event.cache_creation_input_tokens, null);
+  assert.equal(event.output_tokens, null);
 });
 
 test('control telemetry exposes checkpoint and post-seal binary scoring without inventing model calls', () => {

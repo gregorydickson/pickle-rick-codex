@@ -9,6 +9,7 @@ import {
   detectOutputFormat,
   extractAssistantContent,
   extractCodexUsage,
+  inspectCodexUsage,
   observeCodexToolCallStream,
 } from '../services/classifier-utils.js';
 import { runCommand } from '../services/codex.js';
@@ -104,6 +105,30 @@ test('usage extraction accumulates direct and nested counters while ignoring non
     output_tokens: 16,
     cache_creation_input_tokens: 4,
     cache_read_input_tokens: 16,
+  });
+});
+
+test('installed Codex 0.147 terminal usage recognizes cache-write tokens and completion', () => {
+  const installed = fs.readFileSync(path.join(fixtures, 'codex-exec-installed-0.147.jsonl'), 'utf8');
+  assert.deepEqual(inspectCodexUsage(installed), {
+    usage: {
+      input_tokens: 17861,
+      output_tokens: 5,
+      cache_creation_input_tokens: 7,
+      cache_read_input_tokens: 9984,
+    },
+    reported: true,
+    turnCompleted: true,
+  });
+  assert.deepEqual(inspectCodexUsage('{"type":"turn.completed"}\n'), {
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+    reported: false,
+    turnCompleted: true,
   });
 });
 

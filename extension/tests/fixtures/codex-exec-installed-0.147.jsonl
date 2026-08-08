@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fe39a-test"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Installed runtime complete.\n<promise>CITADEL_COMPLETE</promise>"}}
+{"type":"turn.completed","usage":{"input_tokens":17861,"cached_input_tokens":9984,"cache_write_input_tokens":7,"output_tokens":5,"reasoning_output_tokens":0}}

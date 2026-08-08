@@ -17,6 +17,12 @@ export interface ParsedCodexUsage {
   cache_read_input_tokens: number;
 }
 
+export interface CodexUsageObservation {
+  usage: ParsedCodexUsage;
+  reported: boolean;
+  turnCompleted: boolean;
+}
+
 interface JsonObject { [key: string]: unknown }
 
 function asObject(value: unknown): JsonObject | null {
@@ -201,24 +207,34 @@ export function collectCodexToolCalls(output: string): CodexToolCallObservation[
   });
 }
 
-export function extractCodexUsage(output: string): ParsedCodexUsage {
+export function inspectCodexUsage(output: string): CodexUsageObservation {
   const totals: ParsedCodexUsage = {
     input_tokens: 0,
     output_tokens: 0,
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
   };
+  let reported = false;
+  let turnCompleted = false;
   for (const line of output.split(/\r?\n/)) {
     const event = parseObject(line.trim());
     if (!event) continue;
+    if (event.type === 'turn.completed') turnCompleted = true;
     const usage = asObject(event.usage)
       || asObject(asObject(event.response)?.usage)
       || asObject(asObject(event.result)?.usage);
     if (!usage) continue;
+    reported = true;
     totals.input_tokens += Number(usage.input_tokens || 0);
     totals.output_tokens += Number(usage.output_tokens || 0);
-    totals.cache_creation_input_tokens += Number(usage.cache_creation_input_tokens || 0);
+    totals.cache_creation_input_tokens += Number(
+      usage.cache_creation_input_tokens ?? usage.cache_write_input_tokens ?? 0,
+    );
     totals.cache_read_input_tokens += Number(usage.cache_read_input_tokens ?? usage.cached_input_tokens ?? 0);
   }
-  return totals;
+  return { usage: totals, reported, turnCompleted };
+}
+
+export function extractCodexUsage(output: string): ParsedCodexUsage {
+  return inspectCodexUsage(output).usage;
 }

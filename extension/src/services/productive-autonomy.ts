@@ -94,6 +94,7 @@ export interface MaterialRecoveryPlan {
 
 export interface ExecutionTelemetryEvent {
   sequence: number;
+  model_attempt_id?: number;
   ticket_id: string;
   phase: string;
   ticket_attempt: number;
@@ -101,11 +102,13 @@ export interface ExecutionTelemetryEvent {
   recovery_epoch: number;
   strategy_hash: string | null;
   outcome: 'success' | 'failed' | 'cancelled' | 'timed_out';
+  telemetry_status?: 'reported' | 'telemetry_unavailable';
+  telemetry_failure?: 'completed_without_usage' | 'call_ended_without_usage' | null;
   duration_ms: number;
-  input_tokens: number;
-  cached_input_tokens: number;
-  cache_creation_input_tokens?: number;
-  output_tokens: number;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  cache_creation_input_tokens?: number | null;
+  output_tokens: number | null;
   productive_work: number;
   discarded_work: number;
   recorded_at: string;
@@ -114,6 +117,8 @@ export interface ExecutionTelemetryEvent {
 interface ExecutionTelemetryJournal {
   schema_version: 1;
   events: ExecutionTelemetryEvent[];
+  next_model_attempt_id?: number;
+  model_attempts?: ModelCallTelemetryReservation[];
   controls?: ExecutionControlTelemetry;
   unexpected_noncompletion_termination?: {
     schema_version: 1;
@@ -126,6 +131,19 @@ interface ExecutionTelemetryJournal {
     executor_identity: PersistedProcessIdentity;
     recorded_at: string;
   };
+}
+
+export interface ModelCallTelemetryReservation {
+  model_attempt_id: number;
+  ticket_id: string;
+  phase: string;
+  ticket_attempt: number;
+  phase_attempt: number;
+  recovery_epoch: number;
+  strategy_hash: string | null;
+  status: 'started' | 'finalized';
+  started_at: string;
+  finalized_at?: string;
 }
 
 export interface ExecutionControlTelemetry {
@@ -473,7 +491,10 @@ export function nextMaterialRecoveryPlan(
 
 export function recordExecutionTelemetry(
   sessionDir: string,
-  input: Omit<ExecutionTelemetryEvent, 'sequence' | 'recorded_at'>,
+  input: Omit<ExecutionTelemetryEvent, 'sequence' | 'recorded_at' | 'ticket_attempt' | 'phase_attempt'> & {
+    ticket_attempt?: number;
+    phase_attempt?: number;
+  },
 ): ExecutionTelemetryEvent {
   const filePath = telemetryPath(sessionDir);
   const stateManager = new StateManager();
@@ -481,11 +502,145 @@ export function recordExecutionTelemetry(
   stateManager.update(filePath, (raw) => {
     const journal = raw as unknown as ExecutionTelemetryJournal;
     if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
-    event = { ...input, sequence: journal.events.length + 1, recorded_at: new Date().toISOString() };
+    const priorTicketAttempts = journal.events
+      .filter((candidate) => candidate.ticket_id === input.ticket_id)
+      .map((candidate) => Number(candidate.ticket_attempt || 0));
+    const priorPhaseAttempts = journal.events
+      .filter((candidate) => candidate.ticket_id === input.ticket_id && candidate.phase === input.phase)
+      .map((candidate) => Number(candidate.phase_attempt || 0));
+    const ticketAttempt = Number.isInteger(input.ticket_attempt) && Number(input.ticket_attempt) > 0
+      ? Number(input.ticket_attempt) : Math.max(0, ...priorTicketAttempts) + 1;
+    const phaseAttempt = Number.isInteger(input.phase_attempt) && Number(input.phase_attempt) > 0
+      ? Number(input.phase_attempt) : Math.max(0, ...priorPhaseAttempts) + 1;
+    const priorModelAttemptIds = journal.events.map((candidate) => Number(candidate.model_attempt_id || 0));
+    const modelAttemptId = Math.max(
+      Number(journal.next_model_attempt_id || 1),
+      Math.max(0, ...priorModelAttemptIds) + 1,
+    );
+    journal.next_model_attempt_id = modelAttemptId + 1;
+    event = {
+      ...input,
+      model_attempt_id: modelAttemptId,
+      ticket_attempt: ticketAttempt,
+      phase_attempt: phaseAttempt,
+      sequence: Math.max(0, ...journal.events.map((candidate) => Number(candidate.sequence || 0))) + 1,
+      recorded_at: new Date().toISOString(),
+    };
     journal.events.push(event);
     return journal as unknown as Record<string, unknown>;
   }, { createDefault: () => ({ schema_version: 1, events: [] }) });
   if (!event) throw new Error('execution-telemetry-write-failed');
+  return event;
+}
+
+export function reserveModelCallTelemetry(
+  sessionDir: string,
+  input: {
+    ticketId: string;
+    phase: string;
+    ticketAttempt?: number;
+    phaseAttempt?: number;
+    recoveryEpoch?: number;
+    strategyHash?: string | null;
+  },
+): ModelCallTelemetryReservation {
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  let reservation: ModelCallTelemetryReservation | null = null;
+  stateManager.update(filePath, (raw) => {
+    const journal = raw as unknown as ExecutionTelemetryJournal;
+    if (journal.schema_version !== 1 || !Array.isArray(journal.events)) throw new Error('execution-telemetry-corrupt');
+    journal.model_attempts = Array.isArray(journal.model_attempts) ? journal.model_attempts : [];
+    const prior = [...journal.events, ...journal.model_attempts];
+    const phaseAttempts = prior
+      .filter((candidate) => candidate.ticket_id === input.ticketId && candidate.phase === input.phase)
+      .map((candidate) => Number(candidate.phase_attempt || 0));
+    const phaseAttempt = Number.isInteger(input.phaseAttempt) && Number(input.phaseAttempt) > 0
+      ? Number(input.phaseAttempt) : Math.max(0, ...phaseAttempts) + 1;
+    const ticketAttempt = Number.isInteger(input.ticketAttempt) && Number(input.ticketAttempt) > 0
+      ? Number(input.ticketAttempt) : phaseAttempt;
+    const priorIds = prior.map((candidate) => Number(candidate.model_attempt_id || 0));
+    const modelAttemptId = Math.max(
+      Number(journal.next_model_attempt_id || 1),
+      Math.max(0, ...priorIds) + 1,
+    );
+    journal.next_model_attempt_id = modelAttemptId + 1;
+    reservation = {
+      model_attempt_id: modelAttemptId,
+      ticket_id: input.ticketId,
+      phase: input.phase,
+      ticket_attempt: ticketAttempt,
+      phase_attempt: phaseAttempt,
+      recovery_epoch: input.recoveryEpoch ?? 0,
+      strategy_hash: input.strategyHash ?? null,
+      status: 'started',
+      started_at: new Date().toISOString(),
+    };
+    journal.model_attempts.push(reservation);
+    return journal as unknown as Record<string, unknown>;
+  }, { createDefault: () => ({ schema_version: 1, events: [], model_attempts: [], next_model_attempt_id: 1 }) });
+  if (!reservation) throw new Error('model-call-telemetry-reservation-failed');
+  return reservation;
+}
+
+export function finalizeModelCallTelemetry(
+  sessionDir: string,
+  reservation: ModelCallTelemetryReservation,
+  input: {
+    result: CodexSpawnResult;
+    outcome?: ExecutionTelemetryEvent['outcome'];
+    productiveWork?: number;
+    discardedWork?: number;
+  },
+): ExecutionTelemetryEvent {
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  let event: ExecutionTelemetryEvent | null = null;
+  stateManager.update(filePath, (raw) => {
+    const journal = raw as unknown as ExecutionTelemetryJournal;
+    if (journal.schema_version !== 1 || !Array.isArray(journal.events) || !Array.isArray(journal.model_attempts)) {
+      throw new Error('execution-telemetry-corrupt');
+    }
+    const persisted = journal.model_attempts.find((candidate) => (
+      candidate.model_attempt_id === reservation.model_attempt_id
+    ));
+    if (!persisted || persisted.status !== 'started') throw new Error('model-call-telemetry-reservation-missing');
+    const outcome = input.outcome ?? (input.result.cancelled
+      ? 'cancelled'
+      : input.result.timedOut
+        ? 'timed_out'
+        : input.result.exitCode === 0 ? 'success' : 'failed');
+    const usageReported = input.result.usageReported ?? Object.values(input.result.usage)
+      .some((value) => Number(value) > 0);
+    event = {
+      sequence: Math.max(0, ...journal.events.map((candidate) => Number(candidate.sequence || 0))) + 1,
+      model_attempt_id: persisted.model_attempt_id,
+      ticket_id: persisted.ticket_id,
+      phase: persisted.phase,
+      ticket_attempt: persisted.ticket_attempt,
+      phase_attempt: persisted.phase_attempt,
+      recovery_epoch: persisted.recovery_epoch,
+      strategy_hash: persisted.strategy_hash,
+      outcome,
+      telemetry_status: usageReported ? 'reported' : 'telemetry_unavailable',
+      telemetry_failure: usageReported
+        ? null
+        : outcome === 'success' ? 'completed_without_usage' : 'call_ended_without_usage',
+      duration_ms: input.result.durationMs,
+      input_tokens: usageReported ? input.result.usage.input_tokens : null,
+      cached_input_tokens: usageReported ? input.result.usage.cache_read_input_tokens : null,
+      cache_creation_input_tokens: usageReported ? input.result.usage.cache_creation_input_tokens : null,
+      output_tokens: usageReported ? input.result.usage.output_tokens : null,
+      productive_work: input.productiveWork ?? (outcome === 'success' ? 1 : 0),
+      discarded_work: input.discardedWork ?? (outcome === 'success' ? 0 : 1),
+      recorded_at: new Date().toISOString(),
+    };
+    journal.events.push(event);
+    persisted.status = 'finalized';
+    persisted.finalized_at = event.recorded_at;
+    return journal as unknown as Record<string, unknown>;
+  });
+  if (!event) throw new Error('model-call-telemetry-finalize-failed');
   return event;
 }
 
@@ -494,8 +649,8 @@ export function recordModelCallTelemetry(
   input: {
     ticketId: string;
     phase: string;
-    ticketAttempt: number;
-    phaseAttempt: number;
+    ticketAttempt?: number;
+    phaseAttempt?: number;
     recoveryEpoch?: number;
     strategyHash?: string | null;
     result: CodexSpawnResult;
@@ -504,27 +659,8 @@ export function recordModelCallTelemetry(
     discardedWork?: number;
   },
 ): ExecutionTelemetryEvent {
-  const outcome = input.outcome ?? (input.result.cancelled
-    ? 'cancelled'
-    : input.result.timedOut
-      ? 'timed_out'
-      : input.result.exitCode === 0 ? 'success' : 'failed');
-  return recordExecutionTelemetry(sessionDir, {
-    ticket_id: input.ticketId,
-    phase: input.phase,
-    ticket_attempt: input.ticketAttempt,
-    phase_attempt: input.phaseAttempt,
-    recovery_epoch: input.recoveryEpoch ?? 0,
-    strategy_hash: input.strategyHash ?? null,
-    outcome,
-    duration_ms: input.result.durationMs,
-    input_tokens: input.result.usage.input_tokens,
-    cached_input_tokens: input.result.usage.cache_read_input_tokens,
-    cache_creation_input_tokens: input.result.usage.cache_creation_input_tokens,
-    output_tokens: input.result.usage.output_tokens,
-    productive_work: input.productiveWork ?? (outcome === 'success' ? 1 : 0),
-    discarded_work: input.discardedWork ?? (outcome === 'success' ? 0 : 1),
-  });
+  const reservation = reserveModelCallTelemetry(sessionDir, input);
+  return finalizeModelCallTelemetry(sessionDir, reservation, input);
 }
 
 const EMPTY_CONTROLS: ExecutionControlTelemetry = {
@@ -674,10 +810,10 @@ export function executionTelemetrySummary(sessionDir: string, ticketId?: string)
     timedOutCalls: events.filter((event) => event.outcome === 'timed_out').length,
     cancelledCalls: events.filter((event) => event.outcome === 'cancelled').length,
     durationMs: events.reduce((sum, event) => sum + event.duration_ms, 0),
-    inputTokens: events.reduce((sum, event) => sum + event.input_tokens, 0),
-    cachedInputTokens: events.reduce((sum, event) => sum + event.cached_input_tokens, 0),
+    inputTokens: events.reduce((sum, event) => sum + Number(event.input_tokens || 0), 0),
+    cachedInputTokens: events.reduce((sum, event) => sum + Number(event.cached_input_tokens || 0), 0),
     cacheCreationInputTokens: events.reduce((sum, event) => sum + Number(event.cache_creation_input_tokens || 0), 0),
-    outputTokens: events.reduce((sum, event) => sum + event.output_tokens, 0),
+    outputTokens: events.reduce((sum, event) => sum + Number(event.output_tokens || 0), 0),
     productiveWork: events.reduce((sum, event) => sum + event.productive_work, 0),
     discardedWork: events.reduce((sum, event) => sum + event.discarded_work, 0),
     executorRestarts: controls.executor_restarts,

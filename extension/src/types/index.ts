@@ -375,6 +375,7 @@ export interface CodexSpawnResult {
   durationMs: number;
   lastMessage: string;
   usage: CodexUsage;
+  usageReported: boolean;
   terminatedAfterSuccess: boolean;
   cancelled: boolean;
   outputFormat: 'stream-json' | 'codex-block' | 'plain-text';
@@ -406,6 +407,8 @@ export interface RunSpawnedCommandOptions {
   successCheck?: SuccessCheck;
   successSignalGraceMs?: number;
   successPollMs?: number;
+  awaitUsageOnSuccess?: boolean;
+  usageCompletionGraceMs?: number;
   cleanupPaths?: string[];
   onSpawn?: (child: import('node:child_process').ChildProcess) => void;
   cancelCheck?: CancelCheck;
