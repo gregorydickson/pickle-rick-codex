@@ -64,15 +64,25 @@ import {
 } from '../services/candidate-recovery.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
-import { normalizeTicketId, readManifest, restructureTicketFiles, updateTicketStatus } from '../services/tickets.js';
+import {
+  normalizeTicketId,
+  readManifest,
+  refinementTicketMaterializationPaths,
+  restructureTicketFiles,
+  restructureTicketFilesInTransaction,
+  updateTicketStatus,
+} from '../services/tickets.js';
 import {
   beginRefinementRepositoryAdvance,
+  buildReboundRefinementAcceptance,
   clearRefinementRepositoryAdvance,
   markRefinementRepositoryAdvanceVerified,
   refinementAcceptancePath,
   refinementRepositoryAdvancePath,
   refreshAcceptedRefinementRepositoryIdentity,
+  type RefinementAcceptance,
 } from '../services/refinement-artifacts.js';
+import { runTicketTransaction } from '../services/ticket-transaction.js';
 import {
   evaluateCompletionEvidence,
   type CompletionDecision,
@@ -804,6 +814,16 @@ export async function repairTicketVerificationContract(
       ticket.verification,
       options.strategy?.strategyHash || null,
     );
+    const acceptancePath = refinementAcceptancePath(sessionDir);
+    const acceptanceBefore = fs.existsSync(acceptancePath)
+      ? readJsonFile<RefinementAcceptance>(acceptancePath, null)
+      : null;
+    if (fs.existsSync(acceptancePath) && !acceptanceBefore) {
+      throw new Error('contract-repair-refinement-acceptance-invalid');
+    }
+    const repairedAcceptance = acceptanceBefore
+      ? buildReboundRefinementAcceptance(sessionDir, rawManifest as { tickets: Ticket[] }, { workingDir })
+      : null;
     const transaction: VerificationRepairTransaction = {
       schema_version: 1,
       status: 'prepared',
@@ -811,10 +831,24 @@ export async function repairTicketVerificationContract(
       manifest_before: manifestBefore,
       repaired_manifest: rawManifest as { tickets: Ticket[] },
       receipt,
+      ...(acceptanceBefore && repairedAcceptance
+        ? { acceptance_before: acceptanceBefore, repaired_acceptance: repairedAcceptance }
+        : {}),
       prepared_at: new Date().toISOString(),
     };
     atomicWriteJson(path.join(sessionDir, VERIFICATION_REPAIR_TRANSACTION_FILE), transaction);
-    restructureTicketFiles(sessionDir, transaction.repaired_manifest);
+    runTicketTransaction(
+      sessionDir,
+      'repair-sealed-verification-contract',
+      [
+        ...refinementTicketMaterializationPaths(sessionDir, transaction.repaired_manifest),
+        ...(repairedAcceptance ? [acceptancePath] : []),
+      ],
+      () => {
+        restructureTicketFilesInTransaction(sessionDir, transaction.repaired_manifest);
+        if (repairedAcceptance) atomicWriteJson(acceptancePath, repairedAcceptance);
+      },
+    );
     options.afterMaterialization?.();
     persistVerificationRepairReceipt(sessionDir, receipt);
     fs.rmSync(path.join(sessionDir, VERIFICATION_REPAIR_TRANSACTION_FILE), { force: true });

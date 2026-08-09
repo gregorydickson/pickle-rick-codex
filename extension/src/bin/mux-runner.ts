@@ -6,7 +6,7 @@ import { logActivity } from '../services/activity-logger.js';
 import { loadConfig } from '../services/config.js';
 import { canExecute, loadCircuitState, openCircuitBreaker, resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../services/session.js';
-import { enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
+import { capturePipelineVerificationBaselines, enterMuxRunnerPhase, exitMuxRunnerPhase } from '../services/pipeline-bootstrap.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
@@ -67,7 +67,10 @@ import {
   DependencyRepairIsolationError,
   type DependencyGraphInspection,
 } from '../services/dependency-contract-repair.js';
-import { reconcileVerificationRepairTransaction } from '../services/verification-seal-contract.js';
+import {
+  assertTicketVerificationBoundToSeal,
+  reconcileVerificationRepairTransaction,
+} from '../services/verification-seal-contract.js';
 
 interface RunSequentialOptions {
   onFailure?: string;
@@ -191,6 +194,16 @@ async function runSequentialWithLease(
   }
 
   let dependencyInspection = inspectTicketDependencyGraph(sessionDir);
+  const completeAdoptedVerificationRepair = (ticketId: string): void => {
+    const repairedSummary = summarizeTickets(sessionDir);
+    capturePipelineVerificationBaselines(sessionDir, {
+      state: manager.read(statePath),
+      summary: repairedSummary,
+      config,
+    });
+    markLegacyContractRepairComplete(sessionDir);
+    appendRunnerLog(sessionDir, runnerMode, `captured repaired verification baseline and completed legacy repair for ${ticketId}`);
+  };
   let summary;
   try {
     summary = summarizeTickets(sessionDir);
@@ -215,6 +228,7 @@ async function runSequentialWithLease(
       constraints: [(error as Error).message], materialApproach: nextMaterialApproach('contract', priorEpochs),
     }, 'failure');
     await repairContractFn(sessionDir, ticketId, { strategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+    if (legacyContractRepairPending(sessionDir, ticketId)) completeAdoptedVerificationRepair(ticketId);
     appendRunnerLog(sessionDir, runnerMode, `repaired invalid verification contract for ${ticketId} before scheduler dispatch`);
     summary = summarizeTickets(sessionDir);
   }
@@ -643,8 +657,21 @@ async function runSequentialWithLease(
       try {
         if (pendingContractRepair) {
           options.assertDurableOwnership?.();
-          await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
-          markLegacyContractRepairComplete(sessionDir);
+          let alreadyRepaired = false;
+          try {
+            assertTicketVerificationBoundToSeal(
+              sessionDir,
+              ticket.id,
+              String(manager.read(statePath).working_dir || ''),
+            );
+            alreadyRepaired = true;
+          } catch {
+            // The exact seal-bound receipt is the only authority for skipping repair.
+          }
+          if (!alreadyRepaired) {
+            await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
+          }
+          completeAdoptedVerificationRepair(ticket.id);
           pendingContractRepair = false;
           options.assertDurableOwnership?.();
         }

@@ -5,6 +5,7 @@ import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { readPrdSeal } from './prd-seal.js';
 import { normalizeTicketId } from './tickets.js';
 import { recoverInterruptedTicketTransaction } from './ticket-transaction.js';
+import { refinementAcceptancePath, type RefinementAcceptance } from './refinement-artifacts.js';
 import { normalizeVerificationSteps, verificationStepIdentity } from './verification-env.js';
 import type { RefinementManifest, VerificationStep } from '../types/index.js';
 
@@ -38,6 +39,8 @@ export interface VerificationRepairTransaction {
   manifest_before: RefinementManifest;
   repaired_manifest: RefinementManifest;
   receipt: VerificationRepairReceipt;
+  acceptance_before?: RefinementAcceptance;
+  repaired_acceptance?: RefinementAcceptance;
   prepared_at: string;
 }
 
@@ -222,13 +225,24 @@ export function reconcileVerificationRepairTransaction(sessionDir: string): 'com
     throw new Error('verification-contract-repair-transaction-receipt-invalid');
   }
   const current = readJsonFile<RefinementManifest>(path.join(sessionDir, 'refinement_manifest.json'), null);
+  const acceptancePath = refinementAcceptancePath(sessionDir);
+  const currentAcceptance = readJsonFile<RefinementAcceptance>(acceptancePath, null);
+  const hasAcceptanceRebind = Boolean(transaction.acceptance_before || transaction.repaired_acceptance);
+  if (hasAcceptanceRebind && (!transaction.acceptance_before || !transaction.repaired_acceptance)) {
+    throw new Error('verification-contract-repair-transaction-acceptance-corrupt');
+  }
   const currentTicket = current?.tickets?.find((ticket) => normalizeTicketId(ticket.id, ticket.id) === transaction.ticket_id);
   if (currentTicket && validateReceipt(transaction.receipt, authorization, currentTicket.verification)) {
+    if (transaction.repaired_acceptance
+      && JSON.stringify(currentAcceptance) !== JSON.stringify(transaction.repaired_acceptance)) {
+      throw new Error('verification-contract-repair-transaction-acceptance-drift');
+    }
     persistVerificationRepairReceipt(sessionDir, transaction.receipt);
     fs.rmSync(transactionPath, { force: true });
     return 'completed';
   }
   atomicWriteJson(path.join(sessionDir, 'refinement_manifest.json'), transaction.manifest_before);
+  if (transaction.acceptance_before) atomicWriteJson(acceptancePath, transaction.acceptance_before);
   fs.rmSync(transactionPath, { force: true });
   return 'rolled_back';
 }

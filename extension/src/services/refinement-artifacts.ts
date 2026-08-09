@@ -112,8 +112,10 @@ function stableValue(value: unknown): unknown {
   );
 }
 
-function manifestContractSha256(manifestPath: string, preserveMalformedVerification = false): string {
-  const manifest = readJsonFile<{ source?: unknown; tickets?: unknown }>(manifestPath, null);
+function manifestContractSha256Value(
+  manifest: { source?: unknown; tickets?: unknown } | null,
+  preserveMalformedVerification = false,
+): string {
   if (!manifest || !Array.isArray(manifest.tickets)) return '';
   let canonical: RefinementManifest;
   try {
@@ -144,6 +146,13 @@ function manifestContractSha256(manifestPath: string, preserveMalformedVerificat
       .map((field) => [field, stableValue(ticket[field])]));
   });
   return sha256(JSON.stringify(stableValue({ source: canonical.source ?? null, tickets })));
+}
+
+function manifestContractSha256(manifestPath: string, preserveMalformedVerification = false): string {
+  return manifestContractSha256Value(
+    readJsonFile<{ source?: unknown; tickets?: unknown }>(manifestPath, null),
+    preserveMalformedVerification,
+  );
 }
 
 function refinementSessionExclusion(workingDir: string, sessionDir?: string): {
@@ -324,6 +333,7 @@ export function writeRefinementAcceptance(
   options: {
     workingDir?: string;
     expectedInputIdentity?: RefinementInputIdentity;
+    preserveMalformedVerification?: boolean;
   } = {},
 ): RefinementAcceptance {
   const workingDir = acceptanceWorkingDir(sessionDir, options.workingDir);
@@ -343,7 +353,10 @@ export function writeRefinementAcceptance(
     prompt_contract_version: REFINEMENT_PROMPT_CONTRACT_VERSION,
     prd_sha256: currentPrdSha256,
     refined_prd_sha256: fileSha256(path.join(sessionDir, 'prd_refined.md')),
-    manifest_sha256: manifestContractSha256(path.join(sessionDir, 'refinement_manifest.json')),
+    manifest_sha256: manifestContractSha256(
+      path.join(sessionDir, 'refinement_manifest.json'),
+      options.preserveMalformedVerification === true,
+    ),
     repository_identity: options.expectedInputIdentity?.repository_identity || currentRepositoryIdentity,
     accepted_at: new Date().toISOString(),
   };
@@ -357,6 +370,29 @@ export function writeRefinementAcceptance(
   }
   atomicWriteJson(refinementAcceptancePath(sessionDir), receipt);
   return receipt;
+}
+
+/** Rebind an already accepted malformed legacy manifest to its exact repaired representation. */
+export function buildReboundRefinementAcceptance(
+  sessionDir: string,
+  repairedManifest: RefinementManifest,
+  options: { workingDir?: string } = {},
+): RefinementAcceptance {
+  const verdict = validateRefinementAcceptance(sessionDir, {
+    workingDir: options.workingDir,
+    verifyRepository: true,
+    preserveMalformedVerification: true,
+  });
+  if (!verdict.ok || !verdict.receipt) {
+    throw new Error(`Cannot rebind refinement acceptance: ${verdict.reason || 'acceptance receipt is missing'}.`);
+  }
+  const manifestSha256 = manifestContractSha256Value(repairedManifest);
+  if (!manifestSha256) throw new Error('Cannot rebind refinement acceptance to an invalid repaired manifest.');
+  return {
+    ...verdict.receipt,
+    manifest_sha256: manifestSha256,
+    accepted_at: new Date().toISOString(),
+  };
 }
 
 export function refreshAcceptedRefinementRepositoryIdentity(

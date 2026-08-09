@@ -3,9 +3,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { makeTempRoot, prependPath, writeExecutable, writeJson } from './helpers.js';
 import { repairTicketVerificationContract, runTicket } from '../bin/spawn-morty.js';
 import { writePrdSeal } from '../services/prd-seal.js';
+import {
+  beginRefinementRepositoryAdvance,
+  clearRefinementRepositoryAdvance,
+  validateRefinementAcceptance,
+  writeRefinementAcceptance,
+} from '../services/refinement-artifacts.js';
 import {
   assertTicketVerificationBoundToSeal,
   buildVerificationRepairReceipt,
@@ -14,7 +21,7 @@ import {
   verificationRepairReceiptPath,
 } from '../services/verification-seal-contract.js';
 
-function fixture(sealedVerification, manifestVerification = sealedVerification) {
+function fixture(sealedVerification, manifestVerification = sealedVerification, accepted = false) {
   const dataRoot = makeTempRoot('verification-seal-data-');
   const workingDir = makeTempRoot('verification-seal-repo-');
   const sessionDir = makeTempRoot('verification-seal-session-');
@@ -30,6 +37,16 @@ function fixture(sealedVerification, manifestVerification = sealedVerification) 
   });
   const prd = '# Sealed verification fixture\n';
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
+  if (accepted) {
+    execFileSync('git', ['init'], { cwd: workingDir });
+    execFileSync('git', ['config', 'user.name', 'Verification Seal Test'], { cwd: workingDir });
+    execFileSync('git', ['config', 'user.email', 'seal@example.com'], { cwd: workingDir });
+    fs.writeFileSync(path.join(workingDir, 'package.json'), '{"scripts":{"test":"node -e \\\"process.exit(0)\\\""}}\n');
+    execFileSync('git', ['add', 'package.json'], { cwd: workingDir });
+    execFileSync('git', ['commit', '-m', 'baseline'], { cwd: workingDir });
+    fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Refined sealed verification fixture\n');
+    writeRefinementAcceptance(sessionDir, { workingDir, preserveMalformedVerification: true });
+  }
   writePrdSeal(sessionDir, {
     prd,
     repository: { identity: 'fixture@base', working_directory: workingDir, execution_base_policy: 'sealed' },
@@ -107,6 +124,36 @@ test('representation-only legacy malformation is reconstructed with a crash-reco
   assert.equal(reconcileVerificationRepairTransaction(sessionDir), 'completed');
   assert.equal(fs.existsSync(path.join(sessionDir, 'verification-contract-repair-transaction.json')), false);
   assert.equal(fs.existsSync(verificationRepairReceiptPath(sessionDir, 'r1')), true);
+  assert.doesNotThrow(() => assertTicketVerificationBoundToSeal(sessionDir, 'r1', workingDir));
+});
+
+test('adopted trap/mktemp repair atomically rebinds acceptance and restart can begin ticket execution', async () => {
+  const command = 'runtime_root="$(mktemp -d)"; trap \'rm -rf "$runtime_root"\' EXIT; CODEX_HOME="$runtime_root/codex" AGENTS_HOME="$runtime_root/agents" PICKLE_DATA_ROOT="$runtime_root/data" bash install.sh && CODEX_HOME="$runtime_root/codex" AGENTS_HOME="$runtime_root/agents" PICKLE_DATA_ROOT="$runtime_root/data" npm run test:installed';
+  const legacy = [{ command }];
+  const { dataRoot, workingDir, sessionDir } = fixture(legacy, legacy, true);
+  const sealBefore = fs.readFileSync(path.join(sessionDir, 'prd.lock.json'), 'utf8');
+  const acceptanceBefore = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement-acceptance.json'), 'utf8'));
+
+  await assert.rejects(
+    () => withEnvironment({ PICKLE_DATA_ROOT: dataRoot, ...fakeRepairWorker('authorized') }, () => (
+      repairTicketVerificationContract(sessionDir, 'r1', { afterMaterialization: () => { throw new Error('restart now'); } })
+    )),
+    /restart now/,
+  );
+  assert.equal(validateRefinementAcceptance(sessionDir, { workingDir, verifyRepository: true }).ok, true);
+  const acceptanceAfter = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement-acceptance.json'), 'utf8'));
+  assert.equal(acceptanceAfter.prd_sha256, acceptanceBefore.prd_sha256);
+  assert.equal(acceptanceAfter.refined_prd_sha256, acceptanceBefore.refined_prd_sha256);
+  assert.equal(acceptanceAfter.repository_identity, acceptanceBefore.repository_identity);
+  assert.match(acceptanceAfter.manifest_sha256, /^[a-f0-9]{64}$/);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'prd.lock.json'), 'utf8'), sealBefore);
+
+  assert.equal(reconcileVerificationRepairTransaction(sessionDir), 'completed');
+  assert.equal(reconcileVerificationRepairTransaction(sessionDir), null);
+  assert.doesNotThrow(() => beginRefinementRepositoryAdvance({
+    sessionDir, workingDir, ticketId: 'r1', requiresCleanCommit: false,
+  }));
+  clearRefinementRepositoryAdvance(sessionDir);
   assert.doesNotThrow(() => assertTicketVerificationBoundToSeal(sessionDir, 'r1', workingDir));
 });
 

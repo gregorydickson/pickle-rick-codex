@@ -18,6 +18,10 @@ import { assertSchemaVersionDeployParity, RUNTIME_STATE_SCHEMA_VERSION } from '.
 import { normalizeTicketId, validateRefinementManifest } from './tickets.js';
 import { assertTicketVerificationReady } from './verification-env.js';
 import {
+  deferredVerificationManifest,
+  pendingAdoptedVerificationRepairTicket,
+} from './pipeline-bootstrap.js';
+import {
   readAndValidateWorkerLifecycleArtifact,
   workerLifecycleArtifactPath,
   WORKER_LIFECYCLE_PHASES,
@@ -247,8 +251,20 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   }
 
   const workingDir = typeof state?.working_dir === 'string' ? state.working_dir : '';
+  let adoptedRepairTicketId: string | null = null;
+  if (state) {
+    try {
+      adoptedRepairTicketId = pendingAdoptedVerificationRepairTicket(resolvedSessionDir, state, true);
+    } catch (error) {
+      findings.push(finding('error', 'adoption-repair-identity-invalid', error instanceof Error ? error.message : String(error)));
+    }
+  }
   const preflightAcceptance = workingDir
-    ? validateRefinementAcceptance(resolvedSessionDir, { workingDir, verifyRepository: true })
+    ? validateRefinementAcceptance(resolvedSessionDir, {
+      workingDir,
+      verifyRepository: true,
+      preserveMalformedVerification: Boolean(adoptedRepairTicketId),
+    })
     : null;
   const recoverableAdvance = workingDir
     && preflightAcceptance?.reason === 'repository identity does not match the accepted refinement'
@@ -291,7 +307,9 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
         : finding('error', 'refinement-acceptance-invalid', acceptance.reason || 'Refinement acceptance failed.'));
     try {
       manifest = readJsonStrict<RefinementManifest>(manifestPath);
-      const issues = validateRefinementManifest(structuredClone(manifest));
+      const issues = adoptedRepairTicketId
+        ? deferredVerificationManifest(resolvedSessionDir, adoptedRepairTicketId).issues
+        : validateRefinementManifest(structuredClone(manifest));
       if (issues.length) {
         for (const issue of issues) findings.push(finding('error', 'refinement-manifest-invalid', issue));
       } else {
@@ -311,7 +329,7 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
       if (!materializedIds.has(ticketId)) findings.push(finding('error', 'ticket-file-missing', `No materialized ticket file exists for ${ticketId}.`));
       const scope = resolveTicketScope(ticket);
       if (scope.error) findings.push(finding('error', 'scope-contract-invalid', `${ticketId}: ${scope.error}`));
-      if (workingDir) {
+      if (workingDir && normalizeTicketId(ticket.id || ticket.title, 'ticket') !== adoptedRepairTicketId) {
         try {
           assertTicketVerificationReady({
             ticket,
@@ -384,6 +402,12 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
         childRecoverable
           ? `Recorded runner ${runnerPid} is dead; its identity-matched child ${childPid} can be safely reaped on resume.`
           : `Recorded runner ${runnerPid} is no longer alive and can be reconciled on resume.`,
+      ));
+    } else if (adoptedRepairTicketId) {
+      findings.push(finding(
+        'info',
+        'adoption-repair-ready',
+        `Quiesced adopted session is identity-bound and ready to launch verification repair for ${adoptedRepairTicketId}.`,
       ));
     } else {
       findings.push(finding('error', 'session-active', 'Session is active without a provable runner owner.'));

@@ -133,7 +133,7 @@ interface CaptureBaselineContext {
 
 type PendingLegacyAdoptionRecord = LegacyAdoptionRecord & { contract_repair_completed_at?: string };
 
-function pendingAdoptedVerificationRepairTicket(
+export function pendingAdoptedVerificationRepairTicket(
   sessionDir: string,
   state: PersistedState,
   resumeReadyOnly: boolean,
@@ -162,7 +162,7 @@ function pendingAdoptedVerificationRepairTicket(
   return ticketId;
 }
 
-function deferredVerificationManifest(
+export function deferredVerificationManifest(
   sessionDir: string,
   deferredTicketId: string,
 ): { manifest: RefinementManifest; issues: string[] } {
@@ -191,7 +191,7 @@ function deferredVerificationManifest(
   return { manifest, issues: validateRefinementManifest(validationManifest) };
 }
 
-function summarizeDeferredVerificationManifest(
+export function summarizeDeferredVerificationManifest(
   sessionDir: string,
   manifest: RefinementManifest,
 ): TicketSummary {
@@ -332,7 +332,7 @@ function captureVerificationBaselineResult({
   };
 }
 
-function capturePipelineVerificationBaselines(
+export function capturePipelineVerificationBaselines(
   sessionDir: string,
   { state, summary, config, deferredVerificationTicketId = null }: CaptureBaselineContext,
 ): VerificationBaselines | null {
