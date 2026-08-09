@@ -6,7 +6,6 @@ import { logActivity } from '../services/activity-logger.js';
 import { assertCodexSucceeded, runCodexExecMonitored } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
 import {
-  captureSpawnedProcessIdentity,
   reapRecordedLiveProcessGroup,
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
@@ -251,18 +250,13 @@ async function runRefinementCodex(
       addDirs: [],
       env: { ...REFINEMENT_WORKER_ENV, ...(options.env || {}) },
       cancelCheck: () => localCancelCheck() || isRefinementCancelled(manager, statePath),
-      onSpawn: (child) => {
+      onSpawn: (child, identity) => {
         childPid = Number(child.pid || 0);
-        const identity = captureSpawnedProcessIdentity(childPid);
-        if (!identity) {
-          terminateSpawnedProcess(childPid);
-          throw new Error(`Could not persist a safe process identity for refinement worker ${childPid}.`);
-        }
         try {
           manager.update(statePath, (current) => {
             const identities = refinementChildIdentities(current)
               .filter((entry) => entry.pid !== childPid);
-            if (identity) identities.push(identity);
+            identities.push(identity);
             current.refinement_child_identities = identities;
             current.active_child_pid = childPid || null;
             current.active_child_kind = 'refinement';
@@ -275,7 +269,7 @@ async function runRefinementCodex(
           terminateSpawnedProcess(childPid);
           throw error;
         }
-        options.onSpawn?.(child);
+        options.onSpawn?.(child, identity);
       },
     });
   } finally {

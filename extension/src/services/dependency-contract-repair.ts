@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { CodexCancelCheckError, assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
-import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { StateManager } from './state-manager.js';
@@ -688,12 +687,12 @@ export async function repairTicketDependencyContract(
       progressArtifactPaths: [artifactPath], addDirs: [], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'DEPENDENCY_REPAIR_COMPLETE')
         || hasPromiseToken(lastMessage, 'DEPENDENCY_REPAIR_COMPLETE'),
-      onSpawn: (child) => manager.update(statePath, (current) => {
+      onSpawn: (child, identity) => manager.update(statePath, (current) => {
         workerChildPid = Number(child.pid);
         current.active_child_pid = workerChildPid;
         current.active_child_kind = 'codex';
         current.active_child_command = 'dependency-repair';
-        current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+        current.active_child_identity = identity;
         current.active_child_controller_pid = process.pid;
         return current;
       }),

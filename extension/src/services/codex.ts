@@ -2,9 +2,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { finalizeModelCallTelemetry, reserveModelCallTelemetry } from './productive-autonomy.js';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
+import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import {
   collectCodexToolCalls,
   detectOutputFormat,
@@ -136,10 +138,11 @@ async function runSpawnedCommand({
   usageCompletionGraceMs = 5_000,
   cleanupPaths = [],
   onSpawn,
+  captureSpawnedIdentity = captureSpawnedProcessIdentity,
   cancelCheck,
 }: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
-  const startedAt = Date.now();
-  const absoluteDeadlineMs = startedAt + timeoutMs;
+  let startedAt = Date.now();
+  let absoluteDeadlineMs = startedAt + timeoutMs;
   removeStaleOutputs([...cleanupPaths, outputLastMessagePath]);
 
   const maxCapturedStreamBytes = 4 * 1024 * 1024;
@@ -183,11 +186,13 @@ async function runSpawnedCommand({
     let observedStreamBytes = 0;
     let observedArtifactSignature = '';
     let progressSignature = '';
+    let controlsArmed = false;
 
-    const child = spawn(command, args, {
+    const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../bin/monitored-process-broker.js');
+    const child = spawn(process.execPath, [brokerPath], {
       cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...env },
+      stdio: ['pipe', 'pipe', 'pipe', 'ipc'] as const,
+      env: process.env,
       detached: process.platform !== 'win32',
     });
 
@@ -344,66 +349,77 @@ async function runSpawnedCommand({
       armSuccessTermination();
     };
 
-    timeoutTimer = setTimeout(() => {
-      if (terminationCause === null && child.exitCode === null && child.signalCode === null) {
-        if (!successObserved) checkForSuccess();
-        const usage = inspectCodexUsage(currentStdout());
-        const terminalUsageObserved = usage.reported || usage.turnCompleted;
-        const recentProgressThresholdMs = absoluteDeadlineMs - successSignalGraceMs;
-        const nonterminalProgressStillActive = nonterminalProgressAfterSuccess && (
-          latestNonterminalArtifactProgressAtMs > recentProgressThresholdMs
-          || (nonterminalStreamProgressEvents > 1 && latestStreamProgressAtMs > recentProgressThresholdMs)
-        );
-        if (successObserved
-          && (terminalUsageObserved || !nonterminalProgressStillActive)) {
-          if (successGraceTimer) clearTimeout(successGraceTimer);
-          if (!successTerminationSent && requestTermination('success')) {
-            successTerminationSent = true;
+    const armExecutionControls = (): void => {
+      if (controlsArmed || settled) return;
+      controlsArmed = true;
+      startedAt = Date.now();
+      absoluteDeadlineMs = startedAt + timeoutMs;
+      timeoutTimer = setTimeout(() => {
+        if (terminationCause === null && child.exitCode === null && child.signalCode === null) {
+          if (!successObserved) checkForSuccess();
+          const usage = inspectCodexUsage(currentStdout());
+          const terminalUsageObserved = usage.reported || usage.turnCompleted;
+          const recentProgressThresholdMs = absoluteDeadlineMs - successSignalGraceMs;
+          const nonterminalProgressStillActive = nonterminalProgressAfterSuccess && (
+            latestNonterminalArtifactProgressAtMs > recentProgressThresholdMs
+            || (nonterminalStreamProgressEvents > 1 && latestStreamProgressAtMs > recentProgressThresholdMs)
+          );
+          if (successObserved
+            && (terminalUsageObserved || !nonterminalProgressStillActive)) {
+            if (successGraceTimer) clearTimeout(successGraceTimer);
+            if (!successTerminationSent && requestTermination('success')) {
+              successTerminationSent = true;
+            }
+            return;
           }
-          return;
+          requestTermination('timeout');
         }
-        requestTermination('timeout');
+      }, timeoutMs);
+
+      if (typeof successCheck === 'function') {
+        pollTimer = setInterval(checkForSuccess, successPollMs);
+        checkForSuccess();
       }
-    }, timeoutMs);
 
-    if (typeof successCheck === 'function') {
-      pollTimer = setInterval(checkForSuccess, successPollMs);
-      checkForSuccess();
-    }
-
-    if (typeof cancelCheck === 'function') {
-      cancelTimer = setInterval(() => {
-        if (terminationCause !== null) return;
-        let cancelled: boolean;
-        try {
-          cancelled = cancelCheck();
-        } catch (error) {
-          const typedError = new CodexCancelCheckError(error);
-          const accepted = requestTermination('cancel-check-error', typedError);
-          if (!accepted && terminationCause === null
-            && (child.exitCode !== null || child.signalCode !== null)) {
-            // The process can exit before stdio closes. A control-state failure
-            // observed in that drain window must not be silently downgraded to
-            // the child's otherwise-successful exit.
-            terminationCause = 'cancel-check-error';
-            cancelCheckError = typedError;
-            cleanup();
+      if (typeof cancelCheck === 'function') {
+        cancelTimer = setInterval(() => {
+          if (terminationCause !== null) return;
+          let cancelled: boolean;
+          try {
+            cancelled = cancelCheck();
+          } catch (error) {
+            const typedError = new CodexCancelCheckError(error);
+            const accepted = requestTermination('cancel-check-error', typedError);
+            if (!accepted && terminationCause === null
+              && (child.exitCode !== null || child.signalCode !== null)) {
+              // The process can exit before stdio closes. A control-state failure
+              // observed in that drain window must not be silently downgraded to
+              // the child's otherwise-successful exit.
+              terminationCause = 'cancel-check-error';
+              cancelCheckError = typedError;
+              cleanup();
+            }
+            return;
           }
-          return;
-        }
-        if (!cancelled) return;
-        requestTermination('cancel');
-      }, 100);
-    }
+          if (!cancelled) return;
+          requestTermination('cancel');
+        }, 100);
+      }
+    };
 
-    child.stdout.on('data', (chunk: Buffer) => {
+    child.on('message', (message: unknown) => {
+      if (message && typeof message === 'object'
+        && (message as { type?: unknown }).type === 'launched') armExecutionControls();
+    });
+
+    child.stdout!.on('data', (chunk: Buffer) => {
       latestStreamProgressAtMs = Date.now();
       stdoutBytesSeen += chunk.length;
       stdoutBytesRetained = appendBoundedChunk(stdoutChunks, chunk, stdoutBytesRetained);
       checkForSuccess();
     });
 
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr!.on('data', (chunk: Buffer) => {
       latestStreamProgressAtMs = Date.now();
       stderrBytesSeen += chunk.length;
       stderrBytesRetained = appendBoundedChunk(stderrChunks, chunk, stderrBytesRetained);
@@ -472,7 +488,7 @@ async function runSpawnedCommand({
       setTimeout(finalizeAfterFlush, flushQuietMs);
     });
 
-    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+    child.stdin!.on('error', (error: NodeJS.ErrnoException) => {
       // A short-lived command may exit before the prompt has finished writing.
       // Its process exit remains authoritative; an EPIPE on stdin is only the
       // expected consequence of the child closing its read end first.
@@ -484,17 +500,33 @@ async function runSpawnedCommand({
     });
 
     try {
-      onSpawn?.(child);
+      const brokerIdentity = captureSpawnedIdentity(Number(child.pid));
+      if (!brokerIdentity) {
+        throw new Error('Could not capture immutable monitored process broker identity.');
+      }
+      onSpawn?.(child, brokerIdentity);
+      child.send?.({
+        type: 'launch',
+        command,
+        args,
+        cwd,
+        env: { ...process.env, ...env },
+      }, (error) => {
+        if (!error || settled) return;
+        cleanup();
+        terminateProcessTree(child, 'SIGTERM');
+        reject(error);
+      });
     } catch (error) {
       cleanup();
       terminateProcessTree(child, 'SIGTERM');
       const killTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 1_000);
       killTimer.unref?.();
-      child.stdin.destroy();
+      child.stdin!.destroy();
       reject(error);
       return;
     }
-    child.stdin.end(input ?? '');
+    child.stdin!.end(input ?? '');
   });
 }
 
@@ -563,6 +595,7 @@ export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpaw
     progressArtifactPaths: options.progressArtifactPaths,
     cleanupPaths: options.cleanupPaths,
     onSpawn: options.onSpawn,
+    captureSpawnedIdentity: options.captureSpawnedIdentity,
     cancelCheck: options.cancelCheck,
     awaitUsageOnSuccess: args.includes('--json'),
   });
@@ -589,6 +622,7 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
       successPollMs: options.successPollMs,
       cleanupPaths: options.cleanupPaths,
       onSpawn: options.onSpawn,
+      captureSpawnedIdentity: options.captureSpawnedIdentity,
       cancelCheck: options.cancelCheck,
       awaitUsageOnSuccess: args.includes('--json'),
     });

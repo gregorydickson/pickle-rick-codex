@@ -9,6 +9,15 @@ import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 export const LIVE_SESSION_MIGRATION_SCHEMA_VERSION = 1;
 export const LIVE_SESSION_MIGRATION_FILE = 'installed-runtime-migration.json';
 
+export class LiveSessionMigrationContentionError extends Error {
+  readonly code = 'live_session_migration_contention';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'LiveSessionMigrationContentionError';
+  }
+}
+
 export interface PreservedArtifact {
   path: string;
   sha256: string;
@@ -85,7 +94,7 @@ function stableInventory(sessionDir: string): PreservedArtifact[] {
   const first = inventory(sessionDir);
   const second = inventory(sessionDir);
   if (canonicalize(first) !== canonicalize(second)) {
-    throw new Error('Live session changed while its migration snapshot was being captured.');
+    throw new LiveSessionMigrationContentionError('Live session changed while its migration snapshot was being captured.');
   }
   const logical = path.join(sessionDir, 'logical-pipeline.json');
   if (fs.existsSync(logical)) readLogicalPipeline(sessionDir);
@@ -219,7 +228,7 @@ export function prepareLiveSessionMigration(
   const confirmed = inventory(sessionDir);
   if (canonicalize(confirmed) !== canonicalize(payload.preserved_artifacts)) {
     fs.rmSync(path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE), { force: true });
-    throw new Error('Live session changed before its migration snapshot could be sealed.');
+    throw new LiveSessionMigrationContentionError('Live session changed before its migration snapshot could be sealed.');
   }
   return migration;
 }

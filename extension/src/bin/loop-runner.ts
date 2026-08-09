@@ -93,7 +93,6 @@ import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../s
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { scrubWorkerOutput } from '../services/worker-output.js';
-import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
 import { activatePreparedManagerRelaunchRecovery, consumeManagerRelaunchRecovery } from '../services/manager-relaunch-integrity.js';
 import type {
@@ -1701,12 +1700,12 @@ async function runLoopWithLease(
         successCheck: loopSuccessCheck(outputLastMessagePath),
         successSignalGraceMs: 150,
         successPollMs: 50,
-        onSpawn: (child) => {
+        onSpawn: (child, identity) => {
           manager.update(statePath, (current) => {
             current.active_child_pid = child.pid;
             current.active_child_kind = 'codex';
             current.active_child_command = loopConfig.mode;
-            current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+            current.active_child_identity = identity;
             current.active_child_controller_pid = process.pid;
             return current;
           });

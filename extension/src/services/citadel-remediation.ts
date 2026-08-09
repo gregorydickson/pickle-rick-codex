@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
-import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { hasPipelineContract } from './pipeline.js';
 import { resetPipelineForAutonomousRemediation } from './pipeline-state.js';
 import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
@@ -838,11 +837,11 @@ export async function repairCitadelAttribution(
         outputLastMessagePath: lastMessagePath, progressArtifactPaths: [candidateArtifactPath], addDirs: [], inheritConfiguredAddDirs: false,
         successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE')
           || hasPromiseToken(lastMessage, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE'),
-        onSpawn: (child) => manager.update(statePath, (current) => {
+        onSpawn: (child, identity) => manager.update(statePath, (current) => {
           current.active_child_pid = child.pid;
           current.active_child_kind = 'codex';
           current.active_child_command = 'citadel-attribution-repair';
-          current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+          current.active_child_identity = identity;
           current.active_child_controller_pid = process.pid;
           return current;
         }),

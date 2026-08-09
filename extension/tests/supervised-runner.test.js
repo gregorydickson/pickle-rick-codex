@@ -295,6 +295,83 @@ if (count === 1) {
   });
 });
 
+test('pre-publication executor SIGKILL never releases an unregistered model across serial stress', async () => {
+  for (let iteration = 0; iteration < 8; iteration += 1) {
+    const sessionDir = autonomousSession();
+    fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({
+      schema_version: 1, active: true, active_child_pid: null, active_child_identity: null,
+    }));
+    const fixtureDir = makeTempRoot('pickle-supervised-prepublication-');
+    const countPath = path.join(fixtureDir, 'count');
+    const executorPidPath = path.join(fixtureDir, 'executor-pid');
+    const brokerPidPath = path.join(fixtureDir, 'broker-pid');
+    const modelStartedPath = path.join(fixtureDir, 'model-started');
+    const fakeCodexPath = path.join(fixtureDir, 'codex');
+    fs.writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(process.env.MODEL_STARTED_PATH, String(process.pid));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    const durableModule = new URL('../services/durable-supervisor.js', import.meta.url).href;
+    const codexModule = new URL('../services/codex.js', import.meta.url).href;
+    const runnerPath = path.join(fixtureDir, 'executor.mjs');
+    fs.writeFileSync(runnerPath, `
+import fs from 'node:fs';
+const [sessionDir, countPath, executorPidPath, brokerPidPath, modelStartedPath, fakeCodexPath, durableModule, codexModule] = process.argv.slice(2);
+const count = Number(fs.existsSync(countPath) ? fs.readFileSync(countPath, 'utf8') : 0) + 1;
+fs.writeFileSync(countPath, String(count));
+if (count === 1) {
+  const { runCodexExecMonitored } = await import(codexModule);
+  fs.writeFileSync(executorPidPath, String(process.pid));
+  await runCodexExecMonitored({
+    command: fakeCodexPath,
+    prompt: 'must remain gated',
+    timeoutMs: 60000,
+    env: { MODEL_STARTED_PATH: modelStartedPath },
+    onSpawn: (child) => {
+      fs.writeFileSync(brokerPidPath, String(child.pid));
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+    },
+    telemetry: { sessionDir, ticketId: 'T-PREPUBLICATION', phase: 'implement', ticketAttempt: 1, phaseAttempt: 1, recoveryEpoch: 1 },
+  });
+} else {
+  const { acquireSupervisorLease, terminateLogicalPipeline } = await import(durableModule);
+  const lease = acquireSupervisorLease(sessionDir, { ownerId: 'fixture-replacement', ttlMs: 60000 });
+  terminateLogicalPipeline(sessionDir, 'cancelled', { ownerId: lease.owner_id, token: lease.token });
+}
+`);
+
+    const run = runSupervisedRunner(
+      sessionDir,
+      'mux-runner.js',
+      [countPath, executorPidPath, brokerPidPath, modelStartedPath, fakeCodexPath, durableModule, codexModule],
+      { runnerPath, restartDelayMs: 0 },
+    );
+    const deadline = Date.now() + 5_000;
+    while ((!fs.existsSync(executorPidPath) || !fs.existsSync(brokerPidPath)) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(fs.existsSync(executorPidPath) && fs.existsSync(brokerPidPath), 'gated broker did not start');
+    const executorPid = Number(fs.readFileSync(executorPidPath, 'utf8'));
+    const brokerPid = Number(fs.readFileSync(brokerPidPath, 'utf8'));
+    process.kill(executorPid, 'SIGKILL');
+    assert.equal(await run, 130);
+    assert.equal(fs.existsSync(modelStartedPath), false, 'model started before durable ownership publication');
+    const brokerDeadline = Date.now() + 2_000;
+    let brokerAlive = true;
+    while (brokerAlive && Date.now() < brokerDeadline) {
+      try {
+        process.kill(brokerPid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } catch {
+        brokerAlive = false;
+      }
+    }
+    assert.equal(brokerAlive, false, `unreleased broker ${brokerPid} survived its controller`);
+    assert.equal(fs.readFileSync(countPath, 'utf8'), '2');
+  }
+});
+
 test('supervisor refuses replacement when a live child has no immutable recovery identity', async () => {
   const sessionDir = autonomousSession();
   const fixtureDir = makeTempRoot('pickle-supervised-ambiguous-orphan-');

@@ -23,14 +23,27 @@ import {
 } from '../services/session.js';
 import {
   getSessionForCwd,
+  removeSessionMapEntry,
   updateSessionMap,
 } from '../services/session-map.js';
+import { captureProcessLivenessIdentity } from '../services/orphan-reaper.js';
+import { registerAutonomousOwnerSpec } from '../services/autonomous-owner-recovery.js';
 
 const DEFAULTS = {
   max_iterations: 25,
   max_time_minutes: 480,
   worker_timeout_seconds: 900,
 };
+
+function registerProcessOwner(sessionDir) {
+  registerAutonomousOwnerSpec(
+    sessionDir,
+    'mux-runner.js',
+    [],
+    undefined,
+    path.resolve(new URL('../bin/supervised-runner.js', import.meta.url).pathname),
+  );
+}
 
 function makeTempDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -135,13 +148,15 @@ test('reconcileAllSessionLiveness discovers stale sessions and isolates corrupt 
     const sessionsRoot = path.join(dataRoot, 'sessions');
     const expiredDir = path.join(sessionsRoot, 'expired');
     const currentDir = path.join(sessionsRoot, 'current');
-    writeJson(getStatePath(expiredDir), sessionState(expiredDir, '/expired', {
+    writeJson(getStatePath(expiredDir), sessionState(expiredDir, expiredDir, {
       active: true,
       step: 'implement',
       started_at: '2020-01-01T00:00:00.000Z',
       start_time_epoch: 1_577_836_800,
       max_time_minutes: 1,
+      autonomous_supervisor_identity: captureProcessLivenessIdentity(process.pid),
     }));
+    registerProcessOwner(expiredDir);
     writeJson(getStatePath(currentDir), sessionState(currentDir, '/current'));
     fs.mkdirSync(path.join(sessionsRoot, 'missing-state'), { recursive: true });
     fs.writeFileSync(path.join(sessionsRoot, 'not-a-directory'), 'ignored');
@@ -149,11 +164,12 @@ test('reconcileAllSessionLiveness discovers stale sessions and isolates corrupt 
     fs.writeFileSync(getStatePath(path.join(sessionsRoot, 'corrupt')), '{invalid');
 
     const results = reconcileAllSessionLiveness();
-    assert.equal(results.length, 1);
-    assert.equal(results[0].sessionDir, expiredDir);
-    assert.equal(results[0].reason, 'max_time');
-    assert.equal(results[0].state.active, false);
+    assert.equal(results.length, 0);
+    assert.equal(loadSessionState(expiredDir).last_exit_reason, 'autonomous_budget_rollover');
+    assert.equal(loadSessionState(expiredDir).active, true);
+    assert.ok(loadSessionState(expiredDir).autonomous_budget_rollover_intent_id);
     assert.equal(loadSessionState(currentDir).active, false);
+    assert.equal(fs.readFileSync(getStatePath(path.join(sessionsRoot, 'corrupt')), 'utf8'), '{invalid');
   });
 });
 
@@ -175,9 +191,13 @@ test('resolveSessionForCwd keeps live mappings, prunes stale ones, and restores 
       started_at: '2020-01-01T00:00:00.000Z',
       start_time_epoch: 1_577_836_800,
       max_time_minutes: 1,
+      autonomous_supervisor_identity: captureProcessLivenessIdentity(process.pid),
     }));
-    assert.equal(await resolveSessionForCwd(cwd), null);
-    assert.equal(getSessionForCwd(cwd), null);
+    registerProcessOwner(directDir);
+    assert.equal(await resolveSessionForCwd(cwd), directDir);
+    assert.equal(getSessionForCwd(cwd), directDir);
+    assert.equal(loadSessionState(directDir).last_exit_reason, 'autonomous_budget_rollover');
+    await removeSessionMapEntry(cwd, directDir);
 
     const historicalDir = path.join(sessionsRoot, 'historical');
     writeJson(getStatePath(historicalDir), sessionState(historicalDir, cwd, {

@@ -54,7 +54,11 @@ import {
   type WorkspaceSnapshot,
 } from '../services/execution-gate.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
-import { captureProcessLivenessIdentity, captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
+import {
+  captureProcessLivenessIdentity,
+  captureSpawnedProcessIdentity,
+  type PersistedProcessIdentity,
+} from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
 import { recordExecutionControlTelemetry, recordModelCallTelemetry } from '../services/productive-autonomy.js';
 import { lifecycleContextInputHash, readLifecycleContextCheckpoint, writeLifecycleContextCheckpoint } from '../services/lifecycle-checkpoints.js';
@@ -527,10 +531,19 @@ function isSessionCancelled(manager: StateManager, statePath: string): boolean {
   return readCurrentState(manager, statePath).active === false;
 }
 
-function updateActiveChild(statePath: string, manager: StateManager, fields: Record<string, unknown>): void {
+function updateActiveChild(
+  statePath: string,
+  manager: StateManager,
+  fields: Record<string, unknown>,
+  suppliedIdentity: PersistedProcessIdentity | null = null,
+): void {
   if (Object.hasOwn(fields, 'active_child_pid')) {
     const pid = Number(fields.active_child_pid);
-    const identity = Number.isInteger(pid) && pid > 0 ? captureSpawnedProcessIdentity(pid) : null;
+    const identity = suppliedIdentity
+      || (Number.isInteger(pid) && pid > 0 ? captureSpawnedProcessIdentity(pid) : null);
+    if (identity && identity.pid !== pid) {
+      throw new Error(`Supplied worker child identity does not match pid ${pid}.`);
+    }
     if (Number.isInteger(pid) && pid > 0 && !identity && captureProcessLivenessIdentity(pid)) {
       throw new Error(`Could not persist a safe process identity for worker child ${pid}.`);
     }
@@ -782,7 +795,11 @@ export async function repairTicketVerificationContract(
       timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
       outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [sessionDir], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CONTRACT_REPAIR_COMPLETE') || hasPromiseToken(lastMessage, 'CONTRACT_REPAIR_COMPLETE'),
-      onSpawn: (child) => updateActiveChild(statePath, manager, { active_child_pid: child.pid, active_child_kind: 'codex', active_child_command: 'contract-repair' }),
+      onSpawn: (child, identity) => updateActiveChild(statePath, manager, {
+        active_child_pid: child.pid,
+        active_child_kind: 'codex',
+        active_child_command: 'contract-repair',
+      }, identity),
       cancelCheck: shouldCancel,
     });
     assertOwnership();
@@ -1397,12 +1414,12 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
             successCheck: phaseSuccessCheck(phase, lastMessagePath),
             successSignalGraceMs: 150,
             successPollMs: 50,
-            onSpawn: (child) => {
+            onSpawn: (child, identity) => {
               updateActiveChild(statePath, manager, {
                 active_child_pid: child.pid,
                 active_child_kind: 'codex',
                 active_child_command: phase,
-              });
+              }, identity);
             },
             cancelCheck: shouldCancel,
           });

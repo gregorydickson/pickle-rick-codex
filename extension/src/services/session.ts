@@ -23,7 +23,12 @@ import type { PersistedState } from './state-manager.js';
 import type { Config } from '../types/index.js';
 import { tmuxSessionExists } from './tmux.js';
 import { inspectProcessLivenessIdentity, recoverSessionOrphanState, type PersistedProcessIdentity } from './orphan-reaper.js';
-import type { AutonomousOwnerRestorationIntent, AutonomousOwnerSpec } from './autonomous-owner-recovery.js';
+import {
+  validateAutonomousOwnerSpec,
+  type AutonomousOwnerRestorationIntent,
+  type AutonomousOwnerSpec,
+} from './autonomous-owner-recovery.js';
+import { scheduleAutonomousBudgetRollover } from './autonomous-budget.js';
 
 export interface SessionResult {
   sessionDir: string;
@@ -239,12 +244,44 @@ export function reconcileSessionLiveness(
   nowMs: number = Date.now(),
 ): { state: PersistedState; stale: boolean } {
   const statePath = getStatePath(sessionDir);
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
   let state = stateManager.read(statePath);
   const rolloverIntentId = typeof state.autonomous_budget_rollover_intent_id === 'string'
     ? state.autonomous_budget_rollover_intent_id : '';
-  const rolloverEpoch = Math.max(1, Number(state.autonomous_budget_epoch || 0));
+  const hasPersistedRolloverEpoch = state.autonomous_budget_epoch !== undefined
+    && state.autonomous_budget_epoch !== null;
+  const persistedRolloverEpoch = hasPersistedRolloverEpoch
+    ? Number(state.autonomous_budget_epoch) : 1;
+  const rolloverEpoch = Math.max(1, persistedRolloverEpoch);
   const rolloverCancelled = state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled';
   const rolloverUnsafe = state.recovery_required === true || Number(state.orphan_child_pid || 0) > 0;
+  if (rolloverCancelled) return { state, stale: false };
+  const initialOwnerSpec = validateAutonomousOwnerSpec(state.autonomous_owner_spec);
+  if (state.autonomous_owner_spec != null
+    && (!initialOwnerSpec || initialOwnerSpec.session_dir !== resolvedSessionDir)) {
+    state = stateManager.update(statePath, (current) => {
+      if (current.cancel_requested_at || current.cancelled === true || current.last_exit_reason === 'cancelled') {
+        return current;
+      }
+      if (current.recovery_required === true
+        && current.recovery_kind === 'autonomous_owner_contract_invalid'
+        && current.recovery_reason === 'autonomous owner specification is invalid or bound to a different session') {
+        return current;
+      }
+      current.step = current.step === 'complete' ? current.step : 'blocked';
+      current.recovery_required = true;
+      current.recovery_kind = 'autonomous_owner_contract_invalid';
+      current.recovery_reason = 'autonomous owner specification is invalid or bound to a different session';
+      appendHistory(current, 'autonomous_owner_contract_invalid', current.current_ticket || undefined);
+      return current;
+    });
+    return { state, stale: false };
+  }
+  if (rolloverIntentId && hasPersistedRolloverEpoch
+    && (!Number.isInteger(persistedRolloverEpoch) || persistedRolloverEpoch < 1)) {
+    throw new Error('Autonomous budget rollover intent has a corrupt epoch.');
+  }
+  if (rolloverIntentId && rolloverUnsafe) return { state, stale: false };
   if (rolloverIntentId && state.autonomous_owner_recovery_suspended === true && !rolloverCancelled) {
     return { state, stale: false };
   }
@@ -254,11 +291,14 @@ export function reconcileSessionLiveness(
     const supervisorAlive = supervisorIdentity
       ? inspectProcessLivenessIdentity(supervisorIdentity) === 'matched'
       : isProcessAlive(state.autonomous_supervisor_pid);
-    const ownerProcessAlive = state.autonomous_owner_spec ? supervisorAlive : isProcessAlive(state.tmux_runner_pid);
-    const ownerMissing = state.tmux_mode === true && (
-      !ownerProcessAlive
-      || (typeof state.tmux_session_name === 'string' && !tmuxSessionExists(state.tmux_session_name))
-    );
+    const validatedOwnerSpec = initialOwnerSpec;
+    const ownerProcessAlive = validatedOwnerSpec ? supervisorAlive : isProcessAlive(state.tmux_runner_pid);
+    const ownerMissing = validatedOwnerSpec?.owner_mode === 'process'
+      ? !supervisorAlive
+      : state.tmux_mode === true && (
+        !ownerProcessAlive
+        || (typeof state.tmux_session_name === 'string' && !tmuxSessionExists(state.tmux_session_name))
+      );
     const planned = state.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
     const exactRecoveryPending = planned?.rollover_intent_id === rolloverIntentId
       && Number(planned.rollover_epoch) === rolloverEpoch
@@ -279,7 +319,8 @@ export function reconcileSessionLiveness(
         current.autonomous_relaunch_deadline = new Date(nowMs + delayMs + 60_000).toISOString();
         current.tmux_runner_pid = null;
         current.worker_pid = null;
-        const spec = current.autonomous_owner_spec as AutonomousOwnerSpec | null;
+        const candidateSpec = validateAutonomousOwnerSpec(current.autonomous_owner_spec);
+        const spec = candidateSpec?.session_dir === resolvedSessionDir ? candidateSpec : null;
         const existing = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
         if (ownerMissing && spec?.schema_version === 1 && typeof spec.spec_id === 'string') {
           const sameIntent = existing?.rollover_intent_id === rolloverIntentId
@@ -335,6 +376,90 @@ export function reconcileSessionLiveness(
   const startedMs = getRunStartEpoch(state) * 1000;
   const expired = maxMinutes > 0 && startedMs > 0 && nowMs - startedMs >= maxMinutes * 60_000;
   if (!runnerMissing && !expired) return { state, stale: false };
+
+  if (expired && !rolloverIntentId) {
+    // Cancellation and unsafe recovery state are authoritative. In particular,
+    // never manufacture a new autonomous intent while cancellation or an
+    // unowned child is being reconciled.
+    if (state.recovery_required === true && !isProcessAlive(state.active_child_pid)) {
+      return { state, stale: false };
+    }
+    if (state.tmux_mode !== true && !initialOwnerSpec) {
+      state = stateManager.update(statePath, (current) => {
+        if (current.active !== true || current.cancel_requested_at || current.cancelled === true
+          || current.last_exit_reason === 'cancelled' || current.autonomous_budget_rollover_intent_id) return current;
+        current.step = current.step === 'complete' ? current.step : 'blocked';
+        current.recovery_required = true;
+        current.recovery_kind = 'autonomous_owner_contract_invalid';
+        current.recovery_reason = 'elapsed autonomous process session has no authenticated immutable owner specification';
+        appendHistory(current, 'autonomous_owner_contract_invalid', current.current_ticket || undefined);
+        return current;
+      });
+      return { state, stale: false };
+    }
+    const repair = (): boolean => Boolean(scheduleAutonomousBudgetRollover(
+      stateManager,
+      statePath,
+      'max_time',
+      {
+        nowMs,
+        ticketId: typeof state.current_ticket === 'string' ? state.current_ticket : null,
+        repairMissingIntent: true,
+        assertRepairState: initialOwnerSpec ? (current) => {
+          const exact = validateAutonomousOwnerSpec(current.autonomous_owner_spec);
+          if (!exact || exact.spec_id !== initialOwnerSpec.spec_id || exact.session_dir !== resolvedSessionDir) {
+            throw new Error('Cannot repair an autonomous budget rollover after immutable owner state changed.');
+          }
+        } : undefined,
+      },
+    ));
+    const winningRepair = (): boolean => {
+      const current = stateManager.read(statePath);
+      const intentId = typeof current.autonomous_budget_rollover_intent_id === 'string'
+        ? current.autonomous_budget_rollover_intent_id : '';
+      const pending = current.autonomous_budget_rollover_checkpoint_pending as Record<string, unknown> | null;
+      return Boolean(intentId
+        && current.active === true
+        && current.last_exit_reason === 'autonomous_budget_rollover'
+        && current.autonomous_budget_reason === 'max_time'
+        && pending?.intent_id === intentId
+        && Number(pending?.epoch) === Number(current.autonomous_budget_epoch)
+        && pending?.reason === 'max_time');
+    };
+    const reconcileRepairRace = (): boolean => {
+      try {
+        return repair();
+      } catch (error) {
+        if (error instanceof Error
+          && error.message.includes('second autonomous budget rollover')
+          && winningRepair()) return true;
+        throw error;
+      }
+    };
+    if (reconcileRepairRace()) return reconcileSessionLiveness(sessionDir, stateManager, nowMs);
+    state = stateManager.read(statePath);
+    if (state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled'
+      || (state.recovery_required === true && !isProcessAlive(state.active_child_pid))) {
+      return { state, stale: false };
+    }
+    const activeChildPid = isProcessAlive(state.active_child_pid) ? Number(state.active_child_pid) : null;
+    const activeChildRecovery = activeChildPid ? recoverSessionOrphanState(sessionDir, state) : null;
+    if (activeChildRecovery?.status === 'reaped' || activeChildRecovery?.status === 'not-running') {
+      const observedIdentity = state.active_child_identity;
+      stateManager.update(statePath, (current) => {
+        if (Number(current.active_child_pid || 0) !== activeChildPid
+          || JSON.stringify(current.active_child_identity ?? null) !== JSON.stringify(observedIdentity ?? null)) return current;
+        current.active_child_pid = null;
+        current.active_child_kind = null;
+        current.active_child_command = null;
+        current.active_child_identity = null;
+        current.active_child_controller_pid = null;
+        return current;
+      });
+      if (reconcileRepairRace()) return { state: stateManager.read(statePath), stale: false };
+      state = stateManager.read(statePath);
+    }
+  }
 
   const reason = runnerMissing ? 'runner_lost' : 'max_time';
   let orphanChildPid = isProcessAlive(state.active_child_pid) ? Number(state.active_child_pid) : null;

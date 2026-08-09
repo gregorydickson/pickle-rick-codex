@@ -75,6 +75,25 @@ test('autonomous time budget rollover resets the effective work window before re
   assert.equal(pending.step, 'research');
 });
 
+test('repair mode still rejects a genuinely pre-existing rollover intent', () => {
+  const sessionDir = makeTempRoot('pickle-autonomous-preexisting-rollover-');
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, {
+    schema_version: 1, active: true, step: 'implement', history: [], iteration: 1,
+    max_iterations: 25, max_time_minutes: 1, autonomous_budget_epoch: 1,
+    autonomous_budget_rollover_intent_id: 'pre-existing-intent',
+    last_exit_reason: 'autonomous_budget_rollover',
+  });
+  assert.throws(
+    () => scheduleAutonomousBudgetRollover(new StateManager(), statePath, 'max_time', {
+      repairMissingIntent: true,
+    }),
+    /second autonomous budget rollover/,
+  );
+  assert.equal(new StateManager().read(statePath).autonomous_budget_rollover_intent_id,
+    'pre-existing-intent');
+});
+
 test('replacement reconciles a crash after rollover state commit but before lease checkpoint', () => {
   const sessionDir = makeTempRoot('pickle-autonomous-budget-crash-');
   const statePath = path.join(sessionDir, 'state.json');

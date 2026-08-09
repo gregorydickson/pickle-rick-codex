@@ -369,13 +369,46 @@ test('replacement executor reuses a real fenced plan checkpoint and completes wi
     env,
     stdio: 'ignore',
   });
-  const replacementExit = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      replacement.kill('SIGKILL');
-      reject(new Error('replacement executor did not complete'));
-    }, 20_000);
-    replacement.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
-  });
+  let observedReplacementExit = null;
+  replacement.once('exit', (code, signal) => { observedReplacementExit = { code, signal }; });
+  let checkpointCount = afterKill.events.filter((event) => event.kind === 'checkpoint_recorded').length;
+  let observedTerminalState = afterKill.terminal_state;
+  let lastDurableProgressAt = Date.now();
+  let replacementExit;
+  try {
+    replacementExit = await waitFor(() => {
+      if (observedReplacementExit) return observedReplacementExit;
+      const logical = readLogicalPipeline(sessionDir);
+      const currentCheckpointCount = logical.events.filter((event) => event.kind === 'checkpoint_recorded').length;
+      if (currentCheckpointCount > checkpointCount || logical.terminal_state !== observedTerminalState) {
+        checkpointCount = currentCheckpointCount;
+        observedTerminalState = logical.terminal_state;
+        lastDurableProgressAt = Date.now();
+      }
+      if (Date.now() - lastDurableProgressAt > 20_000) {
+        const currentState = new StateManager().read(statePath);
+        const latestCheckpoint = [...logical.events].reverse().find((event) => event.kind === 'checkpoint_recorded');
+        throw new Error(`replacement executor made no durable phase progress for 20 seconds: ${JSON.stringify({
+          pid: replacement.pid,
+          exit: observedReplacementExit,
+          lease_owner: logical.lease?.owner_id || null,
+          lease_generation: logical.lease?.generation || null,
+          terminal_state: logical.terminal_state,
+          latest_checkpoint: latestCheckpoint?.details?.checkpoint || null,
+          step: currentState.step,
+          current_ticket: currentState.current_ticket,
+        })}`);
+      }
+      return false;
+    }, {
+      timeoutMs: Number(state.worker_timeout_seconds) * 1_000,
+      intervalMs: 50,
+      message: 'replacement executor exceeded the configured worker liveness bound despite durable phase progress',
+    });
+  } catch (error) {
+    replacement.kill('SIGKILL');
+    throw error;
+  }
   assert.deepEqual(replacementExit, { code: 0, signal: null });
   const prompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line).prompt);
   const phases = prompts.map((prompt) => prompt.match(/You are executing the "([^"]+)" phase/)?.[1]).filter(Boolean);

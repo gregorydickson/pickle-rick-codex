@@ -10,7 +10,7 @@ import { normalizeTicketId, readManifest, updateTicketStatus } from './tickets.j
 import { normalizeVerificationSteps, verificationStepCommand } from './verification-env.js';
 import type { CodexSpawnResult } from '../types/index.js';
 import { createDisposableDetachedWorktree } from './disposable-worktree.js';
-import { assertRecordedActiveChildRecovered, captureSpawnedProcessIdentity } from './orphan-reaper.js';
+import { assertRecordedActiveChildRecovered } from './orphan-reaper.js';
 import { StateManager } from './state-manager.js';
 
 const RECOVERY_FILE = 'citadel-deterministic-recovery.json';
@@ -328,9 +328,7 @@ export async function runDeterministicRecoveryDiagnostic(
         progressArtifactPaths: [artifactPath],
         addDirs: [attemptDir],
         inheritConfiguredAddDirs: false,
-        onSpawn: (child) => {
-          const identity = captureSpawnedProcessIdentity(Number(child.pid));
-          if (!identity) throw new Error('Could not capture immutable deterministic diagnostic child identity.');
+        onSpawn: (child, identity) => {
           stateManager.update(path.join(sessionDir, 'state.json'), (current) => {
             current.active_child_pid = child.pid;
             current.active_child_kind = 'codex';

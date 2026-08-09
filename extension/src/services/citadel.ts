@@ -2224,12 +2224,12 @@ export async function runCitadel(
         outputLastMessagePath,
         progressArtifactPaths: [candidatePath],
         addDirs: [attemptDir],
-        onSpawn: (child) => {
+        onSpawn: (child, identity) => {
           manager.update(path.join(sessionDir, 'state.json'), (current) => {
             current.active_child_pid = child.pid;
             current.active_child_kind = 'codex';
             current.active_child_command = `citadel-attempt-${attempt}`;
-            current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+            current.active_child_identity = identity;
             current.active_child_controller_pid = process.pid;
             return current;
           });

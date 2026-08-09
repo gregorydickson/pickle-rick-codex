@@ -10,7 +10,7 @@ import {
   runCodexExecMonitored,
 } from './codex.js';
 import { deriveCitadelAcceptanceCriteria, type CitadelSystemBlockArtifact } from './citadel.js';
-import { assertRecordedActiveChildRecovered, captureSpawnedProcessIdentity } from './orphan-reaper.js';
+import { assertRecordedActiveChildRecovered } from './orphan-reaper.js';
 import { atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
 import { isDurableOwnershipDrainError } from './durable-runtime.js';
@@ -858,11 +858,11 @@ async function executeCriterionShards(
         inheritConfiguredAddDirs: false,
         successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_CRITERION_SHARD_COMPLETE')
           || hasPromiseToken(lastMessage, 'CITADEL_CRITERION_SHARD_COMPLETE'),
-        onSpawn: (child) => manager.update(statePath, (current) => {
+        onSpawn: (child, identity) => manager.update(statePath, (current) => {
           current.active_child_pid = child.pid;
           current.active_child_kind = 'codex';
           current.active_child_command = `citadel-criterion-shard-${shard.shard_id}`;
-          current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+          current.active_child_identity = identity;
           current.active_child_controller_pid = process.pid;
           return current;
         }),
@@ -1297,11 +1297,11 @@ export async function repairCitadelReviewerArtifactContract(
         hasPromiseToken(stdout, 'CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE')
         || hasPromiseToken(lastMessage, 'CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE')
       ),
-      onSpawn: (child) => manager.update(statePath, (current) => {
+      onSpawn: (child, identity) => manager.update(statePath, (current) => {
         current.active_child_pid = child.pid;
         current.active_child_kind = 'codex';
         current.active_child_command = 'citadel-reviewer-contract-repair';
-        current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+        current.active_child_identity = identity;
         current.active_child_controller_pid = process.pid;
         return current;
       }),

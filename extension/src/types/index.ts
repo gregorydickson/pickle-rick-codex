@@ -410,7 +410,13 @@ export interface RunSpawnedCommandOptions {
   awaitUsageOnSuccess?: boolean;
   usageCompletionGraceMs?: number;
   cleanupPaths?: string[];
-  onSpawn?: (child: import('node:child_process').ChildProcess) => void;
+  onSpawn?: (
+    child: import('node:child_process').ChildProcess,
+    identity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+  ) => void;
+  captureSpawnedIdentity?: (
+    pid: number,
+  ) => import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
   cancelCheck?: CancelCheck;
 }
 
@@ -425,7 +431,13 @@ export interface CodexExecOptions {
   outputLastMessagePath?: string;
   progressArtifactPaths?: string[];
   cleanupPaths?: string[];
-  onSpawn?: (child: import('node:child_process').ChildProcess) => void;
+  onSpawn?: (
+    child: import('node:child_process').ChildProcess,
+    identity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+  ) => void;
+  captureSpawnedIdentity?: (
+    pid: number,
+  ) => import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
   cancelCheck?: CancelCheck;
   successCheck?: SuccessCheck;
   successSignalGraceMs?: number;

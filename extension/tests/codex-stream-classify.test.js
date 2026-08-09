@@ -13,6 +13,7 @@ import {
   observeCodexToolCallStream,
 } from '../services/classifier-utils.js';
 import { runCommand } from '../services/codex.js';
+import { makeTempRoot } from './helpers.js';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const realJsonl = fs.readFileSync(path.join(fixtures, 'codex-exec-real.jsonl'), 'utf8');
@@ -194,4 +195,45 @@ test('codex runner terminates the spawned process when ownership persistence rej
     }
   }
   assert.equal(alive, false, `child ${childPid} survived rejected ownership persistence`);
+});
+
+test('codex runner never releases a target when immutable broker identity capture fails', async () => {
+  const fixtureDir = makeTempRoot('pickle-broker-capture-failure-');
+  const targetMarker = path.join(fixtureDir, 'target-started');
+  const statePath = path.join(fixtureDir, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({ active_child_pid: null, active_child_identity: null }));
+  let brokerPid = 0;
+  let publicationCalled = false;
+  await assert.rejects(
+    () => runCommand({
+      command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(targetMarker)}, 'started')`],
+      timeoutMs: 10_000,
+      captureSpawnedIdentity: (pid) => {
+        brokerPid = pid;
+        return null;
+      },
+      onSpawn: (_child, identity) => {
+        publicationCalled = true;
+        fs.writeFileSync(statePath, JSON.stringify({ active_child_pid: identity.pid, active_child_identity: identity }));
+      },
+    }),
+    /Could not capture immutable monitored process broker identity/,
+  );
+  assert.equal(publicationCalled, false);
+  assert.equal(fs.existsSync(targetMarker), false, 'target started without an immutable broker identity');
+  assert.deepEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')), {
+    active_child_pid: null, active_child_identity: null,
+  });
+  const deadline = Date.now() + 2_000;
+  let alive = true;
+  while (alive && Date.now() < deadline) {
+    try {
+      process.kill(brokerPid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } catch {
+      alive = false;
+    }
+  }
+  assert.equal(alive, false, `unregistered broker ${brokerPid} survived capture failure`);
 });
