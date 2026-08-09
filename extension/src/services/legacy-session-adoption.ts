@@ -29,6 +29,7 @@ import { getHeadSha, listWorkingTreeDirtyPaths } from './git-utils.js';
 import { pathIsInPipelineScope } from './pipeline-scope.js';
 import { stashUnattributableRemainder } from './dirty-tree-salvage.js';
 import { persistRejectedCandidateCheckpoint } from './candidate-recovery.js';
+import { reconcileArchivedCandidateRefinementBoundary, refinementRepositoryAdvancePath } from './refinement-artifacts.js';
 
 export const LEGACY_ADOPTION_FILE = 'legacy-session-adoption.json';
 export const LEGACY_ADOPTION_SCHEMA_VERSION = 1;
@@ -87,6 +88,13 @@ interface LegacyAdoptionTransaction {
   active_child: PersistedProcessIdentity | null;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
   migration_content_hash?: string;
+  superseded_migration_content_hash?: string;
+  boundary_reconciliation?: {
+    status: 'prepared' | 'completed';
+    ticket_id: string;
+    base_head: string;
+    recovery_ref: string;
+  };
   launched_runtime_root?: string;
   created_at: string;
   updated_at: string;
@@ -105,7 +113,7 @@ interface LegacyAdoptionDependencies {
   stopController?: (identity: PersistedProcessIdentity) => void;
   resumeController?: (identity: PersistedProcessIdentity) => void;
   startWatchdog?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
-  checkpoint?: (stage: LegacyAdoptionTransaction['stage'] | 'candidate_archived' | 'journaled' | 'launching') => void;
+  checkpoint?: (stage: LegacyAdoptionTransaction['stage'] | 'candidate_archived' | 'boundary_prepared' | 'boundary_completed' | 'journaled' | 'launching') => void;
   afterChildQuiesced?: () => void;
   sealSession?: (sessionDir: string) => unknown;
   launch?: (sessionDir: string, runtimeRoot: string) => void;
@@ -472,6 +480,7 @@ export function adoptActiveLegacyMuxSession(
     deps.checkpoint?.('quiesced');
   }
 
+  if (!transaction) throw new Error('Legacy adoption transaction disappeared after quiescence.');
   const releaseOperation = acquireSessionOperation(sessionDir, 'Could not fence the quiesced legacy session for adoption.');
   try {
     if (JSON.stringify(describeInstalledRuntime(sourceRuntimeRoot)) !== JSON.stringify(transaction.source_runtime)
@@ -479,6 +488,64 @@ export function adoptActiveLegacyMuxSession(
       throw new Error('Runtime hash changed while the legacy owner was being quiesced.');
     }
     let migration = readJsonFile<InstalledRuntimeMigration>(path.join(sessionDir, 'installed-runtime-migration.json'), null);
+    const advancePath = refinementRepositoryAdvancePath(sessionDir);
+    if (transaction.stage === 'migrated' && transaction.candidate_archive.ref && fs.existsSync(advancePath)) {
+      if (!migration || migration.content_hash !== transaction.migration_content_hash) {
+        throw new Error('Cannot supersede an incomplete migrated legacy adoption boundary.');
+      }
+      verifyLiveSessionMigration(sessionDir, migration);
+      const ticketId = String(state.current_ticket || '');
+      if (!ticketId) throw new Error('Migrated legacy adoption boundary lost its active ticket identity.');
+      transaction = {
+        ...transaction,
+        stage: 'quiesced',
+        migration_content_hash: undefined,
+        superseded_migration_content_hash: migration.content_hash,
+        boundary_reconciliation: {
+          status: 'prepared', ticket_id: ticketId, base_head: getHeadSha(workingDir),
+          recovery_ref: transaction.candidate_archive.ref,
+        },
+        updated_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      atomicWriteJson(transactionPath, transaction);
+      deps.checkpoint?.('boundary_prepared');
+      fs.rmSync(path.join(sessionDir, 'installed-runtime-migration.json'), { force: true });
+      migration = null;
+    }
+    if (transaction.stage === 'quiesced' && transaction.candidate_archive.ref
+      && (fs.existsSync(advancePath) || transaction.boundary_reconciliation?.status === 'prepared')) {
+      const ticketId = transaction.boundary_reconciliation?.ticket_id || String(state.current_ticket || '');
+      if (!ticketId) throw new Error('Legacy adoption boundary reconciliation lost its active ticket identity.');
+      if (!transaction.boundary_reconciliation) {
+        transaction = {
+          ...transaction,
+          boundary_reconciliation: {
+            status: 'prepared', ticket_id: ticketId, base_head: getHeadSha(workingDir),
+            recovery_ref: transaction.candidate_archive.ref,
+          },
+          updated_at: (deps.now?.() ?? new Date()).toISOString(),
+        };
+        atomicWriteJson(transactionPath, transaction);
+        deps.checkpoint?.('boundary_prepared');
+      }
+      const boundary = transaction.boundary_reconciliation;
+      if (!boundary) throw new Error('Legacy adoption boundary preparation was not persisted.');
+      reconcileArchivedCandidateRefinementBoundary({
+        sessionDir,
+        workingDir,
+        ticketId,
+        baseHead: boundary.base_head,
+        recoveryRef: boundary.recovery_ref,
+        archivedPaths: transaction.candidate_archive.paths,
+      });
+      transaction = {
+        ...transaction,
+        boundary_reconciliation: { ...boundary, status: 'completed' },
+        updated_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      atomicWriteJson(transactionPath, transaction);
+      deps.checkpoint?.('boundary_completed');
+    }
     if (transaction.stage === 'quiesced') {
       migration = prepareLiveSessionMigration(sessionDir, transaction.source_runtime, transaction.target_runtime,
         deps.now?.() ?? new Date(), { forceVerificationContractRepair: true });

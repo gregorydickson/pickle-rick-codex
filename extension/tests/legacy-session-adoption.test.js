@@ -17,6 +17,7 @@ import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } 
 import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import {
+  reconcileArchivedCandidateRefinementBoundary,
   refinementRepositoryIdentity,
   validateRefinementAcceptance,
   writeRefinementAcceptance,
@@ -30,6 +31,8 @@ import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recove
 import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
 import { runSequential } from '../bin/mux-runner.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
+import { getWorkingTreeContentFingerprint, listUntrackedFiles } from '../services/git-utils.js';
+import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -642,6 +645,156 @@ test('legacy adoption archives only attributable active candidate dirt', () => {
   const actions = [];
   assert.throws(() => adoptActiveLegacyMuxSession(foreign.sessionDir, foreign.sourceRoot, foreign.targetRoot, depsFor(foreign, actions)), /unrelated dirty paths/);
   assert.deepEqual(actions, []);
+});
+
+test('legacy adoption atomically rebinds a started refinement boundary after archiving its candidate', () => {
+  const value = fixture();
+  fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'in-flight candidate\n');
+  installLegacyRefinementAcceptance(value);
+  fs.mkdirSync(path.join(value.sessionDir, 'r1'), { recursive: true });
+  fs.writeFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), [
+    '---', 'id: r1', 'title: Legacy ticket 1', 'status: In Progress', '---', '',
+  ].join('\n'));
+  const priorIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+  writeJson(path.join(value.sessionDir, 'refinement-repository-advance.json'), {
+    schema_version: 1,
+    ticket_id: 'r1',
+    baseline_repository_identity: priorIdentity,
+    baseline_head_sha: git(value.repo, ['rev-parse', 'HEAD']),
+    baseline_files_fingerprint: getWorkingTreeContentFingerprint(value.repo),
+    baseline_untracked_files: listUntrackedFiles(value.repo),
+    requires_clean_commit: true,
+    phase: 'started',
+    updated_at: '2026-08-08T19:30:00.000Z',
+  });
+
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  assert.deepEqual(record.candidate_archive.paths, ['tracked.txt']);
+  assert.equal(git(value.repo, ['status', '--porcelain']), '');
+  const currentIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+  assert.notEqual(currentIdentity, priorIdentity);
+  const acceptance = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'refinement-acceptance.json'), 'utf8'));
+  const repairedManifest = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'refinement_manifest.json'), 'utf8'));
+  const reconciliation = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-refinement-boundary-reconciliation.json'), 'utf8',
+  ));
+  assert.equal(acceptance.repository_identity, currentIdentity);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'refinement-repository-advance.json')), false);
+  assert.equal(repairedManifest.tickets[0].status, 'Todo');
+  assert.match(fs.readFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), 'utf8'), /status: "Todo"/);
+  assert.equal(reconciliation.prior_acceptance_repository_identity, priorIdentity);
+  assert.equal(reconciliation.prior_advance.baseline_repository_identity, priorIdentity);
+  assert.equal(reconciliation.recovery_ref, record.candidate_archive.ref);
+  assert.deepEqual(reconciliation.archived_paths, ['tracked.txt']);
+  assert.equal(validateRefinementAcceptance(value.sessionDir, {
+    workingDir: value.repo,
+    verifyRepository: true,
+    preserveMalformedVerification: true,
+  }).ok, true);
+});
+
+test('migrated adoption supersedes stale repository-bound inventory and resumes idempotently', () => {
+  const value = fixture();
+  fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'in-flight migrated candidate\n');
+  installLegacyRefinementAcceptance(value);
+  fs.mkdirSync(path.join(value.sessionDir, 'r1'), { recursive: true });
+  fs.writeFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), [
+    '---', 'id: r1', 'title: Legacy ticket 1', 'status: In Progress', '---', '',
+  ].join('\n'));
+  const priorIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+  writeJson(path.join(value.sessionDir, 'refinement-repository-advance.json'), {
+    schema_version: 1, ticket_id: 'r1', baseline_repository_identity: priorIdentity,
+    baseline_head_sha: git(value.repo, ['rev-parse', 'HEAD']),
+    baseline_files_fingerprint: getWorkingTreeContentFingerprint(value.repo),
+    baseline_untracked_files: listUntrackedFiles(value.repo), requires_clean_commit: true,
+    phase: 'started', updated_at: '2026-08-08T19:30:00.000Z',
+  });
+  const deps = depsFor(value);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'quiesced') throw new Error('simulate-old-migrated-runtime');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /simulate-old-migrated-runtime/,
+  );
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  const staleMigration = prepareLiveSessionMigration(
+    value.sessionDir, transaction.source_runtime, transaction.target_runtime,
+    new Date('2026-08-08T19:59:00.000Z'), { forceVerificationContractRepair: true },
+  );
+  writeJson(transactionPath, {
+    ...transaction, stage: 'migrated', migration_content_hash: staleMigration.content_hash,
+    updated_at: '2026-08-08T19:59:00.000Z',
+  });
+
+  deps.checkpoint = undefined;
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  const completedTransaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  const regeneratedMigration = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  assert.equal(record.status, 'adopted');
+  assert.equal(completedTransaction.superseded_migration_content_hash, staleMigration.content_hash);
+  assert.equal(completedTransaction.boundary_reconciliation.status, 'completed');
+  assert.notEqual(regeneratedMigration.content_hash, staleMigration.content_hash);
+  assert.equal(regeneratedMigration.content_hash, record.migration_content_hash);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'refinement-repository-advance.json')), false);
+  assert.equal(validateRefinementAcceptance(value.sessionDir, {
+    workingDir: value.repo, verifyRepository: true, preserveMalformedVerification: true,
+  }).ok, true);
+  assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).migration_content_hash, record.migration_content_hash);
+});
+
+test('archived boundary reconciliation resumes across prepared, applied, and completed checkpoints', () => {
+  for (const checkpoint of ['boundary_prepared', 'boundary_applied', 'boundary_completed']) {
+    const value = fixture();
+    fs.appendFileSync(path.join(value.repo, 'tracked.txt'), `${checkpoint} candidate\n`);
+    installLegacyRefinementAcceptance(value);
+    fs.mkdirSync(path.join(value.sessionDir, 'r1'), { recursive: true });
+    fs.writeFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), [
+      '---', 'id: r1', 'title: Legacy ticket 1', 'status: In Progress', '---', '',
+    ].join('\n'));
+    const priorIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+    writeJson(path.join(value.sessionDir, 'refinement-repository-advance.json'), {
+      schema_version: 1, ticket_id: 'r1', baseline_repository_identity: priorIdentity,
+      baseline_head_sha: git(value.repo, ['rev-parse', 'HEAD']),
+      baseline_files_fingerprint: getWorkingTreeContentFingerprint(value.repo),
+      baseline_untracked_files: listUntrackedFiles(value.repo), requires_clean_commit: true,
+      phase: 'started', updated_at: '2026-08-08T19:30:00.000Z',
+    });
+    const deps = depsFor(value);
+    let injected = false;
+    deps.checkpoint = (current) => {
+      const injectedCheckpoint = checkpoint === 'boundary_applied' ? 'boundary_prepared' : checkpoint;
+      if (!injected && current === injectedCheckpoint) {
+        injected = true;
+        throw new Error(`injected-${checkpoint}`);
+      }
+    };
+    assert.throws(
+      () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      new RegExp(`injected-${checkpoint}`),
+    );
+    if (checkpoint === 'boundary_applied') {
+      const transaction = JSON.parse(fs.readFileSync(
+        path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+      ));
+      reconcileArchivedCandidateRefinementBoundary({
+        sessionDir: fs.realpathSync(value.sessionDir),
+        workingDir: fs.realpathSync(value.repo),
+        ticketId: transaction.boundary_reconciliation.ticket_id,
+        baseHead: transaction.boundary_reconciliation.base_head,
+        recoveryRef: transaction.boundary_reconciliation.recovery_ref,
+        archivedPaths: transaction.candidate_archive.paths,
+      });
+    }
+    deps.checkpoint = undefined;
+    const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+    assert.equal(record.status, 'adopted', checkpoint);
+    assert.equal(fs.existsSync(path.join(value.sessionDir, 'refinement-repository-advance.json')), false, checkpoint);
+    assert.equal(validateRefinementAcceptance(value.sessionDir, {
+      workingDir: value.repo, verifyRepository: true, preserveMalformedVerification: true,
+    }).ok, true, checkpoint);
+  }
 });
 
 test('legacy adoption freezes the controller then rereads a respawned child before any tmux kill', () => {

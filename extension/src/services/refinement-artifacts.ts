@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile, readTextFile } from './pickle-utils.js';
+import { atomicWriteFile, atomicWriteJson, ensureDir, listTicketFiles, parseTicketFile, readJsonFile, readTextFile } from './pickle-utils.js';
 import {
   amendCommitTrailer,
   countCommitsSince,
@@ -25,6 +26,8 @@ import { resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
 import type { RefinementManifest } from '../types/index.js';
 import { isVerificationContractError } from './verification-env.js';
+import { readRejectedCandidateCheckpoint } from './candidate-recovery.js';
+import { runTicketTransaction } from './ticket-transaction.js';
 
 export const REFINEMENT_PROMPT_CONTRACT_VERSION = 3;
 export const REFINEMENT_ACCEPTANCE_SCHEMA_VERSION = 3;
@@ -72,6 +75,20 @@ interface RefinementRepositoryAdvance {
   verified_changed_paths?: string[];
   updated_at: string;
 }
+
+interface ArchivedCandidateBoundaryReconciliation {
+  schema_version: 1;
+  ticket_id: string;
+  base_head: string;
+  recovery_ref: string;
+  archived_paths: string[];
+  prior_acceptance_repository_identity: string;
+  prior_advance: RefinementRepositoryAdvance;
+  reconciled_repository_identity: string;
+  reconciled_at: string;
+}
+
+const ARCHIVED_CANDIDATE_BOUNDARY_RECONCILIATION_FILE = 'legacy-refinement-boundary-reconciliation.json';
 
 function sha256(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
@@ -527,6 +544,114 @@ export function markRefinementRepositoryAdvanceVerified(input: {
 
 export function clearRefinementRepositoryAdvance(sessionDir: string): void {
   fs.rmSync(refinementRepositoryAdvancePath(sessionDir), { force: true });
+}
+
+export function reconcileArchivedCandidateRefinementBoundary(input: {
+  sessionDir: string;
+  workingDir: string;
+  ticketId: string;
+  baseHead: string;
+  recoveryRef: string;
+  archivedPaths: string[];
+}): void {
+  const advancePath = refinementRepositoryAdvancePath(input.sessionDir);
+  const receiptPath = path.join(input.sessionDir, ARCHIVED_CANDIDATE_BOUNDARY_RECONCILIATION_FILE);
+  const existing = readJsonFile<ArchivedCandidateBoundaryReconciliation>(receiptPath, null);
+  const acceptance = validateRefinementAcceptance(input.sessionDir, { preserveMalformedVerification: true });
+  const checkpoint = readRejectedCandidateCheckpoint(input.sessionDir, input.ticketId);
+  const archivePath = path.join(input.sessionDir, 'legacy-candidate-archive.json');
+  const archive = readJsonFile<{
+    ticket_id?: string; base_head?: string; paths?: string[]; ref?: string; cleanup_complete?: boolean;
+  }>(archivePath, null);
+  const currentIdentity = refinementRepositoryIdentity(input.workingDir, input.sessionDir);
+  const normalizedTicketId = normalizeTicketId(input.ticketId, input.ticketId);
+  const manifestPath = path.join(input.sessionDir, 'refinement_manifest.json');
+  const manifest = readJsonFile<RefinementManifest>(manifestPath, null);
+  const manifestTicket = manifest?.tickets.find((candidate) => (
+    normalizeTicketId(candidate.id, candidate.id) === normalizedTicketId
+  ));
+  const ticketFile = listTicketFiles(input.sessionDir).map(parseTicketFile).find((candidate) => (
+    candidate && normalizeTicketId(candidate.id, candidate.id) === normalizedTicketId
+  ));
+  try {
+    execFileSync('git', ['rev-parse', '--verify', input.recoveryRef], {
+      cwd: input.workingDir, stdio: ['ignore', 'ignore', 'ignore'], timeout: 30_000,
+    });
+  } catch {
+    throw new Error('Cannot reconcile archived legacy candidate without its durable recovery ref.');
+  }
+  if (!acceptance.ok || !acceptance.receipt || !manifest || !manifestTicket || !ticketFile
+    || !checkpoint || checkpoint.base_head !== input.baseHead || checkpoint.recovery_ref !== input.recoveryRef
+    || checkpoint.evidence_path !== archivePath
+    || !archive || archive.cleanup_complete !== true || archive.ticket_id !== input.ticketId
+    || archive.base_head !== input.baseHead || archive.ref !== input.recoveryRef
+    || JSON.stringify([...(archive.paths || [])].sort()) !== JSON.stringify([...input.archivedPaths].sort())
+    || JSON.stringify([...checkpoint.changed_paths].sort()) !== JSON.stringify([...input.archivedPaths].sort())
+    || getHeadSha(input.workingDir) !== input.baseHead
+    || getWorkingTreeStatus(input.workingDir) !== ''
+    || !currentIdentity) {
+    throw new Error('Cannot reconcile archived legacy candidate with its exact started refinement boundary.');
+  }
+  if (existing) {
+    if (existing.schema_version !== 1
+      || existing.ticket_id !== input.ticketId
+      || existing.base_head !== input.baseHead
+      || existing.recovery_ref !== input.recoveryRef
+      || JSON.stringify([...existing.archived_paths].sort()) !== JSON.stringify([...input.archivedPaths].sort())
+      || existing.reconciled_repository_identity !== currentIdentity
+      || acceptance.receipt.repository_identity !== currentIdentity
+      || fs.existsSync(advancePath)
+      || normalizeTicketStatus(manifestTicket.status) !== 'todo') {
+      throw new Error('Archived legacy candidate boundary reconciliation evidence is inconsistent.');
+    }
+    return;
+  }
+  const advance = readJsonFile<RefinementRepositoryAdvance>(advancePath, null);
+  if (!advance || advance.schema_version !== 1 || advance.phase !== 'started'
+    || normalizeTicketId(advance.ticket_id, advance.ticket_id) !== normalizedTicketId
+    || advance.baseline_head_sha !== input.baseHead
+    || normalizeTicketStatus(manifestTicket.status) !== 'in progress') {
+    throw new Error('Cannot reconcile archived legacy candidate with its exact started refinement boundary.');
+  }
+  if (acceptance.receipt.repository_identity !== advance.baseline_repository_identity) {
+    throw new Error('Archived legacy candidate does not start at the accepted refinement boundary.');
+  }
+  const reconciledAt = new Date().toISOString();
+  const reconciliation: ArchivedCandidateBoundaryReconciliation = {
+    schema_version: 1,
+    ticket_id: input.ticketId,
+    base_head: input.baseHead,
+    recovery_ref: input.recoveryRef,
+    archived_paths: [...checkpoint.changed_paths],
+    prior_acceptance_repository_identity: acceptance.receipt.repository_identity,
+    prior_advance: structuredClone(advance),
+    reconciled_repository_identity: currentIdentity,
+    reconciled_at: reconciledAt,
+  };
+  const ticketFailureReason = 'Legacy adoption archived the interrupted candidate before verification-contract repair.';
+  const ticketContent = Object.entries({
+    status: 'Todo', failure_kind: 'interrupted_candidate_archived', failure_reason: ticketFailureReason,
+  }).reduce((content, [field, value]) => {
+    const line = `${field}: ${JSON.stringify(value)}`;
+    const pattern = new RegExp(`^${field}:\\s*.+$`, 'm');
+    return pattern.test(content) ? content.replace(pattern, line) : content.replace(/^---\n/, `---\n${line}\n`);
+  }, ticketFile.content);
+  runTicketTransaction(input.sessionDir, 'reconcile-archived-legacy-candidate-boundary', [
+    refinementAcceptancePath(input.sessionDir), manifestPath, ticketFile.filePath, advancePath, receiptPath,
+  ], () => {
+    atomicWriteJson(refinementAcceptancePath(input.sessionDir), {
+      ...acceptance.receipt,
+      repository_identity: currentIdentity,
+      accepted_at: reconciledAt,
+    });
+    manifestTicket.status = 'Todo';
+    manifestTicket.failure_kind = 'interrupted_candidate_archived';
+    manifestTicket.failure_reason = ticketFailureReason;
+    atomicWriteJson(manifestPath, manifest);
+    atomicWriteFile(ticketFile.filePath, ticketContent);
+    fs.rmSync(advancePath, { force: true });
+    atomicWriteJson(receiptPath, reconciliation);
+  });
 }
 
 export function inspectRefinementRepositoryAdvance(
