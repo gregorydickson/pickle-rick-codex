@@ -620,10 +620,11 @@ test('Citadel trusted npm adapter binds exact immutable topology and fails close
 });
 
 test('Citadel controller accepts only ordered successful inventory completions as semantic progress', async () => {
-  const fixture = makeTrustedPickleTopology(550);
+  const itemTimeoutMs = 5_000;
+  const fixture = makeTrustedPickleTopology(1_400);
   const startedAt = Date.now();
   const results = await runCitadelChecksMonitored(fixture.cwd, fixture.sessionDir, [], {
-    timeoutMs: 2_000,
+    timeoutMs: itemTimeoutMs,
     environment: { ...process.env, PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}` },
     isCancelled: () => false,
     onSpawn: () => {},
@@ -633,7 +634,7 @@ test('Citadel controller accepts only ordered successful inventory completions a
   assert.equal(testResult.status, 'passed');
   assert.equal(testResult.semantic_progress_count, 4);
   assert.equal(testResult.last_progress_identity, 'extension-test-integration');
-  assert.ok(Date.now() - startedAt > 2_000, 'ordered completions must extend work beyond one item window');
+  assert.ok(Date.now() - startedAt > itemTimeoutMs, 'ordered completions must extend work beyond one item window');
   assert.deepEqual(fs.readFileSync(fixture.orderPath, 'utf8').trim().split('\n'), [
     'build', 'audit:test-tiers', 'test:fast', 'test:integration',
   ]);
@@ -1038,18 +1039,27 @@ test('Citadel kills descendants that retain inherited pipes after their leader e
 
 test('Citadel timeout remains failed when SIGTERM handler exits zero and records bounded output loss', async () => {
   const cwd = makeTempRoot('pickle-citadel-timeout-exit-zero-');
+  const readyMarker = path.join(cwd, 'sigterm-handler-ready');
   const result = await runMonitoredCitadelCheck({
     command: 'timeout then zero',
     executable: process.execPath,
     args: ['-e', [
-      "process.stdout.write('x'.repeat(150000));",
+      "const fs = require('node:fs');",
       'process.on(\'SIGTERM\', () => process.exit(0));',
+      "process.stdout.write('x'.repeat(150000));",
+      `fs.writeFileSync(${JSON.stringify(readyMarker)}, 'ready');`,
       'setInterval(() => {}, 1000);',
     ].join(' ')],
   }, cwd, {
-    timeoutMs: 100,
+    timeoutMs: 1_000,
     isCancelled: () => false,
-    onSpawn: () => {},
+    onSpawn: async () => {
+      const deadline = Date.now() + 5_000;
+      while (!fs.existsSync(readyMarker) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(fs.existsSync(readyMarker), true, 'child installed its SIGTERM handler before timeout');
+    },
     onExit: () => {},
   });
   assert.equal(result.status, 'failed');

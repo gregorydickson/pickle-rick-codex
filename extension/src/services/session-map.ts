@@ -116,7 +116,11 @@ export function sessionStateMatchesCwd(state: CwdMatchableState, cwd: string): b
     aliases.push(state.working_dir);
   }
 
-  return aliases.includes(cwd);
+  const normalize = (value: string): string => {
+    try { return fs.realpathSync(value); } catch { return path.resolve(value); }
+  };
+  const expected = normalize(cwd);
+  return aliases.some((alias) => normalize(alias) === expected);
 }
 
 function sleep(milliseconds: number): Promise<void> {

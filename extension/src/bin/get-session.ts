@@ -34,7 +34,10 @@ async function main(argv: string[]): Promise<void> {
     for (const mapped of listSessions()) {
       try {
         const state = loadSessionState(mapped.sessionDir);
-        if (state.active !== true && state.recovery_required !== true) {
+        const legacyMaxTimeEvidence = state.active === false
+          && state.step === 'paused'
+          && state.last_exit_reason === 'max_time';
+        if (state.active !== true && state.recovery_required !== true && !legacyMaxTimeEvidence) {
           await removeSessionMapEntry(mapped.cwd, mapped.sessionDir);
         }
       } catch {

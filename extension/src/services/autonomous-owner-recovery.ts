@@ -173,6 +173,39 @@ export function validateAutonomousOwnerSpec(value: unknown): AutonomousOwnerSpec
   return ownerSpec(value);
 }
 
+export function deriveAutonomousProcessOwnerSpec(
+  sessionDir: string,
+  workingDir: string,
+  runnerBin: string,
+  runnerArgs: string[],
+  runtimeBin: string,
+): AutonomousOwnerSpec {
+  if (!ALLOWED_RUNNERS.has(runnerBin) || path.basename(runnerBin) !== runnerBin) {
+    throw new Error(`Unsupported autonomous owner runner: ${runnerBin}.`);
+  }
+  const exactSessionDir = fs.realpathSync(sessionDir);
+  const exactWorkingDir = fs.realpathSync(workingDir);
+  const exactRuntimeBin = fs.realpathSync(runtimeBin);
+  const supervisorPath = fs.realpathSync(path.join(exactRuntimeBin, 'supervised-runner.js'));
+  const runnerPath = fs.realpathSync(path.join(exactRuntimeBin, runnerBin));
+  const nodePath = fs.realpathSync(process.execPath);
+  const unsigned: Omit<AutonomousOwnerSpec, 'spec_id'> = {
+    schema_version: 1,
+    owner_mode: 'process',
+    session_dir: exactSessionDir,
+    working_dir: exactWorkingDir,
+    tmux_session_name: '', original_tmux_session_id: '', original_tmux_session_created: '', pane_start_command: '',
+    runner_bin: runnerBin,
+    runner_args: [...runnerArgs],
+    supervisor_path: supervisorPath,
+    supervisor_sha256: crypto.createHash('sha256').update(fs.readFileSync(supervisorPath)).digest('hex'),
+    runner_sha256: crypto.createHash('sha256').update(fs.readFileSync(runnerPath)).digest('hex'),
+    node_path: nodePath,
+    node_sha256: crypto.createHash('sha256').update(fs.readFileSync(nodePath)).digest('hex'),
+  };
+  return { ...unsigned, spec_id: stableSpecId(unsigned) };
+}
+
 function persistedIdentity(value: unknown, expectedPid: number | null): PersistedProcessIdentity | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const identity = value as PersistedProcessIdentity;
@@ -365,6 +398,15 @@ export function registerAutonomousOwnerSpec(
             restorer_pid: null,
             restorer_identity: null,
           };
+          const legacyMigration = current.legacy_max_time_migration as Record<string, unknown> | null;
+          if (legacyMigration?.rollover_intent_id === restoration.rollover_intent_id
+            && legacyMigration?.target_owner_spec_id === processSpec.spec_id) {
+            current.legacy_max_time_migration = {
+              ...legacyMigration,
+              status: 'owner_restored',
+              updated_at: new Date().toISOString(),
+            };
+          }
           current.recovery_required = false;
           current.recovery_reason = null;
           appendHistory(current, 'autonomous_owner_restored');
@@ -462,7 +504,7 @@ function failRestoration(manager: StateManager, statePath: string, intentId: str
   });
 }
 
-function authenticateProcessOwnerRuntime(spec: AutonomousOwnerSpec): {
+export function authenticateProcessOwnerRuntime(spec: AutonomousOwnerSpec): {
   supervisorPath: string;
   nodePath: string;
   workingDir: string;
@@ -607,6 +649,15 @@ export function restoreAutonomousBudgetOwner(
           restorer_pid: null,
           restorer_identity: null,
         };
+        const legacyMigration = current.legacy_max_time_migration as Record<string, unknown> | null;
+        if (legacyMigration?.rollover_intent_id === intent.rollover_intent_id
+          && legacyMigration?.target_owner_spec_id === spec.spec_id) {
+          current.legacy_max_time_migration = {
+            ...legacyMigration,
+            status: 'owner_restored',
+            updated_at: new Date().toISOString(),
+          };
+        }
         current.recovery_required = false;
         current.recovery_reason = null;
         appendHistory(current, 'autonomous_owner_restored');

@@ -18,6 +18,22 @@ export interface AutonomousBudgetRolloverOptions {
   assertRepairState?: (state: PersistedState) => void;
 }
 
+interface AuthenticatedLegacyMaxTimeRolloverOptions extends AutonomousBudgetRolloverOptions {
+  legacyInactiveMaxTimeMigration: {
+    migrationId: string;
+    sourceStateSha256: string;
+    sourceHistoryLength: number;
+    prdSealHash: string;
+    startCommit: string;
+    pinnedSha: string | null;
+    sourceOwnerSpecId: string;
+    targetOwnerSpecId: string;
+    targetOwnerSpec: Record<string, unknown>;
+    targetRuntimeRoot: string;
+    targetRuntime: Record<string, unknown>;
+  };
+}
+
 export interface AutonomousBudgetRollover {
   intentId: string;
   epoch: number;
@@ -99,11 +115,11 @@ function emitPendingCheckpoint(
   });
 }
 
-export function scheduleAutonomousBudgetRollover(
+function scheduleAutonomousBudgetRolloverInternal(
   manager: StateManager,
   statePath: string,
   reason: AutonomousBudgetReason,
-  options: AutonomousBudgetRolloverOptions = {},
+  options: AutonomousBudgetRolloverOptions | AuthenticatedLegacyMaxTimeRolloverOptions = {},
 ): AutonomousBudgetRollover | null {
   options.assertDurableOwnership?.();
   const nowMs = options.nowMs ?? Date.now();
@@ -114,8 +130,31 @@ export function scheduleAutonomousBudgetRollover(
   };
   manager.update(statePath, (current: PersistedState) => {
     // Cancellation is authoritative even if it races the caller's threshold read.
-    if (current.active !== true || current.cancel_requested_at
-      || current.last_exit_reason === 'cancelled') return current;
+    const legacyMigration = 'legacyInactiveMaxTimeMigration' in options
+      ? options.legacyInactiveMaxTimeMigration : null;
+    if ((current.active !== true && !legacyMigration) || current.cancel_requested_at
+      || current.cancelled === true || current.last_exit_reason === 'cancelled') return current;
+    if (legacyMigration) {
+      const history = Array.isArray(current.history) ? current.history : [];
+      if (reason !== 'max_time' || current.active !== false || current.step !== 'paused'
+        || current.last_exit_reason !== 'max_time' || current.completed_at
+        || current.recovery_required === true || Number(current.orphan_child_pid || 0) > 0
+        || Number(current.active_child_pid || 0) > 0
+        || current.legacy_max_time_migration
+        || history.length !== legacyMigration.sourceHistoryLength
+        || (history.at(-1) as Record<string, unknown> | undefined)?.step !== 'max_time'
+        || crypto.createHash('sha256').update(JSON.stringify(current)).digest('hex')
+          !== legacyMigration.sourceStateSha256
+        || (current.autonomous_owner_spec as Record<string, unknown> | null)?.spec_id
+          !== legacyMigration.sourceOwnerSpecId
+        || legacyMigration.targetOwnerSpec.spec_id !== legacyMigration.targetOwnerSpecId
+        || legacyMigration.targetOwnerSpec.session_dir !== current.session_dir
+        || legacyMigration.targetOwnerSpec.working_dir !== current.working_dir
+        || legacyMigration.targetOwnerSpec.runner_bin
+          !== (current.autonomous_owner_spec as Record<string, unknown> | null)?.runner_bin) {
+        throw new Error('Legacy max_time migration authority does not match the exact inactive source state.');
+      }
+    }
     const existingIntent = typeof current.autonomous_budget_rollover_intent_id === 'string'
       ? current.autonomous_budget_rollover_intent_id : '';
     if (existingIntent || (current.last_exit_reason === AUTONOMOUS_BUDGET_ROLLOVER_REASON
@@ -163,6 +202,7 @@ export function scheduleAutonomousBudgetRollover(
       current.autonomous_time_budget_window_minutes = nextWindow;
       current.max_time_minutes = nextWindow;
     }
+    if (legacyMigration) current.autonomous_owner_spec = legacyMigration.targetOwnerSpec;
     markRunStart(current, new Date(nowMs));
     current.active = true;
     current.last_exit_reason = AUTONOMOUS_BUDGET_ROLLOVER_REASON;
@@ -184,6 +224,31 @@ export function scheduleAutonomousBudgetRollover(
     current.autonomous_budget_rollover_checkpoint_pending = options.recordDurableCheckpoint
       || options.repairMissingIntent === true
       ? durableCheckpoint : null;
+    if (legacyMigration) {
+      const contract = {
+        schema_version: 1,
+        migration_id: legacyMigration.migrationId,
+        source_state_sha256: legacyMigration.sourceStateSha256,
+        source_history_length: legacyMigration.sourceHistoryLength,
+        prd_seal_hash: legacyMigration.prdSealHash,
+        start_commit: legacyMigration.startCommit,
+        pinned_sha: legacyMigration.pinnedSha,
+        source_owner_spec_id: legacyMigration.sourceOwnerSpecId,
+        target_owner_spec_id: legacyMigration.targetOwnerSpecId,
+        target_runtime_root: legacyMigration.targetRuntimeRoot,
+        target_runtime: legacyMigration.targetRuntime,
+        rollover_intent_id: intentId,
+        rollover_epoch: epoch,
+      };
+      current.legacy_max_time_migration = {
+        ...contract,
+        contract_sha256: crypto.createHash('sha256').update(JSON.stringify(contract)).digest('hex'),
+        status: 'rollover_scheduled',
+        created_at: new Date(nowMs).toISOString(),
+        updated_at: new Date(nowMs).toISOString(),
+      };
+      appendHistory(current, 'legacy_max_time_session_migrated', options.ticketId || undefined);
+    }
     current.autonomous_budget_checkpoint_error = null;
     appendHistory(current, AUTONOMOUS_BUDGET_ROLLOVER_REASON, options.ticketId || undefined);
     scheduled.checkpoint = durableCheckpoint;
@@ -206,6 +271,23 @@ export function scheduleAutonomousBudgetRollover(
     // The exact pending checkpoint remains durable for the replacement owner.
   }
   return rollover;
+}
+
+export function scheduleAutonomousBudgetRollover(
+  manager: StateManager,
+  statePath: string,
+  reason: AutonomousBudgetReason,
+  options: AutonomousBudgetRolloverOptions = {},
+): AutonomousBudgetRollover | null {
+  return scheduleAutonomousBudgetRolloverInternal(manager, statePath, reason, options);
+}
+
+export function scheduleAuthenticatedLegacyMaxTimeRollover(
+  manager: StateManager,
+  statePath: string,
+  options: AuthenticatedLegacyMaxTimeRolloverOptions,
+): AutonomousBudgetRollover | null {
+  return scheduleAutonomousBudgetRolloverInternal(manager, statePath, 'max_time', options);
 }
 
 export function consumeAutonomousBudgetRollover(
@@ -276,6 +358,14 @@ export function consumeAutonomousBudgetRollover(
     current.autonomous_budget_checkpoint_error = null;
     current.autonomous_relaunch_not_before = null;
     current.autonomous_relaunch_deadline = null;
+    const legacyMigration = current.legacy_max_time_migration as Record<string, unknown> | null;
+    if (legacyMigration?.rollover_intent_id === intentId) {
+      current.legacy_max_time_migration = {
+        ...legacyMigration,
+        status: 'rollover_consumed',
+        updated_at: new Date().toISOString(),
+      };
+    }
     appendHistory(current, 'autonomous_budget_rollover_consumed');
     consumed = true;
     return current;

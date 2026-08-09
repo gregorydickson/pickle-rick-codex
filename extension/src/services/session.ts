@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ensureConfigFile, loadConfig } from './config.js';
 import { logActivity } from './activity-logger.js';
 import {
@@ -9,7 +10,7 @@ import {
   getSessionsRoot,
   nowIso,
 } from './pickle-utils.js';
-import { getHeadSha, isGitRepo } from './git-utils.js';
+import { commitExists, getHeadSha, isGitRepo } from './git-utils.js';
 import { cancelPipelineSession, isPipelineSession } from './pipeline-state.js';
 import {
   findLastSessionForCwd,
@@ -17,6 +18,7 @@ import {
   pruneSessionMap,
   removeSessionMapEntry,
   updateSessionMap,
+  withSessionMapLock,
 } from './session-map.js';
 import { StateManager } from './state-manager.js';
 import type { PersistedState } from './state-manager.js';
@@ -25,14 +27,58 @@ import { tmuxSessionExists } from './tmux.js';
 import { inspectProcessLivenessIdentity, recoverSessionOrphanState, type PersistedProcessIdentity } from './orphan-reaper.js';
 import {
   validateAutonomousOwnerSpec,
+  ensureAutonomousOwnerRecoveryDaemon,
+  authenticateProcessOwnerRuntime,
+  deriveAutonomousProcessOwnerSpec,
   type AutonomousOwnerRestorationIntent,
   type AutonomousOwnerSpec,
 } from './autonomous-owner-recovery.js';
-import { scheduleAutonomousBudgetRollover } from './autonomous-budget.js';
+import { scheduleAuthenticatedLegacyMaxTimeRollover, scheduleAutonomousBudgetRollover } from './autonomous-budget.js';
+import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
+import { readLogicalPipeline } from './durable-supervisor.js';
+import { describeInstalledRuntime } from './runtime-descriptor.js';
+import { acquireCwdReservationLocks } from './detached-launch.js';
 
 export interface SessionResult {
   sessionDir: string;
   state: PersistedState;
+}
+
+const cwdAuthorityQueues = new Map<string, Promise<void>>();
+
+async function withInProcessCwdQueue<T>(
+  normalizedCwd: string,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const prior = cwdAuthorityQueues.get(normalizedCwd) ?? Promise.resolve();
+  let releaseQueue!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseQueue = resolve; });
+  const queued = prior.then(() => gate);
+  cwdAuthorityQueues.set(normalizedCwd, queued);
+  await prior;
+  try {
+    return await callback();
+  } finally {
+    releaseQueue();
+    if (cwdAuthorityQueues.get(normalizedCwd) === queued) cwdAuthorityQueues.delete(normalizedCwd);
+  }
+}
+
+async function withFilesystemCwdAuthority<T>(normalizedCwd: string, callback: () => Promise<T>): Promise<T> {
+  const manager = new StateManager();
+  const authorityPath = cwdAuthorityPath(normalizedCwd);
+  let acquired = false;
+  try {
+    manager.acquireLock(authorityPath);
+    acquired = true;
+    return await callback();
+  } finally {
+    if (acquired) manager.releaseLock(authorityPath);
+  }
+}
+
+async function withCwdAuthorityLock<T>(normalizedCwd: string, callback: () => Promise<T>): Promise<T> {
+  return withInProcessCwdQueue(normalizedCwd, () => withFilesystemCwdAuthority(normalizedCwd, callback));
 }
 
 interface CreateInitialStateArgs {
@@ -52,6 +98,10 @@ interface CreateSessionArgs {
 
 interface ResolveSessionForCwdOptions {
   last?: boolean;
+}
+
+interface ReconcileSessionLivenessOptions {
+  allowLegacyMaxTimeMigration?: boolean;
 }
 
 export function getStatePath(sessionDir: string): string {
@@ -123,6 +173,8 @@ export async function createSession({
 }: CreateSessionArgs): Promise<SessionResult> {
   ensureConfigFile();
   const config = loadConfig();
+  ensureDir(getSessionsRoot());
+  return withCwdAuthorityLock(normalizeSessionCwd(cwd), async () => {
   const sessionId = `${new Date().toISOString().slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`;
   const sessionDir = path.join(getSessionsRoot(), sessionId);
   ensureDir(sessionDir);
@@ -147,7 +199,8 @@ export async function createSession({
     original_prompt: prompt,
   }, { enabled: config.defaults.activity_logging });
 
-  return { sessionDir, state };
+    return { sessionDir, state };
+  });
 }
 
 export function loadSessionState(sessionDir: string, stateManager: StateManager = new StateManager()): PersistedState {
@@ -209,6 +262,11 @@ export function normalizeSessionCwd(cwd: string): string {
   }
 }
 
+function cwdAuthorityPath(normalizedCwd: string): string {
+  const digest = crypto.createHash('sha256').update(normalizedCwd).digest('hex');
+  return path.join(getSessionsRoot(), `.cwd-authority-${digest}`);
+}
+
 export function getSessionMapCwds(state: PersistedState): string[] {
   const values: string[] = [];
   const pushUnique = (value: unknown): void => {
@@ -238,10 +296,197 @@ function isProcessAlive(pid: unknown): boolean {
   }
 }
 
-export function reconcileSessionLiveness(
+function isProcessGroupAlive(pgid: unknown): boolean {
+  const normalized = Number(pgid);
+  if (!Number.isInteger(normalized) || normalized <= 0) return false;
+  try {
+    process.kill(-normalized, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface LegacyMaxTimeMigrationEvidence {
+  sourceStateSha256: string;
+  sourceHistoryLength: number;
+  prdSealHash: string;
+  startCommit: string;
+  pinnedSha: string | null;
+  ownerSpecId: string;
+  targetOwnerSpec: AutonomousOwnerSpec;
+  targetRuntimeRoot: string;
+  targetRuntime: Record<string, unknown>;
+}
+
+function validLegacyMaxTimeMigrationTransaction(
+  value: unknown,
+  state: PersistedState,
+  sessionDir: string,
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const transaction = value as Record<string, unknown>;
+  if (transaction.schema_version !== 1 || typeof transaction.migration_id !== 'string'
+    || !['rollover_scheduled', 'owner_restoration_planned', 'owner_restored', 'rollover_consumed']
+      .includes(String(transaction.status || ''))) return false;
+  const contract = {
+    schema_version: transaction.schema_version,
+    migration_id: transaction.migration_id,
+    source_state_sha256: transaction.source_state_sha256,
+    source_history_length: transaction.source_history_length,
+    prd_seal_hash: transaction.prd_seal_hash,
+    start_commit: transaction.start_commit,
+    pinned_sha: transaction.pinned_sha,
+    source_owner_spec_id: transaction.source_owner_spec_id,
+    target_owner_spec_id: transaction.target_owner_spec_id,
+    target_runtime_root: transaction.target_runtime_root,
+    target_runtime: transaction.target_runtime,
+    rollover_intent_id: transaction.rollover_intent_id,
+    rollover_epoch: transaction.rollover_epoch,
+  };
+  if (transaction.contract_sha256 !== crypto.createHash('sha256')
+    .update(JSON.stringify(contract)).digest('hex')) return false;
+  const consumed = transaction.status === 'rollover_consumed';
+  const boundIntent = consumed
+    ? state.autonomous_budget_consumed_intent_id : state.autonomous_budget_rollover_intent_id;
+  if (transaction.rollover_intent_id !== boundIntent
+    || Number(transaction.rollover_epoch) !== Number(state.autonomous_budget_epoch)
+    || transaction.target_owner_spec_id
+      !== (state.autonomous_owner_spec as Record<string, unknown> | null)?.spec_id
+    || transaction.start_commit !== state.start_commit
+    || transaction.pinned_sha !== (state.pinned_sha ?? null)) return false;
+  const restoration = state.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
+  if (['owner_restoration_planned', 'owner_restored'].includes(String(transaction.status))
+    && (!restoration || restoration.rollover_intent_id !== transaction.rollover_intent_id
+      || restoration.owner_spec_id !== transaction.target_owner_spec_id)) return false;
+  try {
+    const prd = fs.readFileSync(path.join(sessionDir, 'prd.md'), 'utf8');
+    const seal = readPrdSeal(sessionDir);
+    assertPrdSealMatchesPrd(seal, prd);
+    if (seal.semantic_hash !== transaction.prd_seal_hash
+      || typeof transaction.target_runtime_root !== 'string') return false;
+    return JSON.stringify(describeInstalledRuntime(transaction.target_runtime_root))
+      === JSON.stringify(transaction.target_runtime);
+  } catch {
+    return false;
+  }
+}
+
+function sha256Json(value: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function validPersistedProcessIdentity(value: unknown): value is PersistedProcessIdentity {
+  const identity = value as PersistedProcessIdentity | null;
+  if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0
+    || !Number.isInteger(identity.pgid) || identity.pgid <= 0
+    || typeof identity.start_time !== 'string' || !identity.start_time
+    || typeof identity.fingerprint !== 'string') return false;
+  return identity.fingerprint === crypto.createHash('sha256')
+    .update(`${identity.pid}\0${identity.pgid}\0${identity.start_time}`).digest('hex');
+}
+
+function legacyMaxTimeMigrationEvidence(
+  state: PersistedState,
+  resolvedSessionDir: string,
+): LegacyMaxTimeMigrationEvidence | null {
+  if (state.active !== false || state.step !== 'paused' || state.last_exit_reason !== 'max_time'
+    || state.cancel_requested_at || state.cancelled === true || state.recovery_required === true
+    || Number(state.orphan_child_pid || 0) > 0 || Number(state.active_child_pid || 0) > 0
+    || state.autonomous_budget_rollover_intent_id || state.autonomous_budget_rollover_checkpoint_pending
+    || state.autonomous_owner_restoration || state.legacy_max_time_migration
+    || state.completed_at) return null;
+  if (isProcessAlive(state.worker_pid) || isProcessAlive(state.tmux_runner_pid)
+    || isProcessAlive(state.active_child_pid)) return null;
+  if (Number(state.schema_version) !== 1 || state.session_dir !== resolvedSessionDir) return null;
+
+  let workingDir: string;
+  try {
+    workingDir = fs.realpathSync(String(state.working_dir || ''));
+  } catch {
+    return null;
+  }
+  if (!isGitRepo(workingDir)) return null;
+  const startCommit = typeof state.start_commit === 'string' ? state.start_commit : '';
+  const pinnedSha = typeof state.pinned_sha === 'string' ? state.pinned_sha : null;
+  if (!/^[a-f0-9]{40,64}$/.test(startCommit) || !commitExists(workingDir, startCommit)
+    || (pinnedSha !== null && (!/^[a-f0-9]{40,64}$/.test(pinnedSha) || !commitExists(workingDir, pinnedSha)))) return null;
+
+  const owner = validateAutonomousOwnerSpec(state.autonomous_owner_spec);
+  if (!owner || owner.session_dir !== resolvedSessionDir || owner.working_dir !== workingDir) return null;
+  if (owner.owner_mode === 'process') {
+    try { authenticateProcessOwnerRuntime(owner); } catch { return null; }
+  }
+  let targetOwnerSpec: AutonomousOwnerSpec;
+  let targetRuntimeRoot: string;
+  let targetRuntime: Record<string, unknown>;
+  try {
+    const testRuntimeBin = process.env.PICKLE_TEST_MODE === '1'
+      ? process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN : null;
+    const runtimeBin = testRuntimeBin
+      ? fs.realpathSync(testRuntimeBin)
+      : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../bin');
+    targetRuntimeRoot = fs.realpathSync(path.resolve(runtimeBin, '../..'));
+    targetRuntime = describeInstalledRuntime(targetRuntimeRoot) as unknown as Record<string, unknown>;
+    targetOwnerSpec = deriveAutonomousProcessOwnerSpec(
+      resolvedSessionDir,
+      workingDir,
+      owner.runner_bin,
+      owner.runner_args,
+      runtimeBin,
+    );
+  } catch {
+    return null;
+  }
+  const supervisorIdentity = state.autonomous_supervisor_identity as PersistedProcessIdentity | null;
+  if (!validPersistedProcessIdentity(supervisorIdentity)
+    || Number(state.autonomous_supervisor_pid) !== supervisorIdentity.pid
+    || inspectProcessLivenessIdentity(supervisorIdentity) === 'matched'
+    || isProcessGroupAlive(supervisorIdentity.pgid)) return null;
+  const daemonIdentity = state.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity | null;
+  if (state.autonomous_owner_recovery_daemon_pid != null
+    && (!validPersistedProcessIdentity(daemonIdentity)
+      || Number(state.autonomous_owner_recovery_daemon_pid) !== daemonIdentity.pid
+      || inspectProcessLivenessIdentity(daemonIdentity) === 'matched'
+      || isProcessGroupAlive(daemonIdentity.pgid))) return null;
+  if (owner.owner_mode === 'tmux' && (tmuxSessionExists(owner.tmux_session_name)
+    || isProcessAlive(state.tmux_runner_pid))) return null;
+  const history = Array.isArray(state.history) ? state.history as Array<Record<string, unknown>> : [];
+  const terminal = history.at(-1);
+  const productive = history.slice(0, -1).some((entry) => entry && typeof entry === 'object'
+    && typeof entry.step === 'string' && !['inactive', 'paused', 'max_time', 'cancelled'].includes(entry.step)
+    && typeof entry.timestamp === 'string' && Number.isFinite(Date.parse(entry.timestamp)));
+  if (!terminal || terminal.step !== 'max_time' || typeof terminal.timestamp !== 'string'
+    || !Number.isFinite(Date.parse(terminal.timestamp)) || !productive) return null;
+
+  try {
+    const prd = fs.readFileSync(path.join(resolvedSessionDir, 'prd.md'), 'utf8');
+    const seal = readPrdSeal(resolvedSessionDir);
+    assertPrdSealMatchesPrd(seal, prd);
+    const logical = readLogicalPipeline(resolvedSessionDir);
+    if (logical.control_state !== 'autonomous_execution' || logical.terminal_state !== null
+      || logical.prd_seal_hash !== seal.semantic_hash) return null;
+    return {
+      sourceStateSha256: sha256Json(state),
+      sourceHistoryLength: history.length,
+      prdSealHash: seal.semantic_hash,
+      startCommit,
+      pinnedSha,
+      ownerSpecId: owner.spec_id,
+      targetOwnerSpec,
+      targetRuntimeRoot,
+      targetRuntime,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function reconcileSessionLivenessInternal(
   sessionDir: string,
   stateManager: StateManager = new StateManager(),
   nowMs: number = Date.now(),
+  options: ReconcileSessionLivenessOptions = {},
 ): { state: PersistedState; stale: boolean } {
   const statePath = getStatePath(sessionDir);
   const resolvedSessionDir = fs.realpathSync(sessionDir);
@@ -256,6 +501,24 @@ export function reconcileSessionLiveness(
   const rolloverCancelled = state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled';
   const rolloverUnsafe = state.recovery_required === true || Number(state.orphan_child_pid || 0) > 0;
   if (rolloverCancelled) return { state, stale: false };
+  if (state.step === 'complete' || state.completed_at || state.last_exit_reason === 'completed') {
+    return { state, stale: false };
+  }
+  if (state.legacy_max_time_migration
+    && !validLegacyMaxTimeMigrationTransaction(state.legacy_max_time_migration, state, resolvedSessionDir)) {
+    state = stateManager.update(statePath, (current) => {
+      if (current.cancel_requested_at || current.cancelled === true || current.step === 'complete') return current;
+      current.active = false;
+      current.step = 'blocked';
+      current.recovery_required = true;
+      current.recovery_kind = 'legacy_max_time_migration_corrupt';
+      current.recovery_reason = 'legacy max_time migration transaction failed its content hash';
+      current.autonomous_owner_recovery_suspended = true;
+      appendHistory(current, 'legacy_max_time_migration_corrupt');
+      return current;
+    });
+    return { state, stale: false };
+  }
   const initialOwnerSpec = validateAutonomousOwnerSpec(state.autonomous_owner_spec);
   if (state.autonomous_owner_spec != null
     && (!initialOwnerSpec || initialOwnerSpec.session_dir !== resolvedSessionDir)) {
@@ -343,6 +606,15 @@ export function reconcileSessionLiveness(
               restorer_pid: null,
               restorer_identity: null,
             };
+            const legacyMigration = current.legacy_max_time_migration as Record<string, unknown> | null;
+            if (legacyMigration?.rollover_intent_id === rolloverIntentId
+              && legacyMigration?.target_owner_spec_id === spec.spec_id) {
+              current.legacy_max_time_migration = {
+                ...legacyMigration,
+                status: 'owner_restoration_planned',
+                updated_at: new Date(nowMs).toISOString(),
+              };
+            }
             appendHistory(current, 'autonomous_owner_restoration_planned');
           } else if (existing?.status === 'failed') {
             const attempt = Math.max(1, Number(existing.attempt || 1));
@@ -364,6 +636,65 @@ export function reconcileSessionLiveness(
       });
     }
     return { state, stale: false };
+  }
+  const legacyEvidence = options.allowLegacyMaxTimeMigration
+    ? legacyMaxTimeMigrationEvidence(state, resolvedSessionDir) : null;
+  if (legacyEvidence) {
+    const migrationFencePath = path.join(resolvedSessionDir, '.legacy-max-time-migration-fence');
+    stateManager.acquireLock(migrationFencePath);
+    const repair = (): boolean => Boolean(scheduleAuthenticatedLegacyMaxTimeRollover(
+      stateManager,
+      statePath,
+      {
+        nowMs,
+        ticketId: typeof state.current_ticket === 'string' ? state.current_ticket : null,
+        repairMissingIntent: true,
+        legacyInactiveMaxTimeMigration: {
+          migrationId: crypto.randomUUID(),
+          sourceStateSha256: legacyEvidence.sourceStateSha256,
+          sourceHistoryLength: legacyEvidence.sourceHistoryLength,
+          prdSealHash: legacyEvidence.prdSealHash,
+          startCommit: legacyEvidence.startCommit,
+          pinnedSha: legacyEvidence.pinnedSha,
+          sourceOwnerSpecId: legacyEvidence.ownerSpecId,
+          targetOwnerSpecId: legacyEvidence.targetOwnerSpec.spec_id,
+          targetOwnerSpec: legacyEvidence.targetOwnerSpec as unknown as Record<string, unknown>,
+          targetRuntimeRoot: legacyEvidence.targetRuntimeRoot,
+          targetRuntime: legacyEvidence.targetRuntime,
+        },
+        assertRepairState: (current) => {
+          const exact = legacyMaxTimeMigrationEvidence(current, resolvedSessionDir);
+          if (!exact || exact.sourceStateSha256 !== legacyEvidence.sourceStateSha256
+            || exact.ownerSpecId !== legacyEvidence.ownerSpecId
+            || exact.targetOwnerSpec.spec_id !== legacyEvidence.targetOwnerSpec.spec_id
+            || exact.targetRuntimeRoot !== legacyEvidence.targetRuntimeRoot
+            || JSON.stringify(exact.targetRuntime) !== JSON.stringify(legacyEvidence.targetRuntime)
+            || exact.prdSealHash !== legacyEvidence.prdSealHash
+            || exact.startCommit !== legacyEvidence.startCommit
+            || exact.pinnedSha !== legacyEvidence.pinnedSha) {
+            throw new Error('Cannot migrate a legacy max_time session after its authenticated evidence changed.');
+          }
+        },
+      },
+    ));
+    try {
+      if (repair()) return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs, options);
+    } catch (error) {
+      const current = stateManager.read(statePath);
+      const receipt = current.legacy_max_time_migration as Record<string, unknown> | null;
+      if (error instanceof Error
+        && error.message.includes('second autonomous budget rollover')
+        && current.active === true
+        && current.last_exit_reason === 'autonomous_budget_rollover'
+        && receipt?.source_state_sha256 === legacyEvidence.sourceStateSha256
+        && receipt?.rollover_intent_id === current.autonomous_budget_rollover_intent_id) {
+        return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs, options);
+      }
+      throw error;
+    } finally {
+      stateManager.releaseLock(migrationFencePath);
+    }
+    state = stateManager.read(statePath);
   }
   if (state.active !== true) return { state, stale: false };
 
@@ -436,7 +767,7 @@ export function reconcileSessionLiveness(
         throw error;
       }
     };
-    if (reconcileRepairRace()) return reconcileSessionLiveness(sessionDir, stateManager, nowMs);
+    if (reconcileRepairRace()) return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs);
     state = stateManager.read(statePath);
     if (state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled'
       || (state.recovery_required === true && !isProcessAlive(state.active_child_pid))) {
@@ -499,6 +830,14 @@ export function reconcileSessionLiveness(
   return { state: reconciled, stale: orphanChildPid === null };
 }
 
+export function reconcileSessionLiveness(
+  sessionDir: string,
+  stateManager: StateManager = new StateManager(),
+  nowMs: number = Date.now(),
+): { state: PersistedState; stale: boolean } {
+  return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs);
+}
+
 export function reconcileAllSessionLiveness(): Array<{ sessionDir: string; reason: string; state: PersistedState }> {
   let entries: fs.Dirent[];
   try {
@@ -524,18 +863,87 @@ export function reconcileAllSessionLiveness(): Array<{ sessionDir: string; reaso
   return reconciled;
 }
 
+function anotherLiveSessionClaimsCwd(cwd: string, selectedSessionDir: string): boolean {
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(getSessionsRoot(), { withFileTypes: true }); } catch { return false; }
+  const selected = path.resolve(selectedSessionDir);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidateDir = path.join(getSessionsRoot(), entry.name);
+    if (path.resolve(candidateDir) === selected || !fs.existsSync(getStatePath(candidateDir))) continue;
+    try {
+      const candidate = loadSessionState(candidateDir);
+      if ((candidate.active === true || candidate.recovery_required === true)
+        && getSessionMapCwds(candidate).some((alias) => normalizeSessionCwd(alias) === cwd)) return true;
+    } catch {
+      // Corrupt unrelated sessions do not grant authority to activate this one.
+      return true;
+    }
+  }
+  return false;
+}
+
+async function reconcileMappedSessionExclusively(
+  cwd: string,
+  sessionDir: string,
+): Promise<{ state: PersistedState; stale: boolean }> {
+  return withInProcessCwdQueue(cwd, async () => {
+    const releaseLaunchReservation = acquireCwdReservationLocks([cwd]);
+    try {
+      return await withFilesystemCwdAuthority(cwd, () => withSessionMapLock(() => {
+    const stillMapped = getSessionForCwd(cwd);
+    const mappedState = loadSessionState(sessionDir);
+    const exactAlias = getSessionMapCwds(mappedState)
+      .some((candidate) => normalizeSessionCwd(candidate) === cwd);
+    const exclusive = stillMapped !== null && path.resolve(stillMapped) === path.resolve(sessionDir)
+      && exactAlias && !anotherLiveSessionClaimsCwd(cwd, sessionDir);
+    return reconcileSessionLivenessInternal(sessionDir, undefined, Date.now(), {
+      allowLegacyMaxTimeMigration: exclusive,
+    });
+      }));
+    } finally {
+      releaseLaunchReservation();
+    }
+  });
+}
+
 export async function resolveSessionForCwd(cwd: string, options: ResolveSessionForCwdOptions = {}): Promise<string | null> {
   const normalizedCwd = normalizeSessionCwd(cwd);
   const direct = getSessionForCwd(normalizedCwd);
   if (direct) {
-    const reconciled = reconcileSessionLiveness(direct);
-    if (!reconciled.stale || options.last) return direct;
+    const mappedState = loadSessionState(direct);
+    const exactAlias = getSessionMapCwds(mappedState)
+      .some((candidate) => normalizeSessionCwd(candidate) === normalizedCwd);
+    if (!exactAlias) {
+      await removeSessionMapEntry(normalizedCwd, direct);
+    } else {
+      const reconciled = await reconcileMappedSessionExclusively(normalizedCwd, direct);
+      if (reconciled.state.legacy_max_time_migration
+        && reconciled.state.autonomous_owner_restoration) {
+        ensureAutonomousOwnerRecoveryDaemon(
+          direct,
+          path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../bin'),
+        );
+      }
+      if (!reconciled.stale || options.last) return direct;
+    }
     await removeSessionMapEntry(normalizedCwd, direct);
   }
   if (options.last) {
     const sessionDir = findLastSessionForCwd(normalizedCwd);
     if (sessionDir) {
+      const candidate = loadSessionState(sessionDir);
+      if (!getSessionMapCwds(candidate)
+        .some((alias) => normalizeSessionCwd(alias) === normalizedCwd)) return null;
       await updateSessionMap(normalizedCwd, sessionDir);
+      const reconciled = await reconcileMappedSessionExclusively(normalizedCwd, sessionDir);
+      if (reconciled.state.legacy_max_time_migration
+        && reconciled.state.autonomous_owner_restoration) {
+        ensureAutonomousOwnerRecoveryDaemon(
+          sessionDir,
+          path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../bin'),
+        );
+      }
       return sessionDir;
     }
   }

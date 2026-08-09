@@ -875,7 +875,11 @@ export function cancelLogicalPipelineByOperator(
   options: ClockOptions = {},
 ): LogicalPipelineState {
   requireNonEmpty(reason, 'operator cancellation reason');
-  return mutate(sessionDir, (state) => {
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const migrationFencePath = path.join(resolvedSessionDir, '.legacy-max-time-migration-fence');
+  manager.acquireLock(migrationFencePath);
+  try {
+    return mutate(resolvedSessionDir, (state) => {
     // The legacy session cancellation marker is persisted before the durable
     // journal is sealed. A live executor can observe that marker and win the
     // race by sealing the same cancelled terminal state under its lease. Treat
@@ -893,5 +897,8 @@ export function cancelLogicalPipelineByOperator(
     }, options.nowMs ?? Date.now());
     state.terminal_state = 'cancelled';
     state.lease = null;
-  });
+    });
+  } finally {
+    manager.releaseLock(migrationFencePath);
+  }
 }

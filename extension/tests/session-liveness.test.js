@@ -1,10 +1,11 @@
 // @tier: fast
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { reconcileSessionLiveness } from '../services/session.js';
+import { reconcileSessionLiveness, resolveSessionForCwd } from '../services/session.js';
 import {
   captureProcessLivenessIdentity,
   captureSpawnedProcessIdentity,
@@ -23,11 +24,13 @@ import {
   acceptRuntimeHandoff,
   acquireSupervisorLease,
   beginAutonomousExecution,
+  cancelLogicalPipelineByOperator,
   createLogicalPipeline,
   releaseRuntimeHandoffLease,
   requestRuntimeHandoff,
 } from '../services/durable-supervisor.js';
-import { prepareLiveSessionHandoffCheckpoint } from '../services/live-session-migration.js';
+import { prepareLiveSessionHandoffCheckpoint, prepareLiveSessionMigration } from '../services/live-session-migration.js';
+import { updateSessionMap } from '../services/session-map.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
   captureOwnedTmuxRunnerBinding,
@@ -85,7 +88,7 @@ async function waitForState(statePath, predicate, timeoutMs = 3_000) {
 function runLivenessProcess(sessionDir, nowMs) {
   const source = `
     import('./services/session.js').then(({ reconcileSessionLiveness }) => {
-      const result = reconcileSessionLiveness(process.argv[1], undefined, Number(process.argv[2]));
+      const result = reconcileSessionLiveness(process.argv[1], undefined, Number(process.argv[2]), { allowLegacyMaxTimeMigration: true });
       process.stdout.write(String(result.state.autonomous_budget_rollover_intent_id || ''));
     });
   `;
@@ -131,6 +134,37 @@ function registerProcessOwner(sessionDir, runnerArgs = []) {
     undefined,
     path.resolve(new URL('../bin/supervised-runner.js', import.meta.url).pathname),
   );
+}
+
+function initializeGitRepository(workingDir) {
+  execFileSync('git', ['init', '-q'], { cwd: workingDir });
+  execFileSync('git', ['config', 'user.email', 'pickle@example.invalid'], { cwd: workingDir });
+  execFileSync('git', ['config', 'user.name', 'Pickle Test'], { cwd: workingDir });
+  fs.writeFileSync(path.join(workingDir, 'tracked.txt'), 'baseline\n');
+  execFileSync('git', ['add', 'tracked.txt'], { cwd: workingDir });
+  execFileSync('git', ['commit', '-qm', 'baseline'], { cwd: workingDir });
+  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
+}
+
+function sealLegacySession(sessionDir, workingDir) {
+  const prd = '# Continue productive autonomous work\n';
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
+  return writePrdSeal(sessionDir, {
+    prd,
+    repository: { identity: 'fixture@base', working_directory: workingDir, execution_base_policy: 'sealed' },
+    acceptance_criteria: [{ id: 'AC-1', text: 'The autonomous owner performs productive work.' }],
+    scope_and_ownership: {}, dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [],
+    preservation_and_rollback: {}, completion_definition: {}, release_gates: [],
+  });
+}
+
+function deadProcessIdentity(pid = 999_999_999) {
+  const pgid = pid;
+  const start_time = 'legacy-owner-start';
+  return {
+    pid, pgid, start_time,
+    fingerprint: crypto.createHash('sha256').update(`${pid}\0${pgid}\0${start_time}`).digest('hex'),
+  };
 }
 
 class InjectBeforeFirstUpdateStateManager extends StateManager {
@@ -423,6 +457,7 @@ test('reconcileSessionLiveness durably repairs a missing rollover intent for an 
     session_dir: expiredDir,
     working_dir: expiredDir,
     max_time_minutes: 1,
+    iteration: 0,
     autonomous_supervisor_identity: captureProcessLivenessIdentity(process.pid),
   }));
   registerProcessOwner(expiredDir);
@@ -464,6 +499,294 @@ test('reconcileSessionLiveness durably repairs a missing rollover intent for an 
   assert.equal(current.stale, false);
   assert.equal(current.state.active, true);
   assert.equal(fs.existsSync(path.join(currentDir, 'state.json')), true);
+});
+
+test('legacy paused max_time session migrates once through mapped lookup, supervised ownership, and productive work', async () => {
+  const dataRoot = makeTempRoot('pickle-legacy-max-time-data-');
+  const workingDir = makeTempRoot('pickle-legacy-max-time-work-');
+  const sessionDir = path.join(dataRoot, 'sessions', 'legacy-session');
+  const sourceRuntimeDir = path.join(sessionDir, 'source-runtime');
+  const statePath = path.join(sessionDir, 'state.json');
+  const fakeBin = path.join(sessionDir, 'fake-bin');
+  fs.mkdirSync(sourceRuntimeDir, { recursive: true });
+  fs.mkdirSync(fakeBin, { recursive: true });
+  const startCommit = initializeGitRepository(workingDir);
+  fs.writeFileSync(path.join(sourceRuntimeDir, 'loop-runner.js'), 'setInterval(() => {}, 1000);\n');
+  fs.writeFileSync(path.join(sourceRuntimeDir, 'supervised-runner.js'), 'throw new Error("stale source runtime executed");\n');
+  const fakeCodex = path.join(fakeBin, 'codex');
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--output-last-message --add-dir'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const output = args[args.indexOf('--output-last-message') + 1];
+const artifactDir = prompt.match(/Worker artifact dir: ([^\\n]+)/)?.[1]?.trim();
+if (artifactDir) {
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(artifactDir + '/anatomy-park-summary.json', JSON.stringify({
+    finding_family: 'legacy-migration-e2e', highest_severity_finding: 'productive real runner iteration',
+    data_flow_path: 'daemon -> supervisor -> loop runner -> codex', fix_applied: 'advanced durable iteration',
+    verification: ['real loop runner'], trap_doors: [], next_action: 'continue',
+  }));
+}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 350);
+fs.writeFileSync(output, '<promise>CONTINUE</promise>');
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+`);
+  fs.chmodSync(fakeCodex, 0o755);
+  writeJson(statePath, state({
+    active: false,
+    working_dir: fs.realpathSync(workingDir),
+    session_dir: fs.realpathSync(sessionDir),
+    step: 'paused',
+    last_exit_reason: 'max_time',
+    start_commit: startCommit,
+    pinned_sha: startCommit,
+    max_time_minutes: 1,
+    history: [
+      { step: 'implement', ticket: 'T-1', timestamp: '2023-11-14T22:13:20.000Z' },
+      { step: 'max_time', ticket: 'T-1', timestamp: '2023-11-14T22:14:20.000Z' },
+    ],
+    current_ticket: 'T-1',
+  }));
+  const seal = sealLegacySession(sessionDir, workingDir);
+  createLogicalPipeline(sessionDir, 'legacy-session');
+  beginAutonomousExecution(sessionDir);
+  writeJson(path.join(sessionDir, 'loop_config.json'), {
+    mode: 'anatomy-park', target: fs.realpathSync(workingDir), stall_limit: 5,
+  });
+  registerAutonomousOwnerSpec(
+    sessionDir,
+    'loop-runner.js',
+    [],
+    undefined,
+    path.join(sourceRuntimeDir, 'supervised-runner.js'),
+  );
+  new StateManager().update(statePath, (current) => {
+    current.autonomous_supervisor_pid = 999_999_999;
+    current.autonomous_supervisor_identity = deadProcessIdentity();
+    return current;
+  });
+
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  const previousTestMode = process.env.PICKLE_TEST_MODE;
+  const previousMigrationRuntime = process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
+  const previousPath = process.env.PATH;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  delete process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
+  process.env.PATH = `${fakeBin}:${previousPath || ''}`;
+  let restoredIdentity = null;
+  let daemonIdentity = null;
+  try {
+    await updateSessionMap(fs.realpathSync(workingDir), sessionDir);
+    const nowMs = Date.now();
+    const callers = await Promise.all(Array.from({ length: 8 }, () => resolveSessionForCwd(workingDir)));
+    assert.deepEqual(new Set(callers), new Set([sessionDir]), 'all concurrent mapped callers select one session');
+    const mapped = callers[0];
+    assert.equal(mapped, sessionDir, 'mapped get-session lookup retains the migrated session');
+
+    const migrated = new StateManager().read(statePath);
+    assert.equal(migrated.active, true);
+    assert.equal(migrated.last_exit_reason, 'autonomous_budget_rollover');
+    assert.equal(migrated.legacy_max_time_migration.prd_seal_hash, seal.semantic_hash);
+    assert.equal(migrated.legacy_max_time_migration.start_commit, startCommit);
+    assert.equal(migrated.legacy_max_time_migration.pinned_sha, startCommit);
+    assert.equal(migrated.legacy_max_time_migration.rollover_intent_id,
+      migrated.autonomous_budget_rollover_intent_id);
+    assert.notEqual(migrated.legacy_max_time_migration.source_owner_spec_id,
+      migrated.legacy_max_time_migration.target_owner_spec_id);
+    assert.equal(migrated.autonomous_owner_spec.spec_id,
+      migrated.legacy_max_time_migration.target_owner_spec_id);
+    assert.equal(migrated.history.filter(({ step }) => step === 'legacy_max_time_session_migrated').length, 1);
+    assert.equal(migrated.history.filter(({ step }) => step === 'autonomous_budget_rollover').length, 1);
+    assert.ok(['pending', 'restoring', 'restored'].includes(migrated.autonomous_owner_restoration.status));
+
+    const restored = await waitForState(statePath, (current) => (
+      current.autonomous_owner_restoration?.status === 'restored'
+        && Number(current.iteration) >= 1
+        && fs.existsSync(path.join(sessionDir, 'anatomy-park-summary.json'))
+    ), 15_000);
+    restoredIdentity = restored.autonomous_supervisor_identity;
+    daemonIdentity = restored.autonomous_owner_recovery_daemon_identity;
+    assert.equal(inspectProcessLivenessIdentity(restoredIdentity), 'matched');
+    assert.equal(restored.autonomous_owner_spec.supervisor_path,
+      path.resolve(new URL('../bin/supervised-runner.js', import.meta.url).pathname));
+    assert.equal(restored.autonomous_owner_spec.runner_bin, 'loop-runner.js');
+    assert.equal(restored.legacy_max_time_migration.status, 'rollover_consumed');
+    assert.match(restored.legacy_max_time_migration.target_runtime.build_hash, /^[a-f0-9]{64}$/);
+    assert.ok(fs.existsSync(path.join(sessionDir, 'loop-runner.log')));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sessionDir, 'anatomy-park-summary.json'), 'utf8'))
+      .finding_family, 'legacy-migration-e2e');
+    const sourceRuntime = {
+      runtime_id: 'legacy-runtime', version: '1', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 1,
+    };
+    const targetRuntime = {
+      runtime_id: 'current-runtime', version: '2', build_hash: 'a'.repeat(64), min_state_schema: 1, max_state_schema: 1,
+    };
+    const liveMigration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime);
+    assert.equal(liveMigration.session_was_active, true);
+    assert.equal(liveMigration.resume_checkpoint.ticket_id, 'T-1');
+    assert.ok(new StateManager().read(statePath).iteration >= 1);
+  } finally {
+    try {
+      cancelLogicalPipelineByOperator(sessionDir, 'test cleanup');
+    } catch {}
+    try {
+      new StateManager().update(statePath, (current) => {
+        current.cancel_requested_at ||= new Date().toISOString();
+        current.last_exit_reason = 'cancelled';
+        return current;
+      });
+    } catch {}
+    if (restoredIdentity) reapRecordedLiveProcessGroup(restoredIdentity);
+    if (daemonIdentity) reapRecordedLiveProcessGroup(daemonIdentity);
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+    if (previousTestMode === undefined) delete process.env.PICKLE_TEST_MODE;
+    else process.env.PICKLE_TEST_MODE = previousTestMode;
+    if (previousMigrationRuntime === undefined) delete process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
+    else process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN = previousMigrationRuntime;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test('mapped legacy migration refuses a cwd already claimed by another live session', async () => {
+  const dataRoot = makeTempRoot('pickle-legacy-exclusive-data-');
+  const workingDir = makeTempRoot('pickle-legacy-exclusive-work-');
+  const legacyDir = path.join(dataRoot, 'sessions', 'legacy');
+  const liveDir = path.join(dataRoot, 'sessions', 'live');
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.mkdirSync(liveDir, { recursive: true });
+  const startCommit = initializeGitRepository(workingDir);
+  writeJson(path.join(legacyDir, 'state.json'), state({
+    active: false,
+    working_dir: fs.realpathSync(workingDir),
+    session_dir: fs.realpathSync(legacyDir),
+    step: 'paused',
+    last_exit_reason: 'max_time',
+    start_commit: startCommit,
+    pinned_sha: startCommit,
+    history: [
+      { step: 'implement', timestamp: '2023-11-14T22:13:20.000Z' },
+      { step: 'max_time', timestamp: '2023-11-14T22:14:20.000Z' },
+    ],
+  }));
+  sealLegacySession(legacyDir, workingDir);
+  createLogicalPipeline(legacyDir, 'legacy-exclusive');
+  beginAutonomousExecution(legacyDir);
+  registerProcessOwner(legacyDir);
+  new StateManager().update(path.join(legacyDir, 'state.json'), (current) => {
+    current.autonomous_supervisor_pid = 999_999_999;
+    current.autonomous_supervisor_identity = deadProcessIdentity();
+    return current;
+  });
+  writeJson(path.join(liveDir, 'state.json'), state({
+    active: true,
+    working_dir: fs.realpathSync(workingDir),
+    session_dir: fs.realpathSync(liveDir),
+  }));
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    await updateSessionMap(fs.realpathSync(workingDir), legacyDir);
+    assert.equal(await resolveSessionForCwd(workingDir), legacyDir);
+    const legacy = new StateManager().read(path.join(legacyDir, 'state.json'));
+    assert.equal(legacy.active, false);
+    assert.equal(legacy.autonomous_budget_rollover_intent_id, undefined);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('cwd authority timeout releases the in-process queue for a later mapped lookup', async () => {
+  const dataRoot = makeTempRoot('pickle-cwd-authority-timeout-data-');
+  const workingDir = makeTempRoot('pickle-cwd-authority-timeout-work-');
+  const sessionDir = path.join(dataRoot, 'sessions', 'active');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const exactCwd = fs.realpathSync(workingDir);
+  writeJson(path.join(sessionDir, 'state.json'), state({
+    active: true,
+    working_dir: exactCwd,
+    session_dir: fs.realpathSync(sessionDir),
+  }));
+  const digest = crypto.createHash('sha256').update(exactCwd).digest('hex');
+  const lockPath = path.join(dataRoot, 'sessions', `.cwd-authority-${digest}.lock`);
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    await updateSessionMap(exactCwd, sessionDir);
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    await assert.rejects(resolveSessionForCwd(exactCwd), /Failed to acquire lock/);
+    fs.rmSync(lockPath, { force: true });
+    assert.equal(await resolveSessionForCwd(exactCwd), sessionDir);
+  } finally {
+    fs.rmSync(lockPath, { force: true });
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('legacy max_time reconciliation does not resurrect unsealed, completed, cancelled, or unsafe inactive state', () => {
+  const nowMs = 1_700_000_120_000;
+  for (const [label, override] of [
+    ['unsealed', {}],
+    ['completed', { step: 'complete', completed_at: '2023-11-14T22:15:00.000Z' }],
+    ['cancelled', { cancel_requested_at: '2023-11-14T22:15:00.000Z' }],
+    ['unsafe', { recovery_required: true, recovery_reason: 'operator evidence' }],
+    ['logical-cancelled', {}],
+  ]) {
+    const workingDir = makeTempRoot(`pickle-legacy-${label}-work-`);
+    const sessionDir = makeTempRoot(`pickle-legacy-${label}-session-`);
+    const startCommit = initializeGitRepository(workingDir);
+    writeJson(path.join(sessionDir, 'state.json'), state({
+      active: false, working_dir: fs.realpathSync(workingDir), session_dir: fs.realpathSync(sessionDir),
+      step: 'paused', last_exit_reason: 'max_time',
+      start_commit: startCommit, pinned_sha: startCommit,
+      history: [
+        { step: 'implement', timestamp: '2023-11-14T22:13:20.000Z' },
+        { step: 'max_time', timestamp: '2023-11-14T22:14:20.000Z' },
+      ],
+      ...override,
+    }));
+    registerProcessOwner(sessionDir);
+    new StateManager().update(path.join(sessionDir, 'state.json'), (current) => {
+      current.autonomous_supervisor_pid = 999_999_999;
+      current.autonomous_supervisor_identity = deadProcessIdentity();
+      return current;
+    });
+    if (label !== 'unsealed') {
+      sealLegacySession(sessionDir, workingDir);
+      createLogicalPipeline(sessionDir, `legacy-${label}`);
+      beginAutonomousExecution(sessionDir);
+      if (label === 'logical-cancelled') cancelLogicalPipelineByOperator(sessionDir, 'already cancelled');
+    }
+    const result = reconcileSessionLiveness(sessionDir, undefined, nowMs, { allowLegacyMaxTimeMigration: true });
+    assert.equal(result.state.active, false, `${label} remains inactive`);
+    assert.equal(result.state.autonomous_budget_rollover_intent_id, undefined, `${label} gets no intent`);
+    assert.equal(result.state.legacy_max_time_migration, undefined, `${label} gets no receipt`);
+  }
+});
+
+test('tampered legacy max_time migration transaction blocks owner recovery', () => {
+  const sessionDir = makeTempRoot('pickle-legacy-migration-tamper-');
+  writeJson(path.join(sessionDir, 'state.json'), state({
+    session_dir: fs.realpathSync(sessionDir),
+    working_dir: fs.realpathSync(sessionDir),
+    legacy_max_time_migration: {
+      schema_version: 1,
+      migration_id: 'migration',
+      status: 'rollover_scheduled',
+      contract_sha256: '0'.repeat(64),
+    },
+  }));
+  const result = reconcileSessionLiveness(sessionDir);
+  assert.equal(result.state.active, false);
+  assert.equal(result.state.step, 'blocked');
+  assert.equal(result.state.recovery_kind, 'legacy_max_time_migration_corrupt');
+  assert.equal(result.state.autonomous_owner_recovery_suspended, true);
 });
 
 test('elapsed liveness repair never resurrects cancellation or unsafe rollover evidence', () => {
