@@ -495,6 +495,10 @@ export const CITADEL_ISOLATION_QUARANTINE_FILE = 'citadel-isolation-quarantine.j
 const CITADEL_REVIEWER_MAX_ATTEMPTS = 2;
 const CITADEL_REVIEWER_MAX_ARTIFACT_BYTES = 1024 * 1024;
 const CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT = 100_000;
+type CitadelReviewerRecoveryMechanism =
+  | 'schema_scaffold_replay'
+  | 'evidence_bundle_reconstruction'
+  | 'criterion_sharded_reconstruction';
 
 interface CitadelReviewAttemptState {
   ordinal: number;
@@ -514,16 +518,17 @@ interface CitadelReviewAttemptState {
   model_attempt_id?: number;
   telemetry_status?: 'started' | 'finalized';
   telemetry_result?: CodexSpawnResult;
-  recovery_mechanism?: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+  recovery_mechanism?: CitadelReviewerRecoveryMechanism;
   runtime_manifest_hash?: string;
   validator_evidence_path?: string;
 }
 
 interface CitadelArtifactContractRuntime {
   schema_version: 1;
-  mechanism: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+  mechanism: CitadelReviewerRecoveryMechanism;
   scaffold_path: string | null;
   evidence_bundle_path: string | null;
+  criterion_shard_bundle_path: string | null;
   manifest_path: string;
   validator_path: string;
   validator_command: string;
@@ -544,10 +549,10 @@ interface CitadelReviewState {
     artifact_path: string;
     instruction?: string;
     resolved_at?: string;
-    mechanism: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+    mechanism: CitadelReviewerRecoveryMechanism;
     failed_candidate_hashes: string[];
     validator_invariants: string[];
-    mechanism_history?: Array<'schema_scaffold_replay' | 'evidence_bundle_reconstruction'>;
+    mechanism_history?: CitadelReviewerRecoveryMechanism[];
     runtime_artifacts: CitadelArtifactContractRuntime;
   };
   updated_at: string;
@@ -581,6 +586,7 @@ interface ArtifactContractExecution {
   mechanism: CitadelArtifactContractRuntime['mechanism'];
   scaffoldPath: string | null;
   evidenceBundlePath: string | null;
+  criterionShardBundlePath: string | null;
   manifestPath: string;
   validatorPath: string;
   validatorCommand: string;
@@ -603,7 +609,10 @@ function assertRuntimeArtifactFile(sessionDir: string, filePath: string): string
 
 function artifactContractExecution(
   sessionDir: string,
+  workingDir: string,
+  checkpointHead: string,
   recovery: NonNullable<CitadelReviewState['artifact_contract_recovery']>,
+  reviewIdentity: string,
   reviewedRange: string,
   expectedAcceptanceCriteria: string[],
   checks: CitadelCheckResult[],
@@ -618,17 +627,22 @@ function artifactContractExecution(
     : assertRuntimeArtifactFile(sessionDir, runtime.scaffold_path);
   const evidenceBundlePath = runtime.evidence_bundle_path === null ? null
     : assertRuntimeArtifactFile(sessionDir, runtime.evidence_bundle_path);
+  const criterionShardBundlePath = runtime.criterion_shard_bundle_path == null ? null
+    : assertRuntimeArtifactFile(sessionDir, runtime.criterion_shard_bundle_path);
   if ((recovery.mechanism === 'schema_scaffold_replay') !== Boolean(scaffoldPath)
     || (recovery.mechanism === 'evidence_bundle_reconstruction') !== Boolean(evidenceBundlePath)
+    || (recovery.mechanism === 'criterion_sharded_reconstruction') !== Boolean(criterionShardBundlePath)
     || runtime.validator_command !== `node ${JSON.stringify(validatorPath)} <candidate-path>`) {
     throw new Error('Citadel artifact-contract runtime files do not match the selected closed mechanism.');
   }
   const manifest = readJsonFile<Record<string, unknown>>(manifestPath, null);
   const selected = recovery.mechanism === 'schema_scaffold_replay'
     ? manifest?.scaffold as Record<string, unknown> | null
-    : manifest?.evidence_bundle as Record<string, unknown> | null;
+    : recovery.mechanism === 'evidence_bundle_reconstruction'
+      ? manifest?.evidence_bundle as Record<string, unknown> | null
+      : manifest?.criterion_shards as Record<string, unknown> | null;
   const validator = manifest?.validator as Record<string, unknown> | null;
-  const selectedPath = scaffoldPath ?? evidenceBundlePath;
+  const selectedPath = scaffoldPath ?? evidenceBundlePath ?? criterionShardBundlePath;
   if (!manifest || manifest.schema_version !== 1 || manifest.mechanism !== recovery.mechanism
     || selected?.path !== selectedPath || selected?.sha256 !== (selectedPath ? fileHash(selectedPath) : null)
     || validator?.path !== validatorPath || validator?.sha256 !== fileHash(validatorPath)) {
@@ -652,11 +666,106 @@ function artifactContractExecution(
       throw new Error('Citadel evidence bundle is not bound to the immutable review evidence.');
     }
   }
+  if (criterionShardBundlePath) {
+    const bundle = readJsonFile<Record<string, unknown>>(criterionShardBundlePath, null);
+    const shardResults = Array.isArray(bundle?.results) ? bundle.results as Array<Record<string, unknown>> : [];
+    const resultFiles = Array.isArray(bundle?.result_files)
+      ? bundle.result_files as Array<Record<string, unknown>> : [];
+    const repositoryPaths = Array.isArray(bundle?.repository_paths)
+      ? bundle.repository_paths.filter((entry): entry is string => typeof entry === 'string') : [];
+    let expectedRepositoryPaths = execFileSync('git', ['diff', '--name-only', reviewedRange], {
+      cwd: workingDir, encoding: 'utf8', timeout: 30_000,
+    }).split('\n').map((entry) => entry.trim()).filter(Boolean);
+    if (expectedRepositoryPaths.length === 0) {
+      expectedRepositoryPaths = execFileSync('git', ['ls-files'], {
+        cwd: workingDir, encoding: 'utf8', timeout: 30_000,
+      }).split('\n').map((entry) => entry.trim()).filter(Boolean);
+    }
+    const checkCommands = checks.map((check) => check.command);
+    const shardPlanIdentity = typeof bundle?.shard_plan_identity === 'string'
+      ? bundle.shard_plan_identity : '';
+    let resultFilesValid = resultFiles.length === shardResults.length;
+    for (let index = 0; resultFilesValid && index < resultFiles.length; index += 1) {
+      const entry = resultFiles[index];
+      const result = shardResults[index];
+      if (Object.keys(entry).sort().join('\0') !== ['path', 'sha256', 'shard_id'].sort().join('\0')
+        || entry.shard_id !== result.shard_id || typeof entry.path !== 'string'
+        || typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
+        resultFilesValid = false;
+        break;
+      }
+      const resultPath = assertRuntimeArtifactFile(sessionDir, entry.path);
+      const persistedResult = readJsonFile<Record<string, unknown>>(resultPath, null);
+      resultFilesValid = entry.sha256 === fileHash(resultPath)
+        && JSON.stringify(persistedResult) === JSON.stringify(result);
+    }
+    const repositoryEvidenceValid = shardResults.every((result) => {
+      const resultRepositoryPaths = Array.isArray(result.repository_paths)
+        ? result.repository_paths.filter((entry): entry is string => typeof entry === 'string') : [];
+      const repositoryEvidence = Array.isArray(result.repository_evidence)
+        ? result.repository_evidence as Array<Record<string, unknown>> : [];
+      const citedChecks = Array.isArray(result.checks_cited)
+        ? result.checks_cited.filter((entry): entry is string => typeof entry === 'string') : [];
+      if (result.checkpoint_head !== checkpointHead || result.reviewed_range !== reviewedRange
+        || resultRepositoryPaths.length === 0
+        || !Array.isArray(result.repository_paths)
+        || result.repository_paths.length !== resultRepositoryPaths.length
+        || !resultRepositoryPaths.every((entry) => repositoryPaths.includes(entry))
+        || citedChecks.length === 0 || !Array.isArray(result.checks_cited)
+        || result.checks_cited.length !== citedChecks.length
+        || !citedChecks.every((entry) => checkCommands.includes(entry))
+        || repositoryEvidence.length === 0) return false;
+      return repositoryEvidence.every((entry) => {
+        if (Object.keys(entry).sort().join('\0') !== ['observation', 'path', 'sha256'].sort().join('\0')
+          || typeof entry.path !== 'string' || !resultRepositoryPaths.includes(entry.path)
+          || typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)
+          || typeof entry.observation !== 'string' || entry.observation.trim().length < 20) return false;
+        const resolved = path.resolve(workingDir, entry.path);
+        if (!resolved.startsWith(`${path.resolve(workingDir)}${path.sep}`)) return false;
+        try {
+          const stat = fs.lstatSync(resolved);
+          return stat.isFile() && !stat.isSymbolicLink() && entry.sha256 === fileHash(resolved);
+        } catch {
+          return false;
+        }
+      });
+    });
+    if (!bundle || bundle.review_identity !== reviewIdentity
+      || bundle.diagnostic_identity !== recovery.diagnostic_identity
+      || !/^[a-f0-9]{64}$/.test(shardPlanIdentity)
+      || selected?.shard_plan_identity !== shardPlanIdentity
+      || bundle.checkpoint_head !== checkpointHead
+      || bundle.reviewed_range !== reviewedRange
+      || repositoryPaths.length === 0
+      || JSON.stringify(bundle.repository_paths) !== JSON.stringify(expectedRepositoryPaths)
+      || JSON.stringify(bundle.acceptance_criteria) !== JSON.stringify(expectedAcceptanceCriteria)
+      || JSON.stringify(bundle.deterministic_checks) !== JSON.stringify(checks)
+      || JSON.stringify(bundle.failed_candidate_hashes) !== JSON.stringify(recovery.failed_candidate_hashes)
+      || JSON.stringify(bundle.validator_invariants) !== JSON.stringify(recovery.validator_invariants)
+      || shardResults.length !== expectedAcceptanceCriteria.length
+      || !resultFilesValid || !repositoryEvidenceValid
+      || JSON.stringify(shardResults.map((result) => result.criterion)) !== JSON.stringify(expectedAcceptanceCriteria)
+      || shardResults.some((result) => (
+        Object.keys(result).sort().join('\0') !== [
+          'schema_version', 'shard_id', 'criterion', 'checkpoint_head', 'reviewed_range',
+          'status', 'evidence', 'repository_paths', 'repository_evidence', 'checks_cited', 'findings',
+        ].sort().join('\0')
+        || result.schema_version !== 1
+        || typeof result.shard_id !== 'string' || !result.shard_id
+        || !['pass', 'fail'].includes(String(result.status))
+        || !Array.isArray(result.evidence) || result.evidence.length === 0
+        || !result.evidence.every((entry) => typeof entry === 'string' && entry.trim())
+        || !Array.isArray(result.findings)
+      ))) {
+      throw new Error('Citadel criterion shard bundle is not a complete typed partition of the immutable review contract.');
+    }
+  }
   const manifestHash = fileHash(manifestPath);
   return {
     mechanism: recovery.mechanism,
     scaffoldPath,
     evidenceBundlePath,
+    criterionShardBundlePath,
     manifestPath,
     validatorPath,
     validatorCommand: runtime.validator_command,
@@ -669,6 +778,9 @@ function artifactContractExecution(
       runtime_manifest_hash: manifestHash,
       validator_hash: fileHash(validatorPath),
       mechanism_input_hash: fileHash(selectedPath!),
+      ...(criterionShardBundlePath ? {
+        shard_plan_identity: (selected as Record<string, unknown>).shard_plan_identity,
+      } : {}),
     }),
   };
 }
@@ -681,7 +793,9 @@ function artifactContractReviewerStrategy(
   const hashes = Array.isArray(recovery.failed_candidate_hashes) ? recovery.failed_candidate_hashes : [];
   const invariants = Array.isArray(recovery.validator_invariants) ? recovery.validator_invariants : [];
   if (recovery.status !== 'resolved' || !instruction || !/^[a-f0-9]{64}$/.test(recovery.diagnostic_identity)
-    || !['schema_scaffold_replay', 'evidence_bundle_reconstruction'].includes(recovery.mechanism)
+    || ![
+      'schema_scaffold_replay', 'evidence_bundle_reconstruction', 'criterion_sharded_reconstruction',
+    ].includes(recovery.mechanism)
     || hashes.length === 0 || hashes.some((value) => !/^[a-f0-9]{64}$/.test(value))
     || invariants.length === 0 || invariants.some((value) => typeof value !== 'string' || !value.trim())) {
     throw new Error('Citadel artifact-contract recovery is not durably resolved.');
@@ -691,7 +805,9 @@ function artifactContractReviewerStrategy(
     id,
     instruction: recovery.mechanism === 'schema_scaffold_replay'
       ? 'Populate the preseeded canonical scaffold and run its deterministic validator before returning.'
-      : 'Reconstruct the report exclusively from the immutable evidence bundle and run its deterministic validator before returning.',
+      : recovery.mechanism === 'evidence_bundle_reconstruction'
+        ? 'Reconstruct the report exclusively from the immutable evidence bundle and run its deterministic validator before returning.'
+        : 'Reconcile independently reviewed typed criterion shards into one canonical report and run its deterministic validator before returning.',
     hash: execution.materialHash,
   };
 }
@@ -1182,11 +1298,16 @@ function prepareArtifactContractAttempt(
   const mechanismInputPath = path.join(
     runtimeDir,
     execution.mechanism === 'schema_scaffold_replay'
-      ? 'citadel-report-scaffold.json' : 'evidence-bundle.json',
+      ? 'citadel-report-scaffold.json'
+      : execution.mechanism === 'evidence_bundle_reconstruction'
+        ? 'evidence-bundle.json' : 'criterion-shard-bundle.json',
   );
   fs.copyFileSync(execution.manifestPath, manifestPath);
   fs.copyFileSync(execution.validatorPath, validatorPath);
-  fs.copyFileSync((execution.scaffoldPath ?? execution.evidenceBundlePath)!, mechanismInputPath);
+  fs.copyFileSync(
+    (execution.scaffoldPath ?? execution.evidenceBundlePath ?? execution.criterionShardBundlePath)!,
+    mechanismInputPath,
+  );
   fs.chmodSync(manifestPath, 0o400);
   fs.chmodSync(mechanismInputPath, 0o400);
   fs.chmodSync(validatorPath, 0o500);
@@ -1237,10 +1358,14 @@ function prepareArtifactContractAttempt(
         `The candidate path is preseeded from this canonical exact-range/exact-criteria scaffold: ${mechanismInputPath}`,
         'Preserve its canonical keys, exact reviewed_range, and exact acceptance_criteria_checked while replacing placeholders after the adversarial review.',
       ]
-    : [
+    : execution.mechanism === 'evidence_bundle_reconstruction' ? [
         'Closed reviewer execution mechanism: evidence_bundle_reconstruction.',
         `Reconstruct the candidate by reading this immutable deterministic evidence bundle: ${mechanismInputPath}`,
         'Ground the report in its exact checks, failed-candidate hashes, validation failures, range, criteria, and validator invariants.',
+      ] : [
+        'Closed reviewer execution mechanism: criterion_sharded_reconstruction.',
+        `Reconcile the independently reviewed typed criterion shards in this immutable bundle: ${mechanismInputPath}`,
+        'Cover every exact acceptance criterion once, preserve cross-criterion blocking findings, and independently decide the canonical aggregate verdict.',
       ];
   return {
     prompt: [
@@ -1661,8 +1786,11 @@ export async function runCitadel(
   }
   const artifactExecution = reviewState.strategy_id === 'artifact-contract-reconstruction'
     ? artifactContractExecution(
-        sessionDir,
+      sessionDir,
+        citadelWorkingDir,
+        checkpointHead,
         reviewState.artifact_contract_recovery!,
+        reviewState.review_identity,
         reviewedRange,
         expectedAcceptanceCriteria,
         checks,

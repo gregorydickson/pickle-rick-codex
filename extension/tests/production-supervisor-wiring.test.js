@@ -1272,6 +1272,18 @@ test('pipeline re-enters durable sealed verification repair after a crash before
 
 test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted strategy epochs', async () => {
   const { sessionDir, workingDir } = createAcceptedSession('Done');
+  const reviewBase = git(workingDir, ['rev-parse', 'HEAD']);
+  fs.appendFileSync(path.join(workingDir, 'README.md'), '\ncriterion shard repository evidence\n');
+  git(workingDir, ['add', 'README.md']);
+  git(workingDir, [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    'commit', '-qm', 'add criterion shard repository evidence',
+  ]);
+  const expectedReviewHead = git(workingDir, ['rev-parse', 'HEAD']);
+  const reviewedRange = `${reviewBase}..HEAD`;
+  const liveReadmeBefore = fs.readFileSync(path.join(workingDir, 'README.md'), 'utf8');
+  const liveStatusBefore = git(workingDir, ['status', '--porcelain=v1', '--untracked-files=all']);
+  refreshAcceptedRefinementRepositoryIdentity(sessionDir, workingDir);
   initializePrdDevelopmentPipeline(sessionDir);
   ensureSessionPrdSeal(sessionDir);
   writePipelineContract(sessionDir, createPipelineContract({
@@ -1310,10 +1322,12 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   const fakeBin = makeTempRoot('production-supervisor-reviewer-recovery-bin-');
   const dataRoot = makeTempRoot('production-supervisor-reviewer-recovery-data-');
   const invocationLog = path.join(sessionDir, 'reviewer-recovery-invocations.jsonl');
+  const shardCounter = path.join(sessionDir, 'reviewer-shard-attempt-count.txt');
   createFakeCodex(fakeBin);
   const environment = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CRITERION_SHARD_COUNTER: shardCounter,
   });
   let citadelRuns = 0;
   const runCitadel = async (dir) => {
@@ -1330,6 +1344,7 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
         recovery_epoch: 1,
         bounded_attempt: 1,
         next_action: 'retry_phase',
+        reviewed_range: reviewedRange,
       });
       return 'citadel-system-blocked';
     }
@@ -1347,7 +1362,7 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
       writeJson(validatorCandidate, {
         schema_version: 1,
         verdict: 'approve',
-        reviewed_range: 'fixture..HEAD',
+        reviewed_range: reviewedRange,
         acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
         findings: [],
         generated_at: new Date().toISOString(),
@@ -1378,16 +1393,65 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
         recommendation: 'Use the next unused closed artifact reconstruction mechanism.',
         recovery_action: 'repair_reviewer_artifact_contract',
         recovery_ticket_ids: [],
+        reviewed_range: reviewedRange,
       });
       return 'citadel-system-blocked';
     }
-    assert.equal(recovered.recovery_epoch, 7);
-    assert.equal(recovered.artifact_contract_recovery.mechanism, 'evidence_bundle_reconstruction');
+    if (citadelRuns === 3) {
+      assert.equal(recovered.recovery_epoch, 7);
+      assert.equal(recovered.artifact_contract_recovery.mechanism, 'evidence_bundle_reconstruction');
+      assert.deepEqual(recovered.artifact_contract_recovery.mechanism_history, [
+        'schema_scaffold_replay',
+        'evidence_bundle_reconstruction',
+      ]);
+      assert.equal(fs.existsSync(recovered.artifact_contract_recovery.runtime_artifacts.evidence_bundle_path), true);
+      recovered.status = 'diagnostic_scheduled';
+      recovered.attempts.push({
+        ordinal: 103,
+        epoch: 7,
+        attempt: 1,
+        candidate_path: path.join(dir, 'failed-evidence-reconstruction.json'),
+        candidate_hash: '9'.repeat(64),
+        status: 'rejected',
+        strategy_id: 'artifact-contract-reconstruction',
+        material_strategy_hash: '8'.repeat(64),
+        strategy_hash: '7'.repeat(64),
+        retry_feedback: 'evidence reconstruction remained invalid',
+        validation_error: 'evidence reconstruction remained invalid',
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      });
+      writeJson(path.join(dir, 'citadel-review-state.json'), recovered);
+      writeCitadelSystemBlock(dir, {
+        code: 'reviewer_artifact_strategy_exhausted',
+        title: 'Citadel reviewer artifact reconstruction requires criterion sharding',
+        evidence: `Evidence-bundle reconstruction failed for review ${reviewIdentity}.`,
+        recommendation: 'Execute the criterion-sharded review recovery plan.',
+        recovery_action: 'repair_reviewer_artifact_contract',
+        recovery_ticket_ids: [],
+        reviewed_range: reviewedRange,
+      });
+      return 'citadel-system-blocked';
+    }
+    assert.equal(recovered.recovery_epoch, 8);
+    assert.equal(recovered.artifact_contract_recovery.mechanism, 'criterion_sharded_reconstruction');
     assert.deepEqual(recovered.artifact_contract_recovery.mechanism_history, [
       'schema_scaffold_replay',
       'evidence_bundle_reconstruction',
+      'criterion_sharded_reconstruction',
     ]);
-    assert.equal(fs.existsSync(recovered.artifact_contract_recovery.runtime_artifacts.evidence_bundle_path), true);
+    const shardBundlePath = recovered.artifact_contract_recovery.runtime_artifacts.criterion_shard_bundle_path;
+    const shardBundle = JSON.parse(fs.readFileSync(shardBundlePath, 'utf8'));
+    assert.deepEqual(shardBundle.acceptance_criteria, deriveCitadelAcceptanceCriteria(dir));
+    assert.equal(shardBundle.results.length, deriveCitadelAcceptanceCriteria(dir).length);
+    assert.equal(shardBundle.results.every(({ status, evidence }) => status === 'pass' && evidence.length > 0), true);
+    assert.equal(shardBundle.results.every((shard) => shard.checkpoint_head === expectedReviewHead), true);
+    assert.equal(shardBundle.results.every((shard) => shard.reviewed_range === reviewedRange), true);
+    assert.equal(shardBundle.results.every((shard) => shard.repository_paths.includes('README.md')), true);
+    assert.equal(shardBundle.results.every((shard) => shard.checks_cited.includes('npm test')), true);
+    assert.equal(shardBundle.results.every((shard) => shard.evidence.some((entry) => (
+      entry.includes('README.md') && entry.includes('criterion shard repository evidence')
+    ))), true);
     assert.equal(fs.existsSync(path.join(dir, 'citadel-report.json')), false);
     return await approveCitadelFixture(dir);
   };
@@ -1418,46 +1482,56 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   assert.equal(interrupted.status, 'started');
   assert.equal(interrupted.attempts[0].status, 'started');
 
+  const scheduled = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel,
+    repairCitadelReviewerArtifactContract: crashOnceRecovery,
+  }));
+  assert.equal(scheduled, 'citadel_system_recovery_scheduled');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+  const pendingRecovery = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'),
+    'utf8',
+  ));
+  const pendingShardJournal = JSON.parse(fs.readFileSync(path.join(
+    sessionDir,
+    'citadel-reviewer-contract-runtime',
+    pendingRecovery.diagnostic_identity,
+    'criterion-shard-journal.json',
+  ), 'utf8'));
+  assert.equal(pendingShardJournal.status, 'pending');
+  assert.deepEqual(pendingShardJournal.shards[0].attempts.map(({ status }) => status), ['rejected']);
   const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
     runSequential: async () => 'success',
     runCitadel,
     repairCitadelReviewerArtifactContract: crashOnceRecovery,
   }));
   assert.equal(result, 'success');
-  assert.equal(citadelRuns, 3);
-  assert.equal(recoveryCalls, 3);
-  const recoveryPrompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
-    .map((line) => JSON.parse(line).prompt)
+  assert.equal(citadelRuns, 4);
+  assert.equal(recoveryCalls, 5);
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line));
+  const recoveryPrompts = invocations
+    .map(({ prompt }) => prompt)
     .filter((prompt) => prompt.includes('reviewer artifact-contract recovery worker'));
-  assert.equal(recoveryPrompts.length, 2);
+  assert.equal(recoveryPrompts.length, 3);
+  const shardInvocations = invocations
+    .filter(({ prompt }) => prompt.includes('criterion-shard review worker'));
+  assert.equal(shardInvocations.length, deriveCitadelAcceptanceCriteria(sessionDir).length + 1);
+  for (const invocation of shardInvocations) {
+    assert.notEqual(invocation.cwd, workingDir);
+    assert.equal(fs.existsSync(invocation.cwd), false);
+    assert.match(invocation.prompt, new RegExp(`Expected repository HEAD: ${expectedReviewHead}`));
+    assert.ok(invocation.prompt.includes(`Immutable reviewed range: ${reviewedRange}`));
+    const addDirIndex = invocation.args.indexOf('--add-dir');
+    assert.notEqual(addDirIndex, -1);
+    assert.notEqual(invocation.args[addDirIndex + 1], workingDir);
+    assert.notEqual(invocation.args[addDirIndex + 1], invocation.cwd);
+  }
+  assert.equal(git(workingDir, ['rev-parse', 'HEAD']), expectedReviewHead);
+  assert.equal(git(workingDir, ['status', '--porcelain=v1', '--untracked-files=all']), liveStatusBefore);
+  assert.equal(fs.readFileSync(path.join(workingDir, 'README.md'), 'utf8'), liveReadmeBefore);
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
-  const twiceFailed = JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-review-state.json'), 'utf8'));
-  twiceFailed.status = 'diagnostic_scheduled';
-  twiceFailed.attempts.push({
-    ordinal: 103,
-    epoch: 7,
-    attempt: 1,
-    candidate_path: path.join(sessionDir, 'failed-evidence-reconstruction.json'),
-    candidate_hash: '9'.repeat(64),
-    status: 'rejected',
-    strategy_id: 'artifact-contract-reconstruction',
-    material_strategy_hash: '8'.repeat(64),
-    strategy_hash: '7'.repeat(64),
-    retry_feedback: 'evidence reconstruction remained invalid',
-    validation_error: 'evidence reconstruction remained invalid',
-    started_at: new Date().toISOString(),
-    completed_at: new Date().toISOString(),
-  });
-  writeJson(path.join(sessionDir, 'citadel-review-state.json'), twiceFailed);
-  const retained = await withProcessEnvironment(environment, async () => (
-    await repairCitadelReviewerArtifactContract(sessionDir, readCitadelSystemBlock(sessionDir))
-  ));
-  assert.equal(retained.kind, 'recovery_scheduled');
-  assert.equal(JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-review-state.json'), 'utf8')).recovery_epoch, 7);
-  const finalRecoveryPrompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
-    .map((line) => JSON.parse(line).prompt)
-    .filter((prompt) => prompt.includes('reviewer artifact-contract recovery worker'));
-  assert.equal(finalRecoveryPrompts.length, 2);
 });
 
 test('live reviewer diagnostic ownership drain remains resumable without consuming its mechanism', async () => {
@@ -1545,6 +1619,98 @@ test('live reviewer diagnostic ownership drain remains resumable without consumi
   assert.equal(resolvedJournal.mechanism, 'schema_scaffold_replay');
   assert.deepEqual(resolvedJournal.mechanism_history, ['schema_scaffold_replay']);
   assert.deepEqual(resolvedJournal.attempts.map(({ status }) => status), ['interrupted', 'resolved']);
+});
+
+test('criterion shard ownership drain preserves its worktree until exact child reap', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  const reviewBase = git(workingDir, ['rev-parse', 'HEAD']);
+  fs.appendFileSync(path.join(workingDir, 'README.md'), '\ncriterion shard repository evidence\n');
+  git(workingDir, ['add', 'README.md']);
+  git(workingDir, [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    'commit', '-qm', 'add drain review evidence',
+  ]);
+  const reviewedRange = `${reviewBase}..HEAD`;
+  const reviewIdentity = '3'.repeat(64);
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 7,
+    strategy_id: 'artifact-contract-reconstruction',
+    strategy_hash: '4'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: [{
+      ordinal: 1,
+      candidate_path: path.join(sessionDir, 'invalid-shard-drain.json'),
+      candidate_hash: '5'.repeat(64),
+      status: 'rejected',
+      validation_error: 'evidence reconstruction remained invalid',
+    }],
+    artifact_contract_recovery: {
+      schema_version: 1,
+      status: 'resolved',
+      diagnostic_identity: '6'.repeat(64),
+      mechanism: 'evidence_bundle_reconstruction',
+      mechanism_history: ['schema_scaffold_replay', 'evidence_bundle_reconstruction'],
+      failed_candidate_hashes: ['5'.repeat(64)],
+      validator_invariants: ['findings is an array'],
+    },
+    updated_at: new Date().toISOString(),
+  });
+  writeCitadelSystemBlock(sessionDir, {
+    code: 'reviewer_artifact_strategy_exhausted',
+    title: 'Citadel reviewer recovery requires criterion sharding',
+    evidence: 'Prior evidence reconstruction failed.',
+    recommendation: 'Run repository-bound criterion shards.',
+    recovery_action: 'repair_reviewer_artifact_contract',
+    recovery_ticket_ids: [],
+    reviewed_range: reviewedRange,
+  });
+  const fakeBin = makeTempRoot('production-supervisor-shard-drain-bin-');
+  createFakeCodex(fakeBin);
+  const block = readCitadelSystemBlock(sessionDir);
+  const manager = new StateManager();
+  await assert.rejects(
+    () => withProcessEnvironment(prependPath(fakeBin, {
+      FAKE_CRITERION_SHARD_DELAY_MS: '10000',
+    }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block, {
+      assertDurableOwnership: () => {
+        if (String(manager.read(path.join(sessionDir, 'state.json')).active_child_command || '')
+          .startsWith('citadel-criterion-shard-')) {
+          throw new DurableOwnershipDrainError('fixture criterion shard lease drained');
+        }
+      },
+    })),
+    /fixture criterion shard lease drained/,
+  );
+  const recoveryJournal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'), 'utf8',
+  ));
+  const shardJournalPath = path.join(
+    sessionDir,
+    'citadel-reviewer-contract-runtime',
+    recoveryJournal.diagnostic_identity,
+    'criterion-shard-journal.json',
+  );
+  const drainedShardJournal = JSON.parse(fs.readFileSync(shardJournalPath, 'utf8'));
+  const drainedAttempt = drainedShardJournal.shards[0].attempts[0];
+  assert.equal(drainedAttempt.status, 'started');
+  assert.equal(fs.existsSync(drainedAttempt.worktree_path), true);
+  const drainedState = manager.read(path.join(sessionDir, 'state.json'));
+  assert.ok(Number.isInteger(drainedState.active_child_pid));
+  assert.ok(drainedState.active_child_identity);
+
+  const replacement = await withProcessEnvironment(prependPath(fakeBin, {
+    FAKE_CRITERION_SHARD_DELAY_MS: '0',
+  }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block));
+  assert.equal(replacement.kind, 'resolved');
+  assert.equal(fs.existsSync(drainedAttempt.worktree_path), false);
+  const resolvedShardJournal = JSON.parse(fs.readFileSync(shardJournalPath, 'utf8'));
+  assert.deepEqual(
+    resolvedShardJournal.shards[0].attempts.map(({ status }) => status),
+    ['interrupted', 'resolved'],
+  );
+  assert.ok(resolvedShardJournal.shards.every((shard) => /^[a-f0-9]{64}$/.test(shard.result_sha256)));
 });
 
 test('replacement reviewer diagnostic reaps a worker orphaned by real controller SIGKILL', async () => {

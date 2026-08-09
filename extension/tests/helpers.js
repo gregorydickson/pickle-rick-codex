@@ -114,6 +114,8 @@ export function createFakeCodex(binDir) {
   return writeExecutable(
     path.join(binDir, 'codex'),
     `#!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -241,7 +243,87 @@ function writeLifecycleArtifact(phase) {
   }
 }
 
-if (prompt.includes('You are the autonomous Citadel reviewer artifact-contract recovery worker')) {
+if (prompt.includes('You are the autonomous Citadel criterion-shard review worker')) {
+  const artifactPath = extractPathAfter('Write the strict shard result to: ');
+  const shardId = extractPathAfter('Shard ID: ');
+  const criterion = JSON.parse(extractPathAfter('Exact acceptance criterion JSON: '));
+  const expectedHead = extractPathAfter('Expected repository HEAD: ');
+  const reviewedRange = extractPathAfter('Immutable reviewed range: ');
+  const eligiblePaths = JSON.parse(extractPathAfter('Eligible repository paths JSON: '));
+  const deterministicChecks = JSON.parse(extractPathAfter('Deterministic checks JSON: '));
+  const shardCounterPath = process.env.FAKE_CRITERION_SHARD_COUNTER || '';
+  const shardAttempt = shardCounterPath && fs.existsSync(shardCounterPath)
+    ? Number(fs.readFileSync(shardCounterPath, 'utf8')) : 0;
+  if (shardCounterPath) fs.writeFileSync(shardCounterPath, String(shardAttempt + 1));
+  if (shardCounterPath && shardAttempt === 0) {
+    fs.writeFileSync(artifactPath, JSON.stringify({
+      schema_version: 1,
+      shard_id: shardId,
+      criterion,
+      checkpoint_head: expectedHead,
+      reviewed_range: reviewedRange,
+      status: 'pass',
+      evidence: ['Generic approval copied from the prompt without reading repository bytes.'],
+      repository_paths: [eligiblePaths[0]],
+      repository_evidence: [{
+        path: eligiblePaths[0],
+        sha256: '0'.repeat(64),
+        observation: 'Generic repository observation copied without reading the file.',
+      }],
+      checks_cited: [deterministicChecks[0]?.command],
+      findings: [],
+    }, null, 2));
+    lastMessage = '<promise>CITADEL_CRITERION_SHARD_COMPLETE</promise>';
+  } else {
+    const shardDelayMs = Number(process.env.FAKE_CRITERION_SHARD_DELAY_MS || '0');
+    if (shardDelayMs > 0) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, shardDelayMs);
+    }
+    try {
+      const insideWorktree = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+        cwd: process.cwd(), encoding: 'utf8',
+      }).trim();
+      const actualHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: process.cwd(), encoding: 'utf8',
+      }).trim();
+      const changedPaths = execFileSync('git', ['diff', '--name-only', reviewedRange], {
+        cwd: process.cwd(), encoding: 'utf8',
+      }).trim().split('\\n').filter(Boolean);
+      const repositoryPath = changedPaths.find((entry) => eligiblePaths.includes(entry));
+      const repositoryContents = repositoryPath
+        ? fs.readFileSync(path.join(process.cwd(), repositoryPath), 'utf8') : '';
+      const repositorySha256 = repositoryPath
+        ? crypto.createHash('sha256').update(fs.readFileSync(path.join(process.cwd(), repositoryPath))).digest('hex')
+        : '';
+      if (insideWorktree !== 'true' || actualHead !== expectedHead || !repositoryPath
+        || !repositoryContents.includes('criterion shard repository evidence')
+        || !deterministicChecks[0]?.command) {
+        throw new Error('criterion shard worker did not receive an exact-HEAD repository evidence surface');
+      }
+      fs.writeFileSync(artifactPath, JSON.stringify({
+        schema_version: 1,
+        shard_id: shardId,
+        criterion,
+        checkpoint_head: actualHead,
+        reviewed_range: reviewedRange,
+        status: 'pass',
+        evidence: ['Inspected ' + repositoryPath + ' at ' + actualHead + ' and found criterion shard repository evidence in the reviewed diff.'],
+        repository_paths: [repositoryPath],
+        repository_evidence: [{
+          path: repositoryPath,
+          sha256: repositorySha256,
+          observation: 'Read ' + repositoryPath + ' and observed the criterion shard repository evidence marker in its exact bytes.',
+        }],
+        checks_cited: [deterministicChecks[0].command],
+        findings: [],
+      }, null, 2));
+      lastMessage = '<promise>CITADEL_CRITERION_SHARD_COMPLETE</promise>';
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(9);
+    }
+  }
+} else if (prompt.includes('You are the autonomous Citadel reviewer artifact-contract recovery worker')) {
   const recoveryDelayMs = Number(process.env.FAKE_REVIEWER_RECOVERY_DELAY_MS || '0');
   if (recoveryDelayMs > 0) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, recoveryDelayMs);

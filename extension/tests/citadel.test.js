@@ -1134,6 +1134,130 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.match(attempt12Prompt, /exact checks, failed-candidate hashes, validation failures, range, criteria/i);
     assert.doesNotMatch(attempt12Prompt, /Free-form prose must not establish this recovery mechanism/);
 
+    const shardDiagnosticIdentity = 'c'.repeat(64);
+    const shardPlanIdentity = 'b'.repeat(64);
+    const shardRuntimeDir = path.join(
+      catalog.sessionDir, 'citadel-reviewer-contract-runtime', shardDiagnosticIdentity,
+    );
+    fs.mkdirSync(shardRuntimeDir, { recursive: true });
+    const shardBundlePath = path.join(shardRuntimeDir, 'criterion-shard-bundle.json');
+    const shardValidatorPath = path.join(shardRuntimeDir, 'validate-citadel-candidate.mjs');
+    const shardManifestPath = path.join(shardRuntimeDir, 'runtime-manifest.json');
+    const catalogWorkingDir = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'state.json'), 'utf8',
+    )).working_dir;
+    const shardCheckpointHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: catalogWorkingDir, encoding: 'utf8',
+    }).trim();
+    let shardRepositoryPaths = execFileSync('git', ['diff', '--name-only', catalogBlock.reviewed_range], {
+      cwd: catalogWorkingDir, encoding: 'utf8',
+    }).trim().split('\n').filter(Boolean);
+    if (shardRepositoryPaths.length === 0) {
+      shardRepositoryPaths = execFileSync('git', ['ls-files'], {
+        cwd: catalogWorkingDir, encoding: 'utf8',
+      }).trim().split('\n').filter(Boolean);
+    }
+    const shardEvidencePath = shardRepositoryPaths[0];
+    const shardEvidenceSha = digest(path.join(catalogWorkingDir, shardEvidencePath));
+    const shardResults = expectedCriteria.map((criterion, index) => ({
+      schema_version: 1,
+      shard_id: `criterion-${index + 1}`,
+      criterion,
+      checkpoint_head: shardCheckpointHead,
+      reviewed_range: catalogBlock.reviewed_range,
+      status: 'pass',
+      evidence: [`Inspected ${shardEvidencePath} at the immutable checkpoint.`],
+      repository_paths: [shardEvidencePath],
+      repository_evidence: [{
+        path: shardEvidencePath,
+        sha256: shardEvidenceSha,
+        observation: `Read the exact bytes of ${shardEvidencePath} while assessing this criterion.`,
+      }],
+      checks_cited: [catalogBlock.checks[0].command],
+      findings: [],
+    }));
+    const shardResultFiles = shardResults.map((result) => {
+      const resultPath = path.join(shardRuntimeDir, `${result.shard_id}-result.json`);
+      fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+      return { shard_id: result.shard_id, path: resultPath, sha256: digest(resultPath) };
+    });
+    fs.writeFileSync(shardBundlePath, JSON.stringify({
+      schema_version: 1,
+      review_identity: bundleState.review_identity,
+      diagnostic_identity: shardDiagnosticIdentity,
+      shard_plan_identity: shardPlanIdentity,
+      checkpoint_head: shardCheckpointHead,
+      reviewed_range: catalogBlock.reviewed_range,
+      repository_paths: shardRepositoryPaths,
+      acceptance_criteria: expectedCriteria,
+      deterministic_checks: catalogBlock.checks,
+      failed_candidate_hashes: failedCandidateHashes,
+      validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
+      result_files: shardResultFiles,
+      results: shardResults,
+    }));
+    fs.copyFileSync(validatorPath, shardValidatorPath);
+    fs.writeFileSync(shardManifestPath, JSON.stringify({
+      schema_version: 1,
+      mechanism: 'criterion_sharded_reconstruction',
+      diagnostic_identity: shardDiagnosticIdentity,
+      scaffold: null,
+      evidence_bundle: null,
+      criterion_shards: {
+        path: shardBundlePath,
+        sha256: digest(shardBundlePath),
+        shard_plan_identity: shardPlanIdentity,
+      },
+      validator: { path: shardValidatorPath, sha256: digest(shardValidatorPath) },
+    }));
+    bundleState.recovery_epoch += 1;
+    bundleState.status = 'running';
+    bundleState.artifact_contract_recovery = {
+      schema_version: 1,
+      status: 'resolved',
+      diagnostic_identity: shardDiagnosticIdentity,
+      artifact_path: diagnosticPath,
+      instruction: 'This prose cannot substitute for executed criterion shard work.',
+      resolved_at: new Date().toISOString(),
+      mechanism: 'criterion_sharded_reconstruction',
+      failed_candidate_hashes: failedCandidateHashes,
+      validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
+      mechanism_history: [
+        'schema_scaffold_replay', 'evidence_bundle_reconstruction', 'criterion_sharded_reconstruction',
+      ],
+      runtime_artifacts: {
+        schema_version: 1,
+        mechanism: 'criterion_sharded_reconstruction',
+        scaffold_path: null,
+        evidence_bundle_path: null,
+        criterion_shard_bundle_path: shardBundlePath,
+        manifest_path: shardManifestPath,
+        validator_path: shardValidatorPath,
+        validator_command: `node ${JSON.stringify(shardValidatorPath)} <candidate-path>`,
+      },
+    };
+    fs.rmSync(path.join(catalog.sessionDir, 'citadel-report.json'), { force: true });
+    fs.writeFileSync(path.join(catalog.sessionDir, 'citadel-review-state.json'), JSON.stringify(bundleState));
+    assert.equal(await runCitadel(catalog.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '13');
+    const shardState = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    const shardAttempt = shardState.attempts.at(-1);
+    assert.equal(shardAttempt.recovery_mechanism, 'criterion_sharded_reconstruction');
+    assert.notEqual(shardAttempt.material_strategy_hash, bundleAttempt.material_strategy_hash);
+    const shardAttemptDir = path.join(path.dirname(shardAttempt.candidate_path), 'artifact-contract-runtime');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(shardAttemptDir, 'criterion-shard-bundle.json'), 'utf8')),
+      JSON.parse(fs.readFileSync(shardBundlePath, 'utf8')),
+    );
+    assert.equal(JSON.parse(fs.readFileSync(shardAttempt.validator_evidence_path, 'utf8')).exit_code, 0);
+    const attempt13Prompt = fs.readFileSync(path.join(catalog.sessionDir, 'citadel-recovery-prompt-13.txt'), 'utf8');
+    assert.match(attempt13Prompt, /Closed reviewer execution mechanism: criterion_sharded_reconstruction/);
+    assert.match(attempt13Prompt, /independently reviewed typed criterion shards/);
+    assert.match(attempt13Prompt, /Cover every exact acceptance criterion once/);
+    assert.doesNotMatch(attempt13Prompt, /This prose cannot substitute for executed criterion shard work/);
+
     for (const criterion of ['oversize artifact is rejected', 'symlink artifact is rejected']) {
       const unsafe = makeCitadelLifecycleSession(criterion);
       await assert.rejects(() => runCitadel(unsafe.sessionDir), /reviewer did not produce a valid artifact/i);
