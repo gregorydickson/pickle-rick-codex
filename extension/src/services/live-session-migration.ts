@@ -56,12 +56,18 @@ function sessionFiles(root: string, current = root): string[] {
     const absolute = path.join(current, entry.name);
     const relative = path.relative(root, absolute);
     if (entry.isSymbolicLink()) throw new Error(`Session migration refuses symbolic link: ${relative}.`);
+    if (entry.isDirectory() && ['watch-materials', 'watch-terminal-recovery'].includes(relative)) return [];
     if (entry.isDirectory()) return sessionFiles(root, absolute);
     if (!entry.isFile() || relative === LIVE_SESSION_MIGRATION_FILE
       || relative === 'legacy-session-adoption-transaction.json'
       || relative === 'legacy-session-adoption.json'
       || relative === 'legacy-session-adoption-watch.json'
+      || relative === 'watch-material-ledger.json'
+      || relative === 'watch-strategy-authority.json'
       || relative === 'legacy-session-adoption-executor.json'
+      || relative === 'legacy-session-adoption-executor-restart.json'
+      || relative === 'legacy-session-adoption-executor-restart-rejected.json'
+      || relative === 'legacy-session-adoption-supervisor-owner.json'
       || relative.endsWith('.lock')) return [];
     return [relative];
   });

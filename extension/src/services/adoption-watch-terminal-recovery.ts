@@ -16,7 +16,7 @@ export interface AdoptionWatchTerminalRecoveryRef {
 
 interface AdoptionWatchTerminalRecoveryArtifact {
   schema_version: 1;
-  reason: 'missing-or-regressed-launch-record';
+  reason: 'missing-or-regressed-launch-record' | 'executor-topology-evidence-changed';
   archived_at: string;
   prior_strategy_state: AdoptionWatchStrategyState;
   prior_state_hash: string;
@@ -42,14 +42,40 @@ export function archiveAdoptionWatchTerminalState(
   replacementEvidenceHash: string,
   archivedAt: string,
 ): AdoptionWatchTerminalRecoveryRef {
-  if (!adoptionWatchStrategyStateLaunched(prior) || validateAdoptionWatchStrategyState(prior)) {
+  return archiveAdoptionWatchStrategyState(
+    sessionDir, prior, replacementEvidenceHash, archivedAt, 'missing-or-regressed-launch-record',
+  );
+}
+
+export function archiveAdoptionWatchExhaustedState(
+  sessionDir: string,
+  prior: AdoptionWatchStrategyState,
+  replacementEvidenceHash: string,
+  archivedAt: string,
+): AdoptionWatchTerminalRecoveryRef {
+  return archiveAdoptionWatchStrategyState(
+    sessionDir, prior, replacementEvidenceHash, archivedAt, 'executor-topology-evidence-changed',
+  );
+}
+
+function archiveAdoptionWatchStrategyState(
+  sessionDir: string,
+  prior: AdoptionWatchStrategyState,
+  replacementEvidenceHash: string,
+  archivedAt: string,
+  reason: AdoptionWatchTerminalRecoveryArtifact['reason'],
+): AdoptionWatchTerminalRecoveryRef {
+  const expected = reason === 'missing-or-regressed-launch-record'
+    ? adoptionWatchStrategyStateLaunched(prior)
+    : prior.cursor === 3 && !prior.active && !adoptionWatchStrategyStateLaunched(prior);
+  if (!expected || validateAdoptionWatchStrategyState(prior)) {
     throw new Error('Cannot archive an invalid or non-launched adoption watchdog strategy state.');
   }
   const priorEvidenceHash = prior.history.at(-1)?.evidence_hash
     || prior.active?.evidence_hash || '0'.repeat(64);
   const payload = {
     schema_version: 1 as const,
-    reason: 'missing-or-regressed-launch-record' as const,
+    reason,
     archived_at: archivedAt,
     prior_strategy_state: prior,
     prior_state_hash: prior.state_hash,
@@ -99,15 +125,34 @@ export function validateAdoptionWatchTerminalRecoveryRefs(
     }
     const { content_hash: contentHash, ...payload } = artifact;
     if (contentHash !== ref.content_hash || contentHash !== hash(canonicalize(payload))
-      || artifact.schema_version !== 1 || artifact.reason !== 'missing-or-regressed-launch-record'
+      || artifact.schema_version !== 1
+      || !['missing-or-regressed-launch-record', 'executor-topology-evidence-changed'].includes(artifact.reason)
       || !Number.isFinite(Date.parse(artifact.archived_at))
       || !/^[a-f0-9]{64}$/.test(artifact.prior_evidence_hash)
       || !/^[a-f0-9]{64}$/.test(artifact.replacement_evidence_hash)
       || artifact.prior_state_hash !== artifact.prior_strategy_state?.state_hash
       || validateAdoptionWatchStrategyState(artifact.prior_strategy_state)
-      || !adoptionWatchStrategyStateLaunched(artifact.prior_strategy_state)) {
+      || (artifact.reason === 'missing-or-regressed-launch-record'
+        ? !adoptionWatchStrategyStateLaunched(artifact.prior_strategy_state)
+        : artifact.prior_strategy_state.cursor !== 3 || artifact.prior_strategy_state.active
+          || adoptionWatchStrategyStateLaunched(artifact.prior_strategy_state))) {
       return 'terminal recovery archive contract is invalid';
     }
   }
   return null;
+}
+
+export function adoptionWatchArchivedMaterialHashes(
+  sessionDir: string,
+  refs: AdoptionWatchTerminalRecoveryRef[],
+): Set<string> {
+  const validation = validateAdoptionWatchTerminalRecoveryRefs(sessionDir, refs);
+  if (validation) throw new Error(validation);
+  const materials = new Set<string>();
+  for (const ref of refs) {
+    const artifact = JSON.parse(fs.readFileSync(path.join(sessionDir, ref.path), 'utf8')) as AdoptionWatchTerminalRecoveryArtifact;
+    for (const material of artifact.prior_strategy_state.history_base_checkpoint.used_material_hashes) materials.add(material);
+    for (const entry of artifact.prior_strategy_state.history) materials.add(entry.material_hash);
+  }
+  return materials;
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import {
   LEGACY_ADOPTION_FILE,
   adoptActiveLegacyMuxSession,
@@ -12,10 +12,15 @@ import {
 import type { LegacyAdoptionRecord } from '../services/legacy-session-adoption.js';
 import type { InstalledRuntimeDescriptor } from '../services/durable-supervisor.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
+import { ensureLegacyAdoptionSupervisorOwner } from '../services/legacy-adoption-supervisor-owner.js';
 import {
   adoptionWatchEvidenceHash,
+  ADOPTION_WATCH_STRATEGY_IDS,
   adoptionWatchStrategyStateLaunched,
+  adoptionWatchStrategyMaterialHash,
   beginAdoptionWatchStrategy,
+  createAdoptionWatchEvidenceRecoveryState,
+  createAdoptionWatchLedgerRecoveryState,
   createAdoptionWatchTerminalRecoveryState,
   createAdoptionWatchStrategyState,
   finishAdoptionWatchStrategy,
@@ -24,9 +29,26 @@ import {
 import type { AdoptionWatchStrategyId, AdoptionWatchStrategyState } from '../services/adoption-watch-strategies.js';
 import {
   archiveAdoptionWatchTerminalState,
+  archiveAdoptionWatchExhaustedState,
+  adoptionWatchArchivedMaterialHashes,
   validateAdoptionWatchTerminalRecoveryRefs,
 } from '../services/adoption-watch-terminal-recovery.js';
 import type { AdoptionWatchTerminalRecoveryRef } from '../services/adoption-watch-terminal-recovery.js';
+import {
+  readAdoptionWatchMaterialMarkers,
+  reconcileAdoptionWatchMaterialLedger,
+  recordAdoptionWatchMaterialMarker,
+} from '../services/adoption-watch-material-ledger.js';
+import { inspectAdoptionWatchAuthority, writeAdoptionWatchAuthority } from '../services/adoption-watch-authority.js';
+import {
+  LEGACY_ADOPTION_EXECUTOR_RESTART_FILE,
+  readAuthenticatedLegacyAdoptionExecutorStatus,
+  requestLegacyAdoptionExecutorRestart,
+} from '../services/legacy-adoption-executor-supervisor.js';
+import type {
+  LegacyAdoptionExecutorRestartRequest,
+  LegacyAdoptionExecutorStatus,
+} from '../services/legacy-adoption-executor-supervisor.js';
 
 interface Args {
   command: 'prepare' | 'launch' | 'watch';
@@ -42,7 +64,7 @@ export const LEGACY_ADOPTION_WATCH_STATUS_FILE = 'legacy-session-adoption-watch.
 export interface LegacyAdoptionWatchFailure {
   kind: 'migration-continuity-failed' | 'runtime-mismatch' | 'ownership-conflict'
     | 'lock-unavailable' | 'launch-failed' | 'watch-status-invalid'
-    | 'terminal-inconsistency' | 'adoption-failed';
+    | 'terminal-inconsistency' | 'executor-restart-requested' | 'adoption-failed';
   name: string;
   message: string;
   recoverable: true;
@@ -67,6 +89,29 @@ export interface LegacyAdoptionWatchStatus {
   launched_runtime_root: string | null;
   strategy_state?: AdoptionWatchStrategyState;
   terminal_recovery_refs?: AdoptionWatchTerminalRecoveryRef[];
+  executor_restart_action?: LegacyAdoptionExecutorRestartAction | null;
+  executor_restart_history?: LegacyAdoptionExecutorRestartAction[];
+}
+
+export interface LegacyAdoptionExecutorRestartAction {
+  schema_version: 1;
+  action: 'executor_restart_requested' | 'awaiting_evidence_change';
+  exhausted_state_hash: string;
+  exhausted_evidence_hash: string;
+  requested_at: string;
+  request: LegacyAdoptionExecutorRestartRequest | null;
+  expected_manager_fingerprint: string | null;
+  expected_manager_generation: number | null;
+  expected_owner_nonce: string | null;
+  expected_executor_spec_sha256: string | null;
+  receipt_hash: string;
+}
+
+export class LegacyAdoptionExecutorRestartYield extends Error {
+  constructor() {
+    super('Legacy adoption executor restart requested.');
+    this.name = 'LegacyAdoptionExecutorRestartYield';
+  }
 }
 
 interface LegacyAdoptionWatchDependencies {
@@ -82,7 +127,10 @@ interface LegacyAdoptionWatchDependencies {
   chooseRuntime?: typeof chooseLegacyLaunchRuntime;
   runtimeMatches?: typeof runtimeRootMatchesDescriptor;
   executeStrategy?: (strategyId: AdoptionWatchStrategyId) => LegacyAdoptionRecord;
-  checkpoint?: (point: 'strategy_persisted') => void;
+  checkpoint?: (point: 'material_reserved' | 'strategy_persisted') => void;
+  readExecutorStatus?: (sessionDir: string) => LegacyAdoptionExecutorStatus | null;
+  requestExecutorRestart?: (sessionDir: string, reason: string) => LegacyAdoptionExecutorRestartRequest;
+  yieldExecutor?: () => never;
 }
 
 function finiteNonNegative(value: number, fallback: number): number {
@@ -105,6 +153,64 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function restartActionHash(action: Omit<LegacyAdoptionExecutorRestartAction, 'receipt_hash'>): string {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    schema_version: action.schema_version, action: action.action,
+    exhausted_state_hash: action.exhausted_state_hash,
+    exhausted_evidence_hash: action.exhausted_evidence_hash,
+    requested_at: action.requested_at, request: action.request,
+    expected_manager_fingerprint: action.expected_manager_fingerprint,
+    expected_manager_generation: action.expected_manager_generation,
+    expected_owner_nonce: action.expected_owner_nonce,
+    expected_executor_spec_sha256: action.expected_executor_spec_sha256,
+  })).digest('hex');
+}
+
+function sealRestartAction(
+  action: Omit<LegacyAdoptionExecutorRestartAction, 'receipt_hash'>,
+): LegacyAdoptionExecutorRestartAction {
+  return { ...action, receipt_hash: restartActionHash(action) };
+}
+
+function invalidRestartActionReason(value: unknown): string | null {
+  if (!isRecord(value) || value.schema_version !== 1
+    || !['executor_restart_requested', 'awaiting_evidence_change'].includes(String(value.action))
+    || typeof value.exhausted_state_hash !== 'string' || !/^[a-f0-9]{64}$/.test(value.exhausted_state_hash)
+    || typeof value.exhausted_evidence_hash !== 'string' || !/^[a-f0-9]{64}$/.test(value.exhausted_evidence_hash)
+    || !isIsoTimestamp(value.requested_at)
+    || typeof value.receipt_hash !== 'string' || !/^[a-f0-9]{64}$/.test(value.receipt_hash)) {
+    return 'executor restart action fields are invalid';
+  }
+  if ((value.expected_manager_fingerprint !== null
+      && (typeof value.expected_manager_fingerprint !== 'string' || !value.expected_manager_fingerprint))
+    || (value.expected_manager_generation !== null
+      && (!Number.isInteger(value.expected_manager_generation) || Number(value.expected_manager_generation) < 1))
+    || (value.expected_owner_nonce !== null
+      && (typeof value.expected_owner_nonce !== 'string' || !value.expected_owner_nonce))
+    || (value.expected_executor_spec_sha256 !== null
+      && (typeof value.expected_executor_spec_sha256 !== 'string'
+        || !/^[a-f0-9]{64}$/.test(value.expected_executor_spec_sha256)))) {
+    return 'executor restart authority binding is invalid';
+  }
+  const hasRequest = value.request !== null;
+  if (hasRequest !== (typeof value.expected_manager_fingerprint === 'string')
+    || hasRequest !== Number.isInteger(value.expected_manager_generation)
+    || hasRequest !== (typeof value.expected_owner_nonce === 'string')
+    || hasRequest !== (typeof value.expected_executor_spec_sha256 === 'string')) {
+    return 'executor restart authority binding does not match its request';
+  }
+  if (value.request !== null && (!isRecord(value.request) || value.request.schema_version !== 1
+    || typeof value.request.request_id !== 'string' || !value.request.request_id
+    || !Number.isInteger(value.request.expected_generation) || Number(value.request.expected_generation) < 0
+    || typeof value.request.expected_executor_fingerprint !== 'string'
+    || typeof value.request.reason !== 'string' || !isIsoTimestamp(value.request.requested_at))) {
+    return 'executor restart request receipt is invalid';
+  }
+  const action = value as unknown as LegacyAdoptionExecutorRestartAction;
+  const { receipt_hash: receiptHash, ...payload } = action;
+  return receiptHash === restartActionHash(payload) ? null : 'executor restart action hash is invalid';
+}
+
 function isIsoTimestamp(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const parsed = Date.parse(value);
@@ -118,6 +224,7 @@ function isNonNegativeInteger(value: unknown): value is number {
 const watchFailureKinds = new Set<LegacyAdoptionWatchFailure['kind']>([
   'migration-continuity-failed', 'runtime-mismatch', 'ownership-conflict', 'lock-unavailable',
   'launch-failed', 'watch-status-invalid', 'terminal-inconsistency', 'adoption-failed',
+  'executor-restart-requested',
 ]);
 
 function invalidWatchStatusReason(
@@ -189,6 +296,26 @@ function invalidWatchStatusReason(
   if (value.terminal_recovery_refs !== undefined) {
     const recoveryError = validateAdoptionWatchTerminalRecoveryRefs(sessionDir, value.terminal_recovery_refs);
     if (recoveryError) return recoveryError;
+  }
+  if (value.executor_restart_action !== undefined && value.executor_restart_action !== null) {
+    const actionError = invalidRestartActionReason(value.executor_restart_action);
+    if (actionError) return actionError;
+    const action = value.executor_restart_action as LegacyAdoptionExecutorRestartAction;
+    const strategy = value.strategy_state as AdoptionWatchStrategyState | undefined;
+    if (!strategy || strategy.cursor !== 3 || strategy.active
+      || strategy.state_hash !== action.exhausted_state_hash
+      || strategy.history_base_checkpoint.evidence_hash !== action.exhausted_evidence_hash) {
+      return 'executor restart action is not bound to the exhausted strategy state';
+    }
+  }
+  if (value.executor_restart_history !== undefined) {
+    if (!Array.isArray(value.executor_restart_history) || value.executor_restart_history.length > 16) {
+      return 'executor restart history is invalid or unbounded';
+    }
+    for (const action of value.executor_restart_history) {
+      const actionError = invalidRestartActionReason(action);
+      if (actionError) return actionError;
+    }
   }
   return null;
 }
@@ -279,21 +406,112 @@ export function runLegacyAdoptionWatch(
   const rawPrior = readJsonFile<unknown>(statusPath, null);
   const readAt = now();
   const delayBounds = legacyAdoptionWatchDelayBounds(deps);
-  const invalidPrior = fs.existsSync(statusPath)
+  const authorityPath = path.join(args.sessionDir, 'watch-strategy-authority.json');
+  const manifestPath = path.join(args.sessionDir, 'watch-material-ledger.json');
+  const materialsPath = path.join(args.sessionDir, 'watch-materials');
+  const recoveryPath = path.join(args.sessionDir, 'watch-terminal-recovery');
+  const persistedStatusInvalidReason = fs.existsSync(statusPath)
     ? invalidWatchStatusReason(rawPrior, args.sessionDir, path.basename(args.sessionDir),
       readAt, delayBounds.maxDelayMs) : null;
+  const controlsAbsent = !fs.existsSync(authorityPath) && !fs.existsSync(manifestPath)
+    && !fs.existsSync(materialsPath);
+  const priorRunIndicator = (fs.existsSync(statusPath)
+      && (Boolean(persistedStatusInvalidReason) || (isRecord(rawPrior) && rawPrior.strategy_state !== undefined)))
+    || (fs.existsSync(recoveryPath) && fs.readdirSync(recoveryPath).length > 0)
+    || fs.existsSync(path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE));
+  const provenanceConflict = controlsAbsent && priorRunIndicator;
+  const authorityInspection = inspectAdoptionWatchAuthority(args.sessionDir);
+  const durableAuthority = authorityInspection.authority;
+  const bootLedger = reconcileAdoptionWatchMaterialLedger(args.sessionDir);
+  const controlArtifactConflict = provenanceConflict || authorityInspection.invalid_present
+    || authorityInspection.control_artifact_conflict || bootLedger.integrity_conflict;
+  const invalidPrior = persistedStatusInvalidReason
+    || (controlArtifactConflict
+      ? 'watcher establishment evidence conflicts with missing or invalid durable strategy controls'
+      : durableAuthority?.ledger_repaired || bootLedger.repaired
+      ? 'material reservation ledger required durable reconciliation' : null);
   let prior = invalidPrior ? null : rawPrior as LegacyAdoptionWatchStatus | null;
   const startedAt = prior?.started_at || new Date(readAt).toISOString();
   let attemptCount = prior?.attempt_count || 0;
   let consecutiveFailures = prior?.status === 'retrying' ? prior.consecutive_failures : 0;
   let lastFailure = prior?.last_failure || null;
   let initialDelay = 0;
+  let terminalRecoveryRefs = prior?.terminal_recovery_refs || [];
   const currentEvidenceHash = () => adoptionWatchEvidenceHash(
     args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot,
   );
-  let strategyState = prior?.strategy_state
-    || createAdoptionWatchStrategyState(path.basename(args.sessionDir), currentEvidenceHash());
-  let terminalRecoveryRefs = prior?.terminal_recovery_refs || [];
+  const usedMaterials = () => new Set([
+    ...readAdoptionWatchMaterialMarkers(args.sessionDir),
+    ...adoptionWatchArchivedMaterialHashes(args.sessionDir, terminalRecoveryRefs),
+  ]);
+  const usedMaterialsForEvidence = (evidenceHash: string) => {
+    const used = usedMaterials();
+    const ordered = ADOPTION_WATCH_STRATEGY_IDS.map((strategyId) => (
+      adoptionWatchStrategyMaterialHash(strategyId, evidenceHash)
+    ));
+    const firstMissing = ordered.findIndex((material) => !used.has(material));
+    const gap = firstMissing >= 0 && ordered.slice(firstMissing + 1).some((material) => used.has(material));
+    const cursor = firstMissing < 0 || gap ? ADOPTION_WATCH_STRATEGY_IDS.length : firstMissing;
+    return { cursor,
+      materials: ordered.filter((material) => used.has(material)) };
+  };
+  const durableLedger = bootLedger;
+  const latestReserved = [...durableLedger.markers.values()].sort((left, right) => (
+    Date.parse(right.first_started_at) - Date.parse(left.first_started_at)
+  ))[0];
+  const initialEvidenceHash = durableAuthority?.strategy_state.history_base_checkpoint.evidence_hash
+    || (!prior && latestReserved?.evidence_hash) || currentEvidenceHash();
+  const salvageStrategy = isRecord(rawPrior) && rawPrior.strategy_state
+    && !validateAdoptionWatchStrategyState(rawPrior.strategy_state)
+    ? rawPrior.strategy_state as AdoptionWatchStrategyState : null;
+  if (!durableAuthority && salvageStrategy) {
+    for (const entry of salvageStrategy.history) recordAdoptionWatchMaterialMarker(args.sessionDir, entry);
+    if (salvageStrategy.active) recordAdoptionWatchMaterialMarker(args.sessionDir, salvageStrategy.active);
+  }
+  const initialMaterials = usedMaterialsForEvidence(initialEvidenceHash);
+  let strategyState = durableAuthority?.strategy_state || prior?.strategy_state || salvageStrategy
+    || (latestReserved
+      ? createAdoptionWatchLedgerRecoveryState(
+        initialEvidenceHash, latestReserved.epoch, latestReserved.epoch_seed,
+        initialMaterials.cursor, initialMaterials.materials,
+      )
+      : createAdoptionWatchStrategyState(
+        path.basename(args.sessionDir), initialEvidenceHash,
+        initialMaterials.cursor, initialMaterials.materials,
+      ));
+  if (controlArtifactConflict && strategyState.cursor < ADOPTION_WATCH_STRATEGY_IDS.length) {
+    strategyState = createAdoptionWatchLedgerRecoveryState(
+      strategyState.history_base_checkpoint.evidence_hash, strategyState.epoch, strategyState.epoch_seed,
+      ADOPTION_WATCH_STRATEGY_IDS.length,
+      usedMaterialsForEvidence(strategyState.history_base_checkpoint.evidence_hash).materials,
+    );
+  }
+  let executorRestartAction = (durableAuthority?.executor_restart_action
+    && !invalidRestartActionReason(durableAuthority.executor_restart_action))
+    ? durableAuthority.executor_restart_action as LegacyAdoptionExecutorRestartAction
+    : prior?.executor_restart_action || null;
+  let executorRestartHistory = prior?.executor_restart_history || [];
+  const persistStatus = (status: LegacyAdoptionWatchStatus): void => {
+    writeAdoptionWatchAuthority(
+      args.sessionDir, status.strategy_state!, status.executor_restart_action || null, status.updated_at,
+    );
+    atomicWriteJson(statusPath, status);
+  };
+
+  if (!invalidPrior && !strategyState.active && !adoptionWatchStrategyStateLaunched(strategyState)
+    && strategyState.cursor < ADOPTION_WATCH_STRATEGY_IDS.length) {
+    const ledger = reconcileAdoptionWatchMaterialLedger(args.sessionDir);
+    const reservedHash = adoptionWatchStrategyMaterialHash(
+      ADOPTION_WATCH_STRATEGY_IDS[strategyState.cursor]!,
+      strategyState.history_base_checkpoint.evidence_hash,
+    );
+    const reserved = ledger.markers.get(reservedHash);
+    if (reserved) {
+      strategyState = beginAdoptionWatchStrategy(
+        strategyState, reserved.evidence_hash, reserved.first_started_at,
+      ).state;
+    }
+  }
 
   if (invalidPrior) {
     const observedAt = new Date(now()).toISOString();
@@ -313,8 +531,9 @@ export function runLegacyAdoptionWatch(
       retry_scheduled_at: observedAt, next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
       last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
       terminal_recovery_refs: terminalRecoveryRefs,
+      executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
     };
-    atomicWriteJson(statusPath, prior);
+    persistStatus(prior);
     consecutiveFailures = 1;
     initialDelay = delay;
   }
@@ -340,8 +559,9 @@ export function runLegacyAdoptionWatch(
       next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
       last_failure: lastFailure, strategy_state: strategyState,
       terminal_recovery_refs: terminalRecoveryRefs,
+      executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
     };
-    atomicWriteJson(statusPath, prior);
+    persistStatus(prior);
     initialDelay = delay;
   }
 
@@ -354,13 +574,14 @@ export function runLegacyAdoptionWatch(
     const converged = launchedRecord(args.sessionDir);
     if (converged) {
       const timestamp = new Date(now()).toISOString();
-      atomicWriteJson(statusPath, {
+      persistStatus({
         schema_version: 1, status: 'launched', session_id: path.basename(args.sessionDir),
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: timestamp,
         attempt_count: attemptCount, consecutive_failures: 0, last_attempt_at: prior?.last_attempt_at || null,
         retry_scheduled_at: null, next_retry_at: null, retry_delay_ms: null, last_failure: lastFailure,
         launched_runtime_root: converged.launched_runtime_root || null, strategy_state: strategyState,
         terminal_recovery_refs: terminalRecoveryRefs,
+        executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
       } satisfies LegacyAdoptionWatchStatus);
       return converged;
     }
@@ -371,8 +592,10 @@ export function runLegacyAdoptionWatch(
         args.sessionDir, strategyState, evidenceHash, prior?.updated_at || observedAt,
       );
       terminalRecoveryRefs = [...terminalRecoveryRefs, archive].slice(-16);
+      const priorMaterials = usedMaterialsForEvidence(evidenceHash);
       strategyState = createAdoptionWatchTerminalRecoveryState(
         path.basename(args.sessionDir), evidenceHash, strategyState,
+        priorMaterials.cursor, priorMaterials.materials,
       );
       consecutiveFailures += 1;
       const delay = legacyAdoptionWatchDelayMs(consecutiveFailures, {
@@ -384,7 +607,7 @@ export function runLegacyAdoptionWatch(
         message: 'Persisted launched strategy lacks its authoritative launched adoption record.', recoverable: true,
         first_observed_at: observedAt, last_observed_at: observedAt,
       };
-      atomicWriteJson(statusPath, {
+      persistStatus({
         schema_version: 1, status: 'retrying', session_id: path.basename(args.sessionDir),
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
         attempt_count: attemptCount, consecutive_failures: consecutiveFailures,
@@ -392,8 +615,117 @@ export function runLegacyAdoptionWatch(
         next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
         last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
         terminal_recovery_refs: terminalRecoveryRefs,
+        executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
       } satisfies LegacyAdoptionWatchStatus);
       initialDelay = delay;
+      continue;
+    }
+    const observedEvidenceHash = currentEvidenceHash();
+    if (strategyState.cursor < ADOPTION_WATCH_STRATEGY_IDS.length
+      && observedEvidenceHash !== strategyState.history_base_checkpoint.evidence_hash) {
+      const preservedEvidenceHash = strategyState.history_base_checkpoint.evidence_hash;
+      const preservedMaterials = usedMaterialsForEvidence(preservedEvidenceHash);
+      strategyState = createAdoptionWatchLedgerRecoveryState(
+        preservedEvidenceHash, strategyState.epoch, strategyState.epoch_seed,
+        ADOPTION_WATCH_STRATEGY_IDS.length, preservedMaterials.materials,
+      );
+    }
+    if (strategyState.cursor === 3) {
+      const observedAt = new Date(now()).toISOString();
+      const evidenceHash = currentEvidenceHash();
+      let requestedNow = false;
+      const authenticatedSupervisor = deps.readExecutorStatus
+        ? deps.readExecutorStatus(args.sessionDir)
+        : readAuthenticatedLegacyAdoptionExecutorStatus({
+          sessionDir: args.sessionDir, sourceRuntimeRoot: args.sourceRuntimeRoot,
+          targetRuntimeRoot: args.targetRuntimeRoot,
+          ...(args.validationSessionDir ? { validationSessionDir: args.validationSessionDir } : {}),
+        });
+      const acknowledgedRestart = Boolean(executorRestartAction?.request && authenticatedSupervisor
+        && authenticatedSupervisor.last_restart_request_id === executorRestartAction.request.request_id
+        && authenticatedSupervisor.executor_generation > executorRestartAction.request.expected_generation
+        && authenticatedSupervisor.executor_identity
+        && authenticatedSupervisor.executor_identity.fingerprint
+          !== executorRestartAction.request.expected_executor_fingerprint
+        && authenticatedSupervisor.manager_generation >= (executorRestartAction.expected_manager_generation || 0)
+        && (authenticatedSupervisor.manager_generation
+          > (executorRestartAction.expected_manager_generation || 0)
+          || authenticatedSupervisor.manager_identity.fingerprint
+            === executorRestartAction.expected_manager_fingerprint)
+        && authenticatedSupervisor.owner_nonce === executorRestartAction.expected_owner_nonce
+        && authenticatedSupervisor.executor_spec_sha256
+          === executorRestartAction.expected_executor_spec_sha256
+        && !fs.existsSync(path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE)));
+      if (executorRestartAction && acknowledgedRestart
+        && evidenceHash !== executorRestartAction.exhausted_evidence_hash) {
+        const archive = archiveAdoptionWatchExhaustedState(
+          args.sessionDir, strategyState, evidenceHash, executorRestartAction.requested_at,
+        );
+        terminalRecoveryRefs = [...terminalRecoveryRefs, archive].slice(-16);
+        executorRestartHistory = [...executorRestartHistory, executorRestartAction].slice(-16);
+        const priorMaterials = usedMaterialsForEvidence(evidenceHash);
+        strategyState = createAdoptionWatchEvidenceRecoveryState(
+          path.basename(args.sessionDir), evidenceHash, strategyState, executorRestartAction.receipt_hash,
+          priorMaterials.cursor, priorMaterials.materials,
+        );
+        executorRestartAction = null;
+        consecutiveFailures = 0;
+        initialDelay = 0;
+        continue;
+      }
+
+      if (!executorRestartAction) {
+        let request: LegacyAdoptionExecutorRestartRequest | null = null;
+        const supervisor = authenticatedSupervisor;
+        if (supervisor?.executor_identity?.pid === process.pid) {
+          try {
+            request = (deps.requestExecutorRestart || requestLegacyAdoptionExecutorRestart)(
+              args.sessionDir, 'adoption strategy catalog exhausted without evidence change',
+            );
+          } catch {
+            request = null;
+          }
+        }
+        executorRestartAction = sealRestartAction({
+          schema_version: 1,
+          action: request ? 'executor_restart_requested' : 'awaiting_evidence_change',
+          exhausted_state_hash: strategyState.state_hash,
+          exhausted_evidence_hash: strategyState.history_base_checkpoint.evidence_hash,
+          requested_at: request?.requested_at || observedAt,
+          request,
+          expected_manager_fingerprint: request ? supervisor?.manager_identity.fingerprint || null : null,
+          expected_manager_generation: request ? supervisor?.manager_generation || null : null,
+          expected_owner_nonce: request ? supervisor?.owner_nonce || null : null,
+          expected_executor_spec_sha256: request ? supervisor?.executor_spec_sha256 || null : null,
+        });
+        requestedNow = Boolean(request);
+      }
+
+      const delay = legacyAdoptionWatchDelayMs(Math.max(1, consecutiveFailures), {
+        baseDelayMs: deps.baseDelayMs, maxDelayMs: deps.maxDelayMs,
+        jitterRatio: deps.jitterRatio, random: deps.random,
+      });
+      lastFailure = {
+        kind: 'executor-restart-requested', name: 'LegacyAdoptionStrategyCatalogExhausted',
+        message: executorRestartAction.action === 'executor_restart_requested'
+          ? 'Strategy catalog exhausted; authenticated executor replacement requested.'
+          : 'Strategy catalog exhausted; awaiting real evidence change.',
+        recoverable: true, first_observed_at: executorRestartAction.requested_at, last_observed_at: observedAt,
+      };
+      persistStatus({
+        schema_version: 1, status: 'retrying', session_id: path.basename(args.sessionDir),
+        watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
+        attempt_count: attemptCount, consecutive_failures: Math.max(1, consecutiveFailures),
+        last_attempt_at: prior?.last_attempt_at || null, retry_scheduled_at: observedAt,
+        next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
+        last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
+        terminal_recovery_refs: terminalRecoveryRefs,
+        executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
+      } satisfies LegacyAdoptionWatchStatus);
+      if (requestedNow) {
+        (deps.yieldExecutor || (() => { throw new LegacyAdoptionExecutorRestartYield(); }))();
+      }
+      wait(delay);
       continue;
     }
     if (initialDelay > 0) {
@@ -405,22 +737,28 @@ export function runLegacyAdoptionWatch(
 
     const attemptAt = new Date(now()).toISOString();
     attemptCount += 1;
-    const begun = beginAdoptionWatchStrategy(strategyState, currentEvidenceHash(), attemptAt);
+    const begun = beginAdoptionWatchStrategy(
+      strategyState, currentEvidenceHash(), attemptAt,
+      usedMaterials(),
+    );
+    recordAdoptionWatchMaterialMarker(args.sessionDir, begun.attempt);
+    deps.checkpoint?.('material_reserved');
     strategyState = begun.state;
-    atomicWriteJson(statusPath, {
+    persistStatus({
       schema_version: 1, status: 'watching', session_id: path.basename(args.sessionDir),
       watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: attemptAt,
       attempt_count: attemptCount, consecutive_failures: consecutiveFailures, last_attempt_at: attemptAt,
       retry_scheduled_at: null, next_retry_at: null, retry_delay_ms: null, last_failure: lastFailure,
       launched_runtime_root: null, strategy_state: strategyState,
       terminal_recovery_refs: terminalRecoveryRefs,
+      executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
     } satisfies LegacyAdoptionWatchStatus);
     deps.checkpoint?.('strategy_persisted');
     try {
       const result = executeAdoptionWatchStrategy(begun.attempt.strategy_id, args, deps);
       const timestamp = new Date(now()).toISOString();
       strategyState = finishAdoptionWatchStrategy(strategyState, 'launched', null, timestamp);
-      atomicWriteJson(statusPath, {
+      persistStatus({
         schema_version: 1, status: 'launched', session_id: path.basename(args.sessionDir),
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: timestamp,
         attempt_count: attemptCount, consecutive_failures: 0, last_attempt_at: attemptAt,
@@ -428,6 +766,7 @@ export function runLegacyAdoptionWatch(
         launched_runtime_root: result.launched_runtime_root || args.targetRuntimeRoot,
         strategy_state: strategyState,
         terminal_recovery_refs: terminalRecoveryRefs,
+        executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
       } satisfies LegacyAdoptionWatchStatus);
       return result;
     } catch (error) {
@@ -450,13 +789,14 @@ export function runLegacyAdoptionWatch(
         first_observed_at: lastFailure?.message === message ? lastFailure.first_observed_at : observedAt,
         last_observed_at: observedAt,
       };
-      atomicWriteJson(statusPath, {
+      persistStatus({
         schema_version: 1, status: 'retrying', session_id: path.basename(args.sessionDir),
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
         attempt_count: attemptCount, consecutive_failures: consecutiveFailures, last_attempt_at: attemptAt,
         retry_scheduled_at: observedAt, next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
         last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
         terminal_recovery_refs: terminalRecoveryRefs,
+        executor_restart_action: executorRestartAction, executor_restart_history: executorRestartHistory,
       } satisfies LegacyAdoptionWatchStatus);
       wait(delay);
     }
@@ -518,18 +858,23 @@ export function runLegacyAdoptionCli(argv: string[]): void {
   const result = args.command === 'prepare'
     ? adoptActiveLegacyMuxSession(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, {
       startWatchdog: (sessionDir, sourceRoot, targetRoot) => {
-        const supervisorBin = fileURLToPath(new URL('./legacy-adoption-executor-supervisor.js', import.meta.url));
-        const childArgs = [supervisorBin, '--session-dir', sessionDir,
-          '--source-runtime-root', sourceRoot, '--target-runtime-root', targetRoot];
-        if (args.validationSessionDir) childArgs.push('--validation-session', args.validationSessionDir);
-        const child = spawn(process.execPath, childArgs, {
-          detached: true, stdio: 'ignore', env: process.env,
-        });
-        child.unref();
+        startLegacyAdoptionSupervisorOwner(sessionDir, sourceRoot, targetRoot, args.validationSessionDir || undefined);
       }, validationSessionDir: args.validationSessionDir || undefined,
     })
     : launchAdoptedLegacySession(args.sessionDir, args.targetRuntimeRoot);
   process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+export function startLegacyAdoptionSupervisorOwner(
+  sessionDir: string,
+  sourceRuntimeRoot: string,
+  targetRuntimeRoot: string,
+  validationSessionDir?: string,
+): void {
+  ensureLegacyAdoptionSupervisorOwner({
+    sessionDir, sourceRuntimeRoot, targetRuntimeRoot,
+    ...(validationSessionDir ? { validationSessionDir } : {}),
+  });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -537,6 +882,6 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     runLegacyAdoptionCli(process.argv.slice(2));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = error instanceof LegacyAdoptionExecutorRestartYield ? 75 : 1;
   }
 }

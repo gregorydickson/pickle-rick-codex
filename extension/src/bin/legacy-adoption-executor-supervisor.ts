@@ -18,9 +18,11 @@ export function runLegacyAdoptionExecutorSupervisorCli(argv: string[]): void {
   const sourceRuntimeRoot = valueAfter(argv, '--source-runtime-root');
   const targetRuntimeRoot = valueAfter(argv, '--target-runtime-root');
   const validationSessionDir = valueAfter(argv, '--validation-session', true);
+  const ownerNonce = argv.includes('--owner-nonce') ? argv[argv.indexOf('--owner-nonce') + 1] : '';
   const result = runLegacyAdoptionExecutorSupervisor({
     sessionDir, sourceRuntimeRoot, targetRuntimeRoot,
     ...(validationSessionDir ? { validationSessionDir } : {}),
+    ...(ownerNonce ? { ownerNonce } : {}),
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

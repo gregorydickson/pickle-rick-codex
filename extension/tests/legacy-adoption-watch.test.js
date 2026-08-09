@@ -18,6 +18,11 @@ import {
   finishAdoptionWatchStrategy,
   validateAdoptionWatchStrategyState,
 } from '../services/adoption-watch-strategies.js';
+import {
+  readAdoptionWatchMaterialMarkers,
+  recordAdoptionWatchMaterialMarker,
+} from '../services/adoption-watch-material-ledger.js';
+import { archiveAdoptionWatchTerminalState } from '../services/adoption-watch-terminal-recovery.js';
 
 function descriptor() {
   return {
@@ -54,7 +59,8 @@ function rehashForgedStrategyState(state) {
   let previous = state.history_base_checkpoint.previous_hash;
   for (const entry of state.history) {
     entry.material_hash = stableHash({
-      strategy_id: entry.strategy_id, evidence_hash: entry.evidence_hash, epoch_seed: entry.epoch_seed,
+      strategy_id: entry.strategy_id, evidence_hash: entry.evidence_hash,
+      constraints_hash: entry.constraints_hash,
     });
     entry.previous_hash = previous;
     const { entry_hash: _entryHash, ...payload } = entry;
@@ -159,6 +165,12 @@ test('watcher status remains mutable control telemetry outside the sealed migrat
     schema_version: 1, active: true, current_ticket: null, step: 'readiness', history: [], working_dir: repo,
   });
   writeJson(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), { status: 'watching', attempt_count: 0 });
+  writeJson(path.join(sessionDir, 'watch-material-ledger.json'), { control: 1 });
+  writeJson(path.join(sessionDir, 'watch-strategy-authority.json'), { control: 1 });
+  fs.mkdirSync(path.join(sessionDir, 'watch-materials'));
+  writeJson(path.join(sessionDir, 'watch-materials', `${'a'.repeat(64)}.json`), { control: 1 });
+  fs.mkdirSync(path.join(sessionDir, 'watch-terminal-recovery'));
+  writeJson(path.join(sessionDir, 'watch-terminal-recovery', `${'b'.repeat(64)}.json`), { control: 1 });
   const runtime = descriptor();
   const migration = prepareLiveSessionMigration(sessionDir, runtime, runtime);
   assert.equal(migration.preserved_artifacts.some((artifact) => artifact.path === LEGACY_ADOPTION_WATCH_STATUS_FILE), false);
@@ -166,10 +178,12 @@ test('watcher status remains mutable control telemetry outside the sealed migrat
   writeJson(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), {
     status: 'retrying', attempt_count: 10, last_failure: { kind: 'migration-continuity-failed' },
   });
+  writeJson(path.join(sessionDir, 'watch-material-ledger.json'), { control: 2 });
+  writeJson(path.join(sessionDir, 'watch-strategy-authority.json'), { control: 2 });
   assert.doesNotThrow(() => verifyLiveSessionMigration(sessionDir, migration));
 });
 
-test('malformed persisted counters and schema are replaced by typed recoverable status before retry', () => {
+test('malformed persisted counters and schema without controls fail closed with typed recovery', () => {
   for (const malformed of [
     { schema_version: 2 },
     {
@@ -184,23 +198,21 @@ test('malformed persisted counters and schema are replaced by typed recoverable 
     writeJson(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), malformed);
     let now = Date.parse('2026-01-01T00:00:00.000Z');
     const waits = [];
-    const launched = record('launched');
-    runLegacyAdoptionWatch(args(sessionDir), {
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
       now: () => now, random: () => 0.5, baseDelayMs: 500, maxDelayMs: 2_000,
-      wait: (delay) => { waits.push(delay); now += delay; },
-      adopt: () => record('adopted'), chooseRuntime: () => ({ runtimeRoot: '/runtime', fallback: false }),
-      launch: () => launched,
-    });
-    assert.deepEqual(waits, [500]);
+      wait: (delay) => { waits.push(delay); now += delay; if (waits.length === 2) throw new Error('malformed-blocked'); },
+      executeStrategy: () => assert.fail('malformed established status must not bootstrap'),
+    }), /malformed-blocked/);
+    assert.deepEqual(waits, [500, 500]);
     const status = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
-    assert.equal(status.status, 'launched');
-    assert.equal(status.attempt_count, 1);
-    assert.equal(status.last_failure.kind, 'watch-status-invalid');
-    assert.match(status.last_failure.message, /Malformed persisted adoption watchdog status/);
+    assert.equal(status.status, 'retrying');
+    assert.equal(status.attempt_count, 0);
+    assert.equal(status.strategy_state.cursor, 3);
+    assert.equal(status.last_failure.kind, 'executor-restart-requested');
   }
 });
 
-test('invalid persisted timestamps cannot throw or bypass the safe retry delay', () => {
+test('invalid persisted timestamps without controls wait safely and fail closed', () => {
   const sessionDir = makeTempRoot('pickle-adoption-watch-invalid-time-');
   writeJson(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), {
     schema_version: 1, status: 'retrying', session_id: path.basename(sessionDir), watcher_pid: 1,
@@ -210,14 +222,12 @@ test('invalid persisted timestamps cannot throw or bypass the safe retry delay',
   });
   let now = Date.parse('2026-01-01T00:00:00.000Z');
   const waits = [];
-  const result = runLegacyAdoptionWatch(args(sessionDir), {
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
     now: () => now, random: () => 0.5, baseDelayMs: 750, maxDelayMs: 3_000,
-    wait: (delay) => { waits.push(delay); now += delay; },
-    adopt: () => record('adopted'), chooseRuntime: () => ({ runtimeRoot: '/runtime', fallback: false }),
-    launch: () => record('launched'),
-  });
-  assert.equal(result.status, 'launched');
-  assert.deepEqual(waits, [750]);
+    wait: (delay) => { waits.push(delay); now += delay; if (waits.length === 2) throw new Error('timestamp-blocked'); },
+    executeStrategy: () => assert.fail('invalid timestamp status must not bootstrap'),
+  }), /timestamp-blocked/);
+  assert.deepEqual(waits, [750, 750]);
 });
 
 test('valid persisted retry deadline is honored before the next numbered attempt', () => {
@@ -272,20 +282,19 @@ test('far-future and delay-inconsistent persisted deadlines are reclassified and
     });
     let now = Date.parse(scheduledAt);
     const waits = [];
-    runLegacyAdoptionWatch(args(sessionDir), {
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
       now: () => now, random: () => 0.5, baseDelayMs: 500, maxDelayMs: 2_000,
-      wait: (delay) => { waits.push(delay); now += delay; },
-      adopt: () => record('adopted'), chooseRuntime: () => ({ runtimeRoot: '/runtime', fallback: false }),
-      launch: () => record('launched'),
-    });
-    assert.deepEqual(waits, [500]);
+      wait: (delay) => { waits.push(delay); now += delay; if (waits.length === 2) throw new Error('deadline-blocked'); },
+      executeStrategy: () => assert.fail('invalid deadline status must not bootstrap'),
+    }), /deadline-blocked/);
+    assert.deepEqual(waits, [500, 500]);
     const status = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
-    assert.equal(status.last_failure.kind, 'watch-status-invalid');
-    assert.ok(status.retry_delay_ms === null);
+    assert.equal(status.last_failure.kind, 'executor-restart-requested');
+    assert.equal(status.strategy_state.cursor, 3);
   }
 });
 
-test('persistent failure executes three material strategies and schedules a new evidence-bound epoch', () => {
+test('persistent failure executes three material strategies then awaits real evidence change', () => {
   const sessionDir = makeTempRoot('pickle-adoption-watch-strategies-');
   let now = Date.parse('2026-01-01T00:00:00.000Z');
   const routes = [];
@@ -303,11 +312,126 @@ test('persistent failure executes three material strategies and schedules a new 
   ]);
   const status = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
   assert.equal(status.status, 'retrying');
-  assert.equal(status.strategy_state.epoch, 2);
-  assert.equal(status.strategy_state.history.length, 4);
-  assert.equal(new Set(status.strategy_state.history.slice(0, 3).map((entry) => entry.material_hash)).size, 3);
-  assert.notEqual(status.strategy_state.history[0].material_hash, status.strategy_state.history[3].material_hash);
+  assert.equal(routes.length, 3);
+  assert.equal(status.strategy_state.epoch, 1);
+  assert.equal(status.strategy_state.cursor, 3);
+  assert.equal(status.strategy_state.history.length, 3);
+  assert.equal(new Set(status.strategy_state.history.map((entry) => entry.material_hash)).size, 3);
+  assert.equal(status.executor_restart_action.action, 'awaiting_evidence_change');
+  assert.equal(status.last_failure.kind, 'executor-restart-requested');
   assert.ok(Date.parse(status.next_retry_at) > now - status.retry_delay_ms);
+});
+
+test('forged supervisor telemetry and migration-only changes cannot unlock an exhausted catalog', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-forged-supervisor-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  let waits = 0;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, random: () => 0.5, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => { throw new Error('persistent'); },
+    wait: (delay) => { now += delay; waits += 1; if (waits === 4) throw new Error('initial-stop'); },
+  }), /initial-stop/);
+
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), {
+    schema_version: 1, session_id: path.basename(sessionDir), status: 'supervising',
+    manager_identity: { pid: process.pid, pgid: process.pid, start_time: 'forged', fingerprint: 'forged-manager' },
+    executor_identity: { pid: process.pid, pgid: process.pid, start_time: 'forged', fingerprint: 'forged-executor' },
+    executor_generation: 999, executor_spec_sha256: 'f'.repeat(64),
+    last_restart_request_id: 'forged-receipt', updated_at: new Date(now).toISOString(),
+  });
+  writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), { arbitrary_runtime_change: crypto.randomUUID() });
+  now += 1_000;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => assert.fail('forged evidence must not authorize a fourth strategy'),
+    wait: () => { throw new Error('forged-stop'); },
+  }), /forged-stop/);
+  const status = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(status.strategy_state.epoch, 1);
+  assert.equal(status.strategy_state.cursor, 3);
+  assert.equal(status.executor_restart_action.action, 'awaiting_evidence_change');
+});
+
+test('immutable material ledger rejects replay after bounded archive references are evicted', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-ledger-');
+  const evidenceHash = 'a'.repeat(64);
+  const initial = createAdoptionWatchStrategyState('session', evidenceHash);
+  const begun = beginAdoptionWatchStrategy(initial, evidenceHash, '2026-01-01T00:00:00.000Z');
+  recordAdoptionWatchMaterialMarker(sessionDir, begun.attempt);
+  const evictedArchiveRefs = Array.from({ length: 20 }, (_, index) => `archive-${index}`).slice(-16);
+  assert.equal(evictedArchiveRefs.includes('archive-0'), false);
+  assert.throws(() => beginAdoptionWatchStrategy(
+    createAdoptionWatchStrategyState('session', evidenceHash), evidenceHash,
+    '2026-01-02T00:00:00.000Z', readAdoptionWatchMaterialMarkers(sessionDir),
+  ), /reuse-rejected/);
+});
+
+test('typed executor restart receipt unlocks a new epoch only after authenticated generation change', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-generation-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  const executorStatus = (generation, pid, fingerprint, lastRestartRequestId = null,
+    managerGeneration = 1, managerFingerprint = 'manager-fingerprint') => ({
+    schema_version: 1, session_id: path.basename(sessionDir), status: 'supervising',
+    manager_identity: { pid: 10, pgid: 10, start_time: 'manager', fingerprint: managerFingerprint },
+    manager_generation: managerGeneration, manager_parent_pid: 9, manager_argv_sha256: 'a'.repeat(64),
+    owner_nonce: 'owner-nonce',
+    executor_identity: { pid, pgid: pid, start_time: `executor-${generation}`, fingerprint },
+    executor_generation: generation, executor_started_at: '2026-01-01T00:00:00.000Z',
+    executor_lease_expires_at: '2026-01-01T00:01:00.000Z', executor_spec_sha256: 'c'.repeat(64),
+    replacement_count: generation - 1, last_loss_at: null, last_restart_request_id: lastRestartRequestId,
+    updated_at: '2026-01-01T00:00:00.000Z',
+  });
+  const firstStatus = executorStatus(1, process.pid, 'executor-one');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), firstStatus);
+  const routes = [];
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, random: () => 0.5, baseDelayMs: 10, maxDelayMs: 40,
+    wait: (delay) => { now += delay; },
+    executeStrategy: (strategyId) => { routes.push(strategyId); throw new Error('persistent'); },
+    readExecutorStatus: () => firstStatus,
+    requestExecutorRestart: () => {
+      writeJson(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'), { pending: true });
+      return {
+        schema_version: 1, request_id: 'restart-1', expected_generation: 1,
+        expected_executor_fingerprint: 'executor-one', reason: 'catalog exhausted',
+        requested_at: '2026-01-01T00:00:00.030Z',
+      };
+    },
+    yieldExecutor: () => { throw new Error('executor-yielded'); },
+  }), /executor-yielded/);
+  assert.equal(routes.length, 3);
+  const requested = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(requested.executor_restart_action.action, 'executor_restart_requested');
+  assert.equal(requested.executor_restart_action.request.expected_generation, 1);
+
+  fs.rmSync(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'));
+  const forgedStatus = executorStatus(2, process.pid + 1, 'executor-forged', 'restart-1', 1, 'forged-manager');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), forgedStatus);
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now,
+    readExecutorStatus: () => forgedStatus,
+    wait: () => { throw new Error('forged-successor-stop'); },
+    executeStrategy: () => assert.fail('same-generation manager drift must not unlock a new epoch'),
+  }), /forged-successor-stop/);
+  const fenced = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(fenced.strategy_state.epoch, 1);
+  assert.equal(fenced.executor_restart_action.request.request_id, 'restart-1');
+
+  const secondStatus = executorStatus(2, process.pid + 2, 'executor-two', 'restart-1', 2, 'manager-successor');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), secondStatus);
+  const resumedRoutes = [];
+  runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now,
+    readExecutorStatus: () => secondStatus,
+    executeStrategy: (strategyId) => { resumedRoutes.push(strategyId); return record('launched'); },
+  });
+  assert.deepEqual(resumedRoutes, ['standard-adopt-launch']);
+  const resumed = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(resumed.strategy_state.epoch, 2);
+  assert.equal(resumed.executor_restart_action, null);
+  assert.equal(resumed.executor_restart_history.length, 1);
+  assert.notEqual(resumed.strategy_state.history[0].material_hash,
+    requested.strategy_state.history[0].material_hash);
 });
 
 test('production strategy routes execute distinct adoption, authentication, and reconstruction operations', () => {
@@ -317,11 +441,11 @@ test('production strategy routes execute distinct adoption, authentication, and 
   let launchCalls = 0;
   let runtimeChecks = 0;
   const adopted = record('adopted');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption.json'), adopted);
   assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
     now: () => now, random: () => 0.5, baseDelayMs: 10, maxDelayMs: 40,
     adopt: () => {
       adoptCalls += 1;
-      writeJson(path.join(sessionDir, 'legacy-session-adoption.json'), adopted);
       return adopted;
     },
     chooseRuntime: () => ({ runtimeRoot: '/runtime', fallback: false }),
@@ -339,7 +463,7 @@ test('strategy history survives a crash after durable dispatch and advances on r
   let now = Date.parse('2026-01-01T00:00:00.000Z');
   assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
     now: () => now,
-    checkpoint: () => { throw new Error('simulated-hard-crash'); },
+    checkpoint: (point) => { if (point === 'strategy_persisted') throw new Error('simulated-hard-crash'); },
     executeStrategy: () => assert.fail('crash happens before execution'),
   }), /simulated-hard-crash/);
   const crashed = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
@@ -355,6 +479,301 @@ test('strategy history survives a crash after durable dispatch and advances on r
   assert.deepEqual(routes, ['authenticated-runtime-revalidation']);
   const recovered = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
   assert.deepEqual(recovered.strategy_state.history.map((entry) => entry.outcome), ['interrupted', 'launched']);
+});
+
+test('crash after material reservation but before active checkpoint advances without replay', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-reservation-crash-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now,
+    checkpoint: (point) => { if (point === 'material_reserved') throw new Error('reservation-crash'); },
+    executeStrategy: () => assert.fail('reserved route must not dispatch before its checkpoint'),
+  }), /reservation-crash/);
+  assert.equal(fs.existsSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE)), false);
+
+  const routes = [];
+  runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now,
+    executeStrategy: (strategyId) => { routes.push(strategyId); return record('launched'); },
+  });
+  assert.deepEqual(routes, ['authenticated-runtime-revalidation']);
+});
+
+test('missing ledger halves repair while a present corrupt manifest fails closed without replay', () => {
+  for (const damage of ['marker', 'manifest-delete', 'manifest-tamper']) {
+    const sessionDir = makeTempRoot(`pickle-adoption-watch-ledger-${damage}-`);
+    let now = Date.parse('2026-01-01T00:00:00.000Z');
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => { throw new Error('first-route-failed'); },
+      wait: () => { throw new Error('damage-stop'); },
+    }), /damage-stop/);
+    const markerDir = path.join(sessionDir, 'watch-materials');
+    const manifestPath = path.join(sessionDir, 'watch-material-ledger.json');
+    if (damage === 'marker') fs.unlinkSync(path.join(markerDir, fs.readdirSync(markerDir)[0]));
+    if (damage === 'manifest-delete') fs.unlinkSync(manifestPath);
+    if (damage === 'manifest-tamper') {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.root_hash = '0'.repeat(64);
+      writeJson(manifestPath, manifest);
+    }
+    now += 1_000;
+    const routes = [];
+    const resume = () => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      wait: (delay) => {
+        now += delay;
+        if (damage === 'manifest-tamper') throw new Error('corrupt-manifest-blocked');
+      },
+      executeStrategy: (strategyId) => { routes.push(strategyId); return record('launched'); },
+    });
+    if (damage === 'manifest-tamper') {
+      assert.throws(resume, /corrupt-manifest-blocked/);
+      assert.deepEqual(routes, []);
+    } else {
+      resume();
+      assert.deepEqual(routes, ['authenticated-runtime-revalidation']);
+    }
+    const status = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+    assert.equal(status.last_failure.kind,
+      damage === 'manifest-tamper' ? 'executor-restart-requested' : 'watch-status-invalid');
+  }
+});
+
+test('combined authority, manifest, and marker damage never shrinks exhausted material completeness', () => {
+  const cases = [
+    'marker-delete+manifest-root',
+    'marker-delete+manifest-delete',
+    'marker-tamper+manifest-root',
+    'authority-root+marker-delete',
+    'authority-delete+manifest-root',
+    'authority-root+marker-delete+manifest-root',
+  ];
+  for (const damage of cases) {
+    const sessionDir = makeTempRoot(`pickle-adoption-watch-combined-${damage.replaceAll('+', '-')}-`);
+    let now = Date.parse('2026-01-01T00:00:00.000Z');
+    let waits = 0;
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => { throw new Error('persistent'); },
+      wait: (delay) => { now += delay; waits += 1; if (waits === 4) throw new Error('combined-ready'); },
+    }), /combined-ready/);
+    const statusPath = path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE);
+    const manifestPath = path.join(sessionDir, 'watch-material-ledger.json');
+    const authorityPath = path.join(sessionDir, 'watch-strategy-authority.json');
+    const authority = JSON.parse(fs.readFileSync(authorityPath, 'utf8'));
+    const routeZero = authority.expected_markers.find((marker) => marker.strategy_id === 'standard-adopt-launch');
+    const markerPath = path.join(sessionDir, 'watch-materials', `${routeZero.material_hash}.json`);
+    if (damage.includes('marker-delete')) fs.unlinkSync(markerPath);
+    if (damage.includes('marker-tamper')) writeJson(markerPath, { material_hash: routeZero.material_hash, corrupt: true });
+    if (damage.includes('manifest-delete')) fs.unlinkSync(manifestPath);
+    if (damage.includes('manifest-root')) {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.root_hash = '0'.repeat(64);
+      writeJson(manifestPath, manifest);
+    }
+    if (damage.includes('authority-delete')) fs.unlinkSync(authorityPath);
+    if (damage.includes('authority-root')) {
+      const damagedAuthority = JSON.parse(fs.readFileSync(authorityPath, 'utf8'));
+      damagedAuthority.ledger_root_hash = '0'.repeat(64);
+      writeJson(authorityPath, damagedAuthority);
+    }
+    const corruptStatus = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    corruptStatus.schema_version = 999;
+    writeJson(statusPath, corruptStatus);
+    now += 1_000;
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => assert.fail(`combined damage replayed a route: ${damage}`),
+      wait: () => { throw new Error('combined-blocked'); },
+    }), /combined-blocked/);
+    const repaired = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    assert.equal(repaired.strategy_state.cursor, 3, damage);
+    assert.equal(repaired.executor_restart_action.action, 'awaiting_evidence_change', damage);
+    assert.equal(readAdoptionWatchMaterialMarkers(sessionDir).size, 3, damage);
+  }
+});
+
+test('corrupt controls plus invalid embedded tail fail closed for every deleted route marker', () => {
+  for (const deletedRoute of [0, 1, 2]) {
+    const sessionDir = makeTempRoot(`pickle-adoption-watch-tail-loss-${deletedRoute}-`);
+    let now = Date.parse('2026-01-01T00:00:00.000Z');
+    let waits = 0;
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => { throw new Error('persistent'); },
+      wait: (delay) => { now += delay; waits += 1; if (waits === 4) throw new Error('tail-ready'); },
+    }), /tail-ready/);
+    const statusPath = path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE);
+    const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    const deletedMaterial = status.strategy_state.history[deletedRoute].material_hash;
+    status.strategy_state.history[2].material_hash = '0'.repeat(64);
+    writeJson(statusPath, status);
+    fs.unlinkSync(path.join(sessionDir, 'watch-materials', `${deletedMaterial}.json`));
+    const manifestPath = path.join(sessionDir, 'watch-material-ledger.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.root_hash = '0'.repeat(64);
+    writeJson(manifestPath, manifest);
+    const authorityPath = path.join(sessionDir, 'watch-strategy-authority.json');
+    const authority = JSON.parse(fs.readFileSync(authorityPath, 'utf8'));
+    authority.ledger_root_hash = '0'.repeat(64);
+    writeJson(authorityPath, authority);
+    now += 1_000;
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => assert.fail(`route ${deletedRoute} replayed after conflicting corruption`),
+      wait: () => { throw new Error('tail-blocked'); },
+    }), /tail-blocked/);
+    const blocked = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    assert.equal(blocked.strategy_state.cursor, 3, `deleted route ${deletedRoute}`);
+    assert.equal(blocked.executor_restart_action.action, 'awaiting_evidence_change');
+    assert.equal(blocked.last_failure.kind, 'executor-restart-requested');
+  }
+});
+
+test('full control deletion cannot turn an established exhausted watcher into pristine bootstrap', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-full-control-deletion-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  let waits = 0;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => { throw new Error('persistent'); },
+    wait: (delay) => { now += delay; waits += 1; if (waits === 4) throw new Error('deletion-ready'); },
+  }), /deletion-ready/);
+  const statusPath = path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE);
+  const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  status.strategy_state.history[2].material_hash = '0'.repeat(64);
+  writeJson(statusPath, status);
+  fs.unlinkSync(path.join(sessionDir, 'watch-strategy-authority.json'));
+  fs.unlinkSync(path.join(sessionDir, 'watch-material-ledger.json'));
+  fs.rmSync(path.join(sessionDir, 'watch-materials'), { recursive: true });
+  now += 1_000;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => assert.fail('full control deletion must not replay route zero'),
+    wait: () => { throw new Error('deletion-blocked'); },
+  }), /deletion-blocked/);
+  const blocked = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  assert.equal(blocked.strategy_state.cursor, 3);
+  assert.equal(blocked.executor_restart_action.action, 'awaiting_evidence_change');
+});
+
+test('invalid status with absent controls is established corruption, while a pristine session bootstraps', () => {
+  const established = makeTempRoot('pickle-adoption-watch-invalid-status-no-controls-');
+  writeJson(path.join(established, LEGACY_ADOPTION_WATCH_STATUS_FILE), { schema_version: 999, prior_run: true });
+  assert.throws(() => runLegacyAdoptionWatch(args(established), {
+    executeStrategy: () => assert.fail('invalid established status must not bootstrap'),
+    wait: () => { throw new Error('established-blocked'); },
+  }), /established-blocked/);
+  const blocked = JSON.parse(fs.readFileSync(path.join(established, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(blocked.strategy_state.cursor, 3);
+
+  const pristine = makeTempRoot('pickle-adoption-watch-true-pristine-');
+  const routes = [];
+  runLegacyAdoptionWatch(args(pristine), {
+    executeStrategy: (strategyId) => { routes.push(strategyId); return record('launched'); },
+  });
+  assert.deepEqual(routes, ['standard-adopt-launch']);
+});
+
+test('orphaned terminal archive or restart-request indicators prevent clean bootstrap', () => {
+  for (const indicator of ['terminal-archive', 'restart-request']) {
+    const sessionDir = makeTempRoot(`pickle-adoption-watch-orphan-${indicator}-`);
+    if (indicator === 'terminal-archive') {
+      fs.mkdirSync(path.join(sessionDir, 'watch-terminal-recovery'));
+      writeJson(path.join(sessionDir, 'watch-terminal-recovery', `${'a'.repeat(64)}.json`), { orphaned: true });
+    } else {
+      writeJson(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'), { orphaned: true });
+    }
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      executeStrategy: () => assert.fail(`${indicator} must prevent clean bootstrap`),
+      wait: () => { throw new Error('indicator-blocked'); },
+    }), /indicator-blocked/);
+    const blocked = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+    assert.equal(blocked.strategy_state.cursor, 3);
+  }
+});
+
+test('corrupt watch status plus migration-only evidence cannot bypass durable exhausted authority', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-corrupt-transition-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  let waits = 0;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => { throw new Error('persistent'); },
+    wait: (delay) => { now += delay; waits += 1; if (waits === 4) throw new Error('exhausted-stop'); },
+  }), /exhausted-stop/);
+  const statusPath = path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE);
+  const corrupt = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  corrupt.schema_version = 999;
+  writeJson(statusPath, corrupt);
+  writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), { changed_without_restart: true });
+  now += 1_000;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    executeStrategy: () => assert.fail('corruption must not authorize strategy replay'),
+    wait: () => { throw new Error('blocked-stop'); },
+  }), /blocked-stop/);
+  const repaired = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  assert.equal(repaired.strategy_state.cursor, 3);
+  assert.equal(repaired.strategy_state.epoch, 1);
+});
+
+test('deleted or root-tampered authority plus invalid status reconstructs reserved evidence without replay', () => {
+  for (const damage of ['delete', 'root-tamper']) {
+    const sessionDir = makeTempRoot(`pickle-adoption-watch-authority-${damage}-`);
+    let now = Date.parse('2026-01-01T00:00:00.000Z');
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      executeStrategy: () => { throw new Error('route-zero-failed'); },
+      wait: () => { throw new Error('authority-stop'); },
+    }), /authority-stop/);
+    const statusPath = path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE);
+    const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    status.schema_version = 999;
+    writeJson(statusPath, status);
+    const authorityPath = path.join(sessionDir, 'watch-strategy-authority.json');
+    if (damage === 'delete') fs.unlinkSync(authorityPath);
+    else {
+      const authority = JSON.parse(fs.readFileSync(authorityPath, 'utf8'));
+      authority.ledger_root_hash = '0'.repeat(64);
+      writeJson(authorityPath, authority);
+    }
+    writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), { unauthenticated_change: damage });
+    now += 1_000;
+    assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+      now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+      wait: () => { throw new Error('transition-blocked'); },
+      executeStrategy: () => assert.fail('unauthenticated evidence transition must not dispatch'),
+    }), /transition-blocked/);
+    const repaired = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    assert.equal(repaired.strategy_state.cursor, 3);
+    assert.equal(repaired.executor_restart_action.action, 'awaiting_evidence_change');
+  }
+});
+
+test('real archive ref eviction plus old marker unlink still cannot replay old material', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-real-eviction-');
+  const refs = [];
+  let oldestAttempt;
+  for (let index = 0; index < 17; index += 1) {
+    const evidence = index.toString(16).padStart(64, '0');
+    const startedAt = new Date(Date.parse('2026-01-01T00:00:00.000Z') + index).toISOString();
+    let state = createAdoptionWatchStrategyState('session', evidence);
+    const begun = beginAdoptionWatchStrategy(state, evidence, startedAt);
+    if (index === 0) oldestAttempt = begun.attempt;
+    recordAdoptionWatchMaterialMarker(sessionDir, begun.attempt);
+    state = finishAdoptionWatchStrategy(begun.state, 'launched', null, startedAt);
+    refs.push(archiveAdoptionWatchTerminalState(sessionDir, state, evidence, startedAt));
+  }
+  const retained = refs.slice(-16);
+  assert.equal(retained.some((ref) => ref.path === refs[0].path), false);
+  fs.unlinkSync(path.join(sessionDir, 'watch-materials', `${oldestAttempt.material_hash}.json`));
+  assert.ok(readAdoptionWatchMaterialMarkers(sessionDir).has(oldestAttempt.material_hash));
+  assert.throws(() => beginAdoptionWatchStrategy(
+    createAdoptionWatchStrategyState('session', oldestAttempt.evidence_hash), oldestAttempt.evidence_hash,
+    '2026-02-01T00:00:00.000Z', readAdoptionWatchMaterialMarkers(sessionDir),
+  ), /reuse-rejected/);
 });
 
 test('tampered strategy material is rejected and replaced with recoverable bounded state', () => {
@@ -378,7 +797,8 @@ test('tampered strategy material is rejected and replaced with recoverable bound
   const repaired = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
   assert.deepEqual(waits, [10]);
   assert.equal(repaired.last_failure.kind, 'watch-status-invalid');
-  assert.equal(repaired.strategy_state.history.length, 1);
+  assert.equal(repaired.strategy_state.history.length, 2);
+  assert.equal(repaired.strategy_state.history[0].outcome, 'failed');
 });
 
 test('semantic replay rejects fully rehashed duplicate, reordered, and skipped strategies', () => {
@@ -408,17 +828,23 @@ test('semantic replay rejects rehashed forged epoch, seed, and cursor heads', ()
     const forged = structuredClone(strategyFailures(2));
     mutate(forged);
     rehashForgedStrategyState(forged);
-    assert.match(validateAdoptionWatchStrategyState(forged), /semantic history replay/);
+    assert.match(validateAdoptionWatchStrategyState(forged), /semantic history replay|strategy history entry/);
   }
 });
 
-test('semantic base checkpoint validates a long history after bounded truncation', () => {
-  const state = strategyFailures(100);
-  assert.equal(state.history.length, 64);
-  assert.equal(state.history_base_checkpoint.sequence, 36);
-  assert.equal(state.epoch, 34);
-  assert.equal(state.cursor, 1);
+test('constant evidence cannot produce a fourth attempt or an artificial next epoch', () => {
+  const state = strategyFailures(3);
+  assert.equal(state.epoch, 1);
+  assert.equal(state.cursor, 3);
   assert.equal(validateAdoptionWatchStrategyState(state), null);
+  assert.throws(() => beginAdoptionWatchStrategy(
+    state, 'a'.repeat(64), '2026-01-01T00:00:04.000Z',
+  ), /catalog-exhausted/);
+  const forged = structuredClone(state);
+  forged.epoch = 2;
+  forged.cursor = 0;
+  rehashForgedStrategyState(forged);
+  assert.match(validateAdoptionWatchStrategyState(forged), /semantic history replay/);
 });
 
 test('begin refuses a launched semantic state with unchanged or changed evidence', () => {

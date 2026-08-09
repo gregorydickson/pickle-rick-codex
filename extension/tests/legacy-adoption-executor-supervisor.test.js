@@ -7,6 +7,9 @@ import { spawn } from 'node:child_process';
 import { makeTempRoot, writeJson } from './helpers.js';
 import {
   LEGACY_ADOPTION_EXECUTOR_FILE,
+  LEGACY_ADOPTION_EXECUTOR_RESTART_FILE,
+  LEGACY_ADOPTION_EXECUTOR_RESTART_REJECTED_FILE,
+  requestLegacyAdoptionExecutorRestart,
   runLegacyAdoptionExecutorSupervisor,
 } from '../services/legacy-adoption-executor-supervisor.js';
 import { prepareLiveSessionMigration, verifyLiveSessionMigration } from '../services/live-session-migration.js';
@@ -53,7 +56,60 @@ test('dead adoption executor is exclusively replaced and converges without insta
   assert.equal(result.status, 'launched');
   assert.deepEqual(spawned, [71000, 71001]);
   assert.equal(result.executor_generation, 2);
+  assert.equal(result.manager_generation, 1);
   assert.equal(result.replacement_count, 1);
+});
+
+test('authenticated strategy restart request is acknowledged by the next executor generation', () => {
+  const value = fixture();
+  let nextPid = 75000;
+  let outcome = 'running';
+  let request = null;
+  const result = runLegacyAdoptionExecutorSupervisor(spec(value), {
+    managerIdentity: identity(70020), spawnExecutor: () => nextPid++, capture: (pid) => identity(pid),
+    inspect: () => 'matched', wait: () => undefined, outcome: () => outcome,
+    reap: (owner) => ({ status: 'reaped', pid: owner.pid, pgid: owner.pgid, reason: 'requested', signals: ['SIGTERM'] }),
+    onIteration: (status) => {
+      if (status.executor_generation === 1 && !request) {
+        request = requestLegacyAdoptionExecutorRestart(value.sessionDir, 'strategy changed');
+      } else if (status.executor_generation === 2) outcome = 'launched';
+    },
+  });
+  assert.equal(result.executor_generation, 2);
+  assert.equal(result.manager_generation, 1);
+  assert.equal(result.last_restart_request_id, request.request_id);
+  assert.equal(result.replacement_count, 1);
+});
+
+test('stale mismatched restart request is quarantined without replacing the live executor', () => {
+  const value = fixture();
+  let iterations = 0;
+  let outcome = 'running';
+  const reaped = [];
+  const result = runLegacyAdoptionExecutorSupervisor(spec(value), {
+    managerIdentity: identity(70021), spawnExecutor: () => 75100, capture: (pid) => identity(pid),
+    inspect: () => 'matched', wait: () => undefined, outcome: () => outcome,
+    reap: (owner) => {
+      reaped.push(owner.pid);
+      return { status: 'reaped', pid: owner.pid, pgid: owner.pgid, reason: 'terminal', signals: ['SIGTERM'] };
+    },
+    onIteration: (status) => {
+      iterations += 1;
+      if (iterations === 1) {
+        writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE), {
+          schema_version: 1, request_id: 'stale-request', expected_generation: status.executor_generation - 1,
+          expected_executor_fingerprint: 'foreign-fingerprint', reason: 'stale', requested_at: new Date().toISOString(),
+        });
+      } else outcome = 'launched';
+    },
+  });
+  assert.equal(result.executor_generation, 1);
+  assert.equal(result.replacement_count, 0);
+  assert.deepEqual(reaped, [75100]);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE)), false);
+  const rejected = JSON.parse(fs.readFileSync(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_REJECTED_FILE), 'utf8'));
+  assert.equal(rejected.request_id, 'stale-request');
+  assert.match(rejected.rejection_reason, /authenticated executor generation/);
 });
 
 test('real killed watchdog executor is automatically replaced and reaches launch without installer rerun', () => {
@@ -113,6 +169,7 @@ test('expired executor is reaped on supervisor restart before one replacement is
   });
   assert.deepEqual(reaped, [72000, 72001]);
   assert.equal(result.executor_generation, 2);
+  assert.equal(result.manager_generation, 2);
   assert.equal(result.replacement_count, 1);
 });
 
