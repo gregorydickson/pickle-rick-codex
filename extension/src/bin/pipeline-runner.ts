@@ -41,6 +41,7 @@ import {
 import { normalizeVerificationSteps } from '../services/verification-env.js';
 import { reconcileVerificationRepairTransaction } from '../services/verification-seal-contract.js';
 import { normalizeTicketId } from '../services/tickets.js';
+import { repairCitadelReviewerArtifactContract } from '../services/citadel-reviewer-recovery.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
   enqueueCitadelRemediationResult,
@@ -62,6 +63,7 @@ interface RunPipelineOptions {
   runCitadel?: typeof runCitadel;
   repairCitadelAttribution?: typeof repairCitadelAttribution;
   repairTicketVerificationContract?: typeof repairTicketVerificationContract;
+  repairCitadelReviewerArtifactContract?: typeof repairCitadelReviewerArtifactContract;
   runDeterministicRecoveryDiagnostic?: typeof runDeterministicRecoveryDiagnostic;
   [key: string]: unknown;
 }
@@ -212,6 +214,8 @@ async function runPipelineWithLease(
   const runCitadelFn = options.runCitadel ?? runCitadel;
   const repairAttributionFn = options.repairCitadelAttribution ?? repairCitadelAttribution;
   const repairVerificationContractFn = options.repairTicketVerificationContract ?? repairTicketVerificationContract;
+  const repairReviewerContractFn = options.repairCitadelReviewerArtifactContract
+    ?? repairCitadelReviewerArtifactContract;
   const repairSystemVerification = async (
     systemBlock: NonNullable<ReturnType<typeof readCitadelSystemBlock>>,
   ): Promise<void> => {
@@ -279,6 +283,15 @@ async function runPipelineWithLease(
         await repairSystemVerification(pendingSystemBlock);
         appendRunnerLog(sessionDir, 'Re-entered durable Citadel verification-contract repair before phase dispatch.');
       }
+    }
+    if (pendingSystemBlock?.recovery_action === 'repair_reviewer_artifact_contract') {
+      const recovery = await repairReviewerContractFn(sessionDir, pendingSystemBlock, {
+        timeoutMs: Number(options.timeoutMs) || undefined,
+        assertDurableOwnership: options.assertDurableOwnership,
+      });
+      options.assertDurableOwnership?.();
+      if (recovery.kind === 'recovery_scheduled') return 'citadel_system_recovery_scheduled';
+      appendRunnerLog(sessionDir, `Recovered durable Citadel reviewer contract diagnostic ${recovery.diagnostic_identity} before phase dispatch.`);
     }
     if (reconcileCitadelRemediation(sessionDir)) {
       pipelineState = ensurePipelineState(sessionDir, pipeline);
@@ -384,6 +397,18 @@ async function runPipelineWithLease(
           resetPipelineForAutonomousRemediation(sessionDir, systemBlock.title);
           pipelineState = ensurePipelineState(sessionDir, pipeline);
           await repairSystemVerification(systemBlock);
+          nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
+          continue;
+        }
+        if (systemBlock.recovery_action === 'repair_reviewer_artifact_contract') {
+          const recovery = await repairReviewerContractFn(sessionDir, systemBlock, {
+            timeoutMs: Number(options.timeoutMs) || undefined,
+            assertDurableOwnership: options.assertDurableOwnership,
+          });
+          options.assertDurableOwnership?.();
+          if (recovery.kind === 'recovery_scheduled') return 'citadel_system_recovery_scheduled';
+          appendRunnerLog(sessionDir, `Resolved Citadel reviewer contract diagnostic ${recovery.diagnostic_identity}; retrying Citadel.`);
+          pipelineState = ensurePipelineState(sessionDir, pipeline);
           nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
           continue;
         }

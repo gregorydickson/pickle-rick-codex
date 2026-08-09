@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import {
@@ -711,10 +712,13 @@ const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
 const countPath = path.join(path.dirname(path.dirname(reportPath)), '..', 'citadel-review-count');
 const count = fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, 'utf8')) + 1 : 1;
 fs.writeFileSync(countPath, String(count));
+if (prompt.includes('Closed reviewer execution mechanism:')) {
+  fs.writeFileSync(path.join(path.dirname(path.dirname(reportPath)), '..', 'citadel-recovery-prompt-' + count + '.txt'), prompt);
+}
 let findings = [];
 if (mode.includes('malformed once') && count === 1) findings = {};
 if (mode.includes('repeated malformed') && !prompt.includes('strict-minimal-json')) findings = {};
-if (mode.includes('catalog exhaustion')) findings = {};
+if (mode.includes('catalog exhaustion') && !prompt.includes('artifact-contract-reconstruction')) findings = {};
 if (mode.includes('oversize artifact')) findings = ['x'.repeat(1024 * 1024 + 1)];
 if (mode.includes('substantive block')) findings = [{
   severity: 'high',
@@ -927,14 +931,12 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
       assert.equal(catalogState.status, 'exhausted');
     }
     assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '10');
-    await assert.rejects(
-      () => runCitadel(catalog.sessionDir),
-      /no unused material reviewer strategy remains/i,
-    );
+    assert.equal(await runCitadel(catalog.sessionDir), 'citadel-system-blocked');
     assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '10');
     const catalogState = JSON.parse(fs.readFileSync(
       path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
     ));
+    assert.equal(catalogState.status, 'diagnostic_scheduled');
     assert.equal(catalogState.attempts.length, 10);
     assert.equal(new Set(catalogState.attempts.map((entry) => entry.strategy_id)).size, 5);
     assert.equal(new Set(catalogState.attempts.map((entry) => entry.material_strategy_hash)).size, 5);
@@ -956,6 +958,181 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
       catalogTelemetry.map((event) => event.strategy_hash),
       catalogState.attempts.map((entry) => entry.strategy_hash),
     );
+    const catalogBlock = readCitadelSystemBlock(catalog.sessionDir);
+    assert.equal(catalogBlock.code, 'reviewer_artifact_strategy_exhausted');
+    assert.equal(catalogBlock.recovery_action, 'repair_reviewer_artifact_contract');
+    assert.equal(catalogBlock.next_action, 'retry_phase');
+    assert.match(catalogBlock.evidence, /all bounded reviewer artifact strategies are exhausted/i);
+    assert.match(catalogBlock.evidence, /findings must be an array/i);
+    assert.equal(catalogBlock.checks.some((check) => check.status === 'passed'), true);
+    const priorMaterialHashes = new Set(catalogState.attempts.map((attempt) => attempt.material_strategy_hash));
+    const failedCandidateHashes = catalogState.attempts.map((attempt) => attempt.candidate_hash);
+    assert.equal(failedCandidateHashes.every((candidateHash) => /^[a-f0-9]{64}$/.test(candidateHash)), true);
+    const diagnosticPath = path.join(catalog.sessionDir, 'citadel-reviewer-artifact-contract-diagnostic.json');
+    fs.writeFileSync(diagnosticPath, JSON.stringify({ mechanism: 'schema_scaffold_replay' }));
+    const runtimeDir = path.join(
+      catalog.sessionDir, 'citadel-reviewer-contract-runtime', 'd'.repeat(64),
+    );
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    const scaffoldPath = path.join(runtimeDir, 'citadel-report-scaffold.json');
+    const validatorPath = path.join(runtimeDir, 'validate-citadel-candidate.mjs');
+    const manifestPath = path.join(runtimeDir, 'runtime-manifest.json');
+    const expectedCriteria = deriveCitadelAcceptanceCriteria(catalog.sessionDir);
+    fs.writeFileSync(scaffoldPath, JSON.stringify({
+      schema_version: 1,
+      verdict: '<approve-or-block>',
+      reviewed_range: catalogBlock.reviewed_range,
+      acceptance_criteria_checked: expectedCriteria,
+      findings: [],
+      generated_at: '<ISO-8601 timestamp>',
+    }));
+    fs.writeFileSync(validatorPath, [
+      "import fs from 'node:fs';",
+      `const expectedRange = ${JSON.stringify(catalogBlock.reviewed_range)};`,
+      `const expectedCriteria = ${JSON.stringify(expectedCriteria)};`,
+      "const value = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));",
+      "if (value.reviewed_range !== expectedRange) throw new Error('reviewed range drift');",
+      "if (JSON.stringify(value.acceptance_criteria_checked) !== JSON.stringify(expectedCriteria)) throw new Error('criteria drift');",
+      "if (!Array.isArray(value.findings)) throw new Error('findings must be an array');",
+    ].join('\n'));
+    const digest = (filePath) => crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+      schema_version: 1,
+      mechanism: 'schema_scaffold_replay',
+      diagnostic_identity: 'd'.repeat(64),
+      scaffold: { path: scaffoldPath, sha256: digest(scaffoldPath) },
+      evidence_bundle: null,
+      validator: { path: validatorPath, sha256: digest(validatorPath) },
+    }));
+    catalogState.recovery_epoch += 1;
+    catalogState.strategy_id = 'artifact-contract-reconstruction';
+    catalogState.status = 'running';
+    catalogState.artifact_contract_recovery = {
+      schema_version: 1,
+      status: 'resolved',
+      diagnostic_identity: 'd'.repeat(64),
+      artifact_path: diagnosticPath,
+      instruction: 'Construct the canonical report from a strict schema scaffold before serializing findings.',
+      resolved_at: new Date().toISOString(),
+      mechanism: 'schema_scaffold_replay',
+      failed_candidate_hashes: failedCandidateHashes,
+      validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
+      mechanism_history: ['schema_scaffold_replay'],
+      runtime_artifacts: {
+        schema_version: 1,
+        mechanism: 'schema_scaffold_replay',
+        scaffold_path: scaffoldPath,
+        evidence_bundle_path: null,
+        manifest_path: manifestPath,
+        validator_path: validatorPath,
+        validator_command: `node ${JSON.stringify(validatorPath)} <candidate-path>`,
+      },
+    };
+    fs.writeFileSync(path.join(catalog.sessionDir, 'citadel-review-state.json'), JSON.stringify(catalogState));
+    assert.equal(await runCitadel(catalog.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '11');
+    const reconstructedState = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    assert.equal(reconstructedState.status, 'accepted');
+    assert.equal(reconstructedState.attempts.length, 11);
+    assert.equal(reconstructedState.attempts.at(-1).strategy_id, 'artifact-contract-reconstruction');
+    assert.equal(priorMaterialHashes.has(reconstructedState.attempts.at(-1).material_strategy_hash), false);
+    const reconstructedAttempt = reconstructedState.attempts.at(-1);
+    assert.equal(reconstructedAttempt.recovery_mechanism, 'schema_scaffold_replay');
+    const attemptRuntimeDir = path.join(path.dirname(reconstructedAttempt.candidate_path), 'artifact-contract-runtime');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(attemptRuntimeDir, 'citadel-report-scaffold.json'), 'utf8')),
+      JSON.parse(fs.readFileSync(scaffoldPath, 'utf8')),
+    );
+    const validatorEvidence = JSON.parse(fs.readFileSync(reconstructedAttempt.validator_evidence_path, 'utf8'));
+    assert.equal(validatorEvidence.exit_code, 0);
+    assert.equal(validatorEvidence.mechanism, 'schema_scaffold_replay');
+    assert.equal(validatorEvidence.candidate_hash, reconstructedAttempt.candidate_hash);
+    const attempt11Prompt = fs.readFileSync(path.join(catalog.sessionDir, 'citadel-recovery-prompt-11.txt'), 'utf8');
+    assert.match(attempt11Prompt, /Closed reviewer execution mechanism: schema_scaffold_replay/);
+    assert.match(attempt11Prompt, /candidate path is preseeded.*canonical exact-range\/exact-criteria scaffold/i);
+    assert.match(attempt11Prompt, /Deterministic validator invocation: node/);
+    assert.match(attempt11Prompt, /persists deterministic validator evidence/);
+    assert.doesNotMatch(attempt11Prompt, /Construct the canonical report from a strict schema scaffold before serializing findings/);
+
+    const evidenceDiagnosticIdentity = 'e'.repeat(64);
+    const evidenceRuntimeDir = path.join(
+      catalog.sessionDir, 'citadel-reviewer-contract-runtime', evidenceDiagnosticIdentity,
+    );
+    fs.mkdirSync(evidenceRuntimeDir, { recursive: true });
+    const evidenceBundlePath = path.join(evidenceRuntimeDir, 'evidence-bundle.json');
+    const evidenceValidatorPath = path.join(evidenceRuntimeDir, 'validate-citadel-candidate.mjs');
+    const evidenceManifestPath = path.join(evidenceRuntimeDir, 'runtime-manifest.json');
+    fs.writeFileSync(evidenceBundlePath, JSON.stringify({
+      schema_version: 1,
+      review_identity: reconstructedState.review_identity,
+      diagnostic_identity: evidenceDiagnosticIdentity,
+      reviewed_range: catalogBlock.reviewed_range,
+      acceptance_criteria: expectedCriteria,
+      deterministic_checks: catalogBlock.checks,
+      failed_candidate_hashes: failedCandidateHashes,
+      validation_failures: reconstructedState.attempts.map((attempt) => ({
+        ordinal: attempt.ordinal,
+        candidate_hash: attempt.candidate_hash || null,
+        validation_error: attempt.validation_error || null,
+      })),
+      validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
+    }));
+    fs.copyFileSync(validatorPath, evidenceValidatorPath);
+    fs.writeFileSync(evidenceManifestPath, JSON.stringify({
+      schema_version: 1,
+      mechanism: 'evidence_bundle_reconstruction',
+      diagnostic_identity: evidenceDiagnosticIdentity,
+      scaffold: null,
+      evidence_bundle: { path: evidenceBundlePath, sha256: digest(evidenceBundlePath) },
+      validator: { path: evidenceValidatorPath, sha256: digest(evidenceValidatorPath) },
+    }));
+    reconstructedState.recovery_epoch += 1;
+    reconstructedState.status = 'running';
+    reconstructedState.attempts.at(-1).status = 'accepted';
+    reconstructedState.artifact_contract_recovery = {
+      schema_version: 1,
+      status: 'resolved',
+      diagnostic_identity: evidenceDiagnosticIdentity,
+      artifact_path: diagnosticPath,
+      instruction: 'Free-form prose must not establish this recovery mechanism.',
+      resolved_at: new Date().toISOString(),
+      mechanism: 'evidence_bundle_reconstruction',
+      failed_candidate_hashes: failedCandidateHashes,
+      validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
+      mechanism_history: ['schema_scaffold_replay', 'evidence_bundle_reconstruction'],
+      runtime_artifacts: {
+        schema_version: 1,
+        mechanism: 'evidence_bundle_reconstruction',
+        scaffold_path: null,
+        evidence_bundle_path: evidenceBundlePath,
+        manifest_path: evidenceManifestPath,
+        validator_path: evidenceValidatorPath,
+        validator_command: `node ${JSON.stringify(evidenceValidatorPath)} <candidate-path>`,
+      },
+    };
+    fs.rmSync(path.join(catalog.sessionDir, 'citadel-report.json'), { force: true });
+    fs.writeFileSync(path.join(catalog.sessionDir, 'citadel-review-state.json'), JSON.stringify(reconstructedState));
+    assert.equal(await runCitadel(catalog.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '12');
+    const bundleState = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    const bundleAttempt = bundleState.attempts.at(-1);
+    assert.equal(bundleAttempt.recovery_mechanism, 'evidence_bundle_reconstruction');
+    assert.notEqual(bundleAttempt.material_strategy_hash, reconstructedAttempt.material_strategy_hash);
+    const bundleAttemptDir = path.join(path.dirname(bundleAttempt.candidate_path), 'artifact-contract-runtime');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(bundleAttemptDir, 'evidence-bundle.json'), 'utf8')),
+      JSON.parse(fs.readFileSync(evidenceBundlePath, 'utf8')),
+    );
+    assert.equal(JSON.parse(fs.readFileSync(bundleAttempt.validator_evidence_path, 'utf8')).exit_code, 0);
+    const attempt12Prompt = fs.readFileSync(path.join(catalog.sessionDir, 'citadel-recovery-prompt-12.txt'), 'utf8');
+    assert.match(attempt12Prompt, /Closed reviewer execution mechanism: evidence_bundle_reconstruction/);
+    assert.match(attempt12Prompt, /immutable deterministic evidence bundle/);
+    assert.match(attempt12Prompt, /exact checks, failed-candidate hashes, validation failures, range, criteria/i);
+    assert.doesNotMatch(attempt12Prompt, /Free-form prose must not establish this recovery mechanism/);
 
     for (const criterion of ['oversize artifact is rejected', 'symlink artifact is rejected']) {
       const unsafe = makeCitadelLifecycleSession(criterion);

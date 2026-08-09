@@ -241,7 +241,29 @@ function writeLifecycleArtifact(phase) {
   }
 }
 
-if (prompt.includes('You are the autonomous Citadel finding attribution repair worker')) {
+if (prompt.includes('You are the autonomous Citadel reviewer artifact-contract recovery worker')) {
+  const recoveryDelayMs = Number(process.env.FAKE_REVIEWER_RECOVERY_DELAY_MS || '0');
+  if (recoveryDelayMs > 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, recoveryDelayMs);
+  }
+  const artifactPath = extractPathAfter('Write the strict recovery artifact to: ');
+  const reviewIdentity = extractPathAfter('Review identity: ');
+  const diagnosticIdentity = extractPathAfter('Diagnostic identity: ');
+  const mechanism = extractPathAfter('Closed recovery mechanism: ');
+  const failedCandidateHashes = JSON.parse(extractPathAfter('Exact failed candidate hashes JSON: '));
+  const validatorInvariants = JSON.parse(extractPathAfter('Exact validator invariants JSON: '));
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    diagnostic_identity: diagnosticIdentity,
+    mechanism,
+    failed_candidate_hashes: failedCandidateHashes,
+    validator_invariants: validatorInvariants,
+    instruction: 'Rebuild the report from the canonical schema scaffold, then validate every bound invariant against the preserved failed candidates before writing.',
+    rationale: 'The failed candidate hashes and validator invariants identify a repeatable artifact-contract construction failure.',
+  }, null, 2));
+  lastMessage = '<promise>CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE</promise>';
+} else if (prompt.includes('You are the autonomous Citadel finding attribution repair worker')) {
   const contextPath = extractPathAfter('Isolated read-only attribution context: ');
   const artifactPath = extractPathAfter('Write the attribution artifact to: ');
   const context = JSON.parse(fs.readFileSync(contextPath, 'utf8'));

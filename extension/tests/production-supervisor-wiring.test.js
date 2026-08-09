@@ -14,7 +14,7 @@ import {
   pipelineExitFailed,
   runPipeline,
 } from '../bin/pipeline-runner.js';
-import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { DurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import {
   acceptRuntimeHandoff,
   acquireSupervisorLease,
@@ -57,6 +57,7 @@ import { PreflightError } from '../services/verification-env.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { buildTicketPhasePrompt } from '../services/prompts.js';
 import { reconcileCitadelAttributionRepair, repairCitadelAttribution } from '../services/citadel-remediation.js';
+import { repairCitadelReviewerArtifactContract } from '../services/citadel-reviewer-recovery.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -1007,6 +1008,54 @@ test('standalone mux converges across restart after exact-owner deterministic re
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
 });
 
+test('standalone mux consumes reviewer artifact-contract recovery and retries Citadel', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  let citadelRuns = 0;
+  let recoveryCalls = 0;
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runCitadel: async (dir) => {
+      citadelRuns += 1;
+      if (citadelRuns === 1) {
+        writeCitadelSystemBlock(dir, {
+          code: 'reviewer_artifact_strategy_exhausted',
+          title: 'Citadel reviewer artifact strategies require contract reconstruction',
+          evidence: `All bounded reviewer artifact strategies are exhausted for review ${'a'.repeat(64)}.`,
+          recommendation: 'Run a strict artifact-contract diagnostic.',
+          recovery_action: 'repair_reviewer_artifact_contract',
+          recovery_ticket_ids: [],
+        });
+        return 'citadel-system-blocked';
+      }
+      return await approveCitadelFixture(dir);
+    },
+    repairCitadelReviewerArtifactContract: async (dir) => {
+      recoveryCalls += 1;
+      writeJson(path.join(dir, 'citadel-review-state.json'), {
+        schema_version: 1,
+        review_identity: 'a'.repeat(64),
+        recovery_epoch: 6,
+        strategy_id: 'artifact-contract-reconstruction',
+        strategy_hash: '',
+        status: 'running',
+        attempts: [],
+        artifact_contract_recovery: { status: 'resolved' },
+        updated_at: new Date().toISOString(),
+      });
+      return { kind: 'resolved', diagnostic_identity: 'd'.repeat(64) };
+    },
+  });
+
+  assert.equal(result, 'success');
+  assert.equal(citadelRuns, 2);
+  assert.equal(recoveryCalls, 1);
+  assert.match(
+    fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'),
+    /Resolved Citadel reviewer contract diagnostic/,
+  );
+});
+
 test('pipeline routes Citadel PRD-contract system blocks to the authorized human boundary', async () => {
   const { sessionDir, workingDir } = createAcceptedSession('Done');
   initializePrdDevelopmentPipeline(sessionDir);
@@ -1219,6 +1268,372 @@ test('pipeline re-enters durable sealed verification repair after a crash before
     fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8'),
     /Re-entered durable Citadel verification-contract repair before phase dispatch/,
   );
+});
+
+test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted strategy epochs', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'recover the Citadel reviewer artifact contract beyond its fixed strategy catalog',
+  }));
+  ensurePipelineState(sessionDir);
+  const reviewIdentity = 'a'.repeat(64);
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 5,
+    strategy_id: 'adversarial-two-pass',
+    strategy_hash: 'b'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: Array.from({ length: 10 }, (_, index) => ({
+      ordinal: index + 1,
+      epoch: Math.floor(index / 2) + 1,
+      attempt: index % 2 + 1,
+      candidate_path: path.join(sessionDir, `invalid-${index + 1}.json`),
+      candidate_hash: (index + 1).toString(16).padStart(64, '0'),
+      status: 'rejected',
+      strategy_id: `catalog-${Math.floor(index / 2) + 1}`,
+      material_strategy_hash: (index + 11).toString(16).padStart(64, '0'),
+      strategy_hash: (index + 21).toString(16).padStart(64, '0'),
+      retry_feedback: 'findings must be an array',
+      validation_error: 'findings must be an array',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    })),
+    updated_at: new Date().toISOString(),
+  });
+  const fakeBin = makeTempRoot('production-supervisor-reviewer-recovery-bin-');
+  const dataRoot = makeTempRoot('production-supervisor-reviewer-recovery-data-');
+  const invocationLog = path.join(sessionDir, 'reviewer-recovery-invocations.jsonl');
+  createFakeCodex(fakeBin);
+  const environment = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+  });
+  let citadelRuns = 0;
+  const runCitadel = async (dir) => {
+    citadelRuns += 1;
+    if (citadelRuns === 1) {
+      writeCitadelSystemBlock(dir, {
+        code: 'reviewer_artifact_strategy_exhausted',
+        title: 'Citadel reviewer artifact strategies require contract reconstruction',
+        evidence: `All bounded reviewer artifact strategies are exhausted for review ${reviewIdentity}.\nLast validation failure: findings must be an array`,
+        recommendation: 'Run a strict artifact-contract diagnostic.',
+        recovery_action: 'repair_reviewer_artifact_contract',
+        recovery_ticket_ids: [],
+        attempt: 1,
+        recovery_epoch: 1,
+        bounded_attempt: 1,
+        next_action: 'retry_phase',
+      });
+      return 'citadel-system-blocked';
+    }
+    const recovered = JSON.parse(fs.readFileSync(path.join(dir, 'citadel-review-state.json'), 'utf8'));
+    if (citadelRuns === 2) {
+      assert.equal(recovered.recovery_epoch, 6);
+      assert.equal(recovered.strategy_id, 'artifact-contract-reconstruction');
+      assert.equal(recovered.artifact_contract_recovery.mechanism, 'schema_scaffold_replay');
+      assert.equal(recovered.artifact_contract_recovery.failed_candidate_hashes.length, 10);
+      const runtime = recovered.artifact_contract_recovery.runtime_artifacts;
+      assert.equal(fs.existsSync(runtime.scaffold_path), true);
+      assert.equal(fs.existsSync(runtime.validator_path), true);
+      assert.equal(fs.existsSync(runtime.manifest_path), true);
+      const validatorCandidate = path.join(dir, 'reviewer-validator-candidate.json');
+      writeJson(validatorCandidate, {
+        schema_version: 1,
+        verdict: 'approve',
+        reviewed_range: 'fixture..HEAD',
+        acceptance_criteria_checked: deriveCitadelAcceptanceCriteria(dir),
+        findings: [],
+        generated_at: new Date().toISOString(),
+      });
+      execFileSync(process.execPath, [runtime.validator_path, validatorCandidate]);
+      fs.rmSync(validatorCandidate, { force: true });
+      recovered.status = 'diagnostic_scheduled';
+      recovered.attempts.push(...[101, 102].map((ordinal) => ({
+        ordinal,
+        epoch: 6,
+        attempt: ordinal - 100,
+        candidate_path: path.join(dir, `failed-reconstruction-${ordinal}.json`),
+        candidate_hash: ordinal.toString(16).padStart(64, '0'),
+        status: 'rejected',
+        strategy_id: 'artifact-contract-reconstruction',
+        material_strategy_hash: 'c'.repeat(64),
+        strategy_hash: ordinal.toString(16).padStart(64, '0'),
+        retry_feedback: 'reconstructed candidate still violates the canonical schema',
+        validation_error: 'reconstructed candidate still violates the canonical schema',
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      })));
+      writeJson(path.join(dir, 'citadel-review-state.json'), recovered);
+      writeCitadelSystemBlock(dir, {
+        code: 'reviewer_artifact_strategy_exhausted',
+        title: 'Citadel reviewer artifact reconstruction requires a new mechanism',
+        evidence: `Schema-scaffold reconstruction failed for review ${reviewIdentity}.`,
+        recommendation: 'Use the next unused closed artifact reconstruction mechanism.',
+        recovery_action: 'repair_reviewer_artifact_contract',
+        recovery_ticket_ids: [],
+      });
+      return 'citadel-system-blocked';
+    }
+    assert.equal(recovered.recovery_epoch, 7);
+    assert.equal(recovered.artifact_contract_recovery.mechanism, 'evidence_bundle_reconstruction');
+    assert.deepEqual(recovered.artifact_contract_recovery.mechanism_history, [
+      'schema_scaffold_replay',
+      'evidence_bundle_reconstruction',
+    ]);
+    assert.equal(fs.existsSync(recovered.artifact_contract_recovery.runtime_artifacts.evidence_bundle_path), true);
+    assert.equal(fs.existsSync(path.join(dir, 'citadel-report.json')), false);
+    return await approveCitadelFixture(dir);
+  };
+  let recoveryCalls = 0;
+  const crashOnceRecovery = async (dir, block, options) => {
+    recoveryCalls += 1;
+    return await repairCitadelReviewerArtifactContract(dir, block, {
+      ...options,
+      ...(recoveryCalls === 1
+        ? { faultInjection: () => { throw new Error('simulated reviewer diagnostic executor loss'); } }
+        : {}),
+    });
+  };
+
+  await assert.rejects(
+    () => withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+      runSequential: async () => 'success',
+      runCitadel,
+      repairCitadelReviewerArtifactContract: crashOnceRecovery,
+    })),
+    /Injected failure before reviewer recovery resolution/,
+  );
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+  const interrupted = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'),
+    'utf8',
+  ));
+  assert.equal(interrupted.status, 'started');
+  assert.equal(interrupted.attempts[0].status, 'started');
+
+  const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel,
+    repairCitadelReviewerArtifactContract: crashOnceRecovery,
+  }));
+  assert.equal(result, 'success');
+  assert.equal(citadelRuns, 3);
+  assert.equal(recoveryCalls, 3);
+  const recoveryPrompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line).prompt)
+    .filter((prompt) => prompt.includes('reviewer artifact-contract recovery worker'));
+  assert.equal(recoveryPrompts.length, 2);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  const twiceFailed = JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-review-state.json'), 'utf8'));
+  twiceFailed.status = 'diagnostic_scheduled';
+  twiceFailed.attempts.push({
+    ordinal: 103,
+    epoch: 7,
+    attempt: 1,
+    candidate_path: path.join(sessionDir, 'failed-evidence-reconstruction.json'),
+    candidate_hash: '9'.repeat(64),
+    status: 'rejected',
+    strategy_id: 'artifact-contract-reconstruction',
+    material_strategy_hash: '8'.repeat(64),
+    strategy_hash: '7'.repeat(64),
+    retry_feedback: 'evidence reconstruction remained invalid',
+    validation_error: 'evidence reconstruction remained invalid',
+    started_at: new Date().toISOString(),
+    completed_at: new Date().toISOString(),
+  });
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), twiceFailed);
+  const retained = await withProcessEnvironment(environment, async () => (
+    await repairCitadelReviewerArtifactContract(sessionDir, readCitadelSystemBlock(sessionDir))
+  ));
+  assert.equal(retained.kind, 'recovery_scheduled');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-review-state.json'), 'utf8')).recovery_epoch, 7);
+  const finalRecoveryPrompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line).prompt)
+    .filter((prompt) => prompt.includes('reviewer artifact-contract recovery worker'));
+  assert.equal(finalRecoveryPrompts.length, 2);
+});
+
+test('live reviewer diagnostic ownership drain remains resumable without consuming its mechanism', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  const reviewIdentity = '4'.repeat(64);
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 5,
+    strategy_id: 'adversarial-two-pass',
+    strategy_hash: '5'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: [{
+      ordinal: 10,
+      epoch: 5,
+      attempt: 2,
+      candidate_path: path.join(sessionDir, 'invalid-drain.json'),
+      candidate_hash: '6'.repeat(64),
+      status: 'rejected',
+      strategy_id: 'adversarial-two-pass',
+      material_strategy_hash: '7'.repeat(64),
+      strategy_hash: '8'.repeat(64),
+      retry_feedback: 'findings must be an array',
+      validation_error: 'findings must be an array',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    }],
+    updated_at: new Date().toISOString(),
+  });
+  writeCitadelSystemBlock(sessionDir, {
+    code: 'reviewer_artifact_strategy_exhausted',
+    title: 'Citadel reviewer artifact strategies require contract reconstruction',
+    evidence: `All bounded reviewer artifact strategies are exhausted for review ${reviewIdentity}.`,
+    recommendation: 'Run a strict artifact-contract diagnostic.',
+    recovery_action: 'repair_reviewer_artifact_contract',
+    recovery_ticket_ids: [],
+  });
+  const reviewStatePath = path.join(sessionDir, 'citadel-review-state.json');
+  const reviewStateBefore = fs.readFileSync(reviewStatePath, 'utf8');
+  const fakeBin = makeTempRoot('production-supervisor-reviewer-drain-bin-');
+  createFakeCodex(fakeBin);
+  const block = readCitadelSystemBlock(sessionDir);
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => withProcessEnvironment(prependPath(fakeBin, {
+      FAKE_REVIEWER_RECOVERY_DELAY_MS: '10000',
+    }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block, {
+      assertDurableOwnership: () => {
+        if (Date.now() - startedAt > 150) throw new DurableOwnershipDrainError('fixture reviewer lease drained');
+      },
+    })),
+    (error) => {
+      assert.ok(error instanceof DurableOwnershipDrainError);
+      assert.match(error.message, /fixture reviewer lease drained/);
+      return true;
+    },
+  );
+  assert.equal(fs.readFileSync(reviewStatePath, 'utf8'), reviewStateBefore);
+  const interruptedJournal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'),
+    'utf8',
+  ));
+  assert.equal(interruptedJournal.mechanism, 'schema_scaffold_replay');
+  assert.deepEqual(interruptedJournal.mechanism_history, ['schema_scaffold_replay']);
+  assert.deepEqual(interruptedJournal.attempts.map(({ status }) => status), ['started']);
+  const drainedState = new StateManager().read(path.join(sessionDir, 'state.json'));
+  assert.ok(Number.isInteger(drainedState.active_child_pid));
+  assert.ok(drainedState.active_child_identity);
+
+  interruptedJournal.status = 'interrupted';
+  interruptedJournal.attempts[0].status = 'interrupted';
+  interruptedJournal.attempts[0].error = 'fixture crash between interrupted persistence and replacement launch';
+  interruptedJournal.attempts[0].completed_at = new Date().toISOString();
+  interruptedJournal.updated_at = interruptedJournal.attempts[0].completed_at;
+  writeJson(path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'), interruptedJournal);
+
+  const replacement = await withProcessEnvironment(prependPath(fakeBin, {
+    FAKE_REVIEWER_RECOVERY_DELAY_MS: '0',
+  }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block));
+  assert.equal(replacement.kind, 'resolved');
+  const resolvedJournal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'),
+    'utf8',
+  ));
+  assert.equal(resolvedJournal.mechanism, 'schema_scaffold_replay');
+  assert.deepEqual(resolvedJournal.mechanism_history, ['schema_scaffold_replay']);
+  assert.deepEqual(resolvedJournal.attempts.map(({ status }) => status), ['interrupted', 'resolved']);
+});
+
+test('replacement reviewer diagnostic reaps a worker orphaned by real controller SIGKILL', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: 'e'.repeat(64),
+    recovery_epoch: 5,
+    strategy_id: 'adversarial-two-pass',
+    strategy_hash: 'f'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: [{
+      ordinal: 10,
+      epoch: 5,
+      attempt: 2,
+      candidate_path: path.join(sessionDir, 'invalid-orphan.json'),
+      candidate_hash: '1'.repeat(64),
+      status: 'rejected',
+      strategy_id: 'adversarial-two-pass',
+      material_strategy_hash: '2'.repeat(64),
+      strategy_hash: '3'.repeat(64),
+      retry_feedback: 'findings must be an array',
+      validation_error: 'findings must be an array',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    }],
+    updated_at: new Date().toISOString(),
+  });
+  writeCitadelSystemBlock(sessionDir, {
+    code: 'reviewer_artifact_strategy_exhausted',
+    title: 'Citadel reviewer artifact strategies require contract reconstruction',
+    evidence: `All bounded reviewer artifact strategies are exhausted for review ${'e'.repeat(64)}.`,
+    recommendation: 'Run a strict artifact-contract diagnostic.',
+    recovery_action: 'repair_reviewer_artifact_contract',
+    recovery_ticket_ids: [],
+  });
+  const fakeBin = makeTempRoot('production-supervisor-reviewer-orphan-bin-');
+  createFakeCodex(fakeBin);
+  const recoveryServiceUrl = new URL('../services/citadel-reviewer-recovery.js', import.meta.url).href;
+  const citadelServiceUrl = new URL('../services/citadel.js', import.meta.url).href;
+  const controller = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { repairCitadelReviewerArtifactContract } from ${JSON.stringify(recoveryServiceUrl)};
+    import { readCitadelSystemBlock } from ${JSON.stringify(citadelServiceUrl)};
+    await repairCitadelReviewerArtifactContract(
+      ${JSON.stringify(sessionDir)},
+      readCitadelSystemBlock(${JSON.stringify(sessionDir)}),
+    );
+  `], {
+    env: prependPath(fakeBin, { FAKE_REVIEWER_RECOVERY_DELAY_MS: '10000' }),
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  const journalPath = path.join(sessionDir, 'citadel-reviewer-contract-recovery.json');
+  const statePath = path.join(sessionDir, 'state.json');
+  let orphanState = null;
+  const waitDeadline = Date.now() + 5_000;
+  while (Date.now() < waitDeadline) {
+    if (fs.existsSync(journalPath)) {
+      const candidate = new StateManager().read(statePath);
+      if (Number.isInteger(candidate.active_child_pid) && candidate.active_child_identity) {
+        orphanState = candidate;
+        break;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (!orphanState) {
+    const stderr = controller.stderr.read()?.toString() || '';
+    throw new Error(`reviewer recovery controller did not launch a journaled worker: ${stderr}`);
+  }
+  const identity = orphanState.active_child_identity;
+  const startedJournal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  assert.deepEqual(startedJournal.attempts.map(({ status }) => status), ['started']);
+  assert.equal(fs.existsSync(startedJournal.attempts[0].candidate_path), false);
+  process.kill(controller.pid, 'SIGKILL');
+  await new Promise((resolve) => controller.once('exit', resolve));
+  const block = readCitadelSystemBlock(sessionDir);
+  const recovery = await withProcessEnvironment(prependPath(fakeBin, {
+    FAKE_REVIEWER_RECOVERY_DELAY_MS: '0',
+  }), async () => (
+    await repairCitadelReviewerArtifactContract(sessionDir, block)
+  ));
+
+  assert.equal(recovery.kind, 'resolved');
+  assert.notEqual(inspectProcessLivenessIdentity(identity), 'matched');
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(journalPath, 'utf8')).attempts.map(({ status }) => status),
+    ['interrupted', 'resolved'],
+  );
+  assert.equal(new StateManager().read(statePath).active_child_pid, null);
 });
 
 test('standalone mux durably resumes unattributed Citadel repair and preserves unrelated Done checkpoints', async () => {

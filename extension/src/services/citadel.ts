@@ -62,7 +62,8 @@ export type CitadelSystemBlockCode =
   | 'scope_contract_invalid'
   | 'acceptance_criteria_missing'
   | 'deterministic_check_failed'
-  | 'deterministic_gate_unavailable';
+  | 'deterministic_gate_unavailable'
+  | 'reviewer_artifact_strategy_exhausted';
 
 export interface CitadelSystemBlockArtifact {
   schema_version: 1;
@@ -74,7 +75,8 @@ export interface CitadelSystemBlockArtifact {
   evidence: string;
   recommendation: string;
   checks: CitadelCheckResult[];
-  recovery_action: 'request_prd_revision' | 'retry_checks' | 'repair_verification_contract';
+  recovery_action: 'request_prd_revision' | 'retry_checks' | 'repair_verification_contract'
+    | 'repair_reviewer_artifact_contract';
   recovery_ticket_ids: string[];
   failure_identity: string;
   attempt: number;
@@ -262,6 +264,7 @@ export function readCitadelSystemBlock(sessionDir: string): CitadelSystemBlockAr
   const codes = new Set<CitadelSystemBlockCode>([
     'scope_contract_invalid', 'acceptance_criteria_missing',
     'deterministic_check_failed', 'deterministic_gate_unavailable',
+    'reviewer_artifact_strategy_exhausted',
   ]);
   const checks = raw.checks;
   const validChecks = Array.isArray(checks) && checks.every((check) => {
@@ -279,7 +282,10 @@ export function readCitadelSystemBlock(sessionDir: string): CitadelSystemBlockAr
     || !['reviewed_range', 'title', 'evidence', 'recommendation', 'failure_identity', 'generated_at']
       .every((field) => typeof raw[field] === 'string' && String(raw[field]).trim().length > 0)
     || !validChecks
-    || !['request_prd_revision', 'retry_checks', 'repair_verification_contract']
+    || ![
+      'request_prd_revision', 'retry_checks', 'repair_verification_contract',
+      'repair_reviewer_artifact_contract',
+    ]
       .includes(String(raw.recovery_action))
     || !Array.isArray(raw.recovery_ticket_ids)
     || !raw.recovery_ticket_ids.every((entry) => typeof entry === 'string' && entry.trim().length > 0)
@@ -508,6 +514,19 @@ interface CitadelReviewAttemptState {
   model_attempt_id?: number;
   telemetry_status?: 'started' | 'finalized';
   telemetry_result?: CodexSpawnResult;
+  recovery_mechanism?: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+  runtime_manifest_hash?: string;
+  validator_evidence_path?: string;
+}
+
+interface CitadelArtifactContractRuntime {
+  schema_version: 1;
+  mechanism: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+  scaffold_path: string | null;
+  evidence_bundle_path: string | null;
+  manifest_path: string;
+  validator_path: string;
+  validator_command: string;
 }
 
 interface CitadelReviewState {
@@ -516,8 +535,21 @@ interface CitadelReviewState {
   recovery_epoch: number;
   strategy_id: string;
   strategy_hash: string;
-  status: 'running' | 'exhausted' | 'accepted';
+  status: 'running' | 'exhausted' | 'diagnostic_scheduled' | 'accepted';
   attempts: CitadelReviewAttemptState[];
+  artifact_contract_recovery?: {
+    schema_version: 1;
+    status: 'started' | 'rejected' | 'resolved';
+    diagnostic_identity: string;
+    artifact_path: string;
+    instruction?: string;
+    resolved_at?: string;
+    mechanism: 'schema_scaffold_replay' | 'evidence_bundle_reconstruction';
+    failed_candidate_hashes: string[];
+    validator_invariants: string[];
+    mechanism_history?: Array<'schema_scaffold_replay' | 'evidence_bundle_reconstruction'>;
+    runtime_artifacts: CitadelArtifactContractRuntime;
+  };
   updated_at: string;
 }
 
@@ -545,6 +577,125 @@ function citadelReviewerStrategy(
   };
 }
 
+interface ArtifactContractExecution {
+  mechanism: CitadelArtifactContractRuntime['mechanism'];
+  scaffoldPath: string | null;
+  evidenceBundlePath: string | null;
+  manifestPath: string;
+  validatorPath: string;
+  validatorCommand: string;
+  manifestHash: string;
+  materialHash: string;
+}
+
+function assertRuntimeArtifactFile(sessionDir: string, filePath: string): string {
+  const resolved = path.resolve(filePath);
+  const runtimeRoot = path.resolve(sessionDir, 'citadel-reviewer-contract-runtime');
+  if (resolved !== runtimeRoot && !resolved.startsWith(`${runtimeRoot}${path.sep}`)) {
+    throw new Error('Citadel artifact-contract runtime path escapes its durable runtime root.');
+  }
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('Citadel artifact-contract runtime input must be a regular non-symlink file.');
+  }
+  return resolved;
+}
+
+function artifactContractExecution(
+  sessionDir: string,
+  recovery: NonNullable<CitadelReviewState['artifact_contract_recovery']>,
+  reviewedRange: string,
+  expectedAcceptanceCriteria: string[],
+  checks: CitadelCheckResult[],
+): ArtifactContractExecution {
+  const runtime = recovery.runtime_artifacts;
+  if (!runtime || runtime.schema_version !== 1 || runtime.mechanism !== recovery.mechanism) {
+    throw new Error('Citadel artifact-contract runtime manifest is missing or uses the wrong mechanism.');
+  }
+  const manifestPath = assertRuntimeArtifactFile(sessionDir, runtime.manifest_path);
+  const validatorPath = assertRuntimeArtifactFile(sessionDir, runtime.validator_path);
+  const scaffoldPath = runtime.scaffold_path === null ? null
+    : assertRuntimeArtifactFile(sessionDir, runtime.scaffold_path);
+  const evidenceBundlePath = runtime.evidence_bundle_path === null ? null
+    : assertRuntimeArtifactFile(sessionDir, runtime.evidence_bundle_path);
+  if ((recovery.mechanism === 'schema_scaffold_replay') !== Boolean(scaffoldPath)
+    || (recovery.mechanism === 'evidence_bundle_reconstruction') !== Boolean(evidenceBundlePath)
+    || runtime.validator_command !== `node ${JSON.stringify(validatorPath)} <candidate-path>`) {
+    throw new Error('Citadel artifact-contract runtime files do not match the selected closed mechanism.');
+  }
+  const manifest = readJsonFile<Record<string, unknown>>(manifestPath, null);
+  const selected = recovery.mechanism === 'schema_scaffold_replay'
+    ? manifest?.scaffold as Record<string, unknown> | null
+    : manifest?.evidence_bundle as Record<string, unknown> | null;
+  const validator = manifest?.validator as Record<string, unknown> | null;
+  const selectedPath = scaffoldPath ?? evidenceBundlePath;
+  if (!manifest || manifest.schema_version !== 1 || manifest.mechanism !== recovery.mechanism
+    || selected?.path !== selectedPath || selected?.sha256 !== (selectedPath ? fileHash(selectedPath) : null)
+    || validator?.path !== validatorPath || validator?.sha256 !== fileHash(validatorPath)) {
+    throw new Error('Citadel artifact-contract runtime manifest does not authenticate its inputs.');
+  }
+  if (scaffoldPath) {
+    const scaffold = readJsonFile<Record<string, unknown>>(scaffoldPath, null);
+    if (!scaffold || scaffold.reviewed_range !== reviewedRange
+      || JSON.stringify(scaffold.acceptance_criteria_checked) !== JSON.stringify(expectedAcceptanceCriteria)
+      || !Array.isArray(scaffold.findings)) {
+      throw new Error('Citadel schema scaffold is not bound to the exact review range and criteria.');
+    }
+  }
+  if (evidenceBundlePath) {
+    const bundle = readJsonFile<Record<string, unknown>>(evidenceBundlePath, null);
+    if (!bundle || bundle.reviewed_range !== reviewedRange
+      || JSON.stringify(bundle.acceptance_criteria) !== JSON.stringify(expectedAcceptanceCriteria)
+      || JSON.stringify(bundle.deterministic_checks) !== JSON.stringify(checks)
+      || JSON.stringify(bundle.failed_candidate_hashes) !== JSON.stringify(recovery.failed_candidate_hashes)
+      || JSON.stringify(bundle.validator_invariants) !== JSON.stringify(recovery.validator_invariants)) {
+      throw new Error('Citadel evidence bundle is not bound to the immutable review evidence.');
+    }
+  }
+  const manifestHash = fileHash(manifestPath);
+  return {
+    mechanism: recovery.mechanism,
+    scaffoldPath,
+    evidenceBundlePath,
+    manifestPath,
+    validatorPath,
+    validatorCommand: runtime.validator_command,
+    manifestHash,
+    materialHash: reportHash({
+      id: 'artifact-contract-reconstruction',
+      mechanism: recovery.mechanism,
+      failed_candidate_hashes: recovery.failed_candidate_hashes,
+      validator_invariants: recovery.validator_invariants,
+      runtime_manifest_hash: manifestHash,
+      validator_hash: fileHash(validatorPath),
+      mechanism_input_hash: fileHash(selectedPath!),
+    }),
+  };
+}
+
+function artifactContractReviewerStrategy(
+  recovery: NonNullable<CitadelReviewState['artifact_contract_recovery']>,
+  execution: ArtifactContractExecution,
+): { id: string; instruction: string; hash: string } {
+  const instruction = typeof recovery.instruction === 'string' ? recovery.instruction.trim() : '';
+  const hashes = Array.isArray(recovery.failed_candidate_hashes) ? recovery.failed_candidate_hashes : [];
+  const invariants = Array.isArray(recovery.validator_invariants) ? recovery.validator_invariants : [];
+  if (recovery.status !== 'resolved' || !instruction || !/^[a-f0-9]{64}$/.test(recovery.diagnostic_identity)
+    || !['schema_scaffold_replay', 'evidence_bundle_reconstruction'].includes(recovery.mechanism)
+    || hashes.length === 0 || hashes.some((value) => !/^[a-f0-9]{64}$/.test(value))
+    || invariants.length === 0 || invariants.some((value) => typeof value !== 'string' || !value.trim())) {
+    throw new Error('Citadel artifact-contract recovery is not durably resolved.');
+  }
+  const id = 'artifact-contract-reconstruction';
+  return {
+    id,
+    instruction: recovery.mechanism === 'schema_scaffold_replay'
+      ? 'Populate the preseeded canonical scaffold and run its deterministic validator before returning.'
+      : 'Reconstruct the report exclusively from the immutable evidence bundle and run its deterministic validator before returning.',
+    hash: execution.materialHash,
+  };
+}
+
 function normalizeCitadelRetryFeedback(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const message = (value instanceof Error ? value.message : String(value)).replace(/\s+/g, ' ').trim();
@@ -552,11 +703,11 @@ function normalizeCitadelRetryFeedback(value: unknown): string | null {
 }
 
 function citadelReviewerAttemptHash(
-  strategy: { id: string; instruction: string },
+  strategy: { id: string; instruction: string; hash?: string },
   retryFeedback: string | null,
 ): string {
   return reportHash({
-    material_approach: { id: strategy.id, instruction: strategy.instruction },
+    material_strategy_hash: strategy.hash ?? reportHash({ id: strategy.id, instruction: strategy.instruction }),
     retry_feedback: retryFeedback,
   });
 }
@@ -989,6 +1140,7 @@ function buildCitadelPrompt(
   reportPath: string = citadelReportPath(sessionDir),
   retryFeedback: string | null = null,
   recoveryStrategy: string | null = null,
+  recoveryExecution: string[] = [],
 ): string {
   return [
     'You are the Citadel release reviewer for a Pickle Rick pipeline.',
@@ -1007,7 +1159,101 @@ function buildCitadelPrompt(
     'After writing the report, return <promise>THE_CITADEL_APPROVES</promise>.',
     ...(retryFeedback ? [`The previous candidate was rejected: ${retryFeedback}. Write a complete fresh candidate.`] : []),
     ...(recoveryStrategy ? [`Recovery strategy: ${recoveryStrategy}`] : []),
+    ...recoveryExecution,
   ].join('\n\n');
+}
+
+interface ArtifactContractAttemptRuntime {
+  prompt: string[];
+  validatorEvidencePath: string;
+  assertInputsUnchanged: () => void;
+  validateCandidate: () => void;
+}
+
+function prepareArtifactContractAttempt(
+  attemptDir: string,
+  candidatePath: string,
+  execution: ArtifactContractExecution,
+): ArtifactContractAttemptRuntime {
+  const runtimeDir = path.join(attemptDir, 'artifact-contract-runtime');
+  fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+  const manifestPath = path.join(runtimeDir, 'runtime-manifest.json');
+  const validatorPath = path.join(runtimeDir, 'validate-citadel-candidate.mjs');
+  const mechanismInputPath = path.join(
+    runtimeDir,
+    execution.mechanism === 'schema_scaffold_replay'
+      ? 'citadel-report-scaffold.json' : 'evidence-bundle.json',
+  );
+  fs.copyFileSync(execution.manifestPath, manifestPath);
+  fs.copyFileSync(execution.validatorPath, validatorPath);
+  fs.copyFileSync((execution.scaffoldPath ?? execution.evidenceBundlePath)!, mechanismInputPath);
+  fs.chmodSync(manifestPath, 0o400);
+  fs.chmodSync(mechanismInputPath, 0o400);
+  fs.chmodSync(validatorPath, 0o500);
+  if (execution.mechanism === 'schema_scaffold_replay') {
+    fs.copyFileSync(mechanismInputPath, candidatePath);
+    fs.chmodSync(candidatePath, 0o600);
+  }
+  const inputHashes = {
+    manifest: fileHash(manifestPath),
+    validator: fileHash(validatorPath),
+    mechanism_input: fileHash(mechanismInputPath),
+  };
+  const validatorEvidencePath = path.join(attemptDir, 'citadel-validator-evidence.json');
+  const validatorCommand = `node ${JSON.stringify(validatorPath)} ${JSON.stringify(candidatePath)}`;
+  const assertInputsUnchanged = (): void => {
+    if (fileHash(manifestPath) !== inputHashes.manifest
+      || fileHash(validatorPath) !== inputHashes.validator
+      || fileHash(mechanismInputPath) !== inputHashes.mechanism_input) {
+      throw new Error('Invalid Citadel reviewer artifact: closed recovery mechanism inputs were modified.');
+    }
+  };
+  const validateCandidate = (): void => {
+    assertInputsUnchanged();
+    const validation = spawnSync(process.execPath, [validatorPath, candidatePath], {
+      cwd: attemptDir,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    const evidence = {
+      schema_version: 1,
+      mechanism: execution.mechanism,
+      validator_command: validatorCommand,
+      exit_code: validation.status,
+      stdout: validation.stdout || '',
+      stderr: validation.stderr || '',
+      candidate_hash: fs.existsSync(candidatePath) ? fileHash(candidatePath) : null,
+      runtime_input_hashes: inputHashes,
+      validated_at: new Date().toISOString(),
+    };
+    atomicWriteJson(validatorEvidencePath, evidence);
+    if (validation.error || validation.status !== 0) {
+      throw new Error(`Invalid Citadel reviewer artifact: deterministic runtime validator rejected the candidate: ${validation.error?.message || validation.stderr || `exit ${validation.status}`}`);
+    }
+  };
+  const mechanismPrompt = execution.mechanism === 'schema_scaffold_replay'
+    ? [
+        'Closed reviewer execution mechanism: schema_scaffold_replay.',
+        `The candidate path is preseeded from this canonical exact-range/exact-criteria scaffold: ${mechanismInputPath}`,
+        'Preserve its canonical keys, exact reviewed_range, and exact acceptance_criteria_checked while replacing placeholders after the adversarial review.',
+      ]
+    : [
+        'Closed reviewer execution mechanism: evidence_bundle_reconstruction.',
+        `Reconstruct the candidate by reading this immutable deterministic evidence bundle: ${mechanismInputPath}`,
+        'Ground the report in its exact checks, failed-candidate hashes, validation failures, range, criteria, and validator invariants.',
+      ];
+  return {
+    prompt: [
+      ...mechanismPrompt,
+      `Authenticated runtime manifest copy: ${manifestPath}`,
+      `Deterministic validator invocation: ${validatorCommand}`,
+      `The controller persists deterministic validator evidence at: ${validatorEvidencePath}`,
+      'Run the validator and repair the candidate until it exits zero before returning the approval token.',
+    ],
+    validatorEvidencePath,
+    assertInputsUnchanged,
+    validateCandidate,
+  };
 }
 
 /** Preserve evidence, then restore the clean release checkpoint before returning control. */
@@ -1386,14 +1632,44 @@ export async function runCitadel(
     } else {
       strategyCatalogExhausted = true;
     }
+  } else if (sameReview && reviewState.status === 'diagnostic_scheduled') {
+    strategyCatalogExhausted = true;
   }
-  const reviewStrategy = strategyCatalogExhausted
-    ? {
-        id: reviewState.strategy_id,
-        instruction: CITADEL_REVIEWER_STRATEGIES.find((entry) => entry.id === reviewState.strategy_id)?.instruction
-          ?? CITADEL_REVIEWER_STRATEGIES[0].instruction,
-        hash: reviewState.strategy_hash,
-      }
+  if (strategyCatalogExhausted) {
+    const lastValidationError = [...reviewState.attempts].reverse()
+      .find((attempt) => attempt.validation_error)?.validation_error
+      || 'Reviewer artifact validation failed without a persisted diagnostic.';
+    reviewState.status = 'diagnostic_scheduled';
+    writeCitadelReviewState(reviewStatePath, reviewState);
+    assertOwnership();
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'infrastructure',
+      code: 'reviewer_artifact_strategy_exhausted',
+      reviewed_range: reviewedRange,
+      title: 'Citadel reviewer artifact strategies require contract reconstruction',
+      evidence: [
+        `All bounded reviewer artifact strategies are exhausted for review ${reviewIdentity}.`,
+        `Last validation failure: ${lastValidationError}`,
+      ].join('\n'),
+      recommendation: 'Run a strict artifact-contract diagnostic that derives and persists a new evidence-bound reviewer instruction before retrying Citadel.',
+      checks,
+      recovery_action: 'repair_reviewer_artifact_contract',
+      recovery_ticket_ids: [],
+    });
+    assertReleaseWorkspaceUnchanged();
+    return 'citadel-system-blocked';
+  }
+  const artifactExecution = reviewState.strategy_id === 'artifact-contract-reconstruction'
+    ? artifactContractExecution(
+        sessionDir,
+        reviewState.artifact_contract_recovery!,
+        reviewedRange,
+        expectedAcceptanceCriteria,
+        checks,
+      )
+    : null;
+  const reviewStrategy = artifactExecution
+    ? artifactContractReviewerStrategy(reviewState.artifact_contract_recovery!, artifactExecution)
     : citadelReviewerStrategy(reviewState.strategy_id);
   reviewState.strategy_id = reviewStrategy.id;
   reviewState.strategy_hash = reviewStrategy.hash;
@@ -1446,11 +1722,6 @@ export async function runCitadel(
   let report: CitadelReport | null = recoveredReport;
   let finalValidationError: unknown = [...reviewState.attempts].reverse()
     .find((entry) => entry.validation_error)?.validation_error ?? null;
-  if (strategyCatalogExhausted) {
-    finalValidationError = new Error(
-      'Citadel reviewer artifact recovery exhausted: no unused material reviewer strategy remains for unchanged evidence.',
-    );
-  }
   let retryFeedback = normalizeCitadelRetryFeedback(finalValidationError);
   for (let attempt = usedAttempts + 1; !report && attempt <= CITADEL_REVIEWER_MAX_ATTEMPTS; attempt += 1) {
     result = null;
@@ -1467,6 +1738,9 @@ export async function runCitadel(
     const outputLastMessagePath = path.join(sessionDir, `citadel-review-attempt-${attemptKey}.last-message.txt`);
     fs.rmSync(outputLastMessagePath, { force: true });
     fs.rmSync(candidatePath, { force: true });
+    const artifactAttemptRuntime = artifactExecution
+      ? prepareArtifactContractAttempt(attemptDir, candidatePath, artifactExecution)
+      : null;
     const journalAttempt: CitadelReviewAttemptState = {
       ordinal,
       epoch: reviewState.recovery_epoch,
@@ -1478,6 +1752,11 @@ export async function runCitadel(
       strategy_hash: attemptStrategyHash,
       retry_feedback: retryFeedback,
       started_at: new Date().toISOString(),
+      ...(artifactAttemptRuntime ? {
+        recovery_mechanism: artifactExecution!.mechanism,
+        runtime_manifest_hash: artifactExecution!.manifestHash,
+        validator_evidence_path: artifactAttemptRuntime.validatorEvidencePath,
+      } : {}),
     };
     reviewState.attempts.push(journalAttempt);
     writeCitadelReviewState(reviewStatePath, reviewState);
@@ -1523,6 +1802,7 @@ export async function runCitadel(
         prompt: buildCitadelPrompt(
           sessionDir, reviewedRange, attemptChecksPath, expectedAcceptanceCriteria, candidatePath, retryFeedback,
           `${reviewStrategy.id}: ${reviewStrategy.instruction}`,
+          artifactAttemptRuntime?.prompt,
         ),
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
         outputLastMessagePath,
@@ -1586,7 +1866,11 @@ export async function runCitadel(
       if (fileHash(attemptChecksPath) !== attemptChecksHash) {
         throw new Error('Invalid Citadel reviewer artifact: immutable deterministic evidence was modified.');
       }
+      artifactAttemptRuntime?.validateCandidate();
       const candidate = readReviewerCandidate(candidatePath, attemptDir);
+      // Bind even schema-invalid regular candidates to the durable attempt so
+      // artifact-contract recovery diagnoses exact bytes rather than prose.
+      journalAttempt.candidate_hash = candidate.hash;
       report = validateCitadelReport(
         candidate.value,
         reviewedRange,
@@ -1598,7 +1882,6 @@ export async function runCitadel(
       )) {
         throw new Error('Invalid Citadel reviewer artifact: required approval signal is missing.');
       }
-      journalAttempt.candidate_hash = candidate.hash;
       journalAttempt.approval_signal = report.verdict === 'block' || (
         hasPromiseToken(result.lastMessage, 'THE_CITADEL_APPROVES')
         || hasPromiseToken(result.stdout, 'THE_CITADEL_APPROVES')

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
+import { readJsonFile } from '../services/pickle-utils.js';
 import { loadConfig } from '../services/config.js';
 import { canExecute, loadCircuitState, openCircuitBreaker, resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../services/session.js';
@@ -54,6 +55,7 @@ import {
   consumeDeterministicCheckFailure,
   runDeterministicRecoveryDiagnostic,
 } from '../services/citadel-deterministic-recovery.js';
+import { repairCitadelReviewerArtifactContract } from '../services/citadel-reviewer-recovery.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
@@ -96,6 +98,7 @@ interface RunSequentialDeps {
   repairTicketDependencyContract?: typeof repairTicketDependencyContract;
   runCitadel?: typeof runCitadel;
   repairCitadelAttribution?: typeof repairCitadelAttribution;
+  repairCitadelReviewerArtifactContract?: typeof repairCitadelReviewerArtifactContract;
   runDeterministicRecoveryDiagnostic?: typeof runDeterministicRecoveryDiagnostic;
 }
 
@@ -198,6 +201,26 @@ async function runSequentialWithLease(
   const reconciledVerificationTransaction = reconcileVerificationRepairTransaction(sessionDir);
   if (reconciledVerificationTransaction) {
     appendRunnerLog(sessionDir, runnerMode, `verification repair transaction ${reconciledVerificationTransaction} before scheduler dispatch`);
+  }
+  const pendingReviewerRecovery = readCitadelSystemBlock(sessionDir);
+  const pendingReviewerState = readJsonFile<Record<string, unknown>>(
+    path.join(sessionDir, 'citadel-review-state.json'),
+    null,
+  );
+  const pendingArtifactRecovery = pendingReviewerState?.artifact_contract_recovery as Record<string, unknown> | undefined;
+  if (pendingReviewerRecovery?.recovery_action === 'repair_reviewer_artifact_contract'
+    && pendingArtifactRecovery?.status !== 'resolved') {
+    const recovery = await (deps.repairCitadelReviewerArtifactContract ?? repairCitadelReviewerArtifactContract)(
+      sessionDir,
+      pendingReviewerRecovery,
+      { timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership },
+    );
+    if (recovery.kind === 'recovery_scheduled') {
+      exitReason = 'citadel_system_recovery_scheduled';
+      exitMuxRunnerPhase(manager, statePath, { exitReason });
+      return exitReason;
+    }
+    appendRunnerLog(sessionDir, runnerMode, `resolved durable Citadel reviewer contract diagnostic ${recovery.diagnostic_identity}`);
   }
 
   let dependencyInspection = inspectTicketDependencyGraph(sessionDir);
@@ -1064,6 +1087,26 @@ export async function runSequential(
               `Citadel material verification-contract recovery rebuilt ${ticketId} with strategy ${strategy.materialApproach}.`,
             );
           }
+          exitReason = 'success';
+          continue;
+        }
+        if (systemBlock.recovery_action === 'repair_reviewer_artifact_contract') {
+          const recovery = await (deps.repairCitadelReviewerArtifactContract ?? repairCitadelReviewerArtifactContract)(
+            sessionDir,
+            systemBlock,
+            { timeoutMs: options.timeoutMs, assertDurableOwnership: ownership.assertOwned },
+          );
+          ownership.assertOwned();
+          if (recovery.kind === 'recovery_scheduled') {
+            exitReason = 'citadel_system_recovery_scheduled';
+            exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+            break;
+          }
+          appendRunnerLog(
+            sessionDir,
+            options.runnerMode || 'pickle',
+            `Resolved Citadel reviewer contract diagnostic ${recovery.diagnostic_identity}; retrying the release gate.`,
+          );
           exitReason = 'success';
           continue;
         }
