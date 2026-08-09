@@ -60,6 +60,7 @@ function sessionFiles(root: string, current = root): string[] {
     if (!entry.isFile() || relative === LIVE_SESSION_MIGRATION_FILE
       || relative === 'legacy-session-adoption-transaction.json'
       || relative === 'legacy-session-adoption.json'
+      || relative === 'legacy-session-adoption-watch.json'
       || relative.endsWith('.lock')) return [];
     return [relative];
   });

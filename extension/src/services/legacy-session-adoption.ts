@@ -9,10 +9,10 @@ import {
   type OrphanReapResult,
   type PersistedProcessIdentity,
 } from './orphan-reaper.js';
-import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
+import { atomicWriteFile, atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { ensureFencedLegacyAdoptionPrdSeal } from './session-prd-seal.js';
 import { StateManager, type PersistedState } from './state-manager.js';
-import { assertOwnedTmuxSession, killTmuxSessionById, runTmux, tmuxSessionExists } from './tmux.js';
+import { assertOwnedTmuxSession, killTmuxSessionById, runTmux, runnerPaneCommandMatches, tmuxSessionExists } from './tmux.js';
 import {
   prepareLiveSessionMigration,
   verifyLiveSessionMigration,
@@ -31,6 +31,7 @@ import { stashUnattributableRemainder } from './dirty-tree-salvage.js';
 import { persistRejectedCandidateCheckpoint } from './candidate-recovery.js';
 import { reconcileArchivedCandidateRefinementBoundary, refinementRepositoryAdvancePath } from './refinement-artifacts.js';
 import { assertCitadelReleaseApproval, citadelReportPath } from './citadel.js';
+import { reclaimLaunchReservations, withLaunchReservations } from './detached-launch.js';
 
 export const LEGACY_ADOPTION_FILE = 'legacy-session-adoption.json';
 export const LEGACY_ADOPTION_SCHEMA_VERSION = 1;
@@ -126,8 +127,42 @@ interface LegacyAdoptionTransaction {
     recovery_ref: string;
   };
   launched_runtime_root?: string;
+  launch_attempt?: {
+    runtime_root: string;
+    owner_pid: number;
+    started_at: string;
+    state_path: 'state.json';
+    state_size: number;
+    state_sha256: string;
+    state_base64: string;
+    logical_pipeline_size?: number;
+    logical_pipeline_sha256?: string;
+    logical_pipeline_base64?: string;
+    reservation_paths: string[];
+  };
   created_at: string;
   updated_at: string;
+}
+
+const LEGACY_LAUNCH_MIN_TIMEOUT_MS = 300_000;
+const LEGACY_LAUNCH_MAX_TIMEOUT_MS = 7_200_000;
+const LEGACY_LAUNCH_STEP_BUDGET_MULTIPLIER = 8;
+
+export function legacyAdoptionLaunchTimeoutMs(
+  sessionDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const manifest = readJsonFile<{ tickets?: unknown[] }>(path.join(sessionDir, 'refinement_manifest.json'), null);
+  const ticketCount = Array.isArray(manifest?.tickets) ? manifest.tickets.length : 0;
+  const state = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), null);
+  const workerTimeoutMs = Math.max(60_000, Number(state?.worker_timeout_seconds || 60) * 1_000);
+  const readinessAndStartupBudget = Math.max(
+    LEGACY_LAUNCH_MIN_TIMEOUT_MS,
+    (ticketCount * LEGACY_LAUNCH_STEP_BUDGET_MULTIPLIER + 2) * workerTimeoutMs,
+  );
+  const configured = Number(env.PICKLE_ADOPTION_LAUNCH_TIMEOUT_MS);
+  const requested = Number.isFinite(configured) && configured > 0 ? configured : readinessAndStartupBudget;
+  return Math.min(LEGACY_LAUNCH_MAX_TIMEOUT_MS, Math.max(readinessAndStartupBudget, requested));
 }
 
 interface LegacyAdoptionDependencies {
@@ -145,6 +180,7 @@ interface LegacyAdoptionDependencies {
   startWatchdog?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
   checkpoint?: (stage: LegacyAdoptionTransaction['stage'] | 'candidate_archived' | 'boundary_prepared' | 'boundary_completed' | 'target_runtime_superseded' | 'journaled' | 'launching') => void;
   afterChildQuiesced?: () => void;
+  afterLaunchReservationsAcquired?: () => void;
   sealSession?: (sessionDir: string) => unknown;
   launch?: (sessionDir: string, runtimeRoot: string) => void;
   handoff?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
@@ -819,19 +855,191 @@ export function adoptActiveLegacyMuxSession(
   }
 }
 
+function exactTargetLaunchOwner(
+  sessionDir: string,
+  runtimeRoot: string,
+  state: Record<string, unknown>,
+  deps: LegacyAdoptionDependencies,
+): ObservedLegacyProcess | null {
+  const runnerPid = Number(state.tmux_runner_pid);
+  if (!Number.isInteger(runnerPid) || runnerPid <= 0) return null;
+  const runner = (deps.observeProcess || observeProcess)(runnerPid);
+  const sessionName = typeof state.tmux_session_name === 'string' ? state.tmux_session_name : '';
+  if (!runner || !exactMuxCommand(runner.command, sessionDir, runtimeRoot) || !sessionName
+    || !(deps.tmuxExists || tmuxSessionExists)(sessionName)) return null;
+  const binding = (deps.tmuxBinding || defaultTmuxBinding)(sessionName);
+  if (!binding) return null;
+  try {
+    verifiedLegacyControllerTopology(runnerPid, binding, sessionDir, runtimeRoot,
+      deps.observeProcess || observeProcess, deps.inspectProcess || inspectProcessLivenessIdentity);
+  } catch {
+    return null;
+  }
+  const lease = readLogicalPipeline(sessionDir).lease;
+  return lease && Date.parse(lease.expires_at) > Date.now() && lease.owner_identity
+    && JSON.stringify(lease.owner_identity) === JSON.stringify(runner.identity) ? runner : null;
+}
+
+function launchReservationPaths(sessionDir: string, stateBytes: Buffer): string[] {
+  const state = JSON.parse(stateBytes.toString('utf8')) as Record<string, unknown>;
+  const cwds = launchReservationCwds(state);
+  return [
+    path.join(sessionDir, '.tmux-launch.lock'),
+    ...cwds.map((cwd) => path.join(
+      path.dirname(sessionDir),
+      `.tmux-cwd-${crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 16)}.lock`,
+    )),
+  ];
+}
+
+function launchReservationCwds(state: Record<string, unknown>): string[] {
+  return [...new Set([
+    ...(Array.isArray(state.session_map_cwds) ? state.session_map_cwds : []),
+    state.working_dir,
+  ].filter((value): value is string => typeof value === 'string' && Boolean(value)))];
+}
+
+function restoreLaunchAttempt(
+  sessionDir: string,
+  transactionPath: string,
+  transaction: LegacyAdoptionTransaction,
+  migration: InstalledRuntimeMigration,
+  deps: LegacyAdoptionDependencies,
+): LegacyAdoptionTransaction {
+  const attempt = transaction.launch_attempt;
+  if (!attempt || attempt.state_path !== 'state.json') {
+    throw new Error('Launching legacy adoption lacks its exact prelaunch rollback checkpoint.');
+  }
+  const stateBytes = Buffer.from(attempt.state_base64, 'base64');
+  if (stateBytes.length !== attempt.state_size
+    || crypto.createHash('sha256').update(stateBytes).digest('hex') !== attempt.state_sha256) {
+    throw new Error('Legacy adoption prelaunch rollback checkpoint is corrupt.');
+  }
+  const preservedState = migration.preserved_artifacts.find((artifact) => artifact.path === attempt.state_path);
+  if (!preservedState || stateBytes.length !== preservedState.size || attempt.state_sha256 !== preservedState.sha256) {
+    throw new Error('Legacy adoption prelaunch rollback checkpoint does not match the sealed migration state.');
+  }
+  let logicalBytes: Buffer | null = null;
+  if (attempt.logical_pipeline_base64 !== undefined) {
+    logicalBytes = Buffer.from(attempt.logical_pipeline_base64, 'base64');
+    const logicalSha = crypto.createHash('sha256').update(logicalBytes).digest('hex');
+    const preservedLogical = migration.preserved_artifacts.find((artifact) => artifact.path === 'logical-pipeline.json');
+    if (logicalBytes.length !== attempt.logical_pipeline_size || logicalSha !== attempt.logical_pipeline_sha256
+      || (preservedLogical && (logicalBytes.length !== preservedLogical.size || logicalSha !== preservedLogical.sha256))) {
+      throw new Error('Legacy adoption logical pipeline rollback checkpoint is corrupt or violates the sealed migration.');
+    }
+  }
+  if (!Number.isFinite(Date.parse(attempt.started_at))) throw new Error('Legacy adoption launch attempt time is invalid.');
+  const reservationPaths = launchReservationPaths(sessionDir, stateBytes);
+  if (JSON.stringify(attempt.reservation_paths) !== JSON.stringify(reservationPaths)) {
+    throw new Error('Legacy adoption launch reservation checkpoint does not match the exact session scope.');
+  }
+  const state = JSON.parse(stateBytes.toString('utf8')) as Record<string, unknown>;
+  return withLaunchReservations(sessionDir, launchReservationCwds(state), path.dirname(sessionDir), () => {
+    deps.afterLaunchReservationsAcquired?.();
+    const statePath = path.join(sessionDir, attempt.state_path);
+    const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+    const stateManager = new StateManager();
+    const lockedPaths = [logicalPath, statePath].sort();
+    for (const lockedPath of lockedPaths) stateManager.acquireLock(lockedPath);
+    try {
+      const currentState = stateManager.read(statePath);
+      assertNoAmbiguousLaunchOwner(sessionDir, attempt.runtime_root, currentState, deps);
+      if (!logicalBytes) {
+        const currentLogical = fs.readFileSync(logicalPath);
+        const currentLogicalSha = crypto.createHash('sha256').update(currentLogical).digest('hex');
+        const preservedLogical = migration.preserved_artifacts.find((artifact) => artifact.path === 'logical-pipeline.json');
+        if (!preservedLogical || currentLogical.length !== preservedLogical.size
+          || currentLogicalSha !== preservedLogical.sha256) {
+          throw new Error('Snapshot-less legacy launch recovery cannot prove the sealed logical pipeline bytes.');
+        }
+      }
+      if (logicalBytes) atomicWriteFile(logicalPath, logicalBytes.toString('utf8'));
+      atomicWriteFile(statePath, stateBytes.toString('utf8'));
+      const withoutAttempt = { ...transaction };
+      delete withoutAttempt.launch_attempt;
+      const restored: LegacyAdoptionTransaction = {
+        ...withoutAttempt,
+        stage: 'adopted',
+        launched_runtime_root: undefined,
+        updated_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      atomicWriteJson(transactionPath, restored);
+      return restored;
+    } finally {
+      for (const lockedPath of [...lockedPaths].reverse()) stateManager.releaseLock(lockedPath);
+    }
+  });
+}
+
+function assertNoAmbiguousLaunchOwner(
+  sessionDir: string,
+  runtimeRoot: string,
+  state: Record<string, unknown>,
+  deps: LegacyAdoptionDependencies,
+): void {
+  if (exactTargetLaunchOwner(sessionDir, runtimeRoot, state, deps)) return;
+  const lease = readLogicalPipeline(sessionDir).lease;
+  if (lease) {
+    const expired = Date.parse(lease.expires_at) <= Date.now();
+    const dead = lease.owner_identity
+      ? (deps.inspectProcess || inspectProcessLivenessIdentity)(lease.owner_identity) !== 'matched'
+      : false;
+    if (!expired && !dead) {
+      throw new Error('Legacy adopted session has an unmatched live logical lease; launch rollback refused.');
+    }
+  }
+  for (const candidate of [Number(state.tmux_runner_pid), Number(state.active_child_pid)]) {
+    if (Number.isInteger(candidate) && candidate > 0 && (deps.observeProcess || observeProcess)(candidate)) {
+      throw new Error(`Legacy adopted session has an ambiguous live owner ${candidate}; launch rollback refused.`);
+    }
+  }
+  const persistedBinding = state.tmux_runner_binding as Record<string, unknown> | null;
+  const sessionName = typeof state.tmux_session_name === 'string' && state.tmux_session_name
+    ? state.tmux_session_name : typeof persistedBinding?.session_name === 'string' ? persistedBinding.session_name : '';
+  if (sessionName && ((deps.tmuxExists || tmuxSessionExists)(sessionName)
+    || (deps.tmuxBinding || defaultTmuxBinding)(sessionName))) {
+    const current = (deps.tmuxBinding || defaultTmuxBinding)(sessionName);
+    const exactBinding = persistedBinding?.schema_version === 1
+      && persistedBinding.session_name === sessionName
+      && typeof persistedBinding.session_id === 'string' && /^\$\d+$/.test(persistedBinding.session_id)
+      && typeof persistedBinding.pane_id === 'string' && /^%\d+$/.test(persistedBinding.pane_id)
+      && Number.isInteger(persistedBinding.pane_pid) && Number(persistedBinding.pane_pid) > 0
+      && typeof persistedBinding.pane_start_command === 'string'
+      && runnerPaneCommandMatches(persistedBinding.pane_start_command, sessionDir)
+      && current?.session_id === persistedBinding.session_id
+      && current.session_created === persistedBinding.session_created
+      && current.pane_id === persistedBinding.pane_id
+      && current.pane_pid === persistedBinding.pane_pid
+      && current.pane_start_command === persistedBinding.pane_start_command;
+    const paneDead = exactBinding
+      && !(deps.observeProcess || observeProcess)(Number(persistedBinding.pane_pid));
+    if (!paneDead) {
+      throw new Error('Legacy adopted session has an unmatched live tmux owner; launch rollback refused.');
+    }
+    assertOwnedTmuxSession(sessionName, sessionDir);
+    (deps.killTmux || killTmuxSessionById)(String(persistedBinding.session_id));
+  }
+}
+
 export function launchAdoptedLegacySession(
   sessionDirInput: string,
   runtimeRoot: string,
   deps: LegacyAdoptionDependencies = {},
 ): LegacyAdoptionRecord {
   const sessionDir = fs.realpathSync(sessionDirInput);
+  const requestedLockTimeout = Number(process.env.PICKLE_ADOPTION_LAUNCH_LOCK_TIMEOUT_MS);
   const launchLock = new StateManager({
-    acquireTimeoutMs: Number(process.env.PICKLE_ADOPTION_LAUNCH_LOCK_TIMEOUT_MS || 60_000),
+    acquireTimeoutMs: Math.max(
+      legacyAdoptionLaunchTimeoutMs(sessionDir) + 60_000,
+      Number.isFinite(requestedLockTimeout) && requestedLockTimeout > 0 ? requestedLockTimeout : 0,
+    ),
     staleLockThresholdMs: 0,
   });
   launchLock.acquireLock(path.join(sessionDir, '.legacy-session-adoption'));
   try {
   const recordPath = path.join(sessionDir, LEGACY_ADOPTION_FILE);
+  const transactionPath = path.join(sessionDir, LEGACY_ADOPTION_TRANSACTION_FILE);
   const record = readJsonFile<LegacyAdoptionRecord>(recordPath, null);
   if (!record || record.schema_version !== 1) throw new Error('Legacy adoption record is missing or invalid.');
   const target = describeInstalledRuntime(runtimeRoot);
@@ -851,14 +1059,82 @@ export function launchAdoptedLegacySession(
     const canonical = { ...record, launched_runtime_root: resolvedRuntimeRoot,
       launched_at: (deps.now?.() ?? new Date()).toISOString() };
     atomicWriteJson(recordPath, canonical);
-    const transactionPath = path.join(sessionDir, LEGACY_ADOPTION_TRANSACTION_FILE);
     const transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
     if (transaction) atomicWriteJson(transactionPath, { ...transaction, stage: 'launched',
-      launched_runtime_root: resolvedRuntimeRoot, updated_at: canonical.launched_at });
+      launch_attempt: undefined, launched_runtime_root: resolvedRuntimeRoot, updated_at: canonical.launched_at });
     return canonical;
   }
+  let transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
+  if (!transaction) throw new Error('Legacy adoption transaction is missing before launch.');
+  const markLaunched = (current: LegacyAdoptionTransaction, ownerRoot = resolvedRuntimeRoot): LegacyAdoptionRecord => {
+    const launched = { ...record, status: 'launched' as const,
+      launched_at: (deps.now?.() ?? new Date()).toISOString(), launched_runtime_root: ownerRoot };
+    const withoutAttempt = { ...current };
+    delete withoutAttempt.launch_attempt;
+    atomicWriteJson(recordPath, launched);
+    atomicWriteJson(transactionPath, { ...withoutAttempt, stage: 'launched', launched_runtime_root: ownerRoot,
+      updated_at: launched.launched_at });
+    return launched;
+  };
   const migration = readJsonFile<InstalledRuntimeMigration>(path.join(sessionDir, 'installed-runtime-migration.json'), null);
   if (!migration || migration.content_hash !== record.migration_content_hash) throw new Error('Legacy migration hash does not match its adoption record.');
+  if (transaction.stage === 'launching') {
+    const attemptedRuntimeRoot = transaction.launch_attempt?.runtime_root || transaction.target_runtime_root;
+    const interruptedState = new StateManager().read(path.join(sessionDir, 'state.json'));
+    if (exactTargetLaunchOwner(sessionDir, attemptedRuntimeRoot, interruptedState, deps)) {
+      const recovered = markLaunched(transaction, attemptedRuntimeRoot);
+      if (attemptedRuntimeRoot === resolvedRuntimeRoot) return recovered;
+      (deps.handoff || ((dir, sourceRoot, targetRoot) => (
+        handoffLaunchedRuntime(dir, sourceRoot, targetRoot, interruptedState)
+      )))(sessionDir, attemptedRuntimeRoot, resolvedRuntimeRoot);
+      const canonical = { ...recovered, launched_runtime_root: resolvedRuntimeRoot,
+        launched_at: (deps.now?.() ?? new Date()).toISOString() };
+      atomicWriteJson(recordPath, canonical);
+      atomicWriteJson(transactionPath, { ...transaction, launch_attempt: undefined, stage: 'launched',
+        launched_runtime_root: resolvedRuntimeRoot, updated_at: canonical.launched_at });
+      return canonical;
+    }
+    assertNoAmbiguousLaunchOwner(sessionDir, attemptedRuntimeRoot, interruptedState, deps);
+    if (!transaction.launch_attempt) {
+      if (interruptedState.active !== false) {
+        throw new Error('Legacy launch recovery cannot reconstruct a non-inactive prelaunch state.');
+      }
+      const reconstructed = Buffer.from(`${JSON.stringify({ ...interruptedState, active: true }, null, 2)}\n`);
+      const preservedState = migration.preserved_artifacts.find((artifact) => artifact.path === 'state.json');
+      if (!preservedState || reconstructed.length !== preservedState.size
+        || crypto.createHash('sha256').update(reconstructed).digest('hex') !== preservedState.sha256) {
+        throw new Error('Legacy launch recovery cannot prove the exact historical state.json bytes.');
+      }
+      const currentLogical = fs.readFileSync(path.join(sessionDir, 'logical-pipeline.json'));
+      const preservedLogical = migration.preserved_artifacts.find((artifact) => artifact.path === 'logical-pipeline.json');
+      const logicalMatchesMigration = preservedLogical
+        && currentLogical.length === preservedLogical.size
+        && crypto.createHash('sha256').update(currentLogical).digest('hex') === preservedLogical.sha256;
+      if ((preservedLogical && !logicalMatchesMigration) || (!preservedLogical && readLogicalPipeline(sessionDir).lease)) {
+        throw new Error('Legacy launch recovery cannot prove the historical logical pipeline boundary.');
+      }
+      const reservationPaths = launchReservationPaths(sessionDir, reconstructed);
+      const logicalSha256 = crypto.createHash('sha256').update(currentLogical).digest('hex');
+      transaction = {
+        ...transaction,
+        launch_attempt: {
+          runtime_root: attemptedRuntimeRoot,
+          owner_pid: 0,
+          started_at: transaction.updated_at,
+          state_path: 'state.json',
+          state_size: reconstructed.length,
+          state_sha256: preservedState.sha256,
+          state_base64: reconstructed.toString('base64'),
+          logical_pipeline_size: currentLogical.length,
+          logical_pipeline_sha256: logicalSha256,
+          logical_pipeline_base64: currentLogical.toString('base64'),
+          reservation_paths: reservationPaths,
+        },
+      };
+      atomicWriteJson(transactionPath, transaction);
+    }
+    transaction = restoreLaunchAttempt(sessionDir, transactionPath, transaction, migration, deps);
+  }
   verifyLiveSessionMigration(sessionDir, migration);
   const logical = readLogicalPipeline(sessionDir);
   const adopted = logical.events.find((event) => event.kind === 'legacy_session_adopted');
@@ -866,38 +1142,72 @@ export function launchAdoptedLegacySession(
     throw new Error('Legacy adoption journal checkpoint or lease fence is invalid.');
   }
   const state = new StateManager().read(path.join(sessionDir, 'state.json'));
-  const transactionPath = path.join(sessionDir, LEGACY_ADOPTION_TRANSACTION_FILE);
-  const transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
-  if (!transaction) throw new Error('Legacy adoption transaction is missing before launch.');
   if (Number(state.tmux_runner_pid) > 0 || state.active_child_pid) {
-    const runner = Number(state.tmux_runner_pid) > 0 ? (deps.observeProcess || observeProcess)(Number(state.tmux_runner_pid)) : null;
-    const expectedBin = path.join(fs.realpathSync(runtimeRoot), 'extension', 'bin', 'mux-runner.js');
-    const exactTarget = runner && exactMuxCommand(runner.command, sessionDir)
-      && runner.command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.some((token) => path.resolve(token.replace(/^["']|["']$/g, '')) === expectedBin);
-    if (transaction.stage !== 'launching' || !exactTarget) throw new Error('Legacy adopted session regained an unverified owner before launch.');
-    const recovered = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString(),
-      launched_runtime_root: resolvedRuntimeRoot };
-    atomicWriteJson(recordPath, recovered);
-    atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', launched_runtime_root: resolvedRuntimeRoot,
-      updated_at: recovered.launched_at });
-    return recovered;
+    throw new Error('Legacy adopted session regained an unverified owner before launch.');
   }
 
   const launch = deps.launch || ((dir: string, root: string) => {
     const result = spawnSync(process.execPath, [
       path.join(root, 'extension', 'bin', 'pickle-tmux.js'), '--resume', dir, '--resume-ready-only', '--on-failure=retry',
-    ], { cwd: String(state.working_dir || process.cwd()), env: process.env, encoding: 'utf8', timeout: 30_000 });
+    ], { cwd: String(state.working_dir || process.cwd()), env: process.env, encoding: 'utf8',
+      timeout: legacyAdoptionLaunchTimeoutMs(sessionDir) });
     if (result.status !== 0) throw new Error(result.stderr || result.stdout || 'Legacy supervised mux launch failed.');
   });
-  atomicWriteJson(transactionPath, { ...transaction, stage: 'launching', updated_at: (deps.now?.() ?? new Date()).toISOString() });
+  const stateBytes = fs.readFileSync(path.join(sessionDir, 'state.json'));
+  const logicalBytes = fs.readFileSync(path.join(sessionDir, 'logical-pipeline.json'));
+  const preservedState = migration.preserved_artifacts.find((artifact) => artifact.path === 'state.json');
+  if (!preservedState || stateBytes.length !== preservedState.size
+    || crypto.createHash('sha256').update(stateBytes).digest('hex') !== preservedState.sha256) {
+    throw new Error('Legacy adoption state changed at the prelaunch transaction boundary.');
+  }
+  const preservedLogical = migration.preserved_artifacts.find((artifact) => artifact.path === 'logical-pipeline.json');
+  const logicalSha256 = crypto.createHash('sha256').update(logicalBytes).digest('hex');
+  if (preservedLogical && (logicalBytes.length !== preservedLogical.size || logicalSha256 !== preservedLogical.sha256)) {
+    throw new Error('Legacy adoption journal changed at the prelaunch transaction boundary.');
+  }
+  const reservationPaths = launchReservationPaths(sessionDir, stateBytes);
+  reclaimLaunchReservations(sessionDir, launchReservationCwds(state), path.dirname(sessionDir));
+  const startedAt = (deps.now?.() ?? new Date()).toISOString();
+  transaction = {
+    ...transaction,
+    stage: 'launching',
+    launch_attempt: {
+      runtime_root: resolvedRuntimeRoot,
+      owner_pid: process.pid,
+      started_at: startedAt,
+      state_path: 'state.json',
+      state_size: stateBytes.length,
+      state_sha256: crypto.createHash('sha256').update(stateBytes).digest('hex'),
+      state_base64: stateBytes.toString('base64'),
+      logical_pipeline_size: logicalBytes.length,
+      logical_pipeline_sha256: logicalSha256,
+      logical_pipeline_base64: logicalBytes.toString('base64'),
+      reservation_paths: reservationPaths,
+    },
+    updated_at: startedAt,
+  };
+  atomicWriteJson(transactionPath, transaction);
   deps.checkpoint?.('launching');
-  launch(sessionDir, resolvedRuntimeRoot);
-  const launched = { ...record, status: 'launched' as const, launched_at: (deps.now?.() ?? new Date()).toISOString(),
-    launched_runtime_root: resolvedRuntimeRoot };
-  atomicWriteJson(recordPath, launched);
-  atomicWriteJson(transactionPath, { ...transaction, stage: 'launched', launched_runtime_root: resolvedRuntimeRoot,
-    updated_at: launched.launched_at });
-  return launched;
+  try {
+    launch(sessionDir, resolvedRuntimeRoot);
+  } catch (error) {
+    const failedState = new StateManager().read(path.join(sessionDir, 'state.json'));
+    if (exactTargetLaunchOwner(sessionDir, resolvedRuntimeRoot, failedState, deps)) {
+      return markLaunched(transaction);
+    }
+    assertNoAmbiguousLaunchOwner(sessionDir, resolvedRuntimeRoot, failedState, deps);
+    transaction = restoreLaunchAttempt(sessionDir, transactionPath, transaction, migration, deps);
+    verifyLiveSessionMigration(sessionDir, migration);
+    throw error;
+  }
+  const launchedState = new StateManager().read(path.join(sessionDir, 'state.json'));
+  if (exactTargetLaunchOwner(sessionDir, resolvedRuntimeRoot, launchedState, deps)) {
+    return markLaunched(transaction);
+  }
+  assertNoAmbiguousLaunchOwner(sessionDir, resolvedRuntimeRoot, launchedState, deps);
+  transaction = restoreLaunchAttempt(sessionDir, transactionPath, transaction, migration, deps);
+  verifyLiveSessionMigration(sessionDir, migration);
+  throw new Error('Legacy launch command exited without establishing an exact target owner.');
   } finally {
     launchLock.releaseLock(path.join(sessionDir, '.legacy-session-adoption'));
   }

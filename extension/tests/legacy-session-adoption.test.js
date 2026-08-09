@@ -9,11 +9,12 @@ import { makeTempRoot, prependPath, projectRoot, writeExecutable, writeJson } fr
 import {
   LEGACY_ADOPTION_FILE,
   adoptActiveLegacyMuxSession,
+  legacyAdoptionLaunchTimeoutMs,
   legacyContractRepairPending,
   launchAdoptedLegacySession,
   markLegacyContractRepairComplete,
 } from '../services/legacy-session-adoption.js';
-import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
+import { acquireSupervisorLease, beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import {
@@ -35,6 +36,7 @@ import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-
 import { getWorkingTreeContentFingerprint, listUntrackedFiles } from '../services/git-utils.js';
 import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
 import { persistCitadelReleaseApproval } from '../services/citadel.js';
+import { acquireLaunchLock } from '../services/detached-launch.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -211,6 +213,34 @@ function depsFor(value, actions = []) {
   };
 }
 
+function exactLaunchDeps(value, onLaunch = () => undefined, base = {}) {
+  const runner = identity(62001);
+  let launchedRoot = value.targetRoot;
+  return {
+    ...depsFor(value),
+    ...base,
+    observeProcess: (pid) => pid === runner.pid
+      ? { identity: runner, parent_pid: value.pane.pid,
+        command: `node ${path.join(fs.realpathSync(launchedRoot), 'extension', 'bin', 'mux-runner.js')} ${fs.realpathSync(value.sessionDir)}` }
+      : pid === value.pane.pid ? { identity: value.pane, parent_pid: 1, command: 'bash' } : null,
+    inspectProcess: () => 'matched',
+    tmuxExists: () => true,
+    tmuxBinding: () => ({
+      session_name: value.tmuxName, session_id: '$launch', session_created: '1723147300', pane_id: '%launch',
+      pane_pid: value.pane.pid, pane_start_command: 'bash',
+    }),
+    launch: (sessionDir, runtimeRoot) => {
+      launchedRoot = runtimeRoot;
+      onLaunch(sessionDir, runtimeRoot);
+      const statePath = path.join(sessionDir, 'state.json');
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      writeJson(statePath, { ...state, active: true, tmux_runner_pid: runner.pid, worker_pid: runner.pid,
+        tmux_session_name: value.tmuxName });
+      acquireSupervisorLease(sessionDir, { ownerId: 'target-runner', ttlMs: 60_000, ownerIdentity: runner });
+    },
+  };
+}
+
 test('legacy mux adoption preserves durable evidence, journals explicit adoption, and launches one supervised mux', () => {
   const value = fixture();
   const actions = [];
@@ -234,14 +264,267 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), false);
 
   let launches = 0;
-  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot, {
-    launch: () => { launches += 1; }, now: () => new Date('2026-08-08T20:01:00.000Z'),
-  });
+  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot,
+    exactLaunchDeps(value, () => { launches += 1; }, { now: () => new Date('2026-08-08T20:01:00.000Z') }));
   assert.equal(launched.status, 'launched');
   assert.equal(launched.launched_runtime_root, fs.realpathSync(value.targetRoot));
   assert.equal(launches, 1);
   launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
   assert.equal(launches, 1);
+});
+
+test('failed adopted launch restores exact state bytes and dead launch reservations before retry', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const before = fs.readFileSync(statePath);
+  const cwdDigest = sha256(String(JSON.parse(before.toString('utf8')).working_dir)).slice(0, 16);
+  const launchLock = path.join(value.sessionDir, '.tmux-launch.lock');
+  const cwdLock = path.join(path.dirname(value.sessionDir), `.tmux-cwd-${cwdDigest}.lock`);
+  const deps = depsFor(value);
+  let contenderBlocked = false;
+  deps.afterLaunchReservationsAcquired = () => {
+    assert.throws(() => acquireLaunchLock(value.sessionDir), /tmux launch is already in progress/);
+    contenderBlocked = true;
+  };
+  deps.launch = () => {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    writeJson(statePath, { ...state, active: false });
+    fs.writeFileSync(launchLock, '2147483647');
+    fs.writeFileSync(cwdLock, '2147483647');
+    throw new Error('simulated readiness timeout');
+  };
+  assert.throws(
+    () => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, deps),
+    /simulated readiness timeout/,
+  );
+  assert.deepEqual(fs.readFileSync(statePath), before);
+  assert.equal(contenderBlocked, true);
+  assert.equal(fs.existsSync(launchLock), false);
+  assert.equal(fs.existsSync(cwdLock), false);
+  const transaction = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8'));
+  assert.equal(transaction.stage, 'adopted');
+  assert.equal(transaction.launch_attempt, undefined);
+
+  let retries = 0;
+  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot,
+    exactLaunchDeps(value, () => { retries += 1; }));
+  assert.equal(launched.status, 'launched');
+  assert.equal(retries, 1);
+});
+
+test('rollback rejects a self-consistent snapshot that is not bound to the sealed migration', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, {
+    ...depsFor(value),
+    checkpoint: (stage) => {
+      if (stage !== 'launching') return;
+      const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+      const tampered = Buffer.from('{"schema_version":1,"active":true}\n');
+      transaction.launch_attempt.state_base64 = tampered.toString('base64');
+      transaction.launch_attempt.state_size = tampered.length;
+      transaction.launch_attempt.state_sha256 = sha256(tampered);
+      writeJson(transactionPath, transaction);
+      throw new Error('tampered launch checkpoint');
+    },
+  }), /tampered launch checkpoint/);
+  assert.throws(
+    () => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, depsFor(value)),
+    /does not match the sealed migration state/,
+  );
+});
+
+test('expired dead launch lease restores the sealed journal and permits retry', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const logicalPath = path.join(value.sessionDir, 'logical-pipeline.json');
+  const exactLogical = fs.readFileSync(logicalPath);
+  assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, {
+    ...depsFor(value),
+    launch: () => {
+      acquireSupervisorLease(value.sessionDir, {
+        ownerId: 'expired-launch-owner', ttlMs: 1_000, nowMs: Date.now() - 60_000,
+        ownerIdentity: identity(64001),
+      });
+      throw new Error('owner expired before acknowledgement');
+    },
+  }), /owner expired before acknowledgement/);
+  assert.deepEqual(fs.readFileSync(logicalPath), exactLogical);
+  assert.equal(readLogicalPipeline(value.sessionDir).lease, null);
+  assert.equal(launchAdoptedLegacySession(value.sessionDir, value.targetRoot, exactLaunchDeps(value)).status, 'launched');
+});
+
+test('snapshot-less legacy attempt with drifted lease journal remains launching without state mutation', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, {
+    ...depsFor(value),
+    checkpoint: (stage) => { if (stage === 'launching') throw new Error('simulated launcher crash'); },
+  }), /simulated launcher crash/);
+  const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  delete transaction.launch_attempt.logical_pipeline_size;
+  delete transaction.launch_attempt.logical_pipeline_sha256;
+  delete transaction.launch_attempt.logical_pipeline_base64;
+  writeJson(transactionPath, transaction);
+  acquireSupervisorLease(value.sessionDir, {
+    ownerId: 'expired-legacy-owner', ttlMs: 1_000, nowMs: Date.now() - 60_000,
+    ownerIdentity: identity(64003),
+  });
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const stateBeforeRetry = fs.readFileSync(statePath);
+  assert.throws(
+    () => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, depsFor(value)),
+    /Snapshot-less legacy launch recovery cannot prove the sealed logical pipeline bytes/,
+  );
+  assert.deepEqual(fs.readFileSync(statePath), stateBeforeRetry);
+  assert.equal(JSON.parse(fs.readFileSync(transactionPath, 'utf8')).stage, 'launching');
+});
+
+test('exact dead partial tmux binding is removed by immutable id before rollback and retry', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const binding = {
+    schema_version: 1, session_name: value.tmuxName, session_id: '$91', session_created: '1723147391',
+    pane_id: '%92', pane_pid: 64002,
+    pane_start_command: `node /runtime/mux-runner.js ${fs.realpathSync(value.sessionDir)}`,
+  };
+  let tmuxLive = true;
+  const killed = [];
+  const deps = {
+    ...depsFor(value),
+    observeProcess: () => null,
+    tmuxExists: () => tmuxLive,
+    tmuxBinding: () => tmuxLive ? binding : null,
+    killTmux: (sessionId) => { killed.push(sessionId); tmuxLive = false; },
+    launch: () => {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      writeJson(statePath, { ...state, active: false, tmux_session_name: value.tmuxName,
+        tmux_runner_binding: binding });
+      throw new Error('runner died after creating tmux');
+    },
+  };
+  assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, deps), /runner died/);
+  assert.deepEqual(killed, ['$91']);
+  assert.equal(launchAdoptedLegacySession(value.sessionDir, value.targetRoot, exactLaunchDeps(value)).status, 'launched');
+});
+
+test('persisted legacy launching stage reconstructs only the proven active prewrite and retries', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const exactPrelaunch = fs.readFileSync(statePath);
+  const state = JSON.parse(exactPrelaunch.toString('utf8'));
+  writeJson(statePath, { ...state, active: false });
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  writeJson(transactionPath, { ...transaction, stage: 'launching', updated_at: '2026-08-08T20:00:01.000Z' });
+  fs.writeFileSync(path.join(value.sessionDir, '.tmux-launch.lock'), '2147483647');
+
+  let launches = 0;
+  let recoveredBytes = null;
+  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot,
+    exactLaunchDeps(value, () => { launches += 1; recoveredBytes = fs.readFileSync(statePath); }));
+  assert.equal(launched.status, 'launched');
+  assert.equal(launches, 1);
+  assert.deepEqual(recoveredBytes, exactPrelaunch);
+});
+
+test('launch rollback refuses a live reservation owner', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const livePid = process.pid;
+  const deps = depsFor(value);
+  deps.launch = () => {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    writeJson(statePath, { ...state, active: false });
+    fs.writeFileSync(path.join(value.sessionDir, '.tmux-launch.lock'), String(livePid));
+    throw new Error('launch failed while child survived');
+  };
+  assert.throws(
+    () => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, deps),
+    /tmux launch is already in progress/,
+  );
+  const transaction = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8'));
+  assert.equal(transaction.stage, 'launching');
+});
+
+test('launch rollback refuses lease-first and tmux-first partial owners without a state pid', () => {
+  const leased = fixture();
+  adoptActiveLegacyMuxSession(leased.sessionDir, leased.sourceRoot, leased.targetRoot, depsFor(leased));
+  assert.throws(() => launchAdoptedLegacySession(leased.sessionDir, leased.targetRoot, {
+    ...depsFor(leased),
+    launch: () => {
+      acquireSupervisorLease(leased.sessionDir, { ownerId: 'partial-runner', ttlMs: 60_000,
+        ownerIdentity: identity(63001) });
+      throw new Error('lease became visible before pid');
+    },
+  }), /unmatched live logical lease/);
+
+  const tmux = fixture();
+  adoptActiveLegacyMuxSession(tmux.sessionDir, tmux.sourceRoot, tmux.targetRoot, depsFor(tmux));
+  assert.throws(() => launchAdoptedLegacySession(tmux.sessionDir, tmux.targetRoot, {
+    ...depsFor(tmux),
+    launch: () => {
+      const statePath = path.join(tmux.sessionDir, 'state.json');
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      writeJson(statePath, { ...state, active: false, tmux_session_name: tmux.tmuxName,
+        tmux_runner_binding: { session_name: tmux.tmuxName } });
+      throw new Error('tmux became visible before pid');
+    },
+  }), /unmatched live tmux owner|unmatched live persisted tmux binding/);
+});
+
+test('launch exception reconciles an exact target runner instead of rolling it back', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const targetPid = 81234;
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const command = `node ${path.join(fs.realpathSync(value.targetRoot), 'extension', 'bin', 'mux-runner.js')} ${fs.realpathSync(value.sessionDir)}`;
+  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot, {
+    ...depsFor(value),
+    observeProcess: (pid) => pid === targetPid
+      ? { identity: identity(pid), parent_pid: value.pane.pid, command }
+      : pid === value.pane.pid
+        ? { identity: value.pane, parent_pid: 1, command: 'bash' }
+      : null,
+    launch: () => {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      writeJson(statePath, { ...state, active: false, tmux_runner_pid: targetPid, worker_pid: targetPid,
+        tmux_session_name: value.tmuxName });
+      acquireSupervisorLease(value.sessionDir, { ownerId: 'target-runner', ttlMs: 60_000,
+        ownerIdentity: identity(targetPid) });
+      throw new Error('launcher lost acknowledgement');
+    },
+  });
+  assert.equal(launched.status, 'launched');
+  assert.equal(launched.launched_runtime_root, fs.realpathSync(value.targetRoot));
+});
+
+test('adoption launch timeout scales beyond readiness and runner startup work', () => {
+  const value = fixture();
+  writeJson(path.join(value.sessionDir, 'refinement_manifest.json'), {
+    tickets: Array.from({ length: 14 }, (_, index) => ({ id: `r${index + 1}` })),
+  });
+  assert.equal(legacyAdoptionLaunchTimeoutMs(value.sessionDir, { PICKLE_ADOPTION_LAUNCH_TIMEOUT_MS: '30000' }), 6_840_000);
+  assert.equal(legacyAdoptionLaunchTimeoutMs(value.sessionDir, { PICKLE_ADOPTION_LAUNCH_TIMEOUT_MS: '7200000' }), 7_200_000);
+});
+
+test('successful launch process exit without an exact owner rolls back and remains retryable', () => {
+  const value = fixture();
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value));
+  const before = fs.readFileSync(path.join(value.sessionDir, 'state.json'));
+  assert.throws(
+    () => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { ...depsFor(value), launch: () => undefined }),
+    /without establishing an exact target owner/,
+  );
+  assert.deepEqual(fs.readFileSync(path.join(value.sessionDir, 'state.json')), before);
+  const transaction = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8'));
+  assert.equal(transaction.stage, 'adopted');
 });
 
 test('default sealing preserves malformed verification only after the legacy owner is durably fenced', () => {
@@ -388,9 +671,6 @@ console.log('<promise>CONTRACT_REPAIR_COMPLETE</promise>');
     assert.equal(readiness.ready, true, JSON.stringify(readiness.findings));
     assert.ok(readiness.findings.some((finding) => finding.code === 'adoption-repair-ready'));
 
-    let launches = 0;
-    launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
-    assert.equal(launches, 1);
     await ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true });
 
     let dispatches = 0;
@@ -441,9 +721,8 @@ test('watchdog prefers the canonical deployed runtime and records its owner root
   );
   assert.deepEqual(selected, { runtimeRoot: canonicalRoot, fallback: false });
   let launchedRoot = null;
-  const record = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot, {
-    launch: (_sessionDir, root) => { launchedRoot = root; },
-  });
+  const record = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot,
+    exactLaunchDeps(value, (_sessionDir, root) => { launchedRoot = root; }));
   assert.equal(launchedRoot, fs.realpathSync(canonicalRoot));
   assert.equal(record.launched_runtime_root, fs.realpathSync(canonicalRoot));
 });
@@ -459,7 +738,7 @@ test('installer death launches bounded checkout fallback and rerun hands it to c
     { timeoutMs: 100, intervalMs: 25, now: () => clock, wait: (milliseconds) => { clock += milliseconds; } },
   );
   assert.deepEqual(selected, { runtimeRoot: value.targetRoot, fallback: true });
-  const fallback = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot, { launch: () => undefined });
+  const fallback = launchAdoptedLegacySession(value.sessionDir, selected.runtimeRoot, exactLaunchDeps(value));
   assert.equal(fallback.launched_runtime_root, fs.realpathSync(value.targetRoot));
 
   const canonicalRoot = runtime('target');

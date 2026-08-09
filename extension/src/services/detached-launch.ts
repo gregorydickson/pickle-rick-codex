@@ -308,6 +308,35 @@ export function acquireCwdReservationLocks(cwds: string[]): ReleaseLock {
   };
 }
 
+export function reclaimLaunchReservations(
+  sessionDir: string,
+  cwds: string[],
+  sessionsRoot = getSessionsRoot(),
+): void {
+  withLaunchReservations(sessionDir, cwds, sessionsRoot, () => undefined);
+}
+
+export function withLaunchReservations<T>(
+  sessionDir: string,
+  cwds: string[],
+  sessionsRoot: string,
+  operation: () => T,
+): T {
+  const releases: ReleaseLock[] = [];
+  let releaseLaunch: ReleaseLock | null = null;
+  try {
+    for (const cwd of uniqueCwds(cwds).sort()) releases.push(acquirePidLock(
+      path.join(sessionsRoot, `.tmux-cwd-${crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 16)}.lock`),
+      `A tmux launch is already in progress for ${cwd}.`,
+    ));
+    releaseLaunch = acquireLaunchLock(sessionDir);
+    return operation();
+  } finally {
+    releaseLaunch?.();
+    while (releases.length) releases.pop()?.();
+  }
+}
+
 function uniqueCwds(values: unknown[]): string[] {
   return [...new Set(values.filter((value): value is string => typeof value === 'string' && Boolean(value)))];
 }
