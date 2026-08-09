@@ -336,11 +336,8 @@ export function capturePipelineVerificationBaselines(
   sessionDir: string,
   { state, summary, config, deferredVerificationTicketId = null }: CaptureBaselineContext,
 ): VerificationBaselines | null {
-  if (!isPipelineSession(sessionDir)) {
-    return null;
-  }
-
-  ensurePipelineState(sessionDir);
+  if (isPipelineSession(sessionDir)) ensurePipelineState(sessionDir);
+  else readLogicalPipeline(sessionDir);
   const existing = readVerificationBaselines(sessionDir);
   const workingDir = (state?.working_dir as string | undefined) || process.cwd();
   const timeoutMs = Number(config?.defaults?.worker_timeout_seconds || 60) * 1000;

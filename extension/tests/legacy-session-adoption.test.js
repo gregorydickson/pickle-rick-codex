@@ -5,7 +5,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeTempRoot, writeJson } from './helpers.js';
+import { makeTempRoot, prependPath, projectRoot, writeExecutable, writeJson } from './helpers.js';
 import {
   LEGACY_ADOPTION_FILE,
   adoptActiveLegacyMuxSession,
@@ -16,10 +16,19 @@ import {
 import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
-import { refinementRepositoryIdentity } from '../services/refinement-artifacts.js';
+import {
+  refinementRepositoryIdentity,
+  validateRefinementAcceptance,
+  writeRefinementAcceptance,
+} from '../services/refinement-artifacts.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
+import { checkReadiness } from '../services/readiness.js';
+import { readVerificationBaselines } from '../services/pipeline-state.js';
+import { assertTicketVerificationBoundToSeal } from '../services/verification-seal-contract.js';
+import { readManifest, updateTicketStatus } from '../services/tickets.js';
 import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recovery.js';
 import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
+import { runSequential } from '../bin/mux-runner.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
 
 function git(cwd, args) {
@@ -274,6 +283,124 @@ test('resume-ready-only keeps every non-adopted-ticket verification fail closed'
     /unsafe legacy verification command contains backticks/,
   );
   assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), true);
+});
+
+test('adopted malformed verifier is ready, repaired once, baselined, dispatched once, and restart-safe', async () => {
+  const value = fixture();
+  const dataRoot = path.dirname(path.dirname(value.sessionDir));
+  const qualityCommand = 'node -e "process.exit(0)"';
+  const legacyCommand = 'runtime_root="$(mktemp -d)"; trap \'rm -rf "$runtime_root"\' EXIT; CODEX_HOME="$runtime_root/codex" AGENTS_HOME="$runtime_root/agents" PICKLE_DATA_ROOT="$runtime_root/data" bash install.sh && CODEX_HOME="$runtime_root/codex" AGENTS_HOME="$runtime_root/agents" PICKLE_DATA_ROOT="$runtime_root/data" npm run test:installed';
+  fs.writeFileSync(path.join(value.repo, 'install.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(value.repo, 'package.json'), JSON.stringify({
+    scripts: { 'test:installed': qualityCommand },
+  }, null, 2));
+  git(value.repo, ['add', 'install.sh', 'package.json']);
+  git(value.repo, ['commit', '-m', 'add verifier prerequisites']);
+  const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].verification = [{ command: legacyCommand }];
+  writeJson(manifestPath, manifest);
+  installLegacyRefinementAcceptance(value);
+  writeRefinementAcceptance(value.sessionDir, {
+    workingDir: value.repo,
+    preserveMalformedVerification: true,
+  });
+  writeJson(path.join(value.sessionDir, 'ticket-recovery-history.json'), { schema_version: 1, events: [] });
+  for (const phase of ['research', 'plan']) {
+    const artifactPath = path.join(value.sessionDir, 'worker-lifecycle', 'r1', `${phase}.json`);
+    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    if (phase === 'research') artifact.evidence = ['legacy evidence remains reusable'];
+    else artifact.steps = ['repair the verification contract before implementation'];
+    writeJson(artifactPath, artifact);
+  }
+  fs.mkdirSync(path.join(value.sessionDir, 'r1'), { recursive: true });
+  fs.writeFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), [
+    '---', 'id: r1', 'title: Legacy ticket 1', 'status: In Progress', '---', '',
+  ].join('\n'));
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.worker_timeout_seconds = 10;
+  state.quality_baseline = {
+    head_sha: git(value.repo, ['rev-parse', 'HEAD']),
+    captured_at: '2026-08-08T19:30:00.000Z',
+    commands: [{ command: qualityCommand, ok: true, exitCode: 0, signature: 'success', output: '' }],
+    command_contract: { [qualityCommand]: qualityCommand },
+  };
+  writeJson(statePath, state);
+
+  const adoptionDeps = depsFor(value);
+  delete adoptionDeps.sealSession;
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, adoptionDeps);
+
+  const fakeBin = makeTempRoot('legacy-adoption-repair-bin-');
+  const repairLog = path.join(fakeBin, 'repairs.log');
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) {
+  console.log('codex fixture 1.0.0');
+  process.exit(0);
+}
+const prompt = fs.readFileSync(0, 'utf8');
+const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
+fs.appendFileSync(process.env.LEGACY_REPAIR_LOG, 'repair\\n');
+fs.writeFileSync(value('Contract repair artifact path: '), JSON.stringify({
+  schema_version: 1,
+  ticket_id: value('Ticket ID: '),
+  verification: JSON.parse(value('Authorized sealed verification steps JSON: ')),
+  rationale: 'reconstruct the exact sealed legacy command as a structured shell step',
+}));
+console.log('<promise>CONTRACT_REPAIR_COMPLETE</promise>');
+`);
+  const environment = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    LEGACY_REPAIR_LOG: repairLog,
+  });
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    const readiness = checkReadiness(value.sessionDir, { runtimeRoot: projectRoot, env: environment });
+    assert.equal(readiness.ready, true, JSON.stringify(readiness.findings));
+    assert.ok(readiness.findings.some((finding) => finding.code === 'adoption-repair-ready'));
+
+    let launches = 0;
+    launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
+    assert.equal(launches, 1);
+    await ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true });
+
+    let dispatches = 0;
+    const runTicket = async (sessionDir, ticketId) => {
+      dispatches += 1;
+      assert.equal(legacyContractRepairPending(sessionDir, ticketId), false);
+      assert.equal(validateRefinementAcceptance(sessionDir, { workingDir: value.repo, verifyRepository: true }).ok, true);
+      assert.doesNotThrow(() => assertTicketVerificationBoundToSeal(sessionDir, ticketId, value.repo));
+      const repaired = readManifest(sessionDir).tickets.find((ticket) => ticket.id === ticketId);
+      assert.equal(repaired.verification[0].kind, 'shell');
+      assert.ok(Object.keys(readVerificationBaselines(sessionDir).by_ticket.r1 || {}).length > 0);
+      updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+      return { status: 'done', applied: false };
+    };
+    const options = {
+      operationLeaseHeld: true,
+      onFailure: 'abort',
+      runnerMode: 'pickle',
+    };
+    assert.equal(
+      await runSequential(value.sessionDir, options, { runTicket }),
+      'success',
+      fs.readFileSync(path.join(value.sessionDir, 'mux-runner.log'), 'utf8'),
+    );
+    assert.equal(fs.readFileSync(repairLog, 'utf8').trim().split('\n').length, 1);
+    assert.equal(dispatches, 1);
+
+    assert.equal(await runSequential(value.sessionDir, options, { runTicket }), 'success');
+    assert.equal(fs.readFileSync(repairLog, 'utf8').trim().split('\n').length, 1);
+    assert.equal(dispatches, 1);
+  } finally {
+    for (const [key, prior] of Object.entries(previous)) {
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  }
 });
 
 test('watchdog prefers the canonical deployed runtime and records its owner root', () => {

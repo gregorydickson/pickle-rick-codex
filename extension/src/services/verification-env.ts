@@ -310,7 +310,7 @@ function hasUnquotedGlob(command: string): boolean {
   return false;
 }
 
-const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'command', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'popd', 'printf', 'pushd', 'pwd', 'read', 'set', 'source', 'test', 'true', 'unset']);
+const SHELL_BUILTINS = new Set(['.', ':', '[', 'cd', 'command', 'echo', 'eval', 'exec', 'exit', 'export', 'false', 'popd', 'printf', 'pushd', 'pwd', 'read', 'set', 'source', 'test', 'trap', 'true', 'unset']);
 const SHELL_RESERVED_WITHOUT_COMMAND = new Set(['for', 'select', 'case', 'done', 'fi', 'esac', 'in', 'function', '}']);
 const SHELL_RESERVED_COMMAND_PREFIXES = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', 'time', '{']);
 const MAX_SHELL_WRAPPER_DEPTH = 16;

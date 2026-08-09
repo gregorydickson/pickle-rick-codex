@@ -21,7 +21,6 @@ import { validateRefinementAcceptance } from './refinement-artifacts.js';
 import { enrichRefinementManifest, readManifest, ticketDependencyIds } from './tickets.js';
 import type { PersistedState } from './state-manager.js';
 import { recordExecutionControlTelemetry } from './productive-autonomy.js';
-import { isVerificationContractError } from './verification-env.js';
 import type { RefinementManifest, Ticket } from '../types/index.js';
 
 interface LegacyAdoptionSealTransaction {
@@ -42,13 +41,6 @@ function readManifestForFencedLegacyAdoption(
   state: PersistedState,
 ): RefinementManifest {
   assertFencedLegacyAdoptionSeal(sessionDir, expectedMigrationContentHash, state);
-
-  try {
-    return readManifest(sessionDir);
-  } catch (error) {
-    if (!isVerificationContractError(error)) throw error;
-  }
-
   const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
   const raw = readJsonFile<RefinementManifest>(manifestPath, null);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Array.isArray(raw.tickets)) {

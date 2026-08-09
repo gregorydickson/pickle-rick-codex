@@ -1028,10 +1028,18 @@ export function cancelPipelineSession(
 export function readVerificationBaselines(
   sessionDir: string,
   stateManager: StateManager = new StateManager(),
-  pipeline: PipelineContract = readPipelineContract(sessionDir),
+  pipeline?: PipelineContract,
 ): VerificationBaselines {
-  const pipelineState = readPipelineState(sessionDir, stateManager, pipeline);
-  return normalizeVerificationBaselines(pipelineState.verification_baselines, pipeline.working_dir);
+  const resolvedPipeline = pipeline || (hasPipelineContract(sessionDir) ? readPipelineContract(sessionDir) : null);
+  if (resolvedPipeline) {
+    const pipelineState = readPipelineState(sessionDir, stateManager, resolvedPipeline);
+    return normalizeVerificationBaselines(pipelineState.verification_baselines, resolvedPipeline.working_dir);
+  }
+  const state = stateManager.read(getSessionStatePath(sessionDir));
+  return normalizeVerificationBaselines(
+    state.verification_baselines,
+    String(state.working_dir || process.cwd()),
+  );
 }
 
 export function writeVerificationBaselines(
@@ -1039,13 +1047,28 @@ export function writeVerificationBaselines(
   verificationBaselines: unknown,
   options: WriteVerificationBaselinesOptions = {},
 ): VerificationBaselines {
-  const pipeline = options.pipeline || readPipelineContract(sessionDir);
-  return transitionPipelineState(sessionDir, (pipelineState) => {
-    pipelineState.verification_baselines = normalizeVerificationBaselines(
+  const pipeline = options.pipeline || (hasPipelineContract(sessionDir) ? readPipelineContract(sessionDir) : null);
+  if (pipeline) {
+    return transitionPipelineState(sessionDir, (pipelineState) => {
+      pipelineState.verification_baselines = normalizeVerificationBaselines(
+        verificationBaselines,
+        pipeline.working_dir,
+      );
+    }, { ...options, pipeline }).pipelineState.verification_baselines;
+  }
+  const stateManager = options.stateManager || new StateManager();
+  const statePath = getSessionStatePath(sessionDir);
+  const updated = stateManager.update(statePath, (state) => {
+    state.verification_baselines = normalizeVerificationBaselines(
       verificationBaselines,
-      pipeline.working_dir,
+      String(state.working_dir || process.cwd()),
     );
-  }, { ...options, pipeline }).pipelineState.verification_baselines;
+    return state;
+  });
+  return normalizeVerificationBaselines(
+    updated.verification_baselines,
+    String(updated.working_dir || process.cwd()),
+  );
 }
 
 export function readTicketVerificationBaseline(
