@@ -75,6 +75,69 @@ test('Citadel verification cwd cannot escape its isolated worktree', () => {
   assert.throws(() => resolveCitadelCheckCwd(isolated, '../outside'), /escapes the isolated release worktree/);
 });
 
+test('Citadel provisions committed dependencies inside a clean self-contained review worktree', async () => {
+  const cwd = makeTempRoot('pickle-citadel-dependency-repo-');
+  execFileSync('git', ['init', '-q'], { cwd });
+  execFileSync('git', ['config', 'user.email', 'pickle@example.test'], { cwd });
+  execFileSync('git', ['config', 'user.name', 'Pickle Test'], { cwd });
+  fs.mkdirSync(path.join(cwd, 'vendor', 'citadel-local-dependency'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'vendor', 'citadel-local-dependency', 'package.json'), JSON.stringify({
+    name: 'citadel-local-dependency', version: '1.0.0', main: 'index.js',
+  }));
+  fs.writeFileSync(path.join(cwd, 'vendor', 'citadel-local-dependency', 'index.js'), 'module.exports = true;\n');
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    name: 'citadel-dependency-fixture', version: '1.0.0',
+    scripts: { test: 'node -e "require(\'citadel-local-dependency\')"' },
+    dependencies: { 'citadel-local-dependency': 'file:vendor/citadel-local-dependency' },
+  }));
+  fs.writeFileSync(path.join(cwd, '.gitignore'), 'node_modules/\n');
+  execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd, stdio: 'ignore', timeout: 30_000,
+  });
+  fs.mkdirSync(path.join(cwd, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'node_modules', 'external-source-marker'), 'must not be linked\n');
+  execFileSync('git', ['add', '.gitignore', 'package.json', 'package-lock.json', 'vendor'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'release checkpoint'], { cwd });
+  const sessionDir = makeTempRoot('pickle-citadel-dependency-session-');
+  const startCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({
+    schema_version: 1, working_dir: cwd, start_commit: startCommit, worker_timeout_seconds: 10,
+  }));
+  fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{ acceptance_criteria: ['The isolated review dependency tree is clean and self-contained.'] }],
+  }));
+
+  const fakeBin = makeTempRoot('pickle-citadel-clean-reviewer-bin-');
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const cp = require('node:child_process');
+const prompt = fs.readFileSync(0, 'utf8');
+const status = cp.execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+const dependency = path.join(process.cwd(), 'node_modules', 'citadel-local-dependency');
+if (status !== '' || !fs.existsSync(dependency) || fs.lstatSync(path.join(process.cwd(), 'node_modules')).isSymbolicLink()
+    || !fs.realpathSync(dependency).startsWith(process.cwd() + path.sep)
+    || fs.existsSync(path.join(process.cwd(), 'node_modules', 'external-source-marker'))) process.exit(9);
+const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
+const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
+const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
+fs.writeFileSync(reportPath, JSON.stringify({ schema_version: 1, verdict: 'approve', reviewed_range: reviewedRange,
+  acceptance_criteria_checked: criteria, findings: [], generated_at: new Date().toISOString() }));
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf('--output-last-message');
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], '<promise>THE_CITADEL_APPROVES</promise>');
+console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }));
+`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+  try {
+    assert.equal(await runCitadel(sessionDir), 'success');
+    assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
+  } finally {
+    process.env.PATH = originalPath;
+  }
+});
+
 test('Citadel rejects an absolute verification cwd before it can mutate the release tree', async () => {
   const { cwd, sessionDir } = makeCitadelLifecycleSession('Checks stay isolated.');
   fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({

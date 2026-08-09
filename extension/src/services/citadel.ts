@@ -186,6 +186,30 @@ export function getCitadelRepositoryFingerprint(workingDir: string): string {
   });
 }
 
+function assertDependencyTreeContained(nodeModulesDir: string, isolatedRoot: string): void {
+  if (!fs.existsSync(nodeModulesDir)) return;
+  if (fs.lstatSync(nodeModulesDir).isSymbolicLink()) {
+    throw new Error(`dependency root is an external symlink: ${nodeModulesDir}`);
+  }
+  const canonicalIsolatedRoot = fs.realpathSync(isolatedRoot);
+  const pending = [nodeModulesDir];
+  while (pending.length > 0) {
+    const current = pending.pop() as string;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = fs.realpathSync(entryPath);
+        const relative = path.relative(canonicalIsolatedRoot, target);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new Error(`dependency symlink escapes the isolated tree: ${entryPath}`);
+        }
+      } else if (entry.isDirectory()) {
+        pending.push(entryPath);
+      }
+    }
+  }
+}
+
 function createCitadelWorktree(workingDir: string, checkpointHead: string): { workingDir: string; cleanup: () => void } {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-citadel-worktree-'));
   const isolated = path.join(parent, 'repository');
@@ -194,26 +218,38 @@ function createCitadelWorktree(workingDir: string, checkpointHead: string): { wo
     stdio: ['ignore', 'ignore', 'pipe'],
     timeout: 30_000,
   });
-  for (const relative of ['node_modules', path.join('extension', 'node_modules')]) {
-    const source = path.join(workingDir, relative);
-    const destination = path.join(isolated, relative);
-    if (!fs.existsSync(source) || fs.existsSync(destination)) continue;
-    fs.symlinkSync(source, destination, 'junction');
-  }
-  return {
-    workingDir: isolated,
-    cleanup: () => {
-      try {
-        execFileSync('git', ['worktree', 'remove', '--force', isolated], {
-          cwd: workingDir,
-          stdio: ['ignore', 'ignore', 'pipe'],
-          timeout: 30_000,
-        });
-      } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-      }
-    },
+  const cleanup = (): void => {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', isolated], {
+        cwd: workingDir,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        timeout: 30_000,
+      });
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
   };
+  try {
+    for (const relative of ['', 'extension']) {
+      const packageRoot = path.join(isolated, relative);
+      if (!fs.existsSync(path.join(packageRoot, 'package.json'))
+        || !fs.existsSync(path.join(packageRoot, 'package-lock.json'))) continue;
+      execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--prefer-offline'], {
+        cwd: packageRoot,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        timeout: 300_000,
+      });
+      assertDependencyTreeContained(path.join(packageRoot, 'node_modules'), isolated);
+    }
+    const dirtyPaths = listWorkingTreeDirtyPaths(isolated);
+    if (dirtyPaths.length > 0) {
+      throw new Error(`dependency provisioning dirtied the isolated tree: ${dirtyPaths.join(', ')}`);
+    }
+    return { workingDir: isolated, cleanup };
+  } catch (error) {
+    cleanup();
+    throw new Error('Citadel could not provision a clean isolated dependency tree from committed lockfiles.', { cause: error });
+  }
 }
 
 function normalizeFinding(value: unknown, index: number): CitadelFinding {
