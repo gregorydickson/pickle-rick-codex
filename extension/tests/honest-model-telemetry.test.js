@@ -17,10 +17,12 @@ const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtur
 function fakeCodex(runtimeDir) {
   const executable = path.join(runtimeDir, 'codex-telemetry');
   fs.writeFileSync(executable, `#!/usr/bin/env node
-console.log(JSON.stringify({ usage: { input_tokens: 11, cache_creation_input_tokens: 4, cache_read_input_tokens: 2, output_tokens: 3 } }));
+const fs = require('node:fs');
+const usage = JSON.stringify({ usage: { input_tokens: 11, cache_creation_input_tokens: 4, cache_read_input_tokens: 2, output_tokens: 3 } });
+fs.writeSync(1, usage + '\\n');
 if (process.env.FAKE_OUTCOME === 'failed') process.exit(7);
 if (process.env.FAKE_OUTCOME === 'wait') {
-  if (process.env.FAKE_MARKER) require('node:fs').writeFileSync(process.env.FAKE_MARKER, 'ready');
+  if (process.env.FAKE_MARKER) fs.writeFileSync(process.env.FAKE_MARKER, 'ready');
   setInterval(() => {}, 1000);
 }
 `, { mode: 0o755 });
@@ -44,7 +46,11 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   const command = fakeCodex(makeTempRoot('pickle-honest-codex-'));
   const success = await invoke(sessionDir, command, 'success', 'research');
   const failed = await invoke(sessionDir, command, 'failed', 'plan');
-  const timedOut = await invoke(sessionDir, command, 'wait', 'implement', { timeoutMs: 80 });
+  const timeoutMarker = path.join(sessionDir, 'timeout-ready');
+  const timedOut = await invoke(sessionDir, command, 'wait', 'implement', {
+    timeoutMs: 500,
+    env: { FAKE_MARKER: timeoutMarker },
+  });
   const cancelMarker = path.join(sessionDir, 'cancel-ready');
   const cancelled = await invoke(sessionDir, command, 'wait', 'review', {
     env: { FAKE_MARKER: cancelMarker },
@@ -54,8 +60,11 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   assert.equal(success.exitCode, 0);
   assert.equal(failed.exitCode, 7);
   assert.equal(timedOut.timedOut, true);
+  assert.equal(fs.readFileSync(timeoutMarker, 'utf8'), 'ready');
+  assert.ok(timedOut.durationMs >= 500 && timedOut.durationMs < 2_000);
   assert.equal(cancelled.cancelled, true);
   for (const result of [success, failed, timedOut, cancelled]) {
+    assert.equal(result.usageReported, true);
     assert.deepEqual(result.usage, {
       input_tokens: 11,
       cache_creation_input_tokens: 4,
@@ -79,6 +88,40 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   assert.deepEqual(events.map((event) => event.model_attempt_id), [1, 2, 3, 4]);
   assert.deepEqual(events.map((event) => event.ticket_attempt), [2, 2, 2, 2]);
   assert.deepEqual(events.map((event) => event.phase_attempt), [1, 1, 1, 1]);
+});
+
+test('a true no-usage timeout persists unavailable telemetry without fabricated zero tokens', async () => {
+  const sessionDir = makeTempRoot('pickle-no-usage-timeout-');
+  const executable = path.join(makeTempRoot('pickle-no-usage-timeout-bin-'), 'codex');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: executable,
+    prompt: 'no usage timeout',
+    timeoutMs: 80,
+    telemetry: { sessionDir, ticketId: 'T1', phase: 'no_usage_timeout' },
+  });
+
+  assert.equal(result.exitCode, 124);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.usageReported, false);
+  assert.deepEqual(result.usage, {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  });
+  assert.ok(result.durationMs >= 80 && result.durationMs < 2_000);
+  const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
+  assert.equal(event.outcome, 'timed_out');
+  assert.equal(event.telemetry_status, 'telemetry_unavailable');
+  assert.equal(event.telemetry_failure, 'call_ended_without_usage');
+  assert.equal(event.input_tokens, null);
+  assert.equal(event.cached_input_tokens, null);
+  assert.equal(event.cache_creation_input_tokens, null);
+  assert.equal(event.output_tokens, null);
 });
 
 test('installed-runtime JSONL retains terminal usage and allocates durable Citadel ordinals across calls', async () => {
