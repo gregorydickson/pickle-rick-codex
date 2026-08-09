@@ -17,6 +17,7 @@ import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } 
 import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import { refinementRepositoryIdentity } from '../services/refinement-artifacts.js';
+import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recovery.js';
 import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
@@ -117,6 +118,13 @@ function installLegacyRefinementAcceptance(value) {
   state.start_commit = git(value.repo, ['rev-parse', 'HEAD']);
   writeJson(statePath, state);
   const manifest = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'refinement_manifest.json'), 'utf8'));
+  manifest.tickets = manifest.tickets.map((ticket, index) => ({
+    title: `Legacy ticket ${index + 1}`,
+    description: 'Repair the adopted legacy verification contract.',
+    priority: 'P0',
+    ...ticket,
+  }));
+  writeJson(path.join(value.sessionDir, 'refinement_manifest.json'), manifest);
   const contractFields = new Set([
     'id', 'title', 'description', 'complexity_tier', 'verification', 'verification_env', 'depends_on',
     'acceptance_criteria', 'priority', 'phase', 'output_artifacts', 'proof_corpus', 'allowed_paths',
@@ -218,6 +226,54 @@ test('default sealing preserves malformed verification only after the legacy own
     acceptance_criteria: ['Adopt safely.'],
     verification: ['node -e "const x = `legacy`"'],
   }]);
+});
+
+test('resume-ready-only reaches the exact sealed adopted verification repair ticket', async () => {
+  const value = fixture();
+  installLegacyRefinementAcceptance(value);
+  const deps = depsFor(value);
+  delete deps.sealSession;
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  const manifestBefore = fs.readFileSync(path.join(value.sessionDir, 'refinement_manifest.json'), 'utf8');
+
+  const ready = await ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true });
+
+  assert.equal(ready.summary.runnable[0].id, 'r1');
+  assert.equal(fs.readFileSync(path.join(value.sessionDir, 'refinement_manifest.json'), 'utf8'), manifestBefore);
+  assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), true);
+
+  markLegacyContractRepairComplete(value.sessionDir);
+  await assert.rejects(
+    () => ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true }),
+    /unsafe legacy verification command contains backticks/,
+  );
+});
+
+test('resume-ready-only keeps every non-adopted-ticket verification fail closed', async () => {
+  const value = fixture();
+  const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets.push({
+    id: 'r2',
+    title: 'Unrelated malformed ticket',
+    description: 'This verifier is not authorized by the adoption checkpoint.',
+    status: 'Todo',
+    priority: 'P1',
+    acceptance_criteria: ['Remain fail closed.'],
+    allowed_paths: ['tracked.txt'],
+    verification: ['node -e "const y = `unrelated`"'],
+  });
+  writeJson(manifestPath, manifest);
+  installLegacyRefinementAcceptance(value);
+  const deps = depsFor(value);
+  delete deps.sealSession;
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+
+  await assert.rejects(
+    () => ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true }),
+    /unsafe legacy verification command contains backticks/,
+  );
+  assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), true);
 });
 
 test('watchdog prefers the canonical deployed runtime and records its owner root', () => {

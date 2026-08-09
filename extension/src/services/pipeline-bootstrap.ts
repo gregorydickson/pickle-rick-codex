@@ -16,8 +16,12 @@ import {
   writeVerificationBaselines,
 } from './pipeline-state.js';
 import {
+  areTicketDependenciesSatisfied,
   getNextRunnableTicket,
   isRunnableTicketStatus,
+  listTickets,
+  normalizeTicketId,
+  normalizeTicketStatus,
   readManifest,
   summarizeTickets,
   updateTicketStatus,
@@ -46,9 +50,14 @@ import type {
   VerificationBaselineEntry,
   VerificationBaselines,
   VerificationStep,
+  RefinementManifest,
+  Ticket,
 } from '../types/index.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from './session-prd-seal.js';
+import { LEGACY_ADOPTION_FILE, type LegacyAdoptionRecord } from './legacy-session-adoption.js';
+import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
+import { readLogicalPipeline } from './durable-supervisor.js';
 
 interface CreateBootstrapSessionOptions {
   prdPath?: string | null;
@@ -119,6 +128,100 @@ interface CaptureBaselineContext {
   state: PersistedState;
   summary: TicketSummary;
   config: Config;
+  deferredVerificationTicketId?: string | null;
+}
+
+type PendingLegacyAdoptionRecord = LegacyAdoptionRecord & { contract_repair_completed_at?: string };
+
+function pendingAdoptedVerificationRepairTicket(
+  sessionDir: string,
+  state: PersistedState,
+  resumeReadyOnly: boolean,
+): string | null {
+  if (!resumeReadyOnly || state.step !== 'verification_contract_repair'
+    || state.failure_kind !== 'verification_contract_failed'
+    || typeof state.current_ticket !== 'string' || !state.current_ticket) return null;
+  const ticketId = normalizeTicketId(state.current_ticket, state.current_ticket);
+  const record = readJsonFile<PendingLegacyAdoptionRecord>(path.join(sessionDir, LEGACY_ADOPTION_FILE), null);
+  if (!record || record.schema_version !== 1
+    || !['adopted', 'launched'].includes(record.status)
+    || record.resume_checkpoint.phase !== 'verification_contract_repair'
+    || normalizeTicketId(record.resume_checkpoint.ticket_id, '') !== ticketId
+    || record.contract_repair_completed_at) return null;
+
+  const prd = fs.readFileSync(path.join(sessionDir, 'prd.md'), 'utf8');
+  const seal = readPrdSeal(sessionDir);
+  assertPrdSealMatchesPrd(seal, prd);
+  const logical = readLogicalPipeline(sessionDir);
+  const adoptionEvent = logical.events.find((event) => event.kind === 'legacy_session_adopted'
+    && event.details.migration_content_hash === record.migration_content_hash);
+  if (!adoptionEvent || logical.control_state !== 'autonomous_execution'
+    || logical.prd_seal_hash !== seal.semantic_hash || logical.lease !== null) {
+    throw new Error('Adopted verification repair lacks its exact sealed migration checkpoint.');
+  }
+  return ticketId;
+}
+
+function deferredVerificationManifest(
+  sessionDir: string,
+  deferredTicketId: string,
+): { manifest: RefinementManifest; issues: string[] } {
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = readJsonFile<RefinementManifest>(manifestPath, null);
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || !Array.isArray(manifest.tickets)) {
+    throw new Error(`Invalid refinement manifest JSON: ${manifestPath}`);
+  }
+  const matchingIndexes = manifest.tickets.flatMap((ticket, index) => (
+    normalizeTicketId(ticket.id || ticket.title, `ticket-${index + 1}`) === deferredTicketId ? [index] : []
+  ));
+  if (matchingIndexes.length !== 1) {
+    throw new Error(`Adopted verification repair ticket ${deferredTicketId} is not unique in the refinement manifest.`);
+  }
+
+  for (const [index, ticket] of manifest.tickets.entries()) {
+    if (index === matchingIndexes[0]) continue;
+    normalizeVerificationSteps(ticket.verification, { verify: ticket.verify });
+  }
+  const validationManifest = structuredClone(manifest);
+  validationManifest.tickets[matchingIndexes[0]] = {
+    ...validationManifest.tickets[matchingIndexes[0]],
+    verification: [{ kind: 'process', executable: process.execPath, args: ['-e', 'process.exit(0)'] }],
+  };
+  delete validationManifest.tickets[matchingIndexes[0]].verify;
+  return { manifest, issues: validateRefinementManifest(validationManifest) };
+}
+
+function summarizeDeferredVerificationManifest(
+  sessionDir: string,
+  manifest: RefinementManifest,
+): TicketSummary {
+  const runtimeById = new Map(listTickets(sessionDir).map((ticket) => [normalizeTicketId(ticket.id, ticket.id), ticket]));
+  const tickets: Ticket[] = manifest.tickets.map((ticket, index) => {
+    const ticketId = normalizeTicketId(ticket.id || ticket.title, `ticket-${index + 1}`);
+    const runtime = runtimeById.get(ticketId);
+    return runtime ? {
+      ...ticket,
+      status: runtime.status,
+      order: runtime.order,
+      filePath: runtime.filePath,
+      content: runtime.content,
+      frontmatter: runtime.frontmatter,
+    } : ticket;
+  });
+  const summary: TicketSummary = {
+    queued: 0, done: 0, blocked: 0, skipped: 0, total: tickets.length, runnable: [], tickets,
+  };
+  for (const ticket of tickets) {
+    const status = normalizeTicketStatus(ticket.status);
+    if (status === 'done') summary.done += 1;
+    else if (status === 'blocked') summary.blocked += 1;
+    else if (status === 'skipped') summary.skipped += 1;
+    else {
+      summary.queued += 1;
+      if (areTicketDependenciesSatisfied(ticket, tickets)) summary.runnable.push(ticket);
+    }
+  }
+  return summary;
 }
 
 export function firstMarkdownHeading(content: string, fallback: string): string {
@@ -231,7 +334,7 @@ function captureVerificationBaselineResult({
 
 function capturePipelineVerificationBaselines(
   sessionDir: string,
-  { state, summary, config }: CaptureBaselineContext,
+  { state, summary, config, deferredVerificationTicketId = null }: CaptureBaselineContext,
 ): VerificationBaselines | null {
   if (!isPipelineSession(sessionDir)) {
     return null;
@@ -245,6 +348,8 @@ function capturePipelineVerificationBaselines(
   let capturedAny = false;
 
   for (const ticket of summary.tickets || []) {
+    if (deferredVerificationTicketId
+      && normalizeTicketId(ticket.id, ticket.id) === deferredVerificationTicketId) continue;
     if (!isRunnableTicketStatus(ticket?.status)) {
       continue;
     }
@@ -397,19 +502,29 @@ export async function ensureBootstrapSessionReady(
   const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
   recoverInterruptedTicketTransaction(sessionDir);
   const current = manager.read(statePath);
+  const deferredVerificationTicketId = pendingAdoptedVerificationRepairTicket(
+    sessionDir,
+    current,
+    options.resumeReadyOnly === true,
+  );
   const validateAcceptance = () => validateRefinementAcceptance(sessionDir, {
     workingDir: current.working_dir as string | undefined,
     verifyRepository: true,
+    preserveMalformedVerification: Boolean(deferredVerificationTicketId),
   });
 
   if (!fs.existsSync(prdPath) && !options.resumeReadyOnly) {
     throw new Error(`Session is not bootstrapped for tmux: missing ${prdPath}. Start with --prd <path>.`);
   }
 
-  let artifactAcceptance = validateRefinementAcceptance(sessionDir);
+  let artifactAcceptance = validateRefinementAcceptance(sessionDir, {
+    preserveMalformedVerification: Boolean(deferredVerificationTicketId),
+  });
   if (artifactAcceptance.ok && typeof current.working_dir === 'string') {
     reconcileVerifiedRefinementRepositoryAdvance(sessionDir, current.working_dir);
-    artifactAcceptance = validateRefinementAcceptance(sessionDir);
+    artifactAcceptance = validateRefinementAcceptance(sessionDir, {
+      preserveMalformedVerification: Boolean(deferredVerificationTicketId),
+    });
   }
   let acceptance = validateAcceptance();
 
@@ -438,22 +553,29 @@ export async function ensureBootstrapSessionReady(
   }
 
   let manifestIssues: string[];
+  let deferredManifest: RefinementManifest | null = null;
   try {
-    const manifestBeforeNormalization = fs.readFileSync(manifestPath, 'utf8');
-    const manifest = readManifest(sessionDir);
-    manifestIssues = validateRefinementManifest(manifest);
-    const manifestAfterNormalization = fs.readFileSync(manifestPath, 'utf8');
-    const normalizedAcceptance = validateAcceptance();
-    if (
-      acceptance.ok
-      && manifestIssues.length === 0
-      && manifestBeforeNormalization !== manifestAfterNormalization
-      && normalizedAcceptance.reason === 'manifest_sha256 does not match the accepted refinement'
-    ) {
-      writeRefinementAcceptance(sessionDir, { workingDir: current.working_dir as string | undefined });
-      acceptance = validateAcceptance();
+    if (deferredVerificationTicketId) {
+      const deferred = deferredVerificationManifest(sessionDir, deferredVerificationTicketId);
+      deferredManifest = deferred.manifest;
+      manifestIssues = deferred.issues;
     } else {
-      acceptance = normalizedAcceptance;
+      const manifestBeforeNormalization = fs.readFileSync(manifestPath, 'utf8');
+      const manifest = readManifest(sessionDir);
+      manifestIssues = validateRefinementManifest(manifest);
+      const manifestAfterNormalization = fs.readFileSync(manifestPath, 'utf8');
+      const normalizedAcceptance = validateAcceptance();
+      if (
+        acceptance.ok
+        && manifestIssues.length === 0
+        && manifestBeforeNormalization !== manifestAfterNormalization
+        && normalizedAcceptance.reason === 'manifest_sha256 does not match the accepted refinement'
+      ) {
+        writeRefinementAcceptance(sessionDir, { workingDir: current.working_dir as string | undefined });
+        acceptance = validateAcceptance();
+      } else {
+        acceptance = normalizedAcceptance;
+      }
     }
   } catch (error) {
     manifestIssues = [error instanceof Error ? error.message : String(error)];
@@ -472,7 +594,9 @@ export async function ensureBootstrapSessionReady(
     throw new Error(`Session is not runnable: ${acceptance.reason}.`);
   }
 
-  const summary = summarizeTickets(sessionDir);
+  const summary = deferredManifest
+    ? summarizeDeferredVerificationManifest(sessionDir, deferredManifest)
+    : summarizeTickets(sessionDir);
   if (!summary.total) {
     throw new Error('Session is not runnable: refinement produced zero tickets.');
   }
@@ -482,20 +606,22 @@ export async function ensureBootstrapSessionReady(
     }
   }
 
-  const nextTicket = getNextRunnableTicket(sessionDir);
-  if (nextTicket) {
+  const ticketsToPreflight = deferredVerificationTicketId
+    ? summary.runnable.filter((ticket) => normalizeTicketId(ticket.id, ticket.id) !== deferredVerificationTicketId)
+    : [getNextRunnableTicket(sessionDir)].filter((ticket): ticket is Ticket => Boolean(ticket));
+  const config = loadConfig();
+  for (const ticket of ticketsToPreflight) {
     assertTicketVerificationReady({
-      ticket: nextTicket,
-      config: loadConfig() as unknown as ConfigVerificationInput,
+      ticket,
+      config: config as unknown as ConfigVerificationInput,
       cwd: (manager.read(statePath).working_dir as string | undefined) || process.cwd(),
       allowedRoots: [sessionDir],
     });
   }
 
   const state = manager.read(statePath);
-  const config = loadConfig();
-  capturePipelineVerificationBaselines(sessionDir, { state, summary, config });
-  ensureSessionPrdSeal(sessionDir);
+  capturePipelineVerificationBaselines(sessionDir, { state, summary, config, deferredVerificationTicketId });
+  if (!deferredVerificationTicketId) ensureSessionPrdSeal(sessionDir);
 
   return { state, summary };
 }
