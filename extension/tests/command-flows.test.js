@@ -1742,6 +1742,46 @@ setInterval(() => {}, 1000);
   assert.deepEqual(JSON.parse(fs.readFileSync(artifactPath, 'utf8')), { stage: 'started', final: true });
 });
 
+test('terminal usage cannot rearm observed success beyond the absolute deadline', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-terminal-usage-deadline-');
+  const artifactDir = makeTempRoot('pickle-codex-terminal-usage-deadline-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const output = args[args.indexOf('--output-last-message') + 1];
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'terminal-deadline-test' }));
+fs.writeFileSync(output, '<promise>DONE</promise>');
+setTimeout(() => console.log(JSON.stringify({
+  type: 'turn.completed',
+  usage: { input_tokens: 21, cached_input_tokens: 8, output_tokens: 5 },
+})), 200);
+process.on('SIGTERM', () => setTimeout(() => process.exit(0), 30));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'terminal usage deadline',
+    timeoutMs: 500,
+    outputLastMessagePath: messagePath,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminatedAfterSuccess, true);
+  assert.equal(result.usageReported, true);
+  assert.deepEqual(result.usage, {
+    input_tokens: 21,
+    output_tokens: 5,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 8,
+  });
+});
+
 test('absolute deadline recognizes unpolled success before classifying the command as timed out', async () => {
   const runtimeDir = makeTempRoot('pickle-codex-deadline-success-');
   const artifactDir = makeTempRoot('pickle-codex-deadline-success-artifacts-');
@@ -1775,7 +1815,7 @@ setInterval(() => {}, 1000);
   assert.match(result.lastMessage, /DEADLINE-DRAINED/);
 });
 
-test('artifact progress extends success shutdown grace but never the absolute timeout', async () => {
+test('artifact progress extends success shutdown grace while ongoing and no-success progress time out', async () => {
   const runtimeDir = makeTempRoot('pickle-codex-progress-');
   const artifactDir = makeTempRoot('pickle-codex-progress-artifacts-');
   const messagePath = path.join(artifactDir, 'phase.last-message.txt');
@@ -1786,12 +1826,12 @@ import fs from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex test'); process.exit(0); }
 const output = args[args.indexOf('--output-last-message') + 1];
-fs.writeFileSync(output, '<promise>DONE</promise>');
+if (process.env.NO_SUCCESS !== '1') fs.writeFileSync(output, '<promise>DONE</promise>');
 let count = 0;
 const timer = setInterval(() => {
   fs.appendFileSync(${JSON.stringify(artifactPath)}, String(count++));
   if (process.env.FINITE_PROGRESS === '1' && count === 5) { clearInterval(timer); process.exit(0); }
-}, 70);
+}, 30);
 `, { mode: 0o755 });
 
   const finite = await runCodexExecMonitored({
@@ -1809,7 +1849,7 @@ const timer = setInterval(() => {
   assert.equal(finite.terminatedAfterSuccess, false);
   assert.equal(fs.readFileSync(artifactPath, 'utf8'), '01234');
 
-  const absolute = await runCodexExecMonitored({
+  const ongoing = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'progress forever',
     timeoutMs: 350,
@@ -1819,6 +1859,20 @@ const timer = setInterval(() => {
     successPollMs: 20,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
   });
-  assert.equal(absolute.exitCode, 124);
-  assert.equal(absolute.timedOut, true);
+  assert.equal(ongoing.exitCode, 124);
+  assert.equal(ongoing.timedOut, true);
+
+  const noSuccess = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'progress without success',
+    env: { NO_SUCCESS: '1' },
+    timeoutMs: 350,
+    outputLastMessagePath: messagePath,
+    progressArtifactPaths: [artifactPath],
+    successSignalGraceMs: 100,
+    successPollMs: 20,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+  assert.equal(noSuccess.exitCode, 124);
+  assert.equal(noSuccess.timedOut, true);
 });

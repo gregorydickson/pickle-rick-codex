@@ -171,6 +171,12 @@ async function runSpawnedCommand({
     let cancelCheckError: CodexCancelCheckError | null = null;
     let successTerminationSent = false;
     let jsonStreamObserved = false;
+    let nonterminalProgressAfterSuccess = false;
+    let latestNonterminalArtifactProgressAtMs = 0;
+    let nonterminalStreamProgressEvents = 0;
+    let latestStreamProgressAtMs = 0;
+    let observedStreamBytes = 0;
+    let observedArtifactSignature = '';
     let progressSignature = '';
 
     const child = spawn(command, args, {
@@ -213,6 +219,21 @@ async function runSpawnedCommand({
         }
       }),
     });
+    const currentArtifactSignature = (): string => JSON.stringify(observedArtifactPaths.map((filePath) => {
+      try {
+        const stat = fs.statSync(filePath);
+        return [filePath, stat.size, stat.mtimeMs];
+      } catch {
+        return [filePath, -1, -1];
+      }
+    }));
+    const currentArtifactTimestampMs = (): number => observedArtifactPaths.reduce((latest, filePath) => {
+      try {
+        return Math.max(latest, fs.statSync(filePath).mtimeMs);
+      } catch {
+        return latest;
+      }
+    }, 0);
 
     const scheduleTermination = (
       signal: NodeJS.Signals,
@@ -243,16 +264,23 @@ async function runSpawnedCommand({
       return true;
     };
 
-    const armSuccessTermination = (): void => {
+    const armSuccessTermination = (afterNonterminalProgress = false): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       const usage = inspectCodexUsage(currentStdout());
       jsonStreamObserved ||= detectOutputFormat(currentStdout()) === 'stream-json';
       const awaitingTerminalUsage = awaitUsageOnSuccess && jsonStreamObserved
         && !usage.reported && !usage.turnCompleted;
+      const requestedGraceMs = awaitingTerminalUsage ? usageCompletionGraceMs : successSignalGraceMs;
+      const armedAtMs = Date.now();
       const drainReserveMs = 250;
-      const graceMs = awaitingTerminalUsage
-        ? Math.min(usageCompletionGraceMs, Math.max(0, absoluteDeadlineMs - Date.now() - drainReserveMs))
-        : successSignalGraceMs;
+      const terminalUsageObserved = usage.reported || usage.turnCompleted;
+      const reservedDrainMs = terminalUsageObserved && !afterNonterminalProgress ? drainReserveMs : 0;
+      const requestedSuccessGraceDeadlineMs = armedAtMs + requestedGraceMs;
+      if (afterNonterminalProgress && requestedSuccessGraceDeadlineMs >= absoluteDeadlineMs) return;
+      const graceMs = Math.min(
+        requestedGraceMs,
+        Math.max(0, absoluteDeadlineMs - armedAtMs - reservedDrainMs),
+      );
       successGraceTimer = setTimeout(() => {
         if (!successTerminationSent && requestTermination('success')) {
           successTerminationSent = true;
@@ -263,8 +291,28 @@ async function runSpawnedCommand({
     const observeProgress = (): void => {
       const signature = currentProgressSignature();
       if (signature === progressSignature) return;
+      const streamBytes = stdoutBytesSeen + stderrBytesSeen;
+      const artifactSignature = currentArtifactSignature();
+      const streamChanged = streamBytes !== observedStreamBytes;
+      const artifactsChanged = artifactSignature !== observedArtifactSignature;
+      observedStreamBytes = streamBytes;
+      observedArtifactSignature = artifactSignature;
       progressSignature = signature;
-      if (successObserved && !successTerminationSent) armSuccessTermination();
+      if (successObserved && !successTerminationSent) {
+        const usage = inspectCodexUsage(currentStdout());
+        const nonterminalProgress = !usage.reported && !usage.turnCompleted;
+        if (nonterminalProgress) {
+          nonterminalProgressAfterSuccess = true;
+          if (streamChanged) nonterminalStreamProgressEvents += 1;
+          if (artifactsChanged) {
+            latestNonterminalArtifactProgressAtMs = Math.max(
+              latestNonterminalArtifactProgressAtMs,
+              currentArtifactTimestampMs(),
+            );
+          }
+        }
+        armSuccessTermination(nonterminalProgress);
+      }
     };
 
     const checkForSuccess = (): void => {
@@ -293,9 +341,16 @@ async function runSpawnedCommand({
 
     timeoutTimer = setTimeout(() => {
       if (terminationCause === null && child.exitCode === null && child.signalCode === null) {
-        const successWasObserved = successObserved;
-        if (!successWasObserved) checkForSuccess();
-        if (!successWasObserved && successObserved) {
+        if (!successObserved) checkForSuccess();
+        const usage = inspectCodexUsage(currentStdout());
+        const terminalUsageObserved = usage.reported || usage.turnCompleted;
+        const recentProgressThresholdMs = absoluteDeadlineMs - successSignalGraceMs;
+        const nonterminalProgressStillActive = nonterminalProgressAfterSuccess && (
+          latestNonterminalArtifactProgressAtMs > recentProgressThresholdMs
+          || (nonterminalStreamProgressEvents > 1 && latestStreamProgressAtMs > recentProgressThresholdMs)
+        );
+        if (successObserved
+          && (terminalUsageObserved || !nonterminalProgressStillActive)) {
           if (successGraceTimer) clearTimeout(successGraceTimer);
           if (!successTerminationSent && requestTermination('success')) {
             successTerminationSent = true;
@@ -328,12 +383,14 @@ async function runSpawnedCommand({
     }
 
     child.stdout.on('data', (chunk: Buffer) => {
+      latestStreamProgressAtMs = Date.now();
       stdoutBytesSeen += chunk.length;
       stdoutBytesRetained = appendBoundedChunk(stdoutChunks, chunk, stdoutBytesRetained);
       checkForSuccess();
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
+      latestStreamProgressAtMs = Date.now();
       stderrBytesSeen += chunk.length;
       stderrBytesRetained = appendBoundedChunk(stderrChunks, chunk, stderrBytesRetained);
       checkForSuccess();
