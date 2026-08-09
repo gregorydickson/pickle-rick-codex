@@ -267,7 +267,7 @@ test('legacy adoption fails closed before signaling on owner identity mismatch',
   assert.equal(fs.existsSync(path.join(value.sessionDir, LEGACY_ADOPTION_FILE)), false);
 });
 
-test('legacy adoption rejects a mux runner that is merely a sibling of the exact supervisor', () => {
+test('legacy adoption accepts a mux runner owned directly by the immutable tmux pane', () => {
   const value = fixture();
   const actions = [];
   const deps = depsFor(value, actions);
@@ -276,11 +276,11 @@ test('legacy adoption rejects a mux runner that is merely a sibling of the exact
     const observed = observe(pid);
     return pid === value.runner.pid ? { ...observed, parent_pid: value.pane.pid } : observed;
   };
-  assert.throws(
-    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
-    /not owned by the exact tmux pane supervisor chain/,
-  );
-  assert.deepEqual(actions, []);
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.equal(record.legacy_owner.supervisor, null);
+  assert.deepEqual(record.legacy_owner.runner, value.runner);
+  assert.deepEqual(record.legacy_owner.pane, value.pane);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7', 'resume']);
 });
 
 test('legacy adoption rejects an arbitrary wrapper inserted into the pane ancestry', () => {
@@ -296,9 +296,30 @@ test('legacy adoption rejects an arbitrary wrapper inserted into the pane ancest
   };
   assert.throws(
     () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
-    /not owned by the exact tmux pane supervisor chain/,
+    /not owned directly by the exact tmux pane or its exact supervisor/,
   );
   assert.deepEqual(actions, []);
+});
+
+test('legacy adoption rejects direct tmux pane identity drift after fencing', () => {
+  const value = fixture();
+  const actions = [];
+  const deps = depsFor(value, actions);
+  const observe = deps.observeProcess;
+  let drifted = false;
+  deps.stopController = () => { actions.push('fence'); drifted = true; };
+  deps.observeProcess = (pid) => {
+    const observed = observe(pid);
+    if (pid === value.runner.pid) return { ...observed, parent_pid: value.pane.pid };
+    return drifted && pid === value.pane.pid
+      ? { ...observed, identity: { ...value.pane, start_time: 'reused-pane' } }
+      : observed;
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /controller ancestry changed/,
+  );
+  assert.deepEqual(actions, ['watchdog', 'fence']);
 });
 
 test('legacy adoption fails closed when the supervisor identity drifts after fencing', () => {

@@ -59,7 +59,7 @@ export interface LegacyAdoptionRecord {
   resume_checkpoint: InstalledRuntimeMigration['resume_checkpoint'];
   legacy_owner: {
     runner: PersistedProcessIdentity;
-    supervisor: PersistedProcessIdentity;
+    supervisor: PersistedProcessIdentity | null;
     pane: PersistedProcessIdentity;
     tmux_session_name: string;
     operation_lock_pid: number;
@@ -80,7 +80,7 @@ interface LegacyAdoptionTransaction {
   source_runtime: InstalledRuntimeDescriptor;
   target_runtime: InstalledRuntimeDescriptor;
   runner: PersistedProcessIdentity;
-  supervisor: PersistedProcessIdentity;
+  supervisor: PersistedProcessIdentity | null;
   pane: PersistedProcessIdentity;
   tmux: LegacyTmuxBinding;
   operation_lock_pid: number;
@@ -214,24 +214,29 @@ function verifiedLegacyControllerTopology(
   runtimeRoot: string,
   observe: (pid: number) => ObservedLegacyProcess | null,
   inspect: (identity: PersistedProcessIdentity) => 'not-running' | 'matched' | 'reused',
-  expected?: { runner: PersistedProcessIdentity; supervisor: PersistedProcessIdentity; pane: PersistedProcessIdentity },
-): { runner: ObservedLegacyProcess; supervisor: ObservedLegacyProcess; pane: ObservedLegacyProcess } {
+  expected?: { runner: PersistedProcessIdentity; supervisor: PersistedProcessIdentity | null; pane: PersistedProcessIdentity },
+): { runner: ObservedLegacyProcess; supervisor: ObservedLegacyProcess | null; pane: ObservedLegacyProcess } {
   const runner = observe(runnerPid);
-  if (!runner || inspect(runner.identity) !== 'matched' || !exactMuxCommand(runner.command, sessionDir, runtimeRoot)) {
+  if (!runner || runner.identity.pid !== runnerPid
+      || inspect(runner.identity) !== 'matched' || !exactMuxCommand(runner.command, sessionDir, runtimeRoot)) {
     throw new Error('Legacy mux runner identity or exact argv does not match the active session.');
   }
-  const supervisor = observe(runner.parent_pid);
-  if (!supervisor || inspect(supervisor.identity) !== 'matched'
-      || !exactSupervisorCommand(supervisor.command, sessionDir, runtimeRoot)
-      || supervisor.parent_pid !== tmux.pane_pid) {
-    throw new Error('Legacy mux runner is not owned by the exact tmux pane supervisor chain.');
-  }
   const pane = observe(tmux.pane_pid);
-  if (!pane || inspect(pane.identity) !== 'matched') {
+  if (!pane || pane.identity.pid !== tmux.pane_pid || inspect(pane.identity) !== 'matched') {
     throw new Error('Legacy tmux pane process identity does not match its immutable binding.');
   }
+  let supervisor: ObservedLegacyProcess | null = null;
+  if (runner.parent_pid !== tmux.pane_pid) {
+    supervisor = observe(runner.parent_pid);
+    if (!supervisor || supervisor.identity.pid !== runner.parent_pid
+        || inspect(supervisor.identity) !== 'matched'
+        || !exactSupervisorCommand(supervisor.command, sessionDir, runtimeRoot)
+        || supervisor.parent_pid !== tmux.pane_pid) {
+      throw new Error('Legacy mux runner is not owned directly by the exact tmux pane or its exact supervisor.');
+    }
+  }
   if (expected && (JSON.stringify(runner.identity) !== JSON.stringify(expected.runner)
-      || JSON.stringify(supervisor.identity) !== JSON.stringify(expected.supervisor)
+      || JSON.stringify(supervisor?.identity ?? null) !== JSON.stringify(expected.supervisor)
       || JSON.stringify(pane.identity) !== JSON.stringify(expected.pane))) {
     throw new Error('Legacy tmux controller ancestry changed after it was recorded.');
   }
@@ -401,7 +406,7 @@ export function adoptActiveLegacyMuxSession(
       schema_version: 1, stage: 'fenced', session_id: path.basename(sessionDir),
       source_runtime_root: fs.realpathSync(sourceRuntimeRoot), target_runtime_root: fs.realpathSync(targetRuntimeRoot),
       source_runtime: sourceRuntime, target_runtime: targetRuntime, runner: topology.runner.identity,
-      supervisor: topology.supervisor.identity, pane: topology.pane.identity,
+      supervisor: topology.supervisor?.identity ?? null, pane: topology.pane.identity,
       tmux, operation_lock_pid: lockPid, active_child: child, candidate_archive: candidateArchive,
       created_at: now.toISOString(), updated_at: now.toISOString(),
     };
