@@ -417,6 +417,12 @@ async function runSpawnedCommand({
     });
 
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      // The child can publish its authoritative success artifact and exit
+      // between polling intervals. Its exit stops all further work, so one
+      // final evaluation cannot extend the deadline or accept a live process.
+      // Never re-evaluate after timeout/cancellation: shutdown handlers may
+      // write drain artifacts that did not exist at the decision boundary.
+      if (terminationCause === null && !successObserved) checkForSuccess();
       cleanup();
       const flushStarted = Date.now();
       let stableSignature = currentProgressSignature();

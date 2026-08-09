@@ -979,10 +979,14 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
   const dataRoot = makeTempRoot();
   const projectDir = cleanWorkerProject('pickle-phase-promise-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const invocationLog = path.join(dataRoot, 'phase-invocations.jsonl');
+  const signalLog = path.join(dataRoot, 'phase-signals.jsonl');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     FAKE_CODEX_HANG_MS: '3000',
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_SIGNAL_LOG: signalLog,
   });
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'phase promise stop'], {
@@ -1004,19 +1008,31 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
     ],
   });
 
-  const started = Date.now();
   const output = runNode([path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'r1'], {
     env,
     cwd: projectDir,
   }).trim();
-  const elapsed = Date.now() - started;
-
-  // Five fake phases would take at least 15s if the promise-token early-stop
-  // contract regressed. Leave enough headroom for this integration suite's
-  // parallel process load while still proving each lingering child is stopped.
-  assert.ok(elapsed < 12000, `spawn-morty took too long after phase success: ${elapsed}ms`);
   const result = JSON.parse(output);
   assert.equal(result.status, 'done');
+
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map(JSON.parse);
+  const signals = fs.readFileSync(signalLog, 'utf8').trim().split('\n').map(JSON.parse);
+  const phases = invocations.map(({ prompt }) => (
+    prompt.match(/You are executing the "([^"]+)" phase/)?.[1] || null
+  )).filter(Boolean);
+  assert.deepEqual(phases, [
+    'research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'conformance',
+  ]);
+  assert.deepEqual(
+    signals.map(({ invocation_nonce }) => invocation_nonce).sort(),
+    invocations.map(({ invocation_nonce }) => invocation_nonce).sort(),
+    'every exact lingering phase process is terminated after publishing its token',
+  );
+  assert.ok(signals.every(({ signal }) => signal === 'SIGTERM'));
+  const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+  assert.equal(state.active_child_pid, null);
+  assert.equal(state.active_child_identity, null);
+  assert.equal(state.active_child_controller_pid, null);
 });
 
 test('spawn-morty distinguishes normal verification command failure from preflight failures', () => {

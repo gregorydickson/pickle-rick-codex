@@ -1795,17 +1795,19 @@ process.on('SIGTERM', () => {
   fs.appendFileSync(output, '\\nDEADLINE-DRAINED');
   setTimeout(() => process.exit(0), 30);
 });
-setTimeout(() => fs.writeFileSync(output, '<promise>DONE</promise>'), 50);
+fs.writeFileSync(output, '<promise>DONE</promise>');
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
 
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'deadline success check',
-    timeoutMs: 400,
+    // Keep the poll beyond the hard deadline while allowing process startup
+    // under saturated CI. The command itself publishes success immediately.
+    timeoutMs: 2_000,
     outputLastMessagePath: messagePath,
     successSignalGraceMs: 100,
-    successPollMs: 1_000,
+    successPollMs: 10_000,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
   });
 
@@ -1813,6 +1815,33 @@ setInterval(() => {}, 1000);
   assert.equal(result.timedOut, false);
   assert.equal(result.terminatedAfterSuccess, true);
   assert.match(result.lastMessage, /DEADLINE-DRAINED/);
+});
+
+test('an exited child gets one bounded final success check before close classification', async () => {
+  const runtimeDir = makeTempRoot('pickle-codex-close-success-');
+  const artifactDir = makeTempRoot('pickle-codex-close-success-artifacts-');
+  const messagePath = path.join(artifactDir, 'phase.last-message.txt');
+  const codexPath = path.join(runtimeDir, 'codex');
+  fs.writeFileSync(codexPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const output = args[args.indexOf('--output-last-message') + 1];
+fs.writeFileSync(output, '<promise>DONE</promise>');
+process.exit(17);
+`, { mode: 0o755 });
+
+  const result = await runCodexExecMonitored({
+    command: codexPath,
+    prompt: 'close success check',
+    timeoutMs: 2_000,
+    outputLastMessagePath: messagePath,
+    successPollMs: 10_000,
+    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminatedAfterSuccess, false);
 });
 
 test('artifact progress extends success shutdown grace while ongoing and no-success progress time out', async () => {

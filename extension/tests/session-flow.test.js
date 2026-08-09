@@ -13,7 +13,7 @@ import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 import { updateSessionMap } from '../services/session-map.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
-import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
+import { captureProcessLivenessIdentity, captureSpawnedProcessIdentity, inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
 import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
 
@@ -29,6 +29,72 @@ function initGitRepo(repoDir) {
   runGit(repoDir, ['init']);
   runGit(repoDir, ['config', 'user.name', 'Pickle Rick Tests']);
   runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
+}
+
+async function waitForMicroverseWorkerGate({ sessionDir, child, runnerIdentity, readyPath }) {
+  const statePath = path.join(sessionDir, 'state.json');
+  const startedAt = Date.now();
+  const overallDeadline = startedAt + 45_000;
+  const inactivityLimitMs = 20_000;
+  let lastProgressAt = startedAt;
+  let lastFingerprint = '';
+  let latest = null;
+
+  while (Date.now() < overallDeadline) {
+    const state = readJsonFile(statePath);
+    const transaction = readJsonFile(path.join(sessionDir, 'microverse-attempt.json'), null);
+    const ledger = readJsonFile(path.join(sessionDir, 'microverse-experiments.json'), null);
+    const metric = readJsonFile(path.join(sessionDir, 'microverse-metrics.json'), null);
+    const activeIdentity = state.active_child_identity || null;
+    const ready = fs.existsSync(readyPath);
+    latest = { state, transaction, ledger, metric, ready };
+
+    if (ready
+      && transaction?.phase === 'running'
+      && transaction.candidate_worktree
+      && state.active_child_kind === 'codex'
+      && activeIdentity
+      && inspectProcessLivenessIdentity(activeIdentity) === 'matched') return latest;
+
+    const terminalReason = child.exitCode !== null || child.signalCode !== null
+      ? `loop-runner exited code=${String(child.exitCode)} signal=${String(child.signalCode)}`
+      : inspectProcessLivenessIdentity(runnerIdentity) !== 'matched'
+        ? 'loop-runner identity is no longer live'
+        : state.recovery_required === true
+          ? `recovery required: ${state.recovery_reason || 'unknown reason'}`
+          : state.cancel_requested_at || state.last_exit_reason === 'cancelled'
+            ? 'session was cancelled'
+            : state.active === false && state.last_exit_reason
+              ? `session stopped with ${state.last_exit_reason}`
+              : null;
+    if (terminalReason) {
+      assert.fail(`${terminalReason} before isolated Codex phase\n${JSON.stringify(latest, null, 2)}\n${fs.existsSync(path.join(sessionDir, 'loop-runner.log')) ? fs.readFileSync(path.join(sessionDir, 'loop-runner.log'), 'utf8') : '<missing loop log>'}`);
+    }
+
+    const fingerprint = JSON.stringify([
+      state.active,
+      state.step,
+      state.iteration,
+      state.last_exit_reason,
+      state.active_child_identity?.fingerprint,
+      Array.isArray(state.history) ? state.history.length : 0,
+      transaction?.experiment_id,
+      transaction?.attempt,
+      transaction?.phase,
+      ledger?.experiments?.length,
+      metric?.history?.length,
+      ready,
+    ]);
+    if (fingerprint !== lastFingerprint) {
+      lastFingerprint = fingerprint;
+      lastProgressAt = Date.now();
+    }
+    if (Date.now() - lastProgressAt >= inactivityLimitMs) {
+      assert.fail(`loop-runner made no durable startup progress for ${inactivityLimitMs}ms\n${JSON.stringify(latest, null, 2)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`loop-runner did not enter the durable isolated Codex phase within 45000ms\n${JSON.stringify(latest, null, 2)}`);
 }
 
 function createCountingLifecycleCodex(binDir, countPath) {
@@ -2145,7 +2211,7 @@ test('microverse measures a numeric metric and commits only an actual improvemen
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
 });
 
-test('microverse defers accepted promotion when the live fingerprint changes and preserves user work', async () => {
+test('microverse defers accepted promotion when the live fingerprint changes and preserves user work', async (t) => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -2156,6 +2222,8 @@ test('microverse defers accepted promotion when the live fingerprint changes and
   runGit(projectDir, ['add', 'score.txt', 'user.txt', 'index-only.txt']);
   runGit(projectDir, ['commit', '-m', 'baseline']);
   const sourceBranch = runGit(projectDir, ['symbolic-ref', '--short', 'HEAD']);
+  const workerReadyPath = path.join(dataRoot, 'isolated-worker-ready');
+  const workerReleasePath = path.join(dataRoot, 'isolated-worker-release');
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
 import fs from 'node:fs';
 const args = process.argv.slice(2);
@@ -2174,7 +2242,15 @@ fs.writeFileSync(artifactPath, JSON.stringify({
   verification: ['score grew'],
 }));
 fs.appendFileSync('score.txt', 'x');
-await new Promise((resolve) => setTimeout(resolve, 750));
+fs.writeFileSync(${JSON.stringify(workerReadyPath)}, ${JSON.stringify('ready\n')});
+const releaseDeadline = Date.now() + 60_000;
+while (!fs.existsSync(${JSON.stringify(workerReleasePath)}) && Date.now() < releaseDeadline) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+}
+if (!fs.existsSync(${JSON.stringify(workerReleasePath)})) {
+  console.error('test worker release was never published');
+  process.exit(3);
+}
 fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], '<promise>LOOP_COMPLETE</promise>');
 console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
 `);
@@ -2193,15 +2269,36 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  await waitFor(() => readJsonFile(path.join(sessionDir, 'state.json')).active_child_kind === 'codex', {
-    message: 'loop-runner never entered isolated codex phase',
+  assert.ok(child.pid);
+  const runnerIdentity = captureProcessLivenessIdentity(child.pid);
+  assert.ok(runnerIdentity, 'loop-runner identity was not captured');
+  t.after(() => {
+    fs.writeFileSync(workerReleasePath, 'release\n');
+    if (inspectProcessLivenessIdentity(runnerIdentity) === 'matched') {
+      try { process.kill(runnerIdentity.pid, 'SIGTERM'); } catch {}
+    }
   });
+  let workerGate;
+  try {
+    workerGate = await waitForMicroverseWorkerGate({
+      sessionDir, child, runnerIdentity, readyPath: workerReadyPath,
+    });
+  } catch (error) {
+    fs.writeFileSync(workerReleasePath, 'release\n');
+    if (inspectProcessLivenessIdentity(runnerIdentity) === 'matched') {
+      try { process.kill(runnerIdentity.pid, 'SIGTERM'); } catch {}
+    }
+    throw error;
+  }
+  assert.equal(workerGate.transaction.experiment_id, 'exp-0001');
+  assert.equal(workerGate.transaction.attempt, 1);
   fs.writeFileSync(path.join(projectDir, 'user.txt'), 'concurrent tracked user work\n');
   fs.writeFileSync(path.join(projectDir, 'user-note.txt'), 'concurrent untracked user work\n');
   fs.writeFileSync(path.join(projectDir, 'index-only.txt'), 'hidden staged user work\n');
   runGit(projectDir, ['add', 'index-only.txt']);
   runGit(projectDir, ['restore', '--worktree', '--source=HEAD', '--', 'index-only.txt']);
   runGit(projectDir, ['switch', '-c', 'concurrent-user-branch']);
+  fs.writeFileSync(workerReleasePath, 'release\n');
   await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', resolve);
@@ -2613,10 +2710,38 @@ test('microverse expands a saturated metric timeout and continues from the stabl
     cwd: projectDir,
   }).trim();
   const counterPath = path.join(sessionDir, 'fake-loop-count.txt');
+  const metricEventsPath = path.join(sessionDir, 'metric-events.jsonl');
+  const candidateTimeoutMarker = path.join(sessionDir, 'candidate-timeout-consumed');
+  const checkpointTimeoutMarker = path.join(sessionDir, 'checkpoint-timeout-consumed');
+  const metricFixturePath = path.join(sessionDir, 'adaptive-metric.mjs');
+  fs.writeFileSync(metricFixturePath, [
+    "import fs from 'node:fs';",
+    `const workerCounter = ${JSON.stringify(counterPath)};`,
+    `const eventsPath = ${JSON.stringify(metricEventsPath)};`,
+    `const candidateMarker = ${JSON.stringify(candidateTimeoutMarker)};`,
+    `const checkpointMarker = ${JSON.stringify(checkpointTimeoutMarker)};`,
+    "const candidateExists = fs.existsSync('growing-metric');",
+    'const workerStarted = fs.existsSync(workerCounter);',
+    "let kind = 'baseline';",
+    'let block = false;',
+    'if (workerStarted && candidateExists && !fs.existsSync(candidateMarker)) {',
+    "  kind = 'candidate_timeout'; block = true; fs.writeFileSync(candidateMarker, 'consumed\\n');",
+    '} else if (workerStarted && !candidateExists && !fs.existsSync(checkpointMarker)) {',
+    "  kind = 'checkpoint_timeout'; block = true; fs.writeFileSync(checkpointMarker, 'consumed\\n');",
+    '} else if (workerStarted && !candidateExists) {',
+    "  kind = 'checkpoint_confirmed';",
+    '} else if (workerStarted && candidateExists) {',
+    "  kind = 'candidate_success';",
+    '}',
+    "const prior = fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, 'utf8').trim().split('\\n').filter(Boolean).length : 0;",
+    "fs.appendFileSync(eventsPath, JSON.stringify({ sequence: prior + 1, kind }) + '\\n');",
+    'if (block) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5_000);',
+    "process.stdout.write(candidateExists ? String(fs.statSync('growing-metric').size) : '0');",
+  ].join('\n'));
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse',
     task: 'keep a growing evaluator from stopping convergence',
-    metric: `if test -f growing-metric; then sleep 1.25; wc -c < growing-metric; elif test -f '${counterPath}'; then sleep 1.25; printf 0; else printf 0; fi`,
+    metric: `${JSON.stringify(process.execPath)} ${JSON.stringify(metricFixturePath)}`,
     direction: 'higher',
     target: 1,
     target_relation: 'gte',
@@ -2636,6 +2761,17 @@ test('microverse expands a saturated metric timeout and continues from the stabl
   assert.equal(ledger.experiments[0].attempt, 2);
   assert.equal(ledger.experiments[0].worker_attempts[0].classification, 'worker_incomplete');
   assert.equal(ledger.experiments[0].worker_attempts[1].classification, 'improved');
+  const metricEvents = fs.readFileSync(metricEventsPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(metricEvents, [
+    { sequence: 1, kind: 'baseline' },
+    { sequence: 2, kind: 'candidate_timeout' },
+    { sequence: 3, kind: 'checkpoint_timeout' },
+    { sequence: 4, kind: 'checkpoint_confirmed' },
+    { sequence: 5, kind: 'candidate_success' },
+  ]);
+  const metricState = readJsonFile(path.join(sessionDir, 'microverse-metrics.json'));
+  assert.deepEqual(metricState.history.map((entry) => entry.classification), ['baseline', 'improved']);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'microverse-attempt.json')), false);
   assert.ok(loopConfig.metric_timeout_seconds >= 2);
   assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   assert.match(log, /metric timeout increased/);

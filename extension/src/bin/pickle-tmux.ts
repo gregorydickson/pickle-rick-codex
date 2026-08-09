@@ -106,6 +106,12 @@ function usage(): string {
   ].join('\n');
 }
 
+function detachedIterationLimit(): number {
+  if (process.env.PICKLE_TEST_MODE !== '1') return 0;
+  const configured = Number(process.env.PICKLE_TEST_MAX_ITERATIONS || 0);
+  return Number.isSafeInteger(configured) && configured > 0 ? configured : 0;
+}
+
 function markAbruptRunnerLossBeforeResume(sessionDir: string | null, manager: StateManager = new StateManager()): void {
   if (!sessionDir) {
     return;
@@ -205,7 +211,10 @@ async function main(argv: string[]): Promise<void> {
     manager.update(statePath, (current) => {
       current.tmux_mode = true;
       current.active = false;
-      current.max_iterations = 0;
+      // Detached runs are unbounded in production. Integration tests may inject
+      // an initial boundary before the runner starts instead of racing a state
+      // rewrite against the detached executor's first budget read.
+      current.max_iterations = detachedIterationLimit();
       if (parsed.maxTime === null) current.max_time_minutes = 0;
       current.tmux_runner_pid = null;
       current.tmux_session_name = sessionName;

@@ -121,12 +121,23 @@ import path from 'node:path';
 
 const args = process.argv.slice(2);
 const prompt = fs.readFileSync(0, 'utf8');
+const invocationNonce = crypto.randomUUID();
 
 if (process.env.FAKE_CODEX_INVOCATION_LOG) {
   fs.appendFileSync(
     process.env.FAKE_CODEX_INVOCATION_LOG,
-    JSON.stringify({ cwd: process.cwd(), args, prompt }) + '\\n',
+    JSON.stringify({ cwd: process.cwd(), args, prompt, pid: process.pid, invocation_nonce: invocationNonce }) + '\\n',
   );
+}
+
+if (process.env.FAKE_CODEX_SIGNAL_LOG) {
+  process.on('SIGTERM', () => {
+    fs.appendFileSync(
+      process.env.FAKE_CODEX_SIGNAL_LOG,
+      JSON.stringify({ pid: process.pid, invocation_nonce: invocationNonce, signal: 'SIGTERM' }) + '\\n',
+    );
+    process.exit(0);
+  });
 }
 
 if (args[0] === '--version') {
