@@ -14,7 +14,6 @@ import type { InstalledRuntimeDescriptor } from '../services/durable-supervisor.
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { ensureLegacyAdoptionSupervisorOwner } from '../services/legacy-adoption-supervisor-owner.js';
 import {
-  adoptionWatchEvidenceHash,
   ADOPTION_WATCH_STRATEGY_IDS,
   adoptionWatchStrategyStateLaunched,
   adoptionWatchStrategyMaterialHash,
@@ -24,9 +23,14 @@ import {
   createAdoptionWatchTerminalRecoveryState,
   createAdoptionWatchStrategyState,
   finishAdoptionWatchStrategy,
+  readAdoptionWatchDomainEvidence,
   validateAdoptionWatchStrategyState,
 } from '../services/adoption-watch-strategies.js';
-import type { AdoptionWatchStrategyId, AdoptionWatchStrategyState } from '../services/adoption-watch-strategies.js';
+import type {
+  AdoptionWatchDomainEvidence,
+  AdoptionWatchStrategyId,
+  AdoptionWatchStrategyState,
+} from '../services/adoption-watch-strategies.js';
 import {
   archiveAdoptionWatchTerminalState,
   archiveAdoptionWatchExhaustedState,
@@ -127,6 +131,7 @@ interface LegacyAdoptionWatchDependencies {
   chooseRuntime?: typeof chooseLegacyLaunchRuntime;
   runtimeMatches?: typeof runtimeRootMatchesDescriptor;
   executeStrategy?: (strategyId: AdoptionWatchStrategyId) => LegacyAdoptionRecord;
+  readDomainEvidence?: () => AdoptionWatchDomainEvidence;
   checkpoint?: (point: 'material_reserved' | 'strategy_persisted') => void;
   readExecutorStatus?: (sessionDir: string) => LegacyAdoptionExecutorStatus | null;
   requestExecutorRestart?: (sessionDir: string, reason: string) => LegacyAdoptionExecutorRestartRequest;
@@ -419,7 +424,9 @@ export function runLegacyAdoptionWatch(
       && (Boolean(persistedStatusInvalidReason) || (isRecord(rawPrior) && rawPrior.strategy_state !== undefined)))
     || (fs.existsSync(recoveryPath) && fs.readdirSync(recoveryPath).length > 0)
     || fs.existsSync(path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE));
-  const provenanceConflict = controlsAbsent && priorRunIndicator;
+  const missingAuthorityForEstablishedLedger = !fs.existsSync(authorityPath) && fs.existsSync(statusPath)
+    && (fs.existsSync(manifestPath) || fs.existsSync(materialsPath));
+  const provenanceConflict = (controlsAbsent && priorRunIndicator) || missingAuthorityForEstablishedLedger;
   const authorityInspection = inspectAdoptionWatchAuthority(args.sessionDir);
   const durableAuthority = authorityInspection.authority;
   const bootLedger = reconcileAdoptionWatchMaterialLedger(args.sessionDir);
@@ -437,9 +444,9 @@ export function runLegacyAdoptionWatch(
   let lastFailure = prior?.last_failure || null;
   let initialDelay = 0;
   let terminalRecoveryRefs = prior?.terminal_recovery_refs || [];
-  const currentEvidenceHash = () => adoptionWatchEvidenceHash(
-    args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot,
-  );
+  const currentDomainEvidence = () => deps.readDomainEvidence?.()
+    || readAdoptionWatchDomainEvidence(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot);
+  const currentEvidenceHash = () => currentDomainEvidence().hash;
   const usedMaterials = () => new Set([
     ...readAdoptionWatchMaterialMarkers(args.sessionDir),
     ...adoptionWatchArchivedMaterialHashes(args.sessionDir, terminalRecoveryRefs),
@@ -479,17 +486,26 @@ export function runLegacyAdoptionWatch(
         path.basename(args.sessionDir), initialEvidenceHash,
         initialMaterials.cursor, initialMaterials.materials,
       ));
-  if (controlArtifactConflict && strategyState.cursor < ADOPTION_WATCH_STRATEGY_IDS.length) {
+  if (authorityInspection.legacy_v1_present) {
+    const v2Domain = currentDomainEvidence();
     strategyState = createAdoptionWatchLedgerRecoveryState(
-      strategyState.history_base_checkpoint.evidence_hash, strategyState.epoch, strategyState.epoch_seed,
-      ADOPTION_WATCH_STRATEGY_IDS.length,
-      usedMaterialsForEvidence(strategyState.history_base_checkpoint.evidence_hash).materials,
+      v2Domain.hash, strategyState.epoch, strategyState.epoch_seed,
+      ADOPTION_WATCH_STRATEGY_IDS.length, [],
     );
   }
-  let executorRestartAction = (durableAuthority?.executor_restart_action
-    && !invalidRestartActionReason(durableAuthority.executor_restart_action))
-    ? durableAuthority.executor_restart_action as LegacyAdoptionExecutorRestartAction
-    : prior?.executor_restart_action || null;
+  if (controlArtifactConflict) {
+    const establishedV2Domain = currentDomainEvidence();
+    strategyState = createAdoptionWatchLedgerRecoveryState(
+      establishedV2Domain.hash, strategyState.epoch, strategyState.epoch_seed,
+      ADOPTION_WATCH_STRATEGY_IDS.length,
+      usedMaterialsForEvidence(establishedV2Domain.hash).materials,
+    );
+  }
+  let executorRestartAction = authorityInspection.legacy_v1_present || controlArtifactConflict ? null
+    : (durableAuthority?.executor_restart_action
+      && !invalidRestartActionReason(durableAuthority.executor_restart_action))
+      ? durableAuthority.executor_restart_action as LegacyAdoptionExecutorRestartAction
+      : prior?.executor_restart_action || null;
   let executorRestartHistory = prior?.executor_restart_history || [];
   const persistStatus = (status: LegacyAdoptionWatchStatus): void => {
     writeAdoptionWatchAuthority(
@@ -587,7 +603,8 @@ export function runLegacyAdoptionWatch(
     }
     if (adoptionWatchStrategyStateLaunched(strategyState)) {
       const observedAt = new Date(now()).toISOString();
-      const evidenceHash = currentEvidenceHash();
+      const domainEvidence = currentDomainEvidence();
+      const evidenceHash = domainEvidence.hash;
       const archive = archiveAdoptionWatchTerminalState(
         args.sessionDir, strategyState, evidenceHash, prior?.updated_at || observedAt,
       );
@@ -632,7 +649,8 @@ export function runLegacyAdoptionWatch(
     }
     if (strategyState.cursor === 3) {
       const observedAt = new Date(now()).toISOString();
-      const evidenceHash = currentEvidenceHash();
+      const domainEvidence = currentDomainEvidence();
+      const evidenceHash = domainEvidence.hash;
       let requestedNow = false;
       const authenticatedSupervisor = deps.readExecutorStatus
         ? deps.readExecutorStatus(args.sessionDir)
@@ -656,7 +674,7 @@ export function runLegacyAdoptionWatch(
         && authenticatedSupervisor.executor_spec_sha256
           === executorRestartAction.expected_executor_spec_sha256
         && !fs.existsSync(path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE)));
-      if (executorRestartAction && acknowledgedRestart
+      if (executorRestartAction && acknowledgedRestart && domainEvidence.authenticated
         && evidenceHash !== executorRestartAction.exhausted_evidence_hash) {
         const archive = archiveAdoptionWatchExhaustedState(
           args.sessionDir, strategyState, evidenceHash, executorRestartAction.requested_at,

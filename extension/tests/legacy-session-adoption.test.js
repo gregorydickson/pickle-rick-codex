@@ -37,6 +37,7 @@ import { getWorkingTreeContentFingerprint, listUntrackedFiles } from '../service
 import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
 import { persistCitadelReleaseApproval } from '../services/citadel.js';
 import { acquireLaunchLock } from '../services/detached-launch.js';
+import { readAdoptionWatchDomainEvidence } from '../services/adoption-watch-strategies.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -259,6 +260,9 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   assert.equal(logical.lease, null);
   assert.deepEqual(logical.events.map((event) => event.kind), ['pipeline_created', 'prd_sealed', 'legacy_session_adopted']);
   assert.equal(logical.events[2].details.migration_content_hash, record.migration_content_hash);
+  assert.equal(readAdoptionWatchDomainEvidence(
+    value.sessionDir, value.sourceRoot, value.targetRoot,
+  ).authenticated, true, 'authenticated post-seal PRD and journal are legitimate migration inventory additions');
   assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), true);
   markLegacyContractRepairComplete(value.sessionDir);
   assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), false);

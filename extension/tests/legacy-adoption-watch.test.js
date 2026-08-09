@@ -1,6 +1,7 @@
 // @tier: fast
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,11 +12,13 @@ import {
   runLegacyAdoptionWatch,
 } from '../bin/adopt-legacy-session.js';
 import { prepareLiveSessionMigration, verifyLiveSessionMigration } from '../services/live-session-migration.js';
+import { describeInstalledRuntime } from '../services/runtime-descriptor.js';
 import {
   adoptionWatchStrategyStateLaunched,
   beginAdoptionWatchStrategy,
   createAdoptionWatchStrategyState,
   finishAdoptionWatchStrategy,
+  readAdoptionWatchDomainEvidence,
   validateAdoptionWatchStrategyState,
 } from '../services/adoption-watch-strategies.js';
 import {
@@ -43,6 +46,20 @@ function record(status = 'adopted') {
 
 function args(sessionDir) {
   return { sessionDir, sourceRuntimeRoot: '/source', targetRuntimeRoot: '/target', validationSessionDir: '' };
+}
+
+function authenticRuntimeRoot(prefix, payload) {
+  const root = makeTempRoot(prefix);
+  fs.writeFileSync(path.join(root, 'install.sh'), '#!/usr/bin/env bash\n');
+  writeJson(path.join(root, 'package.json'), { name: 'runtime-fixture' });
+  writeJson(path.join(root, 'extension', 'package.json'), { version: '1.0.0' });
+  writeJson(path.join(root, 'extension', 'state-schema.json'), { schema_version: 1 });
+  for (const relative of ['skills/fixture.txt', 'extension/bin/fixture.js',
+    'extension/services/fixture.js', 'extension/types/fixture.d.ts']) {
+    fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
+    fs.writeFileSync(path.join(root, relative), payload);
+  }
+  return root;
 }
 
 function canonicalize(value) {
@@ -366,9 +383,13 @@ test('immutable material ledger rejects replay after bounded archive references 
   ), /reuse-rejected/);
 });
 
-test('typed executor restart receipt unlocks a new epoch only after authenticated generation change', () => {
+test('authenticated executor replacements are not novelty and domain change alone unlocks the next epoch', () => {
   const sessionDir = makeTempRoot('pickle-adoption-watch-generation-');
   let now = Date.parse('2026-01-01T00:00:00.000Z');
+  let domainHash = 'd'.repeat(64);
+  let domainAuthenticated = true;
+  let restartRequests = 0;
+  const readDomainEvidence = () => ({ hash: domainHash, authenticated: domainAuthenticated });
   const executorStatus = (generation, pid, fingerprint, lastRestartRequestId = null,
     managerGeneration = 1, managerFingerprint = 'manager-fingerprint') => ({
     schema_version: 1, session_id: path.basename(sessionDir), status: 'supervising',
@@ -388,8 +409,10 @@ test('typed executor restart receipt unlocks a new epoch only after authenticate
     now: () => now, random: () => 0.5, baseDelayMs: 10, maxDelayMs: 40,
     wait: (delay) => { now += delay; },
     executeStrategy: (strategyId) => { routes.push(strategyId); throw new Error('persistent'); },
+    readDomainEvidence,
     readExecutorStatus: () => firstStatus,
     requestExecutorRestart: () => {
+      restartRequests += 1;
       writeJson(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'), { pending: true });
       return {
         schema_version: 1, request_id: 'restart-1', expected_generation: 1,
@@ -409,6 +432,7 @@ test('typed executor restart receipt unlocks a new epoch only after authenticate
   writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), forgedStatus);
   assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
     now: () => now,
+    readDomainEvidence,
     readExecutorStatus: () => forgedStatus,
     wait: () => { throw new Error('forged-successor-stop'); },
     executeStrategy: () => assert.fail('same-generation manager drift must not unlock a new epoch'),
@@ -419,10 +443,49 @@ test('typed executor restart receipt unlocks a new epoch only after authenticate
 
   const secondStatus = executorStatus(2, process.pid + 2, 'executor-two', 'restart-1', 2, 'manager-successor');
   writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), secondStatus);
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence,
+    readExecutorStatus: () => secondStatus,
+    executeStrategy: () => assert.fail('authenticated replacement with unchanged domain must not dispatch'),
+    wait: () => { throw new Error('unchanged-domain-generation-two'); },
+  }), /unchanged-domain-generation-two/);
+  const thirdStatus = executorStatus(3, process.pid + 3, 'executor-three', 'restart-1', 3, 'manager-third');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), thirdStatus);
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence,
+    readExecutorStatus: () => thirdStatus,
+    executeStrategy: () => assert.fail('multiple authenticated replacements must remain supervised waiting'),
+    wait: () => { throw new Error('unchanged-domain-generation-three'); },
+  }), /unchanged-domain-generation-three/);
+  const waiting = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(waiting.strategy_state.epoch, 1);
+  assert.equal(waiting.strategy_state.cursor, 3);
+  assert.equal(waiting.attempt_count, 3);
+  const fourthStatus = executorStatus(4, process.pid + 4, 'executor-four', 'restart-1', 4, 'manager-fourth');
+  writeJson(path.join(sessionDir, 'legacy-session-adoption-executor.json'), fourthStatus);
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence,
+    readExecutorStatus: () => fourthStatus,
+    executeStrategy: () => assert.fail('generation four with unchanged domain must remain waiting'),
+    wait: () => { throw new Error('unchanged-domain-generation-four'); },
+  }), /unchanged-domain-generation-four/);
+  assert.equal(restartRequests, 1);
+
+  domainHash = 'f'.repeat(64);
+  domainAuthenticated = false;
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence,
+    readExecutorStatus: () => fourthStatus,
+    executeStrategy: () => assert.fail('unauthenticated domain bytes must not unlock a new epoch'),
+    wait: () => { throw new Error('unauthenticated-domain-change'); },
+  }), /unauthenticated-domain-change/);
+  domainHash = 'e'.repeat(64);
+  domainAuthenticated = true;
   const resumedRoutes = [];
   runLegacyAdoptionWatch(args(sessionDir), {
     now: () => now,
-    readExecutorStatus: () => secondStatus,
+    readDomainEvidence,
+    readExecutorStatus: () => fourthStatus,
     executeStrategy: (strategyId) => { resumedRoutes.push(strategyId); return record('launched'); },
   });
   assert.deepEqual(resumedRoutes, ['standard-adopt-launch']);
@@ -432,6 +495,207 @@ test('typed executor restart receipt unlocks a new epoch only after authenticate
   assert.equal(resumed.executor_restart_history.length, 1);
   assert.notEqual(resumed.strategy_state.history[0].material_hash,
     requested.strategy_state.history[0].material_hash);
+});
+
+test('authenticated runtime contents provide real domain novelty after replacement acknowledgement', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-real-domain-');
+  const sourceRuntimeRoot = authenticRuntimeRoot('pickle-source-runtime-', 'source');
+  const targetRuntimeRoot = authenticRuntimeRoot('pickle-target-runtime-', 'target-v1');
+  const watchArgs = { sessionDir, sourceRuntimeRoot, targetRuntimeRoot, validationSessionDir: '' };
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  const status = (generation, fingerprint, receipt = null, managerGeneration = 1) => ({
+    schema_version: 1, session_id: path.basename(sessionDir), status: 'supervising',
+    manager_identity: { pid: 10 + managerGeneration, pgid: 10 + managerGeneration,
+      start_time: `manager-${managerGeneration}`, fingerprint: `manager-${managerGeneration}` },
+    manager_generation: managerGeneration, manager_parent_pid: 9, manager_argv_sha256: 'a'.repeat(64),
+    owner_nonce: 'stable-owner',
+    executor_identity: { pid: generation === 1 ? process.pid : process.pid + generation,
+      pgid: process.pid + generation, start_time: `executor-${generation}`, fingerprint },
+    executor_generation: generation, executor_started_at: '2026-01-01T00:00:00.000Z',
+    executor_lease_expires_at: '2026-01-01T00:01:00.000Z', executor_spec_sha256: 'c'.repeat(64),
+    replacement_count: generation - 1, last_loss_at: null, last_restart_request_id: receipt,
+    updated_at: '2026-01-01T00:00:00.000Z',
+  });
+  const initialDomain = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+  assert.equal(initialDomain.authenticated, true);
+  const first = status(1, 'executor-one');
+  assert.throws(() => runLegacyAdoptionWatch(watchArgs, {
+    now: () => now, baseDelayMs: 10, maxDelayMs: 40,
+    readExecutorStatus: () => first,
+    executeStrategy: () => { throw new Error('persistent'); },
+    wait: (delay) => { now += delay; },
+    requestExecutorRestart: () => {
+      writeJson(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'), { pending: true });
+      return { schema_version: 1, request_id: 'real-domain-restart', expected_generation: 1,
+        expected_executor_fingerprint: 'executor-one', reason: 'catalog exhausted',
+        requested_at: '2026-01-01T00:00:00.030Z' };
+    },
+    yieldExecutor: () => { throw new Error('real-domain-yield'); },
+  }), /real-domain-yield/);
+  fs.unlinkSync(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'));
+  const replacement = status(2, 'executor-two', 'real-domain-restart', 2);
+  assert.throws(() => runLegacyAdoptionWatch(watchArgs, {
+    now: () => now, readExecutorStatus: () => replacement,
+    executeStrategy: () => assert.fail('replacement identity alone is not domain novelty'),
+    wait: () => { throw new Error('real-domain-unchanged'); },
+  }), /real-domain-unchanged/);
+
+  fs.appendFileSync(path.join(targetRuntimeRoot, 'extension', 'services', 'fixture.js'), '\ntarget-v2');
+  const changedDomain = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+  assert.equal(changedDomain.authenticated, true);
+  assert.notEqual(changedDomain.hash, initialDomain.hash);
+  const routes = [];
+  runLegacyAdoptionWatch(watchArgs, {
+    now: () => now, readExecutorStatus: () => replacement,
+    executeStrategy: (strategyId) => { routes.push(strategyId); return record('launched'); },
+  });
+  assert.deepEqual(routes, ['standard-adopt-launch']);
+  const resumed = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(resumed.strategy_state.epoch, 2);
+});
+
+test('authenticated migration domain projection binds exact live semantics but ignores inert reseal metadata', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-semantic-migration-');
+  const workingDir = makeTempRoot('pickle-adoption-watch-semantic-working-');
+  const sourceRuntimeRoot = authenticRuntimeRoot('pickle-semantic-source-', 'source');
+  const targetRuntimeRoot = authenticRuntimeRoot('pickle-semantic-target-', 'target');
+  const sourceRuntime = describeInstalledRuntime(sourceRuntimeRoot);
+  const targetRuntime = describeInstalledRuntime(targetRuntimeRoot);
+  execFileSync('git', ['init'], { cwd: workingDir, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'pickle@example.test'], { cwd: workingDir });
+  execFileSync('git', ['config', 'user.name', 'Pickle Test'], { cwd: workingDir });
+  fs.writeFileSync(path.join(workingDir, 'tracked.txt'), 'base\n');
+  execFileSync('git', ['add', 'tracked.txt'], { cwd: workingDir });
+  execFileSync('git', ['commit', '-m', 'base'], { cwd: workingDir, stdio: 'ignore' });
+  execFileSync('git', ['update-ref', `refs/pickle/salvage/${path.basename(sessionDir)}/probe`, 'HEAD'], {
+    cwd: workingDir,
+  });
+  writeJson(path.join(sessionDir, 'state.json'), {
+    schema_version: 1, active: true, working_dir: workingDir, history: [], current_ticket: null, step: 'readiness',
+  });
+  let migration = prepareLiveSessionMigration(
+    sessionDir, sourceRuntime, targetRuntime, new Date('2026-01-01T00:00:00.000Z'),
+    { forceVerificationContractRepair: true },
+  );
+  assert.equal(migration.salvage_refs.length, 1);
+  const adoptionPath = path.join(sessionDir, 'legacy-session-adoption.json');
+  const adoption = {
+    ...record('adopted'), session_id: path.basename(sessionDir), source_runtime: sourceRuntime,
+    target_runtime: targetRuntime, migration_content_hash: migration.content_hash,
+    target_runtime_supersessions: [{ forged_control_id: 'one', superseded_at: '2026-01-01T00:00:00.000Z' }],
+  };
+  writeJson(adoptionPath, adoption);
+  const initial = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+  assert.equal(initial.authenticated, true);
+
+  adoption.target_runtime_supersessions[0] = { forged_control_id: 'two', superseded_at: '2099-01-01T00:00:00.000Z' };
+  writeJson(adoptionPath, adoption);
+  assert.equal(readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot).hash, initial.hash);
+
+  const { content_hash: _oldHash, ...resealedPayload } = migration;
+  migration = { ...resealedPayload, migration_id: crypto.randomUUID(), created_at: '2027-02-03T04:05:06.000Z' };
+  migration.content_hash = stableHash(migration);
+  adoption.migration_content_hash = migration.content_hash;
+  writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), migration);
+  writeJson(adoptionPath, adoption);
+  const resealed = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+  assert.equal(resealed.authenticated, true);
+  assert.equal(resealed.hash, initial.hash);
+
+  const reversed = Object.fromEntries(Object.entries(migration).reverse());
+  writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), reversed);
+  assert.equal(readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot).hash, initial.hash);
+  const sourceAlias = path.join(makeTempRoot('pickle-semantic-aliases-'), 'source');
+  const targetAlias = path.join(path.dirname(sourceAlias), 'target');
+  fs.symlinkSync(sourceRuntimeRoot, sourceAlias);
+  fs.symlinkSync(targetRuntimeRoot, targetAlias);
+  assert.equal(readAdoptionWatchDomainEvidence(sessionDir, sourceAlias, targetAlias).hash, initial.hash);
+
+  const invalidHashes = [];
+  for (const mutate of [
+    (candidate) => { candidate.session_schema = 999; },
+    (candidate) => { candidate.preserved_artifacts = []; },
+    (candidate) => { candidate.salvage_refs = []; },
+    (candidate) => { candidate.resume_checkpoint.ticket_id = 'FORGED'; },
+    (candidate) => { candidate.resume_checkpoint.phase = 'forged'; },
+    (candidate) => { candidate.resume_checkpoint.reuse_phases = ['research']; },
+    (candidate) => { candidate.resume_checkpoint.history_length = 999; },
+  ]) {
+    const candidate = JSON.parse(JSON.stringify(migration));
+    mutate(candidate);
+    delete candidate.content_hash;
+    candidate.content_hash = stableHash(candidate);
+    adoption.migration_content_hash = candidate.content_hash;
+    writeJson(path.join(sessionDir, 'installed-runtime-migration.json'), candidate);
+    writeJson(adoptionPath, adoption);
+    const invalid = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+    assert.equal(invalid.authenticated, false);
+    invalidHashes.push(invalid.hash);
+  }
+  assert.equal(new Set(invalidHashes).size, 1, 'all invalid reseals collapse to stable non-novel evidence');
+
+  writeJson(path.join(sessionDir, 'state.json'), {
+    schema_version: 1, active: true, working_dir: workingDir, history: [{ event: 'resumed' }],
+    current_ticket: 'R1', step: 'readiness',
+  });
+  migration = prepareLiveSessionMigration(
+    sessionDir, sourceRuntime, targetRuntime, new Date('2027-03-04T05:06:07.000Z'),
+    { forceVerificationContractRepair: true },
+  );
+  adoption.migration_content_hash = migration.content_hash;
+  writeJson(adoptionPath, adoption);
+  const changed = readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot);
+  assert.equal(changed.authenticated, true);
+  assert.notEqual(changed.hash, initial.hash);
+});
+
+test('legacy v1 exhausted authority burns its catalog and pending ACK cannot authorize v2 replay', () => {
+  const sessionDir = makeTempRoot('pickle-adoption-watch-v1-migration-');
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  let domainHash = '1'.repeat(64);
+  const readDomainEvidence = () => ({ hash: domainHash, authenticated: true });
+  const supervisor = (generation, fingerprint, receipt = null) => ({
+    schema_version: 1, session_id: path.basename(sessionDir), status: 'supervising',
+    manager_identity: { pid: 10, pgid: 10, start_time: 'manager', fingerprint: 'manager' },
+    manager_generation: generation, manager_parent_pid: 9, manager_argv_sha256: 'a'.repeat(64),
+    owner_nonce: 'owner', executor_identity: { pid: generation === 1 ? process.pid : process.pid + generation,
+      pgid: process.pid + generation, start_time: `executor-${generation}`, fingerprint },
+    executor_generation: generation, executor_started_at: '2026-01-01T00:00:00.000Z',
+    executor_lease_expires_at: '2026-01-01T00:01:00.000Z', executor_spec_sha256: 'c'.repeat(64),
+    replacement_count: generation - 1, last_loss_at: null, last_restart_request_id: receipt,
+    updated_at: '2026-01-01T00:00:00.000Z',
+  });
+  const first = supervisor(1, 'executor-one');
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence, readExecutorStatus: () => first,
+    executeStrategy: () => { throw new Error('persistent'); }, wait: (delay) => { now += delay; },
+    requestExecutorRestart: () => {
+      writeJson(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'), { pending: true });
+      return { schema_version: 1, request_id: 'v1-pending', expected_generation: 1,
+        expected_executor_fingerprint: 'executor-one', reason: 'v1 exhausted',
+        requested_at: '2026-01-01T00:00:00.030Z' };
+    },
+    yieldExecutor: () => { throw new Error('v1-yield'); },
+  }), /v1-yield/);
+  const authorityPath = path.join(sessionDir, 'watch-strategy-authority.json');
+  const authority = JSON.parse(fs.readFileSync(authorityPath, 'utf8'));
+  delete authority.domain_evidence_schema;
+  const { content_hash: _contentHash, ...legacyPayload } = authority;
+  authority.content_hash = stableHash(legacyPayload);
+  writeJson(authorityPath, authority);
+  fs.unlinkSync(path.join(sessionDir, 'legacy-session-adoption-executor-restart.json'));
+  domainHash = '2'.repeat(64);
+  const successor = supervisor(2, 'executor-two', 'v1-pending');
+  assert.throws(() => runLegacyAdoptionWatch(args(sessionDir), {
+    now: () => now, readDomainEvidence, readExecutorStatus: () => successor,
+    executeStrategy: () => assert.fail('v1 pending ACK must never authorize a v2 epoch'),
+    wait: () => { throw new Error('v2-waiting'); },
+  }), /v2-waiting/);
+  const migrated = JSON.parse(fs.readFileSync(path.join(sessionDir, LEGACY_ADOPTION_WATCH_STATUS_FILE), 'utf8'));
+  assert.equal(migrated.strategy_state.cursor, 3);
+  assert.equal(migrated.strategy_state.history_base_checkpoint.evidence_hash, domainHash);
+  assert.equal(migrated.executor_restart_action.action, 'awaiting_evidence_change');
+  assert.equal(migrated.executor_restart_action.request, null);
 });
 
 test('production strategy routes execute distinct adoption, authentication, and reconstruction operations', () => {

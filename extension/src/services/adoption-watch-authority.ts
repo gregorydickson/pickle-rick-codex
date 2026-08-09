@@ -14,6 +14,7 @@ const AUTHORITY_FILE = 'watch-strategy-authority.json';
 
 export interface AdoptionWatchAuthority {
   schema_version: 1;
+  domain_evidence_schema: 2;
   session_id: string;
   strategy_state: AdoptionWatchStrategyState;
   executor_restart_action: unknown | null;
@@ -31,6 +32,7 @@ export interface AdoptionWatchAuthorityInspection {
   authority: AdoptionWatchAuthority | null;
   invalid_present: boolean;
   control_artifact_conflict: boolean;
+  legacy_v1_present: boolean;
 }
 
 function canonicalize(value: unknown): string {
@@ -52,7 +54,8 @@ export function writeAdoptionWatchAuthority(
 ): AdoptionWatchAuthority {
   const ledger = reconcileAdoptionWatchMaterialLedger(sessionDir);
   const payload = {
-    schema_version: 1 as const, session_id: path.basename(sessionDir), strategy_state: strategyState,
+    schema_version: 1 as const, domain_evidence_schema: 2 as const,
+    session_id: path.basename(sessionDir), strategy_state: strategyState,
     executor_restart_action: executorRestartAction, ledger_count: ledger.count,
     ledger_root_hash: ledger.root_hash, expected_material_hashes: [...ledger.markers.keys()].sort(),
     expected_markers: [...ledger.markers.values()].sort((left, right) => left.material_hash.localeCompare(right.material_hash)),
@@ -65,15 +68,19 @@ export function writeAdoptionWatchAuthority(
 
 export function inspectAdoptionWatchAuthority(sessionDir: string): AdoptionWatchAuthorityInspection {
   const filePath = path.join(sessionDir, AUTHORITY_FILE);
-  if (!fs.existsSync(filePath)) return { authority: null, invalid_present: false, control_artifact_conflict: false };
+  if (!fs.existsSync(filePath)) return { authority: null, invalid_present: false,
+    control_artifact_conflict: false, legacy_v1_present: false };
   const authority = readJsonFile<AdoptionWatchAuthority>(filePath, null);
-  if (!authority) return { authority: null, invalid_present: true, control_artifact_conflict: true };
+  if (!authority) return { authority: null, invalid_present: true,
+    control_artifact_conflict: true, legacy_v1_present: false };
+  const legacyV1Present = (authority as { domain_evidence_schema?: unknown }).domain_evidence_schema === undefined;
   const { content_hash: contentHash, ...payload } = authority;
   delete payload.ledger_repaired;
   delete payload.control_artifact_conflict;
   const expectedMaterials = Array.isArray(authority.expected_markers)
     ? authority.expected_markers.map((marker) => marker.material_hash).sort() : [];
-  if (authority.schema_version !== 1 || authority.session_id !== path.basename(sessionDir)
+  if (authority.schema_version !== 1 || authority.domain_evidence_schema !== 2
+    || authority.session_id !== path.basename(sessionDir)
     || validateAdoptionWatchStrategyState(authority.strategy_state)
     || !Number.isInteger(authority.ledger_count) || authority.ledger_count < 0
     || !/^[a-f0-9]{64}$/.test(authority.ledger_root_hash)
@@ -85,17 +92,19 @@ export function inspectAdoptionWatchAuthority(sessionDir: string): AdoptionWatch
     || authority.ledger_count !== expectedMaterials.length
     || JSON.stringify(authority.expected_material_hashes) !== JSON.stringify(expectedMaterials)
     || typeof authority.updated_at !== 'string' || !Number.isFinite(Date.parse(authority.updated_at))
-    || contentHash !== hash(payload)) return { authority: null, invalid_present: true, control_artifact_conflict: true };
+    || contentHash !== hash(payload)) return { authority: null, invalid_present: true,
+      control_artifact_conflict: true, legacy_v1_present: legacyV1Present };
   const ledger = restoreAdoptionWatchMaterialLedger(sessionDir, authority.expected_markers);
   const authorityMarkers = new Map(authority.expected_markers.map((marker) => [marker.material_hash, marker]));
   const authorityRoot = reconcileAdoptionWatchMaterialLedgerFromMarkers(authorityMarkers);
   if (authority.ledger_root_hash !== authorityRoot) {
-    return { authority: null, invalid_present: true, control_artifact_conflict: true };
+    return { authority: null, invalid_present: true, control_artifact_conflict: true,
+      legacy_v1_present: legacyV1Present };
   }
   const restored = { ...authority, ledger_repaired: ledger.repaired,
     control_artifact_conflict: ledger.integrity_conflict };
   return { authority: restored, invalid_present: false,
-    control_artifact_conflict: ledger.integrity_conflict };
+    control_artifact_conflict: ledger.integrity_conflict, legacy_v1_present: false };
 }
 
 export function readAdoptionWatchAuthority(sessionDir: string): AdoptionWatchAuthority | null {

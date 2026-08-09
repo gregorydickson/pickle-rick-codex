@@ -1,6 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { describeInstalledRuntime } from './runtime-descriptor.js';
+import {
+  verifyLiveSessionMigrationDomainBoundary,
+  type InstalledRuntimeMigration,
+} from './live-session-migration.js';
+import type { InstalledRuntimeDescriptor } from './durable-supervisor.js';
 
 export const ADOPTION_WATCH_STRATEGY_IDS = [
   'standard-adopt-launch',
@@ -59,11 +65,10 @@ const strategyConstraints = Object.fromEntries(ADOPTION_WATCH_STRATEGY_IDS.map((
   strategyId,
   hash(`pickle-rick-adoption-watch:${strategyId}:v1`),
 ])) as Record<AdoptionWatchStrategyId, string>;
-const evidenceFiles = [
-  'legacy-session-adoption.json',
-  'legacy-session-adoption-transaction.json',
-  'installed-runtime-migration.json',
-];
+export interface AdoptionWatchDomainEvidence {
+  hash: string;
+  authenticated: boolean;
+}
 
 function canonicalize(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -87,45 +92,118 @@ function isIsoTimestamp(value: unknown): value is string {
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
+function sameRuntimeDescriptor(left: unknown, right: InstalledRuntimeDescriptor): boolean {
+  return Boolean(left && typeof left === 'object' && !Array.isArray(left)
+    && canonicalize(left) === canonicalize(right));
+}
+
+export function adoptionWatchMigrationDomainProjection(migration: InstalledRuntimeMigration): Record<string, unknown> {
+  return {
+    schema_version: migration.schema_version,
+    source_runtime: migration.source_runtime,
+    target_runtime: migration.target_runtime,
+    session_schema: migration.session_schema,
+    session_was_active: migration.session_was_active,
+    resume_checkpoint: migration.resume_checkpoint,
+    preserved_artifacts: [...migration.preserved_artifacts].sort((left, right) => (
+      left.path.localeCompare(right.path) || left.sha256.localeCompare(right.sha256) || left.size - right.size
+    )),
+    salvage_refs: [...migration.salvage_refs].sort(),
+  };
+}
+
+function validMigrationDomainContract(
+  migration: InstalledRuntimeMigration,
+  sourceRuntime: InstalledRuntimeDescriptor,
+  targetRuntime: InstalledRuntimeDescriptor,
+): boolean {
+  const checkpoint = migration.resume_checkpoint;
+  const artifacts = migration.preserved_artifacts;
+  return migration.schema_version === 1 && migration.session_was_active === true
+    && Number.isInteger(migration.session_schema) && migration.session_schema >= 1
+    && sameRuntimeDescriptor(migration.source_runtime, sourceRuntime)
+    && sameRuntimeDescriptor(migration.target_runtime, targetRuntime)
+    && Boolean(checkpoint && typeof checkpoint === 'object'
+      && (checkpoint.ticket_id === null || typeof checkpoint.ticket_id === 'string')
+      && typeof checkpoint.phase === 'string' && checkpoint.phase.length > 0
+      && Array.isArray(checkpoint.reuse_phases) && checkpoint.reuse_phases.every((phase) => typeof phase === 'string')
+      && typeof checkpoint.reason === 'string' && Number.isInteger(checkpoint.history_length)
+      && checkpoint.history_length >= 0)
+    && Array.isArray(artifacts) && artifacts.every((artifact) => (
+      artifact && typeof artifact.path === 'string' && artifact.path.length > 0
+      && /^[a-f0-9]{64}$/.test(artifact.sha256)
+      && Number.isInteger(artifact.size) && artifact.size >= 0
+    ))
+    && new Set(artifacts.map((artifact) => artifact.path)).size === artifacts.length
+    && Array.isArray(migration.salvage_refs)
+    && migration.salvage_refs.every((ref) => typeof ref === 'string' && ref.length > 0)
+    && new Set(migration.salvage_refs).size === migration.salvage_refs.length;
+}
+
+export function readAdoptionWatchDomainEvidence(
+  sessionDir: string,
+  sourceRuntimeRoot: string,
+  targetRuntimeRoot: string,
+): AdoptionWatchDomainEvidence {
+  let authenticated = true;
+  let sourceRuntime: InstalledRuntimeDescriptor | null = null;
+  let targetRuntime: InstalledRuntimeDescriptor | null = null;
+  let canonicalSourceRoot = path.resolve(sourceRuntimeRoot);
+  let canonicalTargetRoot = path.resolve(targetRuntimeRoot);
+  try {
+    canonicalSourceRoot = fs.realpathSync(sourceRuntimeRoot);
+    canonicalTargetRoot = fs.realpathSync(targetRuntimeRoot);
+    sourceRuntime = describeInstalledRuntime(sourceRuntimeRoot);
+    targetRuntime = describeInstalledRuntime(targetRuntimeRoot);
+  } catch {
+    authenticated = false;
+  }
+  let adoptionArtifact: Record<string, unknown> | null = null;
+  const adoptionPath = path.join(sessionDir, 'legacy-session-adoption.json');
+  if (fs.existsSync(adoptionPath)) {
+    try {
+      const record = JSON.parse(fs.readFileSync(adoptionPath, 'utf8')) as Record<string, unknown>;
+      const migration = JSON.parse(fs.readFileSync(
+        path.join(sessionDir, 'installed-runtime-migration.json'), 'utf8',
+      )) as InstalledRuntimeMigration;
+      if (record.schema_version !== 1 || record.session_id !== path.basename(sessionDir)
+        || typeof record.migration_content_hash !== 'string'
+        || record.migration_content_hash !== migration.content_hash
+        || !sourceRuntime || !targetRuntime
+        || !validMigrationDomainContract(migration, sourceRuntime, targetRuntime)
+        || !sameRuntimeDescriptor(record.source_runtime, sourceRuntime)
+        || !sameRuntimeDescriptor(record.target_runtime, targetRuntime)) {
+        throw new Error('adoption domain artifact does not match its runtime identities');
+      }
+      verifyLiveSessionMigrationDomainBoundary(sessionDir, migration, sourceRuntime, targetRuntime, {
+        forceVerificationContractRepair: true,
+      });
+      adoptionArtifact = {
+        schema_version: 1,
+        session_id: record.session_id,
+        source_runtime: record.source_runtime,
+        target_runtime: record.target_runtime,
+        migration: adoptionWatchMigrationDomainProjection(migration),
+      };
+    } catch {
+      authenticated = false;
+    }
+  }
+  return {
+    hash: hash({ domain_evidence_schema: 2, session_id: path.basename(sessionDir),
+      source_runtime_root: canonicalSourceRoot,
+      target_runtime_root: canonicalTargetRoot, source_runtime: sourceRuntime,
+      target_runtime: targetRuntime, adoption_artifact: adoptionArtifact }),
+    authenticated,
+  };
+}
+
 export function adoptionWatchEvidenceHash(
   sessionDir: string,
   sourceRuntimeRoot: string,
   targetRuntimeRoot: string,
 ): string {
-  const artifacts = evidenceFiles.map((name) => {
-    const filePath = path.join(sessionDir, name);
-    if (!fs.existsSync(filePath)) return { name, sha256: null };
-    return { name, sha256: hash(fs.readFileSync(filePath)) };
-  });
-  const runtimeEvidence = [sourceRuntimeRoot, targetRuntimeRoot].map((root) => {
-    const descriptorPath = path.join(root, '.runtime-descriptor.json');
-    return {
-      root,
-      descriptor_sha256: fs.existsSync(descriptorPath) ? hash(fs.readFileSync(descriptorPath)) : null,
-    };
-  });
-  const supervisorPath = path.join(sessionDir, 'legacy-session-adoption-executor.json');
-  let supervisorEvidence: Record<string, unknown> | null = null;
-  if (fs.existsSync(supervisorPath)) {
-    try {
-      const status = JSON.parse(fs.readFileSync(supervisorPath, 'utf8')) as Record<string, unknown>;
-      const manager = status.manager_identity as Record<string, unknown> | undefined;
-      const executor = status.executor_identity as Record<string, unknown> | undefined;
-      supervisorEvidence = {
-        schema_version: status.schema_version,
-        executor_generation: status.executor_generation,
-        executor_spec_sha256: status.executor_spec_sha256,
-        manager_fingerprint: manager?.fingerprint || null,
-        executor_fingerprint: executor?.fingerprint || null,
-        executor_pid: executor?.pid || null,
-      };
-    } catch {
-      supervisorEvidence = { invalid: true };
-    }
-  }
-  return hash({ session_id: path.basename(sessionDir), source_runtime_root: sourceRuntimeRoot,
-    target_runtime_root: targetRuntimeRoot, artifacts, runtime_evidence: runtimeEvidence,
-    supervisor_evidence: supervisorEvidence });
+  return readAdoptionWatchDomainEvidence(sessionDir, sourceRuntimeRoot, targetRuntimeRoot).hash;
 }
 
 export function createAdoptionWatchStrategyState(

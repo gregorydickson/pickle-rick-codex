@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteJson } from './pickle-utils.js';
 import { readLogicalPipeline, type InstalledRuntimeDescriptor } from './durable-supervisor.js';
+import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 
 export const LIVE_SESSION_MIGRATION_SCHEMA_VERSION = 1;
 export const LIVE_SESSION_MIGRATION_FILE = 'installed-runtime-migration.json';
@@ -236,6 +237,72 @@ export function verifyLiveSessionMigration(sessionDir: string, migration: Instal
   const state = readJson(path.join(sessionDir, 'state.json'));
   const refs = listSessionSalvageRefs(String(state?.working_dir || ''), path.basename(sessionDir));
   if (migration.salvage_refs.some((ref) => !refs.includes(ref))) throw new Error('Live session migration lost salvage refs.');
+}
+
+export function verifyLiveSessionMigrationDomainBoundary(
+  sessionDir: string,
+  migration: InstalledRuntimeMigration,
+  sourceRuntime: InstalledRuntimeDescriptor,
+  targetRuntime: InstalledRuntimeDescriptor,
+  options: PrepareLiveSessionMigrationOptions = {},
+): void {
+  verifyLiveSessionMigration(sessionDir, migration);
+  const state = readJson(path.join(sessionDir, 'state.json'));
+  if (!state || state.active !== true) throw new Error('Live session migration no longer describes an active session.');
+  const sessionSchema = Number(state.schema_version ?? 1);
+  if (!Number.isInteger(sessionSchema) || sessionSchema < 1 || migration.session_schema !== sessionSchema) {
+    throw new Error('Live session migration schema does not match the durable session state.');
+  }
+  validateRuntime(sourceRuntime, sessionSchema);
+  validateRuntime(targetRuntime, sessionSchema);
+  if (canonicalize(migration.source_runtime) !== canonicalize(sourceRuntime)
+    || canonicalize(migration.target_runtime) !== canonicalize(targetRuntime)) {
+    throw new Error('Live session migration runtime identity does not match the installed runtime.');
+  }
+  const currentInventory = stableInventory(sessionDir);
+  const preservedPaths = new Set(migration.preserved_artifacts.map((artifact) => artifact.path));
+  const postSealArtifacts = currentInventory.filter((artifact) => !preservedPaths.has(artifact.path));
+  if (postSealArtifacts.some((artifact) => !['logical-pipeline.json', 'prd.lock.json'].includes(artifact.path))) {
+    throw new Error('Live session migration has unauthenticated post-seal artifacts.');
+  }
+  const currentPreserved = currentInventory.filter((artifact) => preservedPaths.has(artifact.path));
+  if (canonicalize(migration.preserved_artifacts) !== canonicalize(currentPreserved)) {
+    throw new Error('Live session migration inventory does not exactly match the durable session.');
+  }
+  const postSealPrd = postSealArtifacts.some((artifact) => artifact.path === 'prd.lock.json')
+    ? readPrdSeal(sessionDir) : null;
+  const postSealJournal = postSealArtifacts.some((artifact) => artifact.path === 'logical-pipeline.json');
+  if (postSealPrd && !postSealJournal) {
+    throw new Error('Live session migration post-seal PRD has no adoption journal.');
+  }
+  if (postSealPrd) {
+    const seal = postSealPrd;
+    assertPrdSealMatchesPrd(seal, fs.readFileSync(path.join(sessionDir, 'prd.md'), 'utf8'));
+  }
+  if (postSealJournal) {
+    const logical = readLogicalPipeline(sessionDir);
+    const adoption = logical.events.find((event) => event.kind === 'legacy_session_adopted');
+    if (!adoption
+      || adoption.details.migration_content_hash !== migration.content_hash
+      || canonicalize(adoption.details.source_runtime) !== canonicalize(sourceRuntime)
+      || canonicalize(adoption.details.target_runtime) !== canonicalize(targetRuntime)
+      || canonicalize(adoption.details.resume_checkpoint) !== canonicalize(migration.resume_checkpoint)) {
+      throw new Error('Live session migration post-seal journal is not bound to the adoption.');
+    }
+    const seal = postSealPrd || (fs.existsSync(path.join(sessionDir, 'prd.lock.json')) ? readPrdSeal(sessionDir) : null);
+    if (!seal || logical.control_state !== 'autonomous_execution'
+      || logical.prd_seal_hash !== seal.semantic_hash) {
+      throw new Error('Live session migration post-seal PRD is not bound to the adoption journal.');
+    }
+  }
+  const salvageRefs = listSessionSalvageRefs(String(state.working_dir || ''), path.basename(sessionDir));
+  if (canonicalize(migration.salvage_refs) !== canonicalize(salvageRefs)) {
+    throw new Error('Live session migration salvage refs do not exactly match the durable session.');
+  }
+  const checkpoint = deriveResumeCheckpoint(sessionDir, state, options);
+  if (canonicalize(migration.resume_checkpoint) !== canonicalize(checkpoint)) {
+    throw new Error('Live session migration resume checkpoint does not match the durable session.');
+  }
 }
 
 
