@@ -381,6 +381,7 @@ export function recordLegacySessionAdoption(
     migration_content_hash: string;
     source_runtime: InstalledRuntimeDescriptor;
     target_runtime: InstalledRuntimeDescriptor;
+    target_runtime_supersessions?: Array<Record<string, unknown>>;
     resume_checkpoint: Record<string, unknown>;
     legacy_owner: Record<string, unknown>;
   },

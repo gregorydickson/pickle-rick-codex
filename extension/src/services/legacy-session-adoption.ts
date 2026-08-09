@@ -11,7 +11,7 @@ import {
 } from './orphan-reaper.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { ensureFencedLegacyAdoptionPrdSeal } from './session-prd-seal.js';
-import { StateManager } from './state-manager.js';
+import { StateManager, type PersistedState } from './state-manager.js';
 import { assertOwnedTmuxSession, killTmuxSessionById, runTmux, tmuxSessionExists } from './tmux.js';
 import {
   prepareLiveSessionMigration,
@@ -25,11 +25,12 @@ import {
 } from './durable-supervisor.js';
 import { describeInstalledRuntime } from './runtime-descriptor.js';
 import { acquireSessionOperation } from './session-operation.js';
-import { getHeadSha, listWorkingTreeDirtyPaths } from './git-utils.js';
+import { getHeadSha, getWorkingTreeStatus, listWorkingTreeDirtyPaths } from './git-utils.js';
 import { pathIsInPipelineScope } from './pipeline-scope.js';
 import { stashUnattributableRemainder } from './dirty-tree-salvage.js';
 import { persistRejectedCandidateCheckpoint } from './candidate-recovery.js';
 import { reconcileArchivedCandidateRefinementBoundary, refinementRepositoryAdvancePath } from './refinement-artifacts.js';
+import { assertCitadelReleaseApproval, citadelReportPath } from './citadel.js';
 
 export const LEGACY_ADOPTION_FILE = 'legacy-session-adoption.json';
 export const LEGACY_ADOPTION_SCHEMA_VERSION = 1;
@@ -70,6 +71,7 @@ export interface LegacyAdoptionRecord {
   launched_at?: string;
   launched_runtime_root?: string;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
+  target_runtime_supersessions?: LegacyAdoptionTransaction['target_runtime_supersessions'];
 }
 
 interface LegacyAdoptionTransaction {
@@ -89,6 +91,34 @@ interface LegacyAdoptionTransaction {
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
   migration_content_hash?: string;
   superseded_migration_content_hash?: string;
+  target_runtime_supersessions?: Array<{
+    prior_target_runtime_root: string;
+    prior_target_runtime: InstalledRuntimeDescriptor;
+    prior_migration_content_hash: string | null;
+    replacement_target_runtime_root: string;
+    replacement_target_runtime: InstalledRuntimeDescriptor;
+    superseded_at: string;
+    validation_session_dir: string;
+    validation_approval_sha256: string;
+    validation_report_sha256: string;
+    validation_approval: Record<string, unknown>;
+    validation_report: Record<string, unknown>;
+  }>;
+  target_runtime_repin?: {
+    status: 'prepared' | 'completed';
+    prior_target_runtime_root: string;
+    prior_target_runtime: InstalledRuntimeDescriptor;
+    prior_migration_content_hash: string | null;
+    replacement_target_runtime_root: string;
+    replacement_target_runtime: InstalledRuntimeDescriptor;
+    validation_session_dir: string;
+    validation_approval_sha256: string;
+    validation_report_sha256: string;
+    validation_approval: Record<string, unknown>;
+    validation_report: Record<string, unknown>;
+    prepared_at: string;
+    replacement_migration_content_hash?: string;
+  };
   boundary_reconciliation?: {
     status: 'prepared' | 'completed';
     ticket_id: string;
@@ -113,12 +143,13 @@ interface LegacyAdoptionDependencies {
   stopController?: (identity: PersistedProcessIdentity) => void;
   resumeController?: (identity: PersistedProcessIdentity) => void;
   startWatchdog?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
-  checkpoint?: (stage: LegacyAdoptionTransaction['stage'] | 'candidate_archived' | 'boundary_prepared' | 'boundary_completed' | 'journaled' | 'launching') => void;
+  checkpoint?: (stage: LegacyAdoptionTransaction['stage'] | 'candidate_archived' | 'boundary_prepared' | 'boundary_completed' | 'target_runtime_superseded' | 'journaled' | 'launching') => void;
   afterChildQuiesced?: () => void;
   sealSession?: (sessionDir: string) => unknown;
   launch?: (sessionDir: string, runtimeRoot: string) => void;
   handoff?: (sessionDir: string, sourceRuntimeRoot: string, targetRuntimeRoot: string) => void;
   now?: () => Date;
+  validationSessionDir?: string;
 }
 
 export function runtimeRootMatchesDescriptor(runtimeRoot: string, descriptor: InstalledRuntimeDescriptor): boolean {
@@ -273,6 +304,77 @@ function defaultWaitForExit(identity: PersistedProcessIdentity): boolean {
 function assertRuntimeCompatible(runtime: InstalledRuntimeDescriptor, schemaVersion: number): void {
   if (schemaVersion < runtime.min_state_schema || schemaVersion > runtime.max_state_schema) {
     throw new Error(`Runtime ${runtime.runtime_id} cannot read legacy state schema ${schemaVersion}.`);
+  }
+}
+
+function assertTargetRuntimeSupersessionAuthorized(
+  sessionDir: string,
+  state: PersistedState,
+  transaction: LegacyAdoptionTransaction,
+  replacement: InstalledRuntimeDescriptor,
+): void {
+  if (!['quiesced', 'migrated'].includes(transaction.stage)
+    || state.active !== true
+    || state.step !== 'verification_contract_repair'
+    || state.failure_kind !== 'verification_contract_failed'
+    || state.failure_reason !== 'legacy session adoption requires structured verification contract repair'
+    || state.tmux_runner_pid !== null
+    || state.tmux_session_name !== null
+    || state.worker_pid !== null
+    || state.active_child_pid !== null
+    || state.active_child_identity !== null
+    || fs.existsSync(path.join(sessionDir, LEGACY_ADOPTION_FILE))
+    || fs.existsSync(path.join(sessionDir, 'prd.lock.json'))) {
+    throw new Error('Target runtime supersession requires an exact quiesced pre-adoption repair boundary.');
+  }
+  const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+  if (fs.existsSync(logicalPath)) {
+    const logical = readLogicalPipeline(sessionDir);
+    if (logical.lease !== null || logical.events.some((event) => event.kind === 'legacy_session_adopted')) {
+      throw new Error('Target runtime supersession refuses an adopted or leased logical pipeline.');
+    }
+  }
+  assertRuntimeCompatible(replacement, Number(state.schema_version ?? 1));
+}
+
+function targetRuntimeValidationEvidence(
+  targetRuntimeRoot: string,
+  validationSessionDir: string | undefined,
+): {
+  validation_session_dir: string; validation_approval_sha256: string; validation_report_sha256: string;
+  validation_approval: Record<string, unknown>; validation_report: Record<string, unknown>;
+} {
+  if (!validationSessionDir) throw new Error('Target runtime supersession requires --validation-session with fresh Citadel approval.');
+  const resolvedValidationSession = fs.realpathSync(validationSessionDir);
+  assertCitadelReleaseApproval(resolvedValidationSession);
+  const validationState = new StateManager().read(path.join(resolvedValidationSession, 'state.json'));
+  if (fs.realpathSync(String(validationState.working_dir || '')) !== fs.realpathSync(targetRuntimeRoot)
+    || getWorkingTreeStatus(targetRuntimeRoot) !== '') {
+    throw new Error('Target runtime validation approval does not bind the exact clean replacement root.');
+  }
+  const validationApproval = readJsonFile<Record<string, unknown>>(path.join(resolvedValidationSession, 'citadel-release-approval.json'), null);
+  const validationReport = readJsonFile<Record<string, unknown>>(citadelReportPath(resolvedValidationSession), null);
+  if (!validationApproval || !validationReport) throw new Error('Target runtime validation evidence is incomplete.');
+  const digest = (value: unknown): string => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  return {
+    validation_session_dir: resolvedValidationSession,
+    validation_approval_sha256: digest(validationApproval),
+    validation_report_sha256: digest(validationReport),
+    validation_approval: validationApproval,
+    validation_report: validationReport,
+  };
+}
+
+function assertPersistedTargetRuntimeValidation(
+  repin: NonNullable<LegacyAdoptionTransaction['target_runtime_repin']>,
+  targetRuntimeRoot: string,
+): void {
+  const digest = (value: unknown): string => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  if (digest(repin.validation_approval) !== repin.validation_approval_sha256
+    || digest(repin.validation_report) !== repin.validation_report_sha256
+    || repin.validation_approval.head !== getHeadSha(targetRuntimeRoot)
+    || getWorkingTreeStatus(targetRuntimeRoot) !== '') {
+    throw new Error('Persisted target runtime validation evidence no longer binds the clean replacement checkout.');
   }
 }
 
@@ -509,11 +611,62 @@ export function adoptActiveLegacyMuxSession(
   if (!transaction) throw new Error('Legacy adoption transaction disappeared after quiescence.');
   const releaseOperation = acquireSessionOperation(sessionDir, 'Could not fence the quiesced legacy session for adoption.');
   try {
-    if (JSON.stringify(describeInstalledRuntime(sourceRuntimeRoot)) !== JSON.stringify(transaction.source_runtime)
-      || JSON.stringify(describeInstalledRuntime(targetRuntimeRoot)) !== JSON.stringify(transaction.target_runtime)) {
-      throw new Error('Runtime hash changed while the legacy owner was being quiesced.');
-    }
     let migration = readJsonFile<InstalledRuntimeMigration>(path.join(sessionDir, 'installed-runtime-migration.json'), null);
+    const installedSourceRuntime = describeInstalledRuntime(sourceRuntimeRoot);
+    if (fs.realpathSync(sourceRuntimeRoot) !== transaction.source_runtime_root
+      || JSON.stringify(installedSourceRuntime) !== JSON.stringify(transaction.source_runtime)) {
+      throw new Error('Source runtime hash changed while the legacy owner was being quiesced.');
+    }
+    const installedTargetRuntime = describeInstalledRuntime(targetRuntimeRoot);
+    const resolvedTargetRuntimeRoot = fs.realpathSync(targetRuntimeRoot);
+    const targetRuntimeChanged = resolvedTargetRuntimeRoot !== transaction.target_runtime_root
+      || JSON.stringify(installedTargetRuntime) !== JSON.stringify(transaction.target_runtime);
+    if (targetRuntimeChanged) {
+      assertTargetRuntimeSupersessionAuthorized(sessionDir, new StateManager().read(statePath), transaction, installedTargetRuntime);
+      const pendingRepin = transaction.target_runtime_repin?.status === 'prepared'
+        ? transaction.target_runtime_repin : null;
+      if (pendingRepin) {
+        assertPersistedTargetRuntimeValidation(pendingRepin, targetRuntimeRoot);
+        if (pendingRepin.replacement_target_runtime_root !== resolvedTargetRuntimeRoot
+          || JSON.stringify(pendingRepin.replacement_target_runtime) !== JSON.stringify(installedTargetRuntime)
+        ) {
+          throw new Error('Prepared target runtime supersession does not match the approved replacement evidence.');
+        }
+      } else {
+        if (transaction.stage === 'migrated') {
+          if (!migration || migration.content_hash !== transaction.migration_content_hash) {
+            throw new Error('Cannot repin target runtime without the exact migrated session evidence.');
+          }
+          verifyLiveSessionMigration(sessionDir, migration);
+        } else if (transaction.migration_content_hash) {
+          throw new Error('Quiesced target runtime supersession found an unexplained migration hash.');
+        }
+        const validation = targetRuntimeValidationEvidence(targetRuntimeRoot, deps.validationSessionDir);
+        const preparedAt = (deps.now?.() ?? new Date()).toISOString();
+        const priorMigrationContentHash = transaction.migration_content_hash || null;
+        transaction = {
+          ...transaction,
+          stage: 'quiesced',
+          migration_content_hash: undefined,
+          ...(priorMigrationContentHash ? { superseded_migration_content_hash: priorMigrationContentHash } : {}),
+          target_runtime_repin: {
+            status: 'prepared',
+            prior_target_runtime_root: transaction.target_runtime_root,
+            prior_target_runtime: transaction.target_runtime,
+            prior_migration_content_hash: priorMigrationContentHash,
+            replacement_target_runtime_root: resolvedTargetRuntimeRoot,
+            replacement_target_runtime: installedTargetRuntime,
+            ...validation,
+            prepared_at: preparedAt,
+          },
+          updated_at: preparedAt,
+        };
+        atomicWriteJson(transactionPath, transaction);
+        deps.checkpoint?.('target_runtime_superseded');
+        fs.rmSync(path.join(sessionDir, 'installed-runtime-migration.json'), { force: true });
+        migration = null;
+      }
+    }
     const advancePath = refinementRepositoryAdvancePath(sessionDir);
     if (transaction.stage === 'migrated' && transaction.candidate_archive.ref && fs.existsSync(advancePath)) {
       if (!migration || migration.content_hash !== transaction.migration_content_hash) {
@@ -572,6 +725,40 @@ export function adoptActiveLegacyMuxSession(
       atomicWriteJson(transactionPath, transaction);
       deps.checkpoint?.('boundary_completed');
     }
+    if (transaction.stage === 'quiesced' && transaction.target_runtime_repin?.status === 'prepared') {
+      const repin = transaction.target_runtime_repin;
+      migration = prepareLiveSessionMigration(sessionDir, transaction.source_runtime, repin.replacement_target_runtime,
+        deps.now?.() ?? new Date(), { forceVerificationContractRepair: true });
+      verifyLiveSessionMigration(sessionDir, migration);
+      const completedAt = (deps.now?.() ?? new Date()).toISOString();
+      transaction = {
+        ...transaction,
+        stage: 'migrated',
+        target_runtime_root: repin.replacement_target_runtime_root,
+        target_runtime: repin.replacement_target_runtime,
+        migration_content_hash: migration.content_hash,
+        target_runtime_repin: { ...repin, status: 'completed', replacement_migration_content_hash: migration.content_hash },
+        target_runtime_supersessions: [
+          ...(transaction.target_runtime_supersessions || []),
+          {
+            prior_target_runtime_root: repin.prior_target_runtime_root,
+            prior_target_runtime: repin.prior_target_runtime,
+            prior_migration_content_hash: repin.prior_migration_content_hash,
+            replacement_target_runtime_root: repin.replacement_target_runtime_root,
+            replacement_target_runtime: repin.replacement_target_runtime,
+            superseded_at: completedAt,
+            validation_session_dir: repin.validation_session_dir,
+            validation_approval_sha256: repin.validation_approval_sha256,
+            validation_report_sha256: repin.validation_report_sha256,
+            validation_approval: repin.validation_approval,
+            validation_report: repin.validation_report,
+          },
+        ],
+        updated_at: completedAt,
+      };
+      atomicWriteJson(transactionPath, transaction);
+      deps.checkpoint?.('migrated');
+    }
     if (transaction.stage === 'quiesced') {
       migration = prepareLiveSessionMigration(sessionDir, transaction.source_runtime, transaction.target_runtime,
         deps.now?.() ?? new Date(), { forceVerificationContractRepair: true });
@@ -583,6 +770,10 @@ export function adoptActiveLegacyMuxSession(
     if (!migration || migration.content_hash !== transaction.migration_content_hash) throw new Error('Legacy migration transaction is incomplete.');
     verifyLiveSessionMigration(sessionDir, migration);
     if (transaction.stage === 'migrated') {
+      if (fs.realpathSync(targetRuntimeRoot) !== transaction.target_runtime_root
+        || JSON.stringify(describeInstalledRuntime(targetRuntimeRoot)) !== JSON.stringify(transaction.target_runtime)) {
+        throw new Error('Target runtime drifted before sealing; migrated adoption remains resumable for an approved repin.');
+      }
       if (deps.sealSession) deps.sealSession(sessionDir);
       else ensureFencedLegacyAdoptionPrdSeal(sessionDir, migration.content_hash);
       transaction = { ...transaction, stage: 'sealed', updated_at: (deps.now?.() ?? new Date()).toISOString() };
@@ -594,6 +785,7 @@ export function adoptActiveLegacyMuxSession(
       migration_content_hash: migration.content_hash,
       source_runtime: transaction.source_runtime,
       target_runtime: transaction.target_runtime,
+      target_runtime_supersessions: transaction.target_runtime_supersessions || [],
       resume_checkpoint: { ...migration.resume_checkpoint },
       legacy_owner: { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane, tmux: transaction.tmux,
         operation_lock_pid: transaction.operation_lock_pid, active_child: transaction.active_child },
@@ -613,6 +805,7 @@ export function adoptActiveLegacyMuxSession(
         operation_lock_pid: transaction.operation_lock_pid, active_child: transaction.active_child },
       adopted_at: (deps.now?.() ?? new Date()).toISOString(),
       candidate_archive: transaction.candidate_archive,
+      target_runtime_supersessions: transaction.target_runtime_supersessions || [],
     };
     atomicWriteJson(recordPath, record);
     atomicWriteJson(transactionPath, { ...transaction, stage: 'adopted', updated_at: record.adopted_at });

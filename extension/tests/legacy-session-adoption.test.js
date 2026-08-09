@@ -34,9 +34,31 @@ import { runSequential } from '../bin/mux-runner.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
 import { getWorkingTreeContentFingerprint, listUntrackedFiles } from '../services/git-utils.js';
 import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
+import { persistCitadelReleaseApproval } from '../services/citadel.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function approveTargetRuntime(targetRoot) {
+  if (!fs.existsSync(path.join(targetRoot, '.git'))) git(targetRoot, ['init']);
+  git(targetRoot, ['config', 'user.name', 'Runtime Approval']);
+  git(targetRoot, ['config', 'user.email', 'runtime-approval@example.test']);
+  git(targetRoot, ['add', '-A']);
+  if (git(targetRoot, ['status', '--porcelain'])) git(targetRoot, ['commit', '-m', 'approved runtime']);
+  const head = git(targetRoot, ['rev-parse', 'HEAD']);
+  const sessionDir = makeTempRoot('runtime-validation-session-');
+  writeJson(path.join(sessionDir, 'state.json'), {
+    schema_version: 1, active: false, working_dir: targetRoot, start_commit: head,
+  });
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{ id: 'validation', acceptance_criteria: ['Approved runtime passes its release gate.'] }],
+  });
+  persistCitadelReleaseApproval(sessionDir, {
+    schema_version: 1, verdict: 'approve', reviewed_range: `${head}..HEAD`,
+    acceptance_criteria_checked: ['Approved runtime passes its release gate.'], findings: [], generated_at: '2026-08-08T20:00:00.000Z',
+  });
+  return sessionDir;
 }
 
 function runtime(label) {
@@ -869,6 +891,133 @@ test('migrated adoption supersedes stale repository-bound inventory and resumes 
     workingDir: value.repo, verifyRepository: true, preserveMalformedVerification: true,
   }).ok, true);
   assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).migration_content_hash, record.migration_content_hash);
+});
+
+test('quiesced adoption durably repins an approved compatible target runtime', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'quiesced') throw new Error('pause-before-target-repin');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pause-before-target-repin/,
+  );
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// approved target\n');
+  deps.validationSessionDir = approveTargetRuntime(value.targetRoot);
+  const replacement = describeInstalledRuntime(value.targetRoot);
+  deps.checkpoint = undefined;
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  const transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  const migration = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  assert.deepEqual(record.target_runtime, replacement);
+  assert.deepEqual(migration.target_runtime, replacement);
+  assert.equal(transaction.target_runtime_supersessions.length, 1);
+  assert.equal(transaction.target_runtime_supersessions[0].prior_migration_content_hash, null);
+  assert.deepEqual(transaction.target_runtime_supersessions[0].replacement_target_runtime, replacement);
+  assert.equal(record.target_runtime_supersessions[0].validation_approval_sha256,
+    transaction.target_runtime_supersessions[0].validation_approval_sha256);
+  const adoptionEvent = readLogicalPipeline(value.sessionDir).events.find((event) => event.kind === 'legacy_session_adopted');
+  assert.deepEqual(adoptionEvent.details.target_runtime_supersessions, record.target_runtime_supersessions);
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  )).target_runtime_supersessions.length, 1);
+});
+
+test('quiesced target repin requires a Citadel validation session for the exact clean checkout', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'quiesced') throw new Error('pause-for-unapproved-repin');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pause-for-unapproved-repin/,
+  );
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// unapproved target\n');
+  deps.checkpoint = undefined;
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /--validation-session/,
+  );
+  const transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(transaction.stage, 'quiesced');
+  assert.equal(transaction.target_runtime_repin, undefined);
+});
+
+test('migrated adoption verifies old evidence before target repin and resumes after supersession crash', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'migrated') throw new Error('pause-at-old-migration');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pause-at-old-migration/,
+  );
+  const oldMigration = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// approved migrated target\n');
+  deps.validationSessionDir = approveTargetRuntime(value.targetRoot);
+  const replacement = describeInstalledRuntime(value.targetRoot);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'target_runtime_superseded') throw new Error('crash-after-target-supersession');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /crash-after-target-supersession/,
+  );
+  const prepared = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(prepared.stage, 'quiesced');
+  assert.equal(prepared.target_runtime_repin.status, 'prepared');
+  assert.equal(prepared.target_runtime_repin.prior_migration_content_hash, oldMigration.content_hash);
+  assert.deepEqual(prepared.target_runtime, oldMigration.target_runtime);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'installed-runtime-migration.json')), true);
+
+  deps.checkpoint = undefined;
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  const regenerated = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  assert.deepEqual(record.target_runtime, replacement);
+  assert.deepEqual(regenerated.target_runtime, replacement);
+  assert.notEqual(regenerated.content_hash, oldMigration.content_hash);
+  assert.equal(record.migration_content_hash, regenerated.content_hash);
+  const completed = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(completed.target_runtime_repin.status, 'completed');
+  assert.equal(completed.target_runtime_supersessions.length, 1);
+});
+
+test('target runtime repin refuses migrated evidence drift before mutating its durable pin', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint === 'migrated') throw new Error('pause-before-drifted-repin');
+  };
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pause-before-drifted-repin/,
+  );
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  const before = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// replacement\n');
+  deps.validationSessionDir = approveTargetRuntime(value.targetRoot);
+  writeJson(path.join(value.sessionDir, 'ticket-recovery-history.json'), { schema_version: 1, events: [] });
+  deps.checkpoint = undefined;
+  assert.throws(
+    () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /continuity failed/,
+  );
+  const after = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  assert.equal(after.stage, 'migrated');
+  assert.deepEqual(after.target_runtime, before.target_runtime);
+  assert.equal(after.target_runtime_supersessions, undefined);
 });
 
 test('archived boundary reconciliation resumes across prepared, applied, and completed checkpoints', () => {

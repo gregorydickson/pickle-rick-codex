@@ -11,6 +11,7 @@ project_is_source=0
 runtime_is_installed_source=0
 repo_is_checkout=0
 adopt_session=""
+validation_session=""
 
 require_command() {
   local command_name="$1"
@@ -37,6 +38,7 @@ Usage:
   bash install.sh
   bash install.sh --project /path/to/project
   bash install.sh --adopt-session /path/to/legacy/session
+  bash install.sh --adopt-session /path/to/legacy/session --validation-session /path/to/citadel/session
 
 The former --enable-hooks option is rejected until the installed Codex hook
 event, payload, decision, and trust contracts have authenticated validation.
@@ -321,6 +323,14 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --validation-session)
+      validation_session="${2:-}"
+      if [[ -z "$validation_session" ]]; then
+        echo "--validation-session requires a session directory." >&2
+        exit 1
+      fi
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -339,6 +349,9 @@ agents_home="$(canonicalize_path "$agents_home")"
 target_root="$(canonicalize_path "$target_root")"
 if [[ -n "$adopt_session" ]]; then
   adopt_session="$(canonicalize_path "$adopt_session")"
+fi
+if [[ -n "$validation_session" ]]; then
+  validation_session="$(canonicalize_path "$validation_session")"
 fi
 assert_safe_install_roots
 
@@ -387,10 +400,13 @@ if [[ -n "$adopt_session" ]]; then
     echo "Legacy adoption CLI is missing from the validated target build." >&2
     exit 1
   fi
+  validation_args=()
+  if [[ -n "$validation_session" ]]; then validation_args=(--validation-session "$validation_session"); fi
   node "$repo_root/extension/bin/adopt-legacy-session.js" prepare \
     --session-dir "$adopt_session" \
     --source-runtime-root "$target_root" \
-    --target-runtime-root "$repo_root"
+    --target-runtime-root "$repo_root" \
+    "${validation_args[@]}"
 fi
 
 mkdir -p "$target_root"

@@ -14,6 +14,7 @@ interface Args {
   sessionDir: string;
   sourceRuntimeRoot: string;
   targetRuntimeRoot: string;
+  validationSessionDir: string;
 }
 
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
@@ -45,6 +46,10 @@ function valueAfter(argv: string[], name: string): string {
   return path.resolve(value);
 }
 
+function optionalValueAfter(argv: string[], name: string): string {
+  return argv.includes(name) ? valueAfter(argv, name) : '';
+}
+
 function parseArgs(argv: string[]): Args {
   const command = argv[0];
   if (command !== 'prepare' && command !== 'launch' && command !== 'watch') {
@@ -55,6 +60,7 @@ function parseArgs(argv: string[]): Args {
     sessionDir: valueAfter(argv, '--session-dir'),
     sourceRuntimeRoot: command !== 'launch' ? valueAfter(argv, '--source-runtime-root') : '',
     targetRuntimeRoot: valueAfter(argv, '--target-runtime-root'),
+    validationSessionDir: command !== 'launch' ? optionalValueAfter(argv, '--validation-session') : '',
   };
 }
 
@@ -63,7 +69,10 @@ export function runLegacyAdoptionCli(argv: string[]): void {
   if (args.command === 'watch') {
     for (;;) {
       try {
-        const adopted = adoptActiveLegacyMuxSession(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, { startWatchdog: () => undefined });
+        const adopted = adoptActiveLegacyMuxSession(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, {
+          startWatchdog: () => undefined,
+          validationSessionDir: args.validationSessionDir || undefined,
+        });
         const selected = chooseLegacyLaunchRuntime(
           args.sourceRuntimeRoot,
           args.targetRuntimeRoot,
@@ -80,12 +89,14 @@ export function runLegacyAdoptionCli(argv: string[]): void {
   const result = args.command === 'prepare'
     ? adoptActiveLegacyMuxSession(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, {
       startWatchdog: (sessionDir, sourceRoot, targetRoot) => {
-        const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'watch', '--session-dir', sessionDir,
-          '--source-runtime-root', sourceRoot, '--target-runtime-root', targetRoot], {
+        const childArgs = [fileURLToPath(import.meta.url), 'watch', '--session-dir', sessionDir,
+          '--source-runtime-root', sourceRoot, '--target-runtime-root', targetRoot];
+        if (args.validationSessionDir) childArgs.push('--validation-session', args.validationSessionDir);
+        const child = spawn(process.execPath, childArgs, {
           detached: true, stdio: 'ignore', env: process.env,
         });
         child.unref();
-      },
+      }, validationSessionDir: args.validationSessionDir || undefined,
     })
     : launchAdoptedLegacySession(args.sessionDir, args.targetRuntimeRoot);
   process.stdout.write(`${JSON.stringify(result)}\n`);
