@@ -427,15 +427,16 @@ export async function launchDetachedLoop({
       runTmux(['rename-window', '-t', `${sessionName}:0`, 'runner']);
 
       const runnerArgs = [
-        shellQuote(sessionDir),
         ...(runnerDescriptor.mode === 'pickle' ? [`--on-failure=${onFailure}`] : []),
         `--launch-owner=${process.pid}`,
         `--run-started-at=${launchStartedAtMs}`,
-      ].join(' ');
+      ];
       const runnerCommand = [
         'node',
-        shellQuote(path.join(runtimeRoot, 'bin', runnerDescriptor.runnerBin)),
-        runnerArgs,
+        shellQuote(path.join(runtimeRoot, 'bin', 'supervised-runner.js')),
+        shellQuote(sessionDir),
+        `--runner-bin=${runnerDescriptor.runnerBin}`,
+        ...runnerArgs,
         ';',
         'status=$?',
         ';',

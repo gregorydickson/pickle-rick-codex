@@ -7,7 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readFrontmatterField, parseTicketFile } from '../services/pickle-utils.js';
@@ -15,6 +15,17 @@ import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prepe
 
 function runGit(dir, args) {
   return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function runWorkerAsync(sessionDir, env, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [path.join(repoRoot, 'bin/spawn-morty.js'), sessionDir, 'R1'], {
+      cwd,
+      env: { ...process.env, ...env },
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+    }, (error, stdout) => error ? reject(error) : resolve(stdout));
+  });
 }
 
 function initGitRepo(dir) {
@@ -224,6 +235,29 @@ test('VAL-ORACLE-031: a no-diff / no-commit run never fabricates or baseline-sta
 
   const completion = readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit');
   assert.equal(completion, null, 'no completion_commit fabricated on a no-diff run');
+});
+
+test('VAL-ORACLE-031 fast-exit stress: concurrent no-op workers leave no untracked child ownership', async () => {
+  const fixtures = Array.from({ length: 8 }, (_, index) => {
+    const projectDir = baseRepo();
+    const fakeBin = makeTempRoot(`pickle-oracle-fast-exit-${index}-`);
+    createFakeCodex(fakeBin);
+    const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: makeTempRoot() });
+    const sessionDir = setupSession(projectDir, env, `oracle fast exit ${index}`, [R1_TICKET]);
+    return { projectDir, env, sessionDir };
+  });
+
+  await Promise.all(fixtures.map(({ projectDir, env, sessionDir }) => (
+    runWorkerAsync(sessionDir, env, projectDir)
+  )));
+
+  for (const { sessionDir } of fixtures) {
+    const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+    assert.equal(state.active_child_pid, null);
+    assert.equal(state.active_child_identity, null);
+    assert.equal(state.active_child_controller_pid, null);
+    assert.equal(readFrontmatterField(ticketFilePath(sessionDir), 'completion_commit'), null);
+  }
 });
 
 test('VAL-ORACLE-035 (F1): a surviving foreign completion_commit is refused even when the run makes NO new commit', () => {

@@ -60,6 +60,13 @@ export interface RuntimeHandoffSourceExitIntent {
   source_runtime: InstalledRuntimeDescriptor;
 }
 
+export class SupervisorCheckpointIntegrityError extends Error {
+  constructor(receiptId: string) {
+    super(`Supervisor checkpoint receipt ${receiptId} conflicts with its durable payload.`);
+    this.name = 'SupervisorCheckpointIntegrityError';
+  }
+}
+
 export interface LogicalPipelineEvent {
   sequence: number;
   event_id: string;
@@ -585,6 +592,25 @@ export function recordSupervisorCheckpoint(
       lease = assertLeaseFence(state, ownerId, token, nowMs);
     } catch (error) {
       throw new Error(`Only the active supervisor lease may checkpoint: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+    const receiptId = typeof checkpoint.receipt_id === 'string' ? checkpoint.receipt_id : '';
+    const matchingReceipts = receiptId ? state.events.filter((event) => (
+      event.kind === 'checkpoint_recorded'
+      && (event.details.checkpoint as Record<string, unknown> | undefined)?.receipt_id === receiptId
+    )) : [];
+    if (matchingReceipts.length > 0) {
+      const withoutLeaseGeneration = (value: Record<string, unknown>): Record<string, unknown> => {
+        const payload = { ...value };
+        delete payload.lease_generation;
+        return payload;
+      };
+      const incoming = canonicalize(withoutLeaseGeneration(checkpoint));
+      const exact = matchingReceipts.every((event) => {
+        const durable = event.details.checkpoint as Record<string, unknown>;
+        return canonicalize(withoutLeaseGeneration(durable)) === incoming;
+      });
+      if (!exact) throw new SupervisorCheckpointIntegrityError(receiptId);
+      return;
     }
     appendEvent(state, 'checkpoint_recorded', {
       checkpoint: { ...checkpoint, lease_generation: lease.generation },

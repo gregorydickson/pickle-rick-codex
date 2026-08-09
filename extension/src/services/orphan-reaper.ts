@@ -16,6 +16,7 @@ export interface OrphanReapResult {
 
 export interface ProcessIdentity {
   pid: number;
+  parentPid: number;
   pgid: number;
   startTime: string;
   argv: string[] | null;
@@ -54,16 +55,17 @@ function readProcArgv(pid: number): string[] | null {
 
 function inspectProcess(pid: number): ProcessIdentity | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'pgid=', '-o', 'state=', '-o', 'lstart='], {
+  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=', '-o', 'pgid=', '-o', 'state=', '-o', 'lstart='], {
     encoding: 'utf8',
     timeout: 5_000,
   });
   if (metadata.status !== 0 || !metadata.stdout.trim()) return null;
-  const match = metadata.stdout.trim().match(/^(\d+)\s+(\S+)\s+([\s\S]+)$/);
+  const match = metadata.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]+)$/);
   if (!match) return null;
-  const pgid = Number(match[1]);
-  if (match[2].startsWith('Z')) return null;
-  const startTime = match[3].trim();
+  const parentPid = Number(match[1]);
+  const pgid = Number(match[2]);
+  if (match[3].startsWith('Z')) return null;
+  const startTime = match[4].trim();
   const commandResult = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'command='], {
     encoding: 'utf8',
     timeout: 5_000,
@@ -73,6 +75,7 @@ function inspectProcess(pid: number): ProcessIdentity | null {
   const argv = readProcArgv(pid);
   return {
     pid,
+    parentPid,
     pgid,
     startTime,
     argv,
@@ -118,10 +121,22 @@ export function inspectProcessLivenessIdentity(
     : 'reused';
 }
 
-export function captureSpawnedProcessIdentity(pid: number, attempts: number = 5): PersistedProcessIdentity | null {
+export function captureSpawnedProcessIdentity(
+  pid: number,
+  attempts: number = 5,
+  expectedParentPid: number = process.pid,
+): PersistedProcessIdentity | null {
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
-    const identity = captureProcessIdentity(pid);
-    if (identity) return identity;
+    const observed = inspectProcess(pid);
+    if (observed && observed.pgid === observed.pid && observed.parentPid === expectedParentPid) {
+      return {
+        pid: observed.pid,
+        pgid: observed.pgid,
+        start_time: observed.startTime,
+        fingerprint: observed.fingerprint,
+      };
+    }
+    if (observed && observed.parentPid !== expectedParentPid) return null;
     if (attempt + 1 < attempts) waitSync(10);
   }
   return null;

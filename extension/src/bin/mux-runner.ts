@@ -60,6 +60,11 @@ import { repairCitadelReviewerArtifactContract } from '../services/citadel-revie
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
+  fenceAutonomousOwnerRecoveryForHandoff,
+  releaseAutonomousOwnerRecoveryHandoffFence,
+  transferAutonomousOwnerRecoveryForAcceptedHandoff,
+} from '../services/autonomous-owner-recovery.js';
+import {
   enqueueCitadelRemediationResult,
   reconcileCitadelAttributionRepair,
   reconcileCitadelRemediation,
@@ -74,6 +79,11 @@ import {
   DependencyRepairIsolationError,
   type DependencyGraphInspection,
 } from '../services/dependency-contract-repair.js';
+import {
+  AUTONOMOUS_BUDGET_ROLLOVER_REASON,
+  consumeAutonomousBudgetRollover,
+  scheduleAutonomousBudgetRollover,
+} from '../services/autonomous-budget.js';
 import {
   assertTicketVerificationBoundToSeal,
   reconcileVerificationRepairTransaction,
@@ -102,6 +112,8 @@ interface RunSequentialDeps {
   repairCitadelReviewerArtifactContract?: typeof repairCitadelReviewerArtifactContract;
   runDeterministicRecoveryDiagnostic?: typeof runDeterministicRecoveryDiagnostic;
 }
+
+export { AUTONOMOUS_BUDGET_ROLLOVER_REASON } from '../services/autonomous-budget.js';
 
 function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
   const descriptor = getRunnerDescriptor(mode);
@@ -187,6 +199,10 @@ async function runSequentialWithLease(
   // A SIGKILL can leave a detached worker process group alive. Reap the exact
   // captured identity before runner startup clears its recovery handle.
   assertRecordedActiveChildRecovered(sessionDir, manager);
+  consumeAutonomousBudgetRollover(manager, statePath, {
+    assertDurableOwnership: options.assertDurableOwnership,
+    recordDurableCheckpoint: options.recordDurableCheckpoint,
+  });
   enterMuxRunnerPhase(manager, statePath, {
     markRunStart,
     runStartedAtMs: Number(options.runStartedAtMs),
@@ -401,8 +417,23 @@ async function runSequentialWithLease(
 
     const ticketStopReason = shouldStop(manager.read(statePath));
     if (ticketStopReason && failureMode !== 'retry') {
-      exitReason = ticketStopReason;
-      appendRunnerLog(sessionDir, runnerMode, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
+      if (options.durableOwnershipHeld === true
+        && (ticketStopReason === 'max_time' || ticketStopReason === 'max_iterations')) {
+        const rollover = scheduleAutonomousBudgetRollover(manager, statePath, ticketStopReason, {
+          assertDurableOwnership: options.assertDurableOwnership,
+          recordDurableCheckpoint: options.recordDurableCheckpoint,
+          ticketId: ticket.id,
+        });
+        exitReason = rollover ? AUTONOMOUS_BUDGET_ROLLOVER_REASON : 'cancelled';
+        if (rollover) appendRunnerLog(
+          sessionDir,
+          runnerMode,
+          `ticket ${ticket.id} crossed ${ticketStopReason}; persisted autonomous budget epoch ${rollover.epoch} and requested replacement after ${rollover.delayMs}ms checkpoint=${rollover.checkpointRecorded ? 'recorded' : 'reconcile-on-replacement'}`,
+        );
+      } else {
+        exitReason = ticketStopReason;
+        appendRunnerLog(sessionDir, runnerMode, `stopping before ticket ${ticket.id}: ${ticketStopReason}`);
+      }
       break;
     }
 
@@ -519,6 +550,21 @@ async function runSequentialWithLease(
       });
     };
 
+    const scheduleBudgetRollover = (reason: 'max_time' | 'max_iterations'): boolean => {
+      const rollover = scheduleAutonomousBudgetRollover(manager, statePath, reason, {
+        assertDurableOwnership: options.assertDurableOwnership,
+        recordDurableCheckpoint: options.recordDurableCheckpoint,
+        ticketId: ticket.id,
+      });
+      if (!rollover) return false;
+      appendRunnerLog(
+        sessionDir,
+        runnerMode,
+        `ticket ${ticket.id} crossed ${reason}; persisted autonomous budget epoch ${rollover.epoch} and requested replacement after ${rollover.delayMs}ms checkpoint=${rollover.checkpointRecorded ? 'recorded' : 'reconcile-on-replacement'}`,
+      );
+      return true;
+    };
+
     const decideRecovery = (
       failureKind: TicketFailureKind,
       message: string,
@@ -608,6 +654,19 @@ async function runSequentialWithLease(
         };
       }
       const stopReason = shouldStop(latestState);
+      if (options.durableOwnershipHeld === true
+        && (stopReason === 'max_time' || stopReason === 'max_iterations')) {
+        if (!scheduleBudgetRollover(stopReason)) return {
+          action: 'abort' as const,
+          exitReason: 'cancelled',
+          reason: 'operator cancellation won the autonomous budget rollover race',
+        };
+        return {
+          action: 'abort' as const,
+          exitReason: AUTONOMOUS_BUDGET_ROLLOVER_REASON,
+          reason: `scheduled autonomous replacement after ${stopReason}`,
+        };
+      }
       if (adaptiveExhausted && !stopReason) {
         const reason = adaptiveExitReason === 'recovery_exhausted'
           ? `exhausted durable recovery budget ${ticketFailureLimit}/${ticketFailureLimit}`
@@ -640,6 +699,12 @@ async function runSequentialWithLease(
         && scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage';
       const stopReason = shouldStop(latestState);
       if (stopReason) {
+        if (options.durableOwnershipHeld === true
+          && (stopReason === 'max_time' || stopReason === 'max_iterations')) {
+          exitReason = scheduleBudgetRollover(stopReason)
+            ? AUTONOMOUS_BUDGET_ROLLOVER_REASON : 'cancelled';
+          break;
+        }
         if (
           failureMode === 'retry'
           && (stopReason === 'max_time' || stopReason === 'max_iterations')
@@ -918,7 +983,8 @@ async function runSequentialWithLease(
 
   const holdActiveForReleaseGate = options.holdActiveForReleaseGate === true && exitReason === 'success';
   const preserveActiveForRuntimeHandoff = exitReason === 'runtime_handoff';
-  const finalReason = holdActiveForReleaseGate || preserveActiveForRuntimeHandoff
+  const preserveActiveForBudgetRollover = exitReason === AUTONOMOUS_BUDGET_ROLLOVER_REASON;
+  const finalReason = holdActiveForReleaseGate || preserveActiveForRuntimeHandoff || preserveActiveForBudgetRollover
     ? exitReason
     : exitMuxRunnerPhase(manager, statePath, {
       exitReason,
@@ -978,15 +1044,37 @@ export async function runSequential(
   let exitReason = 'error';
   let releaseGateHeld = false;
   try {
-    ownership = startDurableRuntimeOwnership(sessionDir, {
-      handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
-      targetRuntime: options.targetRuntime,
-    });
+    const handoffRequestId = typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined;
+    if (handoffRequestId && options.targetRuntime) {
+      fenceAutonomousOwnerRecoveryForHandoff(
+        sessionDir, handoffRequestId, 'mux-runner.js', [],
+        path.dirname(fileURLToPath(import.meta.url)), options.targetRuntime,
+      );
+    }
+    try {
+      ownership = startDurableRuntimeOwnership(sessionDir, {
+        handoffRequestId,
+        targetRuntime: options.targetRuntime,
+      });
+    } catch (error) {
+      if (handoffRequestId) releaseAutonomousOwnerRecoveryHandoffFence(sessionDir, handoffRequestId);
+      throw error;
+    }
+    if (handoffRequestId && process.env.PICKLE_TEST_MODE === '1'
+      && process.env.PICKLE_TEST_HANDOFF_CRASH_AFTER_ACQUIRE === '1') {
+      process.kill(process.pid, 'SIGKILL');
+    }
     activatePreparedManagerRelaunchRecovery(sessionDir);
     if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
       ownership.assertOwned();
       finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);
       ownership.assertOwned();
+      transferAutonomousOwnerRecoveryForAcceptedHandoff(
+        sessionDir,
+        'mux-runner.js',
+        [],
+        path.dirname(fileURLToPath(import.meta.url)),
+      );
     }
     ownership.assertOwned();
     if (reconcileCitadelRemediation(sessionDir)) {

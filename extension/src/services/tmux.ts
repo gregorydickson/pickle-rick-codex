@@ -22,7 +22,7 @@ export interface TmuxRunnerBinding {
 export function runnerPaneCommandMatches(command: string, sessionDir: string): boolean {
   const sessionAliases = [...new Set([path.resolve(sessionDir), fs.realpathSync(sessionDir)])];
   return sessionAliases.some((candidate) => command.includes(candidate))
-    && /(?:supervised-runner|mux-runner|pipeline-runner|loop-runner)\.js(?:\s|['"]|$)/.test(command);
+    && /(?:recovered-supervisor-owner|supervised-runner|mux-runner|pipeline-runner|loop-runner)\.js(?:\s|['"]|$)/.test(command);
 }
 
 export function readTmuxRunnerBinding(target: string, options: TmuxCallOptions = {}): TmuxRunnerBinding | null {

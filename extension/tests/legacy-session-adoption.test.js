@@ -82,7 +82,7 @@ function identity(pid) {
   return { pid, pgid: pid, start_time: `start-${pid}`, fingerprint: `fingerprint-${pid}` };
 }
 
-function fixture() {
+function fixture(options = {}) {
   const repo = makeTempRoot('pickle-legacy-repo-');
   git(repo, ['init']);
   git(repo, ['config', 'user.name', 'Legacy Adoption']);
@@ -93,7 +93,7 @@ function fixture() {
   const sessionDir = path.join(makeTempRoot('pickle-legacy-data-'), 'sessions', '2026-08-08-legacy');
   fs.mkdirSync(sessionDir, { recursive: true });
   // Mirrors the installed inventory's tmux pane shell -> mux runner layout.
-  const runner = identity(51980);
+  const runner = identity(options.runnerPid ?? 51980);
   const supervisor = identity(51970);
   const pane = identity(51956);
   const child = identity(4300);
@@ -275,6 +275,43 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   assert.equal(launches, 1);
   launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
   assert.equal(launches, 1);
+});
+
+test('legacy adoption retires the authenticated old lock even when its pid was reused by a live process', () => {
+  const value = fixture({ runnerPid: process.pid });
+  const record = adoptActiveLegacyMuxSession(
+    value.sessionDir,
+    value.sourceRoot,
+    value.targetRoot,
+    depsFor(value),
+  );
+
+  assert.equal(record.status, 'adopted');
+  assert.equal(fs.existsSync(path.join(value.sessionDir, '.session-operation.lock')), false);
+});
+
+test('legacy adoption never retires a replaced operation lock with the recorded pid', () => {
+  const value = fixture({ runnerPid: process.pid });
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+
+  assert.throws(() => adoptActiveLegacyMuxSession(
+    value.sessionDir,
+    value.sourceRoot,
+    value.targetRoot,
+    {
+      ...depsFor(value),
+      checkpoint: (stage) => {
+        if (stage === 'candidate_archived') {
+          writeJson(path.join(value.sessionDir, '.session-operation.lock'), { pid: value.runner.pid, ts: 2 });
+        }
+      },
+    },
+  ), /Could not fence the quiesced legacy session/);
+
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, '.session-operation.lock'), 'utf8',
+  )).ts, 2);
+  assert.equal(JSON.parse(fs.readFileSync(transactionPath, 'utf8')).stage, 'quiesced');
 });
 
 test('failed adopted launch restores exact state bytes and dead launch reservations before retry', () => {

@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   assertSchemaVersionDeployParity,
   SchemaVersionAheadError,
@@ -184,6 +185,45 @@ test('StateManager does not steal a legacy stale-looking lock from a live owner'
   );
 
   assert.equal(fs.readFileSync(lockPath, 'utf8'), `${process.pid}`);
+});
+
+test('StateManager reclaims a stale lock owned by a defunct zombie process', async () => {
+  const tempRoot = makeTempRoot('pickle-zombie-lock-');
+  const statePath = path.join(tempRoot, 'state.json');
+  const zombiePidPath = path.join(tempRoot, 'zombie.pid');
+  fs.writeFileSync(statePath, JSON.stringify(defaultState(tempRoot)));
+  const parent = spawn('python3', ['-c', [
+    'import os,sys,time',
+    'pid=os.fork()',
+    'if pid == 0: os._exit(0)',
+    'open(sys.argv[1], "w").write(str(pid))',
+    'time.sleep(30)',
+  ].join('\n'), zombiePidPath], { stdio: 'ignore' });
+  try {
+    const deadline = Date.now() + 5_000;
+    let zombiePid = 0;
+    let zombieObserved = false;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(zombiePidPath)) zombiePid = Number(fs.readFileSync(zombiePidPath, 'utf8'));
+      if (zombiePid > 0) {
+        const status = spawnSync('ps', ['-p', String(zombiePid), '-o', 'stat='], { encoding: 'utf8' });
+        if (status.stdout.trim().startsWith('Z')) { zombieObserved = true; break; }
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    assert.equal(zombieObserved, true, 'fixture child did not become defunct');
+    fs.writeFileSync(`${statePath}.lock`, JSON.stringify({ pid: zombiePid, ts: Date.now() - 60_000 }));
+    const updated = new StateManager({ staleLockThresholdMs: 1, acquireTimeoutMs: 1_000 })
+      .update(statePath, (state) => ({ ...state, iteration: 2 }));
+    assert.equal(updated.iteration, 2);
+    assert.equal(fs.existsSync(`${statePath}.lock`), false);
+  } finally {
+    const exited = new Promise((resolve) => parent.once('exit', resolve));
+    if (parent.pid) {
+      try { process.kill(parent.pid, 'SIGKILL'); } catch { /* already exited */ }
+    }
+    await exited;
+  }
 });
 
 test('StateManager transaction rolls back all files when mutation fails', () => {

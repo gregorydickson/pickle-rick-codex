@@ -22,7 +22,8 @@ import { StateManager } from './state-manager.js';
 import type { PersistedState } from './state-manager.js';
 import type { Config } from '../types/index.js';
 import { tmuxSessionExists } from './tmux.js';
-import { recoverSessionOrphanState } from './orphan-reaper.js';
+import { inspectProcessLivenessIdentity, recoverSessionOrphanState, type PersistedProcessIdentity } from './orphan-reaper.js';
+import type { AutonomousOwnerRestorationIntent, AutonomousOwnerSpec } from './autonomous-owner-recovery.js';
 
 export interface SessionResult {
   sessionDir: string;
@@ -238,7 +239,91 @@ export function reconcileSessionLiveness(
   nowMs: number = Date.now(),
 ): { state: PersistedState; stale: boolean } {
   const statePath = getStatePath(sessionDir);
-  const state = stateManager.read(statePath);
+  let state = stateManager.read(statePath);
+  const rolloverIntentId = typeof state.autonomous_budget_rollover_intent_id === 'string'
+    ? state.autonomous_budget_rollover_intent_id : '';
+  const rolloverEpoch = Math.max(1, Number(state.autonomous_budget_epoch || 0));
+  const rolloverCancelled = state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled';
+  const rolloverUnsafe = state.recovery_required === true || Number(state.orphan_child_pid || 0) > 0;
+  if (rolloverIntentId && state.autonomous_owner_recovery_suspended === true && !rolloverCancelled) {
+    return { state, stale: false };
+  }
+  if (rolloverIntentId && Number.isInteger(rolloverEpoch) && !rolloverCancelled && !rolloverUnsafe) {
+    const deadlineMs = Date.parse(String(state.autonomous_relaunch_deadline || ''));
+    const supervisorIdentity = state.autonomous_supervisor_identity as PersistedProcessIdentity | null;
+    const supervisorAlive = supervisorIdentity
+      ? inspectProcessLivenessIdentity(supervisorIdentity) === 'matched'
+      : isProcessAlive(state.autonomous_supervisor_pid);
+    const ownerProcessAlive = state.autonomous_owner_spec ? supervisorAlive : isProcessAlive(state.tmux_runner_pid);
+    const ownerMissing = state.tmux_mode === true && (
+      !ownerProcessAlive
+      || (typeof state.tmux_session_name === 'string' && !tmuxSessionExists(state.tmux_session_name))
+    );
+    const planned = state.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
+    const exactRecoveryPending = planned?.rollover_intent_id === rolloverIntentId
+      && Number(planned.rollover_epoch) === rolloverEpoch
+      && planned.owner_spec_id === (state.autonomous_owner_spec as AutonomousOwnerSpec | null)?.spec_id
+      && (planned.status === 'pending' || planned.status === 'restoring');
+    if (state.active === true && ownerMissing && exactRecoveryPending
+      && Number.isFinite(deadlineMs) && nowMs <= deadlineMs) return { state, stale: false };
+    if (state.active !== true || !Number.isFinite(deadlineMs) || nowMs > deadlineMs || ownerMissing) {
+      const delayMs = Math.min(30_000, 250 * (2 ** Math.min(rolloverEpoch - 1, 7)));
+      state = stateManager.update(statePath, (current) => {
+        const currentEpoch = Math.max(1, Number(current.autonomous_budget_epoch || 0));
+        if (current.autonomous_budget_rollover_intent_id !== rolloverIntentId
+          || currentEpoch !== rolloverEpoch
+          || current.cancel_requested_at || current.cancelled === true || current.last_exit_reason === 'cancelled') return current;
+        current.active = true;
+        current.last_exit_reason = 'autonomous_budget_rollover';
+        current.autonomous_relaunch_not_before = new Date(nowMs + delayMs).toISOString();
+        current.autonomous_relaunch_deadline = new Date(nowMs + delayMs + 60_000).toISOString();
+        current.tmux_runner_pid = null;
+        current.worker_pid = null;
+        const spec = current.autonomous_owner_spec as AutonomousOwnerSpec | null;
+        const existing = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
+        if (ownerMissing && spec?.schema_version === 1 && typeof spec.spec_id === 'string') {
+          const sameIntent = existing?.rollover_intent_id === rolloverIntentId
+            && Number(existing?.rollover_epoch) === rolloverEpoch
+            && existing?.owner_spec_id === spec.spec_id;
+          const restorerIdentity = existing?.restorer_identity as PersistedProcessIdentity | null;
+          const restorerAlive = existing?.status === 'restoring' && (restorerIdentity
+            ? inspectProcessLivenessIdentity(restorerIdentity) === 'matched'
+            : isProcessAlive(existing.restorer_pid));
+          if (!sameIntent || existing?.status === 'restored' || (existing?.status === 'restoring' && !restorerAlive)) {
+            current.autonomous_owner_restoration = {
+              schema_version: 1,
+              intent_id: crypto.randomUUID(),
+              rollover_intent_id: rolloverIntentId,
+              rollover_epoch: rolloverEpoch,
+              owner_spec_id: spec.spec_id,
+              status: 'pending',
+              attempt: sameIntent ? Number(existing?.attempt || 0) : 0,
+              not_before: new Date(nowMs + delayMs).toISOString(),
+              restorer_pid: null,
+              restorer_identity: null,
+            };
+            appendHistory(current, 'autonomous_owner_restoration_planned');
+          } else if (existing?.status === 'failed') {
+            const attempt = Math.max(1, Number(existing.attempt || 1));
+            const retryDelay = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
+            current.autonomous_owner_restoration = {
+              ...existing,
+              status: 'pending',
+              not_before: new Date(nowMs + retryDelay).toISOString(),
+              restorer_pid: null,
+              restorer_identity: null,
+            };
+            appendHistory(current, 'autonomous_owner_restoration_retried');
+          }
+        }
+        appendHistory(current, ownerMissing
+          ? 'autonomous_budget_owner_recovery_scheduled'
+          : 'autonomous_budget_relaunch_rescheduled');
+        return current;
+      });
+    }
+    return { state, stale: false };
+  }
   if (state.active !== true) return { state, stale: false };
 
   const tmuxName = typeof state.tmux_session_name === 'string' ? state.tmux_session_name : '';

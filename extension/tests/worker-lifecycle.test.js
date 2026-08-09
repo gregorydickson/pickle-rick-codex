@@ -369,6 +369,7 @@ test('field-equivalent malformed contract plus two review refusals completes wit
     FAKE_CODEX_APPEND_TEXT: 'implemented\n',
     FAKE_LIFECYCLE_REFUSAL_PHASE: 'review',
     FAKE_LIFECYCLE_REFUSAL_COUNT: '2',
+    FAKE_LIFECYCLE_INVALID_ONCE_PHASE: 'research,conformance',
     FAKE_LIFECYCLE_PROMPT_LOG: promptLog,
   });
   const { projectDir, sessionDir } = setupLifecycleRun(env);
@@ -380,14 +381,48 @@ test('field-equivalent malformed contract plus two review refusals completes wit
 
   runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry'], { env, cwd: projectDir });
 
-  const calls = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  const execInvocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
     .filter((entry) => entry.args[0] === 'exec');
-  assert.ok(calls.length <= 15, `expected <=15 model calls, got ${calls.length}`);
-  assert.equal(calls.length, 13);
-  const phases = calls.map((entry) => path.basename(entry.args[entry.args.indexOf('--output-last-message') + 1] || '').split('.')[1]);
-  assert.equal(phases.filter((phase) => phase === 'research').length, 1);
-  assert.equal(phases.filter((phase) => phase === 'plan').length, 1);
-  assert.equal(phases[0], 'contract-repair');
+  const calls = execInvocations.filter((entry) => entry.args.includes('--output-last-message'));
+  const nonModelExecs = execInvocations.filter((entry) => !entry.args.includes('--output-last-message'));
+  assert.ok(
+    nonModelExecs.every((entry) => entry.args[1] === '--help'),
+    `unexpected non-model exec invocation: ${JSON.stringify(nonModelExecs.map((entry) => entry.args))}`,
+  );
+  const phases = calls.map((entry) => path.basename(
+    entry.args[entry.args.indexOf('--output-last-message') + 1] || '',
+  ).split('.')[1]);
+  const requiredTrace = [
+    'contract-repair',
+    'research', 'research_review', 'plan', 'plan_review', 'implement', 'review',
+    'implement', 'review',
+    'implement', 'review', 'simplify', 'conformance',
+  ];
+  const retryableReadOnlyPhases = new Set([
+    'research', 'research_review', 'plan', 'plan_review', 'review', 'conformance',
+  ]);
+  const collapsedTrace = phases.filter((phase, index) => phase !== phases[index - 1]);
+  const requiredCounts = new Map(requiredTrace.map((phase) => [
+    phase,
+    requiredTrace.filter((candidate) => candidate === phase).length,
+  ]));
+  const actualCounts = new Map(phases.map((phase) => [
+    phase,
+    phases.filter((candidate) => candidate === phase).length,
+  ]));
+  const extraPhases = [...actualCounts.entries()].flatMap(([phase, count]) => (
+    Array(Math.max(0, count - (requiredCounts.get(phase) || 0))).fill(phase)
+  ));
+  assert.ok(calls.length <= 15, `expected <=15 model calls, got ${calls.length}: ${phases.join(' -> ')}`);
+  assert.deepEqual(collapsedTrace, requiredTrace, `unexpected lifecycle trace: ${phases.join(' -> ')}`);
+  assert.ok(
+    extraPhases.length <= 2 && extraPhases.every((phase) => retryableReadOnlyPhases.has(phase)),
+    `only two bounded read-only artifact retries are allowed: ${phases.join(' -> ')}`,
+  );
+  assert.deepEqual(extraPhases, ['research', 'conformance']);
+  assert.equal(actualCounts.get('contract-repair'), 1);
+  assert.equal(actualCounts.get('implement'), 3);
+  assert.equal(actualCounts.get('simplify'), 1);
   const repairedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.deepEqual(repairedManifest.tickets[0].acceptance_criteria, originalCriteria);
   assert.equal(parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md')).status, 'Done');

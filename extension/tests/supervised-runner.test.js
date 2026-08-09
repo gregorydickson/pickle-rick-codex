@@ -4,10 +4,11 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeTempRoot } from './helpers.js';
+import { makeTempRoot, repoRoot, runNode, writeJson } from './helpers.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
   beginAutonomousExecution,
+  readLogicalPipeline,
   acceptRuntimeHandoff,
   acquireSupervisorLease,
   createLogicalPipeline,
@@ -18,9 +19,16 @@ import {
 } from '../services/durable-supervisor.js';
 import { recordSupervisorSignalTermination, runSupervisedRunner, supervisedRunnerDecision } from '../bin/supervised-runner.js';
 import { executionTelemetrySummary, recordUnexpectedNoncompletionTermination } from '../services/productive-autonomy.js';
+import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
+import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
+import { reconcileSessionLiveness } from '../services/session.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
+  fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({
+    schema_version: 1, active: true, history: [], iteration: 0, max_iterations: 25,
+    max_time_minutes: 480, working_dir: sessionDir, step: 'implement',
+  }));
   createLogicalPipeline(sessionDir, 'pipeline');
   writePrdSeal(sessionDir, {
     prd: '# Approved\n',
@@ -55,6 +63,103 @@ test('supervised runner restarts every nonterminal autonomous executor exit', ()
   assert.equal(supervisedRunnerDecision(sessionDir), 'restart');
   requestPrdRevision(sessionDir, 'contradiction evidence', 'proposed patch');
   assert.equal(supervisedRunnerDecision(sessionDir), 'wait_for_prd');
+});
+
+test('default iteration and unusable time budgets roll through supervised replacements into productive work', async () => {
+  const dataRoot = makeTempRoot('pickle-supervised-budget-data-');
+  const projectDir = makeTempRoot('pickle-supervised-budget-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'supervised budget rollover'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1', title: 'Budget rollover', description: 'Continue after the configured boundary.',
+      acceptance_criteria: ['A replacement executor completes the ticket.'],
+      verification: ['node -e "process.exit(0)"'], allowed_paths: ['README.md'], priority: 'P1', status: 'Todo',
+    }],
+  });
+  fs.writeFileSync(path.join(sessionDir, 'prd.md'), '# Budget rollover\n');
+  fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Budget rollover\n');
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    writeRefinementAcceptance(sessionDir);
+    ensureSessionPrdSeal(sessionDir);
+    const statePath = path.join(sessionDir, 'state.json');
+    const initial = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    writeJson(statePath, {
+      ...initial,
+      active: true,
+      iteration: 25,
+      max_iterations: 25,
+      max_time_minutes: 0.000001,
+      run_started_at: '2020-01-01T00:00:00.000Z',
+    });
+
+    const fixtureDir = makeTempRoot('pickle-supervised-budget-executor-');
+    const launchesPath = path.join(fixtureDir, 'launches');
+    const workPath = path.join(fixtureDir, 'work');
+    const runnerPath = path.join(fixtureDir, 'executor.mjs');
+    const muxModule = new URL('../bin/mux-runner.js', import.meta.url).href;
+    const ticketsModule = new URL('../services/tickets.js', import.meta.url).href;
+    fs.writeFileSync(runnerPath, `
+import fs from 'node:fs';
+const [sessionDir, launchesPath, workPath, dataRoot, muxModule, ticketsModule] = process.argv.slice(2);
+process.env.PICKLE_DATA_ROOT = dataRoot;
+fs.writeFileSync(launchesPath, String(Number(fs.existsSync(launchesPath) ? fs.readFileSync(launchesPath, 'utf8') : 0) + 1));
+const { runSequential, muxRunnerExitFailed } = await import(muxModule);
+const { updateTicketStatus } = await import(ticketsModule);
+const reason = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+  runTicket: async (_sessionDir, ticketId) => {
+    fs.writeFileSync(workPath, String(Number(fs.existsSync(workPath) ? fs.readFileSync(workPath, 'utf8') : 0) + 1));
+    updateTicketStatus(sessionDir, ticketId, { status: 'Done' });
+    return { status: 'done', applied: true };
+  },
+  runCitadel: async () => 'cancelled',
+});
+process.exitCode = muxRunnerExitFailed(reason) ? 1 : 0;
+`);
+
+    const run = runSupervisedRunner(sessionDir, 'mux-runner.js', [
+      launchesPath, workPath, dataRoot, muxModule, ticketsModule,
+    ], { runnerPath, restartDelayMs: 0 });
+    let rollover = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    for (let attempt = 0; attempt < 100 && rollover.last_exit_reason !== 'autonomous_budget_rollover'; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      rollover = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    }
+    assert.equal(rollover.active, true);
+    assert.equal(rollover.last_exit_reason, 'autonomous_budget_rollover');
+    assert.equal(rollover.max_iterations, 50);
+    assert.equal(reconcileSessionLiveness(sessionDir).state.active, true);
+
+    assert.equal(await run, 130);
+    assert.equal(fs.readFileSync(launchesPath, 'utf8'), '3');
+    assert.equal(fs.readFileSync(workPath, 'utf8'), '1');
+    const completed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(completed.last_exit_reason, 'cancelled');
+    assert.equal(completed.max_time_minutes, 1, 'tiny zero-work time window expands to a productive minimum');
+    assert.equal(completed.autonomous_budget_epoch, 2);
+    assert.equal(completed.autonomous_budget_consumed_epoch, 2);
+    assert.equal(completed.history.filter((entry) => entry.step === 'autonomous_budget_rollover_consumed').length, 2);
+    const logical = readLogicalPipeline(sessionDir);
+    assert.equal(logical.terminal_state, 'cancelled');
+    const budgetCheckpoints = logical.events
+      .map((event) => event.details.checkpoint)
+      .filter((checkpoint) => checkpoint?.kind?.startsWith('autonomous_budget_rollover'));
+    assert.deepEqual(budgetCheckpoints.map((checkpoint) => checkpoint.kind), [
+      'autonomous_budget_rollover', 'autonomous_budget_rollover_consumed',
+      'autonomous_budget_rollover', 'autonomous_budget_rollover_consumed',
+    ]);
+    assert.equal(budgetCheckpoints[0].intent_id, budgetCheckpoints[1].intent_id);
+    assert.equal(budgetCheckpoints[2].intent_id, budgetCheckpoints[3].intent_id);
+    assert.notEqual(budgetCheckpoints[0].intent_id, budgetCheckpoints[2].intent_id);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
 });
 
 test('supervised runner exits for cooperative logical cancellation', () => {

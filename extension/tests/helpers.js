@@ -183,7 +183,8 @@ function writeLifecycleArtifact(phase) {
   const missingPhase = process.env.FAKE_LIFECYCLE_MISSING_PHASE || '';
   const refusalPhase = process.env.FAKE_LIFECYCLE_REFUSAL_PHASE || '';
   const refusalLimit = Number(process.env.FAKE_LIFECYCLE_REFUSAL_COUNT || '0');
-  const invalidOncePhase = process.env.FAKE_LIFECYCLE_INVALID_ONCE_PHASE || '';
+  const invalidOncePhases = new Set((process.env.FAKE_LIFECYCLE_INVALID_ONCE_PHASE || '')
+    .split(',').map((candidate) => candidate.trim()).filter(Boolean));
   if (!artifactPath || phase === missingPhase) return;
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
   const controlSessionDir = extractPathAfter('Session dir: ');
@@ -194,7 +195,7 @@ function writeLifecycleArtifact(phase) {
   const priorRefusals = refusalCounterPath && fs.existsSync(refusalCounterPath) ? Number(fs.readFileSync(refusalCounterPath, 'utf8')) : 0;
   const shouldRefuse = phase === refusalPhase && (refusalLimit === 0 || priorRefusals < refusalLimit);
   if (shouldRefuse && refusalCounterPath) fs.writeFileSync(refusalCounterPath, String(priorRefusals + 1));
-  if (phase === invalidOncePhase && invalidOnceMarker && !fs.existsSync(invalidOnceMarker)) {
+  if (invalidOncePhases.has(phase) && invalidOnceMarker && !fs.existsSync(invalidOnceMarker)) {
     fs.writeFileSync(invalidOnceMarker, 'consumed\\n');
     fs.writeFileSync(artifactPath, '{invalid json');
     return;

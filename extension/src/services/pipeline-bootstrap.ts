@@ -667,18 +667,21 @@ export function enterMuxRunnerPhase(
   options: EnterMuxRunnerPhaseOptions = {},
 ): PersistedState {
   return manager.update(statePath, (state) => {
-    const cancellationAtMs = Date.parse(String(state.cancel_requested_at || ''));
-    if (
-      Number.isFinite(options.runStartedAtMs)
-      && Number.isFinite(cancellationAtMs)
-      && cancellationAtMs >= Number(options.runStartedAtMs)
-    ) {
+    const runStartedAtMs = Number(options.runStartedAtMs);
+    // Pre-fence callers treat cancellation fields as historical exit state. Every
+    // production mux launch supplies this timestamp, making any observed marker
+    // authoritative for that launch and preventing startup from clearing it.
+    const launchHasCancellationFence = Number.isFinite(runStartedAtMs) && runStartedAtMs > 0;
+    if (launchHasCancellationFence && (state.cancel_requested_at || state.cancelled === true
+      || state.last_exit_reason === 'cancelled')) {
       throw new Error('Session execution was cancelled during runner startup.');
     }
     state.active = true;
     state.tmux_runner_pid = options.runnerPid || process.pid;
     state.last_exit_reason = null;
     state.cancel_requested_at = null;
+    state.autonomous_relaunch_not_before = null;
+    state.autonomous_relaunch_deadline = null;
     state.active_child_pid = null;
     state.active_child_kind = null;
     state.active_child_command = null;

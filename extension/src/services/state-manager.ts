@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import {
   STATE_SCHEMA_VERSION,
   atomicWriteJson,
@@ -29,9 +30,20 @@ function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const commandEnd = stat.lastIndexOf(')');
+    if (commandEnd >= 0 && stat.slice(commandEnd + 2, commandEnd + 3) === 'Z') return false;
+    return true;
+  } catch {
+    const inspected = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], {
+      encoding: 'utf8', timeout: 5_000,
+    });
+    if (inspected.status !== 0 || !inspected.stdout.trim()) return false;
+    return !inspected.stdout.trim().startsWith('Z');
   }
 }
 

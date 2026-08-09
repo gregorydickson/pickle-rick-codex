@@ -201,15 +201,12 @@ export function enterLoopRunnerPhase(
   manager: StateManager,
   statePath: string,
   loopMode: string,
-  options: { runStartedAtMs?: number } = {},
+  _options: { runStartedAtMs?: number } = {},
 ): PersistedState {
+  void _options;
   return manager.update(statePath, (state) => {
-    const cancellationAtMs = Date.parse(String(state.cancel_requested_at || ''));
-    if (
-      Number.isFinite(options.runStartedAtMs)
-      && Number.isFinite(cancellationAtMs)
-      && cancellationAtMs >= Number(options.runStartedAtMs)
-    ) {
+    if (state.cancel_requested_at || state.cancelled === true
+      || state.last_exit_reason === 'cancelled') {
       throw new Error('Session execution was cancelled during loop runner startup.');
     }
     state.active = true;
@@ -218,6 +215,8 @@ export function enterLoopRunnerPhase(
     state.step = loopMode;
     state.last_exit_reason = null;
     state.cancel_requested_at = null;
+    state.autonomous_relaunch_not_before = null;
+    state.autonomous_relaunch_deadline = null;
     state.loop_mode = loopMode;
     state.loop_stall_count = 0;
     state.active_child_pid = null;
@@ -247,15 +246,12 @@ export function exitLoopRunnerPhase(
 export function claimLoopRunnerStartup(
   manager: StateManager,
   statePath: string,
-  options: { runStartedAtMs?: number } = {},
+  _options: { runStartedAtMs?: number } = {},
 ): PersistedState {
+  void _options;
   return manager.update(statePath, (state) => {
-    const cancellationAtMs = Date.parse(String(state.cancel_requested_at || ''));
-    if (
-      Number.isFinite(options.runStartedAtMs)
-      && Number.isFinite(cancellationAtMs)
-      && cancellationAtMs >= Number(options.runStartedAtMs)
-    ) {
+    if (state.cancel_requested_at || state.cancelled === true
+      || state.last_exit_reason === 'cancelled') {
       throw new Error('Session execution was cancelled during loop runner startup.');
     }
     state.tmux_runner_pid = process.pid;

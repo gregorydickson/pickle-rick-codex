@@ -647,7 +647,7 @@ test('recordBootstrapPreflightBlocked clears ownership and persists the failure 
   assert.equal(state.history.at(-1).step, 'preflight-environment-missing');
 });
 
-test('enterMuxRunnerPhase establishes fresh runner ownership and invokes the run-start hook', () => {
+test('enterMuxRunnerPhase treats historical cancellation as legacy exit state without a launch fence', () => {
   const manager = managerFor(runnerState({
     last_exit_reason: 'cancelled',
     cancel_requested_at: '2026-07-18T00:00:00.000Z',
@@ -674,6 +674,37 @@ test('enterMuxRunnerPhase establishes fresh runner ownership and invokes the run
   assert.equal(state.worker_pid, null);
   assert.equal(state.run_started, true);
   assert.equal(state.history.at(-1).step, 'runner_start');
+});
+
+test('enterMuxRunnerPhase preserves cancellation dominance for a fenced production launch', () => {
+  const manager = managerFor(runnerState({
+    last_exit_reason: 'cancelled',
+    cancel_requested_at: '2026-07-18T00:00:00.000Z',
+  }));
+
+  assert.throws(() => enterMuxRunnerPhase(manager, '/tmp/state.json', {
+    runnerPid: 808,
+    runStartedAtMs: Date.parse('2026-07-19T00:00:00.000Z'),
+  }), /cancelled during runner startup/);
+  assert.equal(manager.state.active, false);
+  assert.equal(manager.state.tmux_runner_pid, null);
+  assert.equal(manager.state.last_exit_reason, 'cancelled');
+  assert.equal(manager.state.cancel_requested_at, '2026-07-18T00:00:00.000Z');
+});
+
+test('enterMuxRunnerPhase accepts an inactive legacy state with cancellation fields absent', () => {
+  const legacyState = runnerState();
+  delete legacyState.last_exit_reason;
+  const manager = managerFor(legacyState);
+
+  const state = enterMuxRunnerPhase(manager, '/tmp/state.json', {
+    runnerPid: 808,
+    runStartedAtMs: Date.parse('2026-07-19T00:00:00.000Z'),
+  });
+  assert.equal(state.active, true);
+  assert.equal(state.tmux_runner_pid, 808);
+  assert.equal(state.last_exit_reason, null);
+  assert.equal(state.cancel_requested_at, null);
 });
 
 test('exitMuxRunnerPhase maps success, errors, contract blocks, pauses, and deferred exits', () => {

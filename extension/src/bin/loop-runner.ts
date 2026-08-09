@@ -84,6 +84,12 @@ import {
   exitLoopRunnerPhase,
   readLoopConfig,
 } from '../services/pipeline-phase-setup.js';
+import {
+  AUTONOMOUS_BUDGET_ROLLOVER_REASON,
+  consumeAutonomousBudgetRollover,
+  scheduleAutonomousBudgetRollover,
+} from '../services/autonomous-budget.js';
+import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { scrubWorkerOutput } from '../services/worker-output.js';
@@ -1441,11 +1447,18 @@ function writeStopSummaryArtifacts(sessionDir: string, loopConfig: LoopConfig, s
 
 interface RunLoopOptions {
   operationLeaseHeld?: boolean;
+  durableOwnershipHeld?: boolean;
+  assertDurableOwnership?: () => void;
+  recordDurableCheckpoint?: (checkpoint: Record<string, unknown>) => void;
   launchOwnerPid?: number | null;
   runStartedAtMs?: number;
 }
 
-async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Promise<void> {
+async function runLoopWithLease(
+  sessionDir: string,
+  runStartedAtMs: number,
+  options: RunLoopOptions = {},
+): Promise<void> {
   const statePath = path.join(sessionDir, 'state.json');
   const manager = new StateManager();
   const config = loadConfig();
@@ -1453,6 +1466,12 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
   const initialState = manager.read(statePath);
 
   activatePreparedManagerRelaunchRecovery(sessionDir);
+  if (options.durableOwnershipHeld === true) {
+    consumeAutonomousBudgetRollover(manager, statePath, {
+      assertDurableOwnership: options.assertDurableOwnership,
+      recordDurableCheckpoint: options.recordDurableCheckpoint,
+    });
+  }
   claimLoopRunnerStartup(manager, statePath, { runStartedAtMs });
   consumeManagerRelaunchRecovery(sessionDir);
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
@@ -1538,13 +1557,31 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         );
       }
       if (Number.isInteger(state.max_iterations) && (state.max_iterations as number) > 0 && (state.iteration as number) >= (state.max_iterations as number)) {
-        exitReason = 'max_iterations';
+        if (options.durableOwnershipHeld === true) {
+          const rollover = scheduleAutonomousBudgetRollover(manager, statePath, 'max_iterations', {
+            assertDurableOwnership: options.assertDurableOwnership,
+            recordDurableCheckpoint: options.recordDurableCheckpoint,
+          });
+          exitReason = rollover ? AUTONOMOUS_BUDGET_ROLLOVER_REASON : 'cancelled';
+          if (rollover) appendRunnerLog(sessionDir, `crossed max_iterations; scheduled autonomous budget epoch ${rollover.epoch} after ${rollover.delayMs}ms checkpoint=${rollover.checkpointRecorded ? 'recorded' : 'reconcile-on-replacement'}`);
+        } else {
+          exitReason = 'max_iterations';
+        }
         break;
       }
       if (Number.isFinite(state.max_time_minutes) && (state.max_time_minutes as number) > 0) {
         const elapsedMinutes = (Date.now() / 1000 - getRunStartEpoch(state)) / 60;
         if (elapsedMinutes >= (state.max_time_minutes as number)) {
-          exitReason = 'max_time';
+          if (options.durableOwnershipHeld === true) {
+            const rollover = scheduleAutonomousBudgetRollover(manager, statePath, 'max_time', {
+              assertDurableOwnership: options.assertDurableOwnership,
+              recordDurableCheckpoint: options.recordDurableCheckpoint,
+            });
+            exitReason = rollover ? AUTONOMOUS_BUDGET_ROLLOVER_REASON : 'cancelled';
+            if (rollover) appendRunnerLog(sessionDir, `crossed max_time; scheduled autonomous budget epoch ${rollover.epoch} after ${rollover.delayMs}ms checkpoint=${rollover.checkpointRecorded ? 'recorded' : 'reconcile-on-replacement'}`);
+          } else {
+            exitReason = 'max_time';
+          }
           break;
         }
       }
@@ -2113,7 +2150,9 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
         exitReason = 'error';
       }
     }
-    const finalReason = exitLoopRunnerPhase(manager, statePath, exitReason);
+    const finalReason = exitReason === AUTONOMOUS_BUDGET_ROLLOVER_REASON
+      ? exitReason
+      : exitLoopRunnerPhase(manager, statePath, exitReason);
     writeStopSummaryArtifacts(sessionDir, loopConfig, manager.read(statePath), finalReason);
     appendRunnerLog(sessionDir, `loop-runner finished: ${finalReason}`);
   }
@@ -2144,10 +2183,35 @@ export async function runLoop(sessionDir: string, options: RunLoopOptions = {}):
       undefined,
       Number.isInteger(launchOwnerPid) && launchOwnerPid > 0 ? launchOwnerPid : null,
     );
+  const durableRuntime = options.operationLeaseHeld !== true
+    && options.durableOwnershipHeld !== true
+    && fs.existsSync(path.join(sessionDir, 'prd.lock.json'))
+    && fs.existsSync(path.join(sessionDir, 'logical-pipeline.json'));
+  let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
+  let exitReason = 'error';
   try {
-    await runLoopWithLease(sessionDir, runStartedAtMs);
+    if (durableRuntime) {
+      ownership = startDurableRuntimeOwnership(sessionDir);
+    }
+    await runLoopWithLease(sessionDir, runStartedAtMs, ownership ? {
+      ...options,
+      durableOwnershipHeld: true,
+      assertDurableOwnership: ownership.assertOwned,
+      recordDurableCheckpoint: ownership.recordCheckpoint,
+    } : options);
+    exitReason = String(new StateManager().read(path.join(sessionDir, 'state.json')).last_exit_reason || 'error');
+  } catch (error) {
+    if (isDurableOwnershipDrainError(error)) {
+      exitReason = 'runtime_handoff';
+      return;
+    }
+    throw error;
   } finally {
-    releaseOperation?.();
+    try {
+      ownership?.finish(exitReason);
+    } finally {
+      releaseOperation?.();
+    }
   }
 }
 

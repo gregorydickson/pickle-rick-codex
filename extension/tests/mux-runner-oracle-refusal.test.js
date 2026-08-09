@@ -537,6 +537,7 @@ test('mux-runner CLI treats terminal recovery blocks as failures and dependency 
   assert.equal(muxRunnerExitFailed('recovery_exhausted'), true);
   assert.equal(muxRunnerExitFailed('recovery_required'), true);
   assert.equal(muxRunnerExitFailed('dependency_repair_scheduled'), false);
+  assert.equal(muxRunnerExitFailed('autonomous_budget_rollover'), false);
   assert.equal(muxRunnerExitFailed('success'), false);
 });
 
@@ -1178,14 +1179,14 @@ test('mux-runner refuses to overlap another live session operation', async () =>
   }
 });
 
-test('mux-runner preserves cancellation requested during startup', async () => {
+test('mux-runner preserves terminal cancellation regardless of its timestamp', async () => {
   const { dataRoot, sessionDir } = createSessionWithTodoTicket('startup cancellation task');
   const statePath = path.join(sessionDir, 'state.json');
   const runStartedAtMs = Date.now();
   new StateManager().update(statePath, (state) => {
     state.active = false;
     state.last_exit_reason = 'cancelled';
-    state.cancel_requested_at = new Date(runStartedAtMs + 1).toISOString();
+    state.cancel_requested_at = new Date(runStartedAtMs - 60_000).toISOString();
     return state;
   });
   let calls = 0;

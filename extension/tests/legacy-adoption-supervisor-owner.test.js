@@ -187,6 +187,48 @@ test('real prepare seam tmux owner replaces a SIGKILLed node supervisor and conv
   }
 });
 
+test('dead ready tmux owner rebinds its old status to a new nonce and converges ready', () => {
+  const value = fixture();
+  writeJson(path.join(value.sessionDir, 'state.json'), {
+    schema_version: 1, active: true, working_dir: value.sessionDir, history: [],
+    tmux_runner_pid: null, tmux_session_name: null, worker_pid: null, active_child_pid: null,
+  });
+  let currentOwner = null;
+  try {
+    startLegacyAdoptionSupervisorOwner(value.sessionDir, value.sourceRuntimeRoot, value.targetRuntimeRoot);
+    const firstOwner = JSON.parse(fs.readFileSync(
+      path.join(value.sessionDir, LEGACY_ADOPTION_SUPERVISOR_OWNER_FILE), 'utf8',
+    ));
+    const first = readAuthenticatedLegacyAdoptionExecutorStatus(value);
+    assert.ok(first);
+    assert.equal(firstOwner.status, 'ready');
+
+    killTmuxSessionById(firstOwner.binding.session_id);
+    startLegacyAdoptionSupervisorOwner(value.sessionDir, value.sourceRuntimeRoot, value.targetRuntimeRoot);
+    currentOwner = JSON.parse(fs.readFileSync(
+      path.join(value.sessionDir, LEGACY_ADOPTION_SUPERVISOR_OWNER_FILE), 'utf8',
+    ));
+    const rebound = readAuthenticatedLegacyAdoptionExecutorStatus(value);
+    assert.ok(rebound, 'replacement owner did not authenticate its rebound supervisor status');
+    assert.equal(currentOwner.status, 'ready');
+    assert.notEqual(currentOwner.launch_nonce, firstOwner.launch_nonce);
+    assert.notEqual(currentOwner.binding.session_id, firstOwner.binding.session_id);
+    assert.equal(rebound.owner_nonce, currentOwner.launch_nonce);
+    assert.ok(rebound.manager_generation > first.manager_generation);
+    assert.notEqual(rebound.manager_identity.fingerprint, first.manager_identity.fingerprint);
+    assert.notEqual(rebound.executor_identity.fingerprint, first.executor_identity.fingerprint);
+  } finally {
+    if (!currentOwner) {
+      currentOwner = JSON.parse(fs.readFileSync(
+        path.join(value.sessionDir, LEGACY_ADOPTION_SUPERVISOR_OWNER_FILE), 'utf8',
+      ));
+    }
+    if (currentOwner?.binding?.session_id && tmuxSessionExists(currentOwner.binding.session_name)) {
+      killTmuxSessionById(currentOwner.binding.session_id);
+    }
+  }
+});
+
 test('successor manager processes an exact pending restart request after predecessor death', () => {
   const value = fixture();
   writeJson(path.join(value.sessionDir, 'state.json'), {
@@ -200,7 +242,7 @@ test('successor manager processes an exact pending restart request after predece
     const first = readAuthenticatedLegacyAdoptionExecutorStatus(value);
     assert.ok(first);
     process.kill(first.manager_identity.pid, 'SIGSTOP');
-    const request = requestLegacyAdoptionExecutorRestart(value.sessionDir, 'manager death window');
+    const request = requestLegacyAdoptionExecutorRestart(value.sessionDir, 'manager death window', first);
     process.kill(first.manager_identity.pid, 'SIGKILL');
 
     const replacementDeadline = Date.now() + 15_000;

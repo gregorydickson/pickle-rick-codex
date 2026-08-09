@@ -1,6 +1,7 @@
 // @tier: fast
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawn } from 'node:child_process';
 import {
   assertSessionOrphanRecovered,
   captureProcessIdentity,
@@ -271,4 +272,25 @@ test('capture and recovery entrypoints fail closed for invalid process identifie
 
   const idleManager = { read: () => ({ recovery_required: false }), update: () => assert.fail('unexpected update') };
   assert.equal(assertSessionOrphanRecovered('/tmp/unused-session', idleManager), null);
+});
+
+test('spawn identity capture rejects a live pid that is not owned by the expected parent', () => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: process.platform !== 'win32',
+    stdio: 'ignore',
+  });
+  const pid = Number(child.pid);
+  try {
+    assert.ok(captureSpawnedProcessIdentity(pid, 20), 'direct detached child identity is captured');
+    assert.equal(
+      captureSpawnedProcessIdentity(pid, 1, process.pid + 1),
+      null,
+      'the same live pid cannot be accepted for a different parent fence',
+    );
+  } finally {
+    try {
+      if (process.platform !== 'win32') process.kill(-pid, 'SIGKILL');
+      else child.kill('SIGKILL');
+    } catch { /* already exited */ }
+  }
 });

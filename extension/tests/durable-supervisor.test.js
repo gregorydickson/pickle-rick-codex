@@ -113,6 +113,28 @@ test('watchdog replaces a killed executor and resumes from the durable journal c
   assert.deepEqual(result.state.events.slice(-2).map((event) => event.kind), ['executor_lost', 'lease_recovered']);
 });
 
+test('checkpoint receipt replay is idempotent only for the exact canonical payload', () => {
+  const sessionDir = createAutonomousPipeline('checkpoint-receipt-integrity-');
+  const lease = acquireSupervisorLease(sessionDir, { ownerId: 'receipt-owner', ttlMs: 60_000, nowMs: 3_000 });
+  const checkpoint = { kind: 'budget', receipt_id: 'receipt-1', intent_id: 'intent-1', epoch: 1 };
+  recordSupervisorCheckpoint(sessionDir, lease.owner_id, lease.token, checkpoint, { nowMs: 3_100 });
+  recordSupervisorCheckpoint(sessionDir, lease.owner_id, lease.token, {
+    epoch: 1, intent_id: 'intent-1', receipt_id: 'receipt-1', kind: 'budget',
+  }, { nowMs: 3_200 });
+  assert.throws(() => recordSupervisorCheckpoint(sessionDir, lease.owner_id, lease.token, {
+    ...checkpoint, intent_id: 'conflicting-intent',
+  }, { nowMs: 3_300 }), (error) => {
+    assert.equal(error.name, 'SupervisorCheckpointIntegrityError');
+    assert.match(error.message, /conflicts with its durable payload/);
+    return true;
+  });
+  const receipts = readLogicalPipeline(sessionDir).events.filter((event) => (
+    event.kind === 'checkpoint_recorded' && event.details.checkpoint?.receipt_id === 'receipt-1'
+  ));
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].details.checkpoint.intent_id, 'intent-1');
+});
+
 test('normal terminal contract accepts only completed and cancelled and seals the journal', () => {
   const sessionDir = createAutonomousPipeline('terminal-contract-');
   assert.throws(() => terminateLogicalPipeline(sessionDir, 'failed'), /scores are zero/);

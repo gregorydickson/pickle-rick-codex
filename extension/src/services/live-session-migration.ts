@@ -66,8 +66,8 @@ function sessionFiles(root: string, current = root): string[] {
       || relative === 'watch-material-ledger.json'
       || relative === 'watch-strategy-authority.json'
       || relative === 'legacy-session-adoption-executor.json'
-      || relative === 'legacy-session-adoption-executor-restart.json'
-      || relative === 'legacy-session-adoption-executor-restart-rejected.json'
+      || relative.startsWith('legacy-session-adoption-executor-restart')
+      || relative.startsWith('.legacy-session-adoption-executor-restart')
       || relative === 'legacy-session-adoption-supervisor-owner.json'
       || relative.endsWith('.lock')) return [];
     return [relative];

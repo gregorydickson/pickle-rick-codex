@@ -15,8 +15,13 @@ import {
 } from '../services/orphan-reaper.js';
 import { StateManager } from '../services/state-manager.js';
 import { reconcileValidatedCitadelTelemetry } from '../services/citadel.js';
+import {
+  ensureAutonomousOwnerRecoveryDaemon,
+  reconcileAutonomousOwnerHandoffTransaction,
+  registerAutonomousOwnerSpec,
+} from '../services/autonomous-owner-recovery.js';
 
-const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
+const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js', 'loop-runner.js']);
 
 function appendLog(sessionDir: string, message: string): void {
   fs.appendFileSync(path.join(sessionDir, 'supervisor.log'), `[${new Date().toISOString()}] ${message}\n`, { mode: 0o600 });
@@ -33,6 +38,33 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function initializeAutonomousOwnerRecovery(
+  sessionDir: string,
+  runnerBin: string,
+  forwarded: string[],
+  runtimeBin: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try {
+      const spec = registerAutonomousOwnerSpec(
+        sessionDir,
+        runnerBin,
+        forwarded,
+        undefined,
+        path.join(runtimeBin, 'supervised-runner.js'),
+      );
+      if (spec) ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error)
+        || !error.message.includes('without an exact tmux runner binding')
+        || Date.now() >= deadline) throw error;
+      await delay(25);
+    }
+  }
+}
+
 export function recordSupervisorSignalTermination(
   sessionDir: string,
   reason: string,
@@ -44,12 +76,19 @@ export function recordSupervisorSignalTermination(
   });
 }
 
-export function supervisedRunnerDecision(sessionDir: string): 'restart' | 'wait_for_prd' | 'wait_for_handoff' | 'completed' | 'cancelled' {
+export function supervisedRunnerDecision(
+  sessionDir: string,
+  nowMs = Date.now(),
+): 'restart' | 'wait_for_budget' | 'wait_for_prd' | 'wait_for_handoff' | 'completed' | 'cancelled' {
   abortExpiredRuntimeHandoff(sessionDir);
   const logical = readLogicalPipeline(sessionDir);
   if (logical.terminal_state === 'completed') return 'completed';
   if (logical.terminal_state === 'cancelled') return 'cancelled';
   if (hasPendingRuntimeHandoff(sessionDir)) return 'wait_for_handoff';
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  const budgetWakeupMs = Date.parse(String(state.autonomous_relaunch_not_before || ''));
+  if (state.active === true && state.last_exit_reason === 'autonomous_budget_rollover'
+    && Number.isFinite(budgetWakeupMs) && budgetWakeupMs > nowMs) return 'wait_for_budget';
   return logical.control_state === 'prd_revision_required' ? 'wait_for_prd' : 'restart';
 }
 
@@ -68,20 +107,37 @@ export async function runSupervisedRunner(
   }
   const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
   const runnerPath = testOptions.runnerPath || path.join(runtimeBin, runnerBin);
-  const acceptingHandoff = runnerArgs.some((arg) => arg.startsWith('--handoff-request='));
+  let acceptingHandoff = runnerArgs.some((arg) => arg.startsWith('--handoff-request='));
+  let effectiveRunnerArgs = [...runnerArgs];
   let restartCount = 0;
 
   while (true) {
+    if (acceptingHandoff && !hasPendingRuntimeHandoff(sessionDir)) {
+      const handoffRecovery = reconcileAutonomousOwnerHandoffTransaction(sessionDir);
+      if (handoffRecovery === 'rolled_back') return 1;
+      const handoffState = new StateManager().read(path.join(sessionDir, 'state.json'));
+      if (handoffState.autonomous_owner_recovery_suspended === true) {
+        await delay(1_000);
+        continue;
+      }
+      if (handoffState.recovery_required === true) return 1;
+      effectiveRunnerArgs = effectiveRunnerArgs.filter((arg) => (
+        !arg.startsWith('--handoff-request=') && !arg.startsWith('--target-runtime=')
+      ));
+      acceptingHandoff = false;
+    }
+    if (!acceptingHandoff) ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
     const before = supervisedRunnerDecision(sessionDir);
     if (before === 'completed') return 0;
     if (before === 'cancelled') return 130;
-    if (before === 'wait_for_prd' || (before === 'wait_for_handoff' && !acceptingHandoff)) {
+    if (before === 'wait_for_budget' || before === 'wait_for_prd'
+      || (before === 'wait_for_handoff' && !acceptingHandoff)) {
       await delay(1_000);
       continue;
     }
 
     appendLog(sessionDir, `launching ${runnerBin} executor restart=${restartCount}`);
-    const child = spawn(process.execPath, [runnerPath, sessionDir, ...runnerArgs], {
+    const child = spawn(process.execPath, [runnerPath, sessionDir, ...effectiveRunnerArgs], {
       cwd: process.cwd(),
       env: process.env,
       stdio: 'inherit',
@@ -108,10 +164,14 @@ async function main(argv: string[]): Promise<void> {
   const runnerBin = runnerArg?.slice('--runner-bin='.length) || '';
   const sessionDir = argv.find((arg) => !arg.startsWith('--')) || '';
   if (!sessionDir || !runnerBin) {
-    throw new Error('Usage: node bin/supervised-runner.js <session-dir> --runner-bin=mux-runner.js|pipeline-runner.js [runner args]');
+    throw new Error('Usage: node bin/supervised-runner.js <session-dir> --runner-bin=mux-runner.js|pipeline-runner.js|loop-runner.js [runner args]');
   }
   const forwarded = argv.filter((arg) => arg !== sessionDir && arg !== runnerArg);
+  const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
   const acceptingHandoff = forwarded.some((arg) => arg.startsWith('--handoff-request='));
+  if (!acceptingHandoff) {
+    await initializeAutonomousOwnerRecovery(sessionDir, runnerBin, forwarded, runtimeBin);
+  }
   let executorIdentity: PersistedProcessIdentity | null = null;
   const signalExitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {

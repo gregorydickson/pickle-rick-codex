@@ -46,8 +46,9 @@ import {
 import { inspectAdoptionWatchAuthority, writeAdoptionWatchAuthority } from '../services/adoption-watch-authority.js';
 import {
   LEGACY_ADOPTION_EXECUTOR_RESTART_FILE,
+  prepareLegacyAdoptionExecutorRestart,
+  publishLegacyAdoptionExecutorRestart,
   readAuthenticatedLegacyAdoptionExecutorStatus,
-  requestLegacyAdoptionExecutorRestart,
 } from '../services/legacy-adoption-executor-supervisor.js';
 import type {
   LegacyAdoptionExecutorRestartRequest,
@@ -132,9 +133,11 @@ interface LegacyAdoptionWatchDependencies {
   runtimeMatches?: typeof runtimeRootMatchesDescriptor;
   executeStrategy?: (strategyId: AdoptionWatchStrategyId) => LegacyAdoptionRecord;
   readDomainEvidence?: () => AdoptionWatchDomainEvidence;
-  checkpoint?: (point: 'material_reserved' | 'strategy_persisted') => void;
+  checkpoint?: (point: 'material_reserved' | 'strategy_persisted'
+    | 'restart_intent_persisted' | 'restart_intent_rebound' | 'restart_request_published') => void;
   readExecutorStatus?: (sessionDir: string) => LegacyAdoptionExecutorStatus | null;
   requestExecutorRestart?: (sessionDir: string, reason: string) => LegacyAdoptionExecutorRestartRequest;
+  restoreSupervisorOwner?: () => void;
   yieldExecutor?: () => never;
 }
 
@@ -420,10 +423,14 @@ export function runLegacyAdoptionWatch(
       readAt, delayBounds.maxDelayMs) : null;
   const controlsAbsent = !fs.existsSync(authorityPath) && !fs.existsSync(manifestPath)
     && !fs.existsSync(materialsPath);
+  const restartTelemetryIndicator = fs.readdirSync(args.sessionDir).some((entry) => (
+    entry.startsWith('legacy-session-adoption-executor-restart')
+    || entry.startsWith('.legacy-session-adoption-executor-restart')
+  ));
   const priorRunIndicator = (fs.existsSync(statusPath)
       && (Boolean(persistedStatusInvalidReason) || (isRecord(rawPrior) && rawPrior.strategy_state !== undefined)))
     || (fs.existsSync(recoveryPath) && fs.readdirSync(recoveryPath).length > 0)
-    || fs.existsSync(path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE));
+    || restartTelemetryIndicator;
   const missingAuthorityForEstablishedLedger = !fs.existsSync(authorityPath) && fs.existsSync(statusPath)
     && (fs.existsSync(manifestPath) || fs.existsSync(materialsPath));
   const provenanceConflict = (controlsAbsent && priorRunIndicator) || missingAuthorityForEstablishedLedger;
@@ -659,6 +666,25 @@ export function runLegacyAdoptionWatch(
           targetRuntimeRoot: args.targetRuntimeRoot,
           ...(args.validationSessionDir ? { validationSessionDir: args.validationSessionDir } : {}),
         });
+      const durableSession = readJsonFile<Record<string, unknown>>(path.join(args.sessionDir, 'state.json'), null);
+      const cancellationRequested = Boolean(durableSession?.cancel_requested_at
+        || durableSession?.cancelled === true || durableSession?.active === false);
+      if (!authenticatedSupervisor && !cancellationRequested
+        && (deps.restoreSupervisorOwner || (durableSession
+          && fs.existsSync(args.sourceRuntimeRoot) && fs.existsSync(args.targetRuntimeRoot)))
+        && (!executorRestartAction || executorRestartAction.action === 'awaiting_evidence_change')) {
+        try {
+          (deps.restoreSupervisorOwner || (() => {
+            ensureLegacyAdoptionSupervisorOwner({
+              sessionDir: args.sessionDir, sourceRuntimeRoot: args.sourceRuntimeRoot,
+              targetRuntimeRoot: args.targetRuntimeRoot,
+              ...(args.validationSessionDir ? { validationSessionDir: args.validationSessionDir } : {}),
+            });
+          }))();
+        } catch {
+          // The durable retry deadline below keeps owner restoration active and bounded.
+        }
+      }
       const acknowledgedRestart = Boolean(executorRestartAction?.request && authenticatedSupervisor
         && authenticatedSupervisor.last_restart_request_id === executorRestartAction.request.request_id
         && authenticatedSupervisor.executor_generation > executorRestartAction.request.expected_generation
@@ -692,31 +718,112 @@ export function runLegacyAdoptionWatch(
         continue;
       }
 
-      if (!executorRestartAction) {
+      const restartPath = path.join(args.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE);
+      if (executorRestartAction?.action === 'executor_restart_requested'
+        && executorRestartAction.request && authenticatedSupervisor?.executor_identity?.pid === process.pid
+        && authenticatedSupervisor.last_restart_request_id !== executorRestartAction.request.request_id
+        && !fs.existsSync(restartPath)
+        && (authenticatedSupervisor.executor_generation !== executorRestartAction.request.expected_generation
+          || authenticatedSupervisor.executor_identity.fingerprint
+            !== executorRestartAction.request.expected_executor_fingerprint)) {
+        const reboundRequest: LegacyAdoptionExecutorRestartRequest = {
+          ...executorRestartAction.request,
+          expected_generation: authenticatedSupervisor.executor_generation,
+          expected_executor_fingerprint: authenticatedSupervisor.executor_identity.fingerprint,
+        };
+        executorRestartAction = sealRestartAction({
+          ...executorRestartAction,
+          request: reboundRequest,
+          expected_manager_fingerprint: authenticatedSupervisor.manager_identity.fingerprint,
+          expected_manager_generation: authenticatedSupervisor.manager_generation,
+          expected_owner_nonce: authenticatedSupervisor.owner_nonce,
+          expected_executor_spec_sha256: authenticatedSupervisor.executor_spec_sha256,
+        });
+        writeAdoptionWatchAuthority(args.sessionDir, strategyState, executorRestartAction, observedAt);
+        deps.checkpoint?.('restart_intent_rebound');
+      }
+      if (executorRestartAction?.action === 'executor_restart_requested'
+        && executorRestartAction.request && authenticatedSupervisor?.executor_identity?.pid === process.pid
+        && authenticatedSupervisor.executor_generation === executorRestartAction.request.expected_generation
+        && authenticatedSupervisor.executor_identity.fingerprint
+          === executorRestartAction.request.expected_executor_fingerprint
+        && authenticatedSupervisor.last_restart_request_id !== executorRestartAction.request.request_id
+        && !fs.existsSync(restartPath)) {
+        publishLegacyAdoptionExecutorRestart(
+          args.sessionDir, executorRestartAction.request, authenticatedSupervisor,
+        );
+        deps.checkpoint?.('restart_request_published');
+        requestedNow = true;
+      } else if (executorRestartAction?.action === 'executor_restart_requested'
+        && executorRestartAction.request && authenticatedSupervisor?.executor_identity?.pid === process.pid) {
+        const published = readJsonFile<LegacyAdoptionExecutorRestartRequest>(restartPath, null);
+        requestedNow = Boolean(published
+          && JSON.stringify(published) === JSON.stringify(executorRestartAction.request));
+      }
+
+      if (!executorRestartAction
+        || (executorRestartAction.action === 'awaiting_evidence_change'
+          && executorRestartAction.request === null)) {
         let request: LegacyAdoptionExecutorRestartRequest | null = null;
         const supervisor = authenticatedSupervisor;
-        if (supervisor?.executor_identity?.pid === process.pid) {
-          try {
-            request = (deps.requestExecutorRestart || requestLegacyAdoptionExecutorRestart)(
-              args.sessionDir, 'adoption strategy catalog exhausted without evidence change',
+        const publishedRequest = readJsonFile<LegacyAdoptionExecutorRestartRequest>(restartPath, null);
+        const exactPublishedRequest = Boolean(executorRestartAction?.action === 'awaiting_evidence_change'
+          && executorRestartAction.request === null
+          && publishedRequest && supervisor?.executor_identity
+          && publishedRequest.schema_version === 1
+          && typeof publishedRequest.request_id === 'string' && publishedRequest.request_id
+          && publishedRequest.expected_generation === supervisor.executor_generation
+          && publishedRequest.expected_executor_fingerprint === supervisor.executor_identity.fingerprint
+          && typeof publishedRequest.reason === 'string'
+          && isIsoTimestamp(publishedRequest.requested_at)
+          && Date.parse(publishedRequest.requested_at) >= Date.parse(executorRestartAction.requested_at));
+        if (exactPublishedRequest) {
+          request = publishedRequest;
+        } else if (!fs.existsSync(restartPath) && supervisor?.executor_identity?.pid === process.pid) {
+          if (deps.requestExecutorRestart) {
+            try {
+              request = deps.requestExecutorRestart(
+                args.sessionDir, 'adoption strategy catalog exhausted without evidence change',
+              );
+            } catch {
+              request = null;
+            }
+          } else {
+            request = prepareLegacyAdoptionExecutorRestart(
+              supervisor, 'adoption strategy catalog exhausted without evidence change',
+              { requestedAt: observedAt },
             );
-          } catch {
-            request = null;
+            executorRestartAction = sealRestartAction({
+              schema_version: 1, action: 'executor_restart_requested',
+              exhausted_state_hash: strategyState.state_hash,
+              exhausted_evidence_hash: strategyState.history_base_checkpoint.evidence_hash,
+              requested_at: request.requested_at, request,
+              expected_manager_fingerprint: supervisor.manager_identity.fingerprint,
+              expected_manager_generation: supervisor.manager_generation,
+              expected_owner_nonce: supervisor.owner_nonce,
+              expected_executor_spec_sha256: supervisor.executor_spec_sha256,
+            });
+            writeAdoptionWatchAuthority(args.sessionDir, strategyState, executorRestartAction, observedAt);
+            deps.checkpoint?.('restart_intent_persisted');
+            publishLegacyAdoptionExecutorRestart(args.sessionDir, request, supervisor);
           }
+          if (request) deps.checkpoint?.('restart_request_published');
         }
-        executorRestartAction = sealRestartAction({
-          schema_version: 1,
-          action: request ? 'executor_restart_requested' : 'awaiting_evidence_change',
-          exhausted_state_hash: strategyState.state_hash,
-          exhausted_evidence_hash: strategyState.history_base_checkpoint.evidence_hash,
-          requested_at: request?.requested_at || observedAt,
-          request,
-          expected_manager_fingerprint: request ? supervisor?.manager_identity.fingerprint || null : null,
-          expected_manager_generation: request ? supervisor?.manager_generation || null : null,
-          expected_owner_nonce: request ? supervisor?.owner_nonce || null : null,
-          expected_executor_spec_sha256: request ? supervisor?.executor_spec_sha256 || null : null,
-        });
-        requestedNow = Boolean(request);
+        if (!executorRestartAction || request) {
+          executorRestartAction = sealRestartAction({
+            schema_version: 1,
+            action: request ? 'executor_restart_requested' : 'awaiting_evidence_change',
+            exhausted_state_hash: strategyState.state_hash,
+            exhausted_evidence_hash: strategyState.history_base_checkpoint.evidence_hash,
+            requested_at: request?.requested_at || executorRestartAction?.requested_at || observedAt,
+            request,
+            expected_manager_fingerprint: request ? supervisor?.manager_identity.fingerprint || null : null,
+            expected_manager_generation: request ? supervisor?.manager_generation || null : null,
+            expected_owner_nonce: request ? supervisor?.owner_nonce || null : null,
+            expected_executor_spec_sha256: request ? supervisor?.executor_spec_sha256 || null : null,
+          });
+        }
+        requestedNow = Boolean(request && supervisor?.executor_identity?.pid === process.pid);
       }
 
       const delay = legacyAdoptionWatchDelayMs(Math.max(1, consecutiveFailures), {

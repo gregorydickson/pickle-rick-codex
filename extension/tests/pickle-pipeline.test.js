@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { pipelineExitFailed } from '../bin/pipeline-runner.js';
+import { readLogicalPipeline } from '../services/durable-supervisor.js';
+import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import {
   createFakeCodex,
   createFakeTmux,
@@ -37,6 +39,7 @@ test('pipeline-runner CLI treats every non-success terminal reason as failure', 
   assert.equal(pipelineExitFailed('success'), false);
   assert.equal(pipelineExitFailed('dependency_repair_scheduled'), false, 'durable dependency wakeup is nonterminal');
   assert.equal(pipelineExitFailed('citadel_attribution_repair_scheduled'), false, 'durable attribution wakeup is nonterminal');
+  assert.equal(pipelineExitFailed('autonomous_budget_rollover'), false, 'budget rollover is a supervised continuation');
   for (const reason of ['citadel-blocked', 'circuit_open', 'cancelled', 'no_tickets', 'future-failure']) {
     assert.equal(pipelineExitFailed(reason), true, reason);
   }
@@ -147,6 +150,54 @@ test('pipeline-runner executes the configured phases to completion', () => {
   assert.equal(pipelineState.phase_statuses.citadel, 'done');
   assert.match(runnerLog, /pipeline-runner started/);
   assert.match(runnerLog, /pipeline-runner finished: success/);
+});
+
+test('pipeline-runner persists a nonterminal rollover checkpoint without advancing its phase', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-pipeline-budget-project-');
+  const fakeBin = makeTempRoot('pickle-rick-pipeline-budget-bin-');
+  createFakeCodex(fakeBin);
+  initGitRepo(projectDir);
+  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), '--tmux', 'pipeline budget rollover'], {
+    env,
+    cwd: projectDir,
+  }).trim();
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'R1', title: 'Pipeline budget', description: 'Stay in pickle across a replacement.',
+      acceptance_criteria: ['The phase remains resumable.'], verification: ['node -e "process.exit(0)"'],
+      priority: 'P1', status: 'Todo', allowed_paths: ['baseline.txt'],
+    }],
+  });
+  writeJson(path.join(sessionDir, 'pipeline.json'), {
+    schema_version: 1, working_dir: fs.realpathSync(projectDir), target: fs.realpathSync(projectDir),
+    phases: ['pickle', 'citadel'], skip_flags: { anatomy: true, szechuan: true },
+    bootstrap_source: 'task', task: 'pipeline budget rollover',
+  });
+  acceptTestRefinement(sessionDir, projectDir);
+  ensureSessionPrdSeal(sessionDir);
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = readJsonFile(statePath);
+  state.active = true;
+  state.iteration = 25;
+  state.max_iterations = 25;
+  writeJson(statePath, state);
+
+  runNode([path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], { env, cwd: projectDir });
+
+  const rolled = readJsonFile(statePath);
+  const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'));
+  assert.equal(rolled.active, true);
+  assert.equal(rolled.last_exit_reason, 'autonomous_budget_rollover');
+  assert.equal(rolled.max_iterations, 50);
+  assert.equal(pipelineState.current_phase, 'pickle');
+  assert.notEqual(pipelineState.phase_statuses.pickle, 'done');
+  const checkpoints = readLogicalPipeline(sessionDir).events
+    .map((event) => event.details.checkpoint)
+    .filter((checkpoint) => checkpoint?.kind === 'autonomous_budget_rollover');
+  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints[0].intent_id, rolled.autonomous_budget_rollover_intent_id);
 });
 
 test('pickle-pipeline refuses launch on verification preflight block before tmux detach', () => {

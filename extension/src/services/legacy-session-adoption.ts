@@ -88,6 +88,7 @@ interface LegacyAdoptionTransaction {
   pane: PersistedProcessIdentity;
   tmux: LegacyTmuxBinding;
   operation_lock_pid: number;
+  operation_lock_sha256: string;
   active_child: PersistedProcessIdentity | null;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
   migration_content_hash?: string;
@@ -260,11 +261,46 @@ function validPersistedIdentity(value: unknown): value is PersistedProcessIdenti
     && typeof identity.fingerprint === 'string' && identity.fingerprint);
 }
 
-function operationLockPid(sessionDir: string): number {
-  const lock = readJsonFile<Record<string, unknown>>(path.join(sessionDir, '.session-operation.lock'), null);
-  const pid = Number(lock?.pid);
+interface LegacyOperationLockSnapshot {
+  pid: number;
+  sha256: string;
+}
+
+function legacyOperationLockSnapshot(sessionDir: string): LegacyOperationLockSnapshot {
+  const lockPath = path.join(sessionDir, '.session-operation.lock');
+  let raw: Buffer;
+  try {
+    raw = fs.readFileSync(lockPath);
+  } catch (error) {
+    throw new Error('Legacy adoption requires an owned session-operation lock.', { cause: error });
+  }
+  let lock: Record<string, unknown>;
+  try {
+    lock = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error('Legacy adoption requires an owned session-operation lock.', { cause: error });
+  }
+  const pid = Number(lock.pid);
   if (!Number.isInteger(pid) || pid <= 0) throw new Error('Legacy adoption requires an owned session-operation lock.');
-  return pid;
+  return { pid, sha256: crypto.createHash('sha256').update(raw).digest('hex') };
+}
+
+function retireLegacyOperationLock(
+  sessionDir: string,
+  expected: LegacyOperationLockSnapshot,
+): boolean {
+  let current: LegacyOperationLockSnapshot;
+  try {
+    current = legacyOperationLockSnapshot(sessionDir);
+  } catch (error) {
+    if ((error as { cause?: { code?: string } }).cause?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (current.pid !== expected.pid || current.sha256 !== expected.sha256) {
+    return false;
+  }
+  fs.unlinkSync(path.join(sessionDir, '.session-operation.lock'));
+  return true;
 }
 
 function exactMuxCommand(command: string, sessionDir: string, runtimeRoot?: string): boolean {
@@ -561,8 +597,8 @@ export function adoptActiveLegacyMuxSession(
     const tmuxName = String(state.tmux_session_name || '');
     if (!Number.isInteger(runnerPid) || runnerPid <= 0 || !tmuxName) throw new Error('Legacy session lacks live mux ownership metadata.');
     assertOwnedTmuxSession(tmuxName, sessionDir);
-    const lockPid = operationLockPid(sessionDir);
-    if (lockPid !== runnerPid) throw new Error('Legacy runner and operation lock owners do not match.');
+    const operationLock = legacyOperationLockSnapshot(sessionDir);
+    if (operationLock.pid !== runnerPid) throw new Error('Legacy runner and operation lock owners do not match.');
     const tmux = bindingFor(tmuxName);
     if (!tmux || !exists(tmuxName)) {
       throw new Error('Legacy tmux session lacks an immutable live binding.');
@@ -579,7 +615,8 @@ export function adoptActiveLegacyMuxSession(
       source_runtime_root: fs.realpathSync(sourceRuntimeRoot), target_runtime_root: fs.realpathSync(targetRuntimeRoot),
       source_runtime: sourceRuntime, target_runtime: targetRuntime, runner: topology.runner.identity,
       supervisor: topology.supervisor?.identity ?? null, pane: topology.pane.identity,
-      tmux, operation_lock_pid: lockPid, active_child: child, candidate_archive: candidateArchive,
+      tmux, operation_lock_pid: operationLock.pid, operation_lock_sha256: operationLock.sha256,
+      active_child: child, candidate_archive: candidateArchive,
       created_at: now.toISOString(), updated_at: now.toISOString(),
     };
     atomicWriteJson(transactionPath, transaction);
@@ -638,6 +675,9 @@ export function adoptActiveLegacyMuxSession(
     } else if (runnerStatus === 'matched') {
       throw new Error('Legacy tmux disappeared while its recorded controller remained live.');
     }
+    if (typeof transaction.operation_lock_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(transaction.operation_lock_sha256)) {
+      throw new Error('Legacy adoption transaction lacks authenticated session-operation lock evidence.');
+    }
     clearQuiescedOwnership(sessionDir);
     transaction = { ...transaction, stage: 'quiesced', updated_at: (deps.now?.() ?? new Date()).toISOString() };
     atomicWriteJson(transactionPath, transaction);
@@ -645,6 +685,15 @@ export function adoptActiveLegacyMuxSession(
   }
 
   if (!transaction) throw new Error('Legacy adoption transaction disappeared after quiescence.');
+  if (transaction.stage === 'quiesced') {
+    if (typeof transaction.operation_lock_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(transaction.operation_lock_sha256)) {
+      throw new Error('Legacy adoption transaction lacks authenticated session-operation lock evidence.');
+    }
+    retireLegacyOperationLock(sessionDir, {
+      pid: transaction.operation_lock_pid,
+      sha256: transaction.operation_lock_sha256,
+    });
+  }
   const releaseOperation = acquireSessionOperation(sessionDir, 'Could not fence the quiesced legacy session for adoption.');
   try {
     let migration = readJsonFile<InstalledRuntimeMigration>(path.join(sessionDir, 'installed-runtime-migration.json'), null);

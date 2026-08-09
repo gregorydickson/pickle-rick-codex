@@ -45,11 +45,20 @@ import { normalizeTicketId } from '../services/tickets.js';
 import { repairCitadelReviewerArtifactContract } from '../services/citadel-reviewer-recovery.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
+  fenceAutonomousOwnerRecoveryForHandoff,
+  releaseAutonomousOwnerRecoveryHandoffFence,
+  transferAutonomousOwnerRecoveryForAcceptedHandoff,
+} from '../services/autonomous-owner-recovery.js';
+import {
   enqueueCitadelRemediationResult,
   reconcileCitadelAttributionRepair,
   reconcileCitadelRemediation,
   repairCitadelAttribution,
 } from '../services/citadel-remediation.js';
+import {
+  AUTONOMOUS_BUDGET_ROLLOVER_REASON,
+  consumeAutonomousBudgetRollover,
+} from '../services/autonomous-budget.js';
 
 export { enqueueCitadelRemediation, reconcileCitadelRemediation } from '../services/citadel-remediation.js';
 
@@ -58,6 +67,7 @@ type PreparePipelineLoopPhase = Parameters<typeof preparePipelineLoopPhaseSessio
 interface RunPipelineOptions {
   onFailure?: string;
   assertDurableOwnership?: () => void;
+  recordDurableCheckpoint?: (checkpoint: Record<string, unknown>) => void;
   handoffRequestId?: string;
   targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
   runSequential?: typeof runSequential;
@@ -119,6 +129,7 @@ function isBlockingExitReason(exitReason: string): boolean {
 
 export function pipelineExitFailed(exitReason: string): boolean {
   return exitReason !== 'success'
+    && exitReason !== AUTONOMOUS_BUDGET_ROLLOVER_REASON
     && exitReason !== 'dependency_repair_scheduled'
     && exitReason !== 'citadel_attribution_repair_scheduled'
     && exitReason !== 'citadel_system_recovery_scheduled'
@@ -148,9 +159,9 @@ async function runPipelinePhase(
   beginPipelinePhase(sessionDir, phase, { runnerPid: process.pid, runStartedAtMs });
   try {
     const exitReason = await executePhase();
-    if (exitReason === 'runtime_handoff') {
-      // Runtime handoff transfers the in-flight phase to the green executor.
-      // Keep both session and pipeline phase state live until it accepts.
+    if (exitReason === 'runtime_handoff' || exitReason === AUTONOMOUS_BUDGET_ROLLOVER_REASON) {
+      // Runtime handoff and budget rollover both transfer the in-flight phase.
+      // Keep session and phase state live for the replacement executor.
       return exitReason;
     }
     if (exitReason === 'cancelled') {
@@ -192,6 +203,7 @@ async function runPipelineLoopPhase(
   pipeline: PipelineContract,
   preparePhase: PreparePipelineLoopPhase,
   runStartedAtMs: number,
+  options: RunPipelineOptions,
 ): Promise<string> {
   return await runPipelinePhase(sessionDir, phase, runStartedAtMs, async () => {
     const scope = resolvePipelineScope(sessionDir, pipeline);
@@ -199,6 +211,9 @@ async function runPipelineLoopPhase(
     await preparePipelineLoopPhaseSession(sessionDir, pipeline, preparePhase, scope.paths);
     await runLoop(sessionDir, {
       operationLeaseHeld: true,
+      durableOwnershipHeld: options.assertDurableOwnership !== undefined,
+      assertDurableOwnership: options.assertDurableOwnership,
+      recordDurableCheckpoint: options.recordDurableCheckpoint,
       runStartedAtMs,
     });
     return readSessionExitReason(sessionDir);
@@ -245,6 +260,10 @@ async function runPipelineWithLease(
   };
   appendRunnerLog(sessionDir, getRunnerDescriptor('pipeline').runnerStartMarker);
   try {
+    consumeAutonomousBudgetRollover(new StateManager(), path.join(sessionDir, 'state.json'), {
+      assertDurableOwnership: options.assertDurableOwnership,
+      recordDurableCheckpoint: options.recordDurableCheckpoint,
+    });
     const pipeline = readPipelineContract(sessionDir);
     let pipelineState = ensurePipelineState(sessionDir, pipeline);
     const verificationRepairReconciliation = reconcileVerificationRepairTransaction(sessionDir);
@@ -345,6 +364,7 @@ async function runPipelineWithLease(
           pipeline,
           preparePipelineAnatomyParkPhase,
           runStartedAtMs,
+          options,
         );
       } else if (nextPhase === 'szechuan-sauce') {
         exitReason = await runPipelineLoopPhase(
@@ -353,6 +373,7 @@ async function runPipelineWithLease(
           pipeline,
           preparePipelineSzechuanSaucePhase,
           runStartedAtMs,
+          options,
         );
       } else {
         throw new Error(`Unsupported pipeline phase: ${nextPhase}.`);
@@ -499,21 +520,44 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
   let ownership: ReturnType<typeof startDurableRuntimeOwnership> | null = null;
   let exitReason = 'error';
   try {
-    ownership = startDurableRuntimeOwnership(sessionDir, {
-      handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
-      targetRuntime: options.targetRuntime,
-    });
+    const handoffRequestId = typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined;
+    if (handoffRequestId && options.targetRuntime) {
+      fenceAutonomousOwnerRecoveryForHandoff(
+        sessionDir, handoffRequestId, 'pipeline-runner.js', [],
+        path.dirname(fileURLToPath(import.meta.url)), options.targetRuntime,
+      );
+    }
+    try {
+      ownership = startDurableRuntimeOwnership(sessionDir, {
+        handoffRequestId,
+        targetRuntime: options.targetRuntime,
+      });
+    } catch (error) {
+      if (handoffRequestId) releaseAutonomousOwnerRecoveryHandoffFence(sessionDir, handoffRequestId);
+      throw error;
+    }
+    if (handoffRequestId && process.env.PICKLE_TEST_MODE === '1'
+      && process.env.PICKLE_TEST_HANDOFF_CRASH_AFTER_ACQUIRE === '1') {
+      process.kill(process.pid, 'SIGKILL');
+    }
     activatePreparedManagerRelaunchRecovery(sessionDir);
     consumeManagerRelaunchRecovery(sessionDir);
     if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
       ownership.assertOwned();
       finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);
       ownership.assertOwned();
+      transferAutonomousOwnerRecoveryForAcceptedHandoff(
+        sessionDir,
+        'pipeline-runner.js',
+        [],
+        path.dirname(fileURLToPath(import.meta.url)),
+      );
     }
     exitReason = await runPipelineWithLease(sessionDir, {
       ...options,
       onFailure: 'retry',
       assertDurableOwnership: ownership.assertOwned,
+      recordDurableCheckpoint: ownership.recordCheckpoint,
     }, runStartedAtMs);
     return exitReason;
   } catch (error) {

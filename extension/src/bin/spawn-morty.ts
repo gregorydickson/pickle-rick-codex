@@ -54,7 +54,7 @@ import {
   type WorkspaceSnapshot,
 } from '../services/execution-gate.js';
 import { getRunnerDescriptor } from '../services/runner-descriptors.js';
-import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
+import { captureProcessLivenessIdentity, captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { appendHistory } from '../services/session.js';
 import { recordExecutionControlTelemetry, recordModelCallTelemetry } from '../services/productive-autonomy.js';
 import { lifecycleContextInputHash, readLifecycleContextCheckpoint, writeLifecycleContextCheckpoint } from '../services/lifecycle-checkpoints.js';
@@ -531,18 +531,16 @@ function updateActiveChild(statePath: string, manager: StateManager, fields: Rec
   if (Object.hasOwn(fields, 'active_child_pid')) {
     const pid = Number(fields.active_child_pid);
     const identity = Number.isInteger(pid) && pid > 0 ? captureSpawnedProcessIdentity(pid) : null;
-    if (Number.isInteger(pid) && pid > 0 && !identity) {
-      let alive = false;
-      try {
-        process.kill(pid, 0);
-        alive = true;
-      } catch {
-        // A short-lived deterministic command may finish before identity capture.
-      }
-      if (alive) throw new Error(`Could not persist a safe process identity for worker child ${pid}.`);
+    if (Number.isInteger(pid) && pid > 0 && !identity && captureProcessLivenessIdentity(pid)) {
+      throw new Error(`Could not persist a safe process identity for worker child ${pid}.`);
+    }
+    if (!identity) {
+      fields.active_child_pid = null;
+      fields.active_child_kind = null;
+      fields.active_child_command = null;
     }
     fields.active_child_identity = identity;
-    fields.active_child_controller_pid = Number.isInteger(pid) && pid > 0 ? process.pid : null;
+    fields.active_child_controller_pid = identity ? process.pid : null;
   }
   manager.update(statePath, (current) => {
     Object.assign(current, fields);
