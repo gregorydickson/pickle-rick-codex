@@ -49,7 +49,11 @@ import {
 import { isVerificationCommandError, repairTicketVerificationContract, runTicket } from './spawn-morty.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
-import { runCitadel } from '../services/citadel.js';
+import { readCitadelSystemBlock, runCitadel } from '../services/citadel.js';
+import {
+  consumeDeterministicCheckFailure,
+  runDeterministicRecoveryDiagnostic,
+} from '../services/citadel-deterministic-recovery.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
@@ -92,6 +96,7 @@ interface RunSequentialDeps {
   repairTicketDependencyContract?: typeof repairTicketDependencyContract;
   runCitadel?: typeof runCitadel;
   repairCitadelAttribution?: typeof repairCitadelAttribution;
+  runDeterministicRecoveryDiagnostic?: typeof runDeterministicRecoveryDiagnostic;
 }
 
 function appendRunnerLog(sessionDir: string, mode: string, message: string): void {
@@ -887,7 +892,8 @@ async function runSequentialWithLease(
   }
 
   const holdActiveForReleaseGate = options.holdActiveForReleaseGate === true && exitReason === 'success';
-  const finalReason = holdActiveForReleaseGate
+  const preserveActiveForRuntimeHandoff = exitReason === 'runtime_handoff';
+  const finalReason = holdActiveForReleaseGate || preserveActiveForRuntimeHandoff
     ? exitReason
     : exitMuxRunnerPhase(manager, statePath, {
       exitReason,
@@ -919,6 +925,7 @@ export async function runSequential(
   deps: RunSequentialDeps = {},
 ): Promise<string> {
   const repairAttributionFn = deps.repairCitadelAttribution ?? repairCitadelAttribution;
+  const repairVerificationContractFn = deps.repairTicketVerificationContract ?? repairTicketVerificationContract;
   const configuredRunStartedAtMs = Number(options.runStartedAtMs);
   const runStartedAtMs = Number.isFinite(configuredRunStartedAtMs) && configuredRunStartedAtMs > 0
     ? configuredRunStartedAtMs
@@ -1017,6 +1024,75 @@ export async function runSequential(
         exitReason = 'success';
         releaseGateHeld = false;
         continue;
+      }
+      if (citadelExit === 'citadel-system-blocked') {
+        const systemBlock = readCitadelSystemBlock(sessionDir);
+        if (!systemBlock) throw new Error('Citadel system block result is missing its typed recovery artifact.');
+        appendRunnerLog(
+          sessionDir,
+          options.runnerMode || 'pickle',
+          `Citadel system block ${systemBlock.code} selected ${systemBlock.recovery_action}; attempt ${systemBlock.bounded_attempt}/2 in recovery epoch ${systemBlock.recovery_epoch}.`,
+        );
+        releaseGateHeld = false;
+        if (systemBlock.recovery_action === 'request_prd_revision') {
+          exitReason = 'prd_revision_required';
+          exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+          requestPrdRevision(sessionDir, systemBlock.evidence, systemBlock.recommendation);
+          break;
+        }
+        if (systemBlock.recovery_action === 'repair_verification_contract') {
+          for (const ticketId of systemBlock.recovery_ticket_ids) {
+            const priorEpochs = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticketId).length;
+            const route = recoveryRoute('contract');
+            const strategy = beginRecoveryStrategyEpoch(sessionDir, {
+              ticketId,
+              domain: 'contract',
+              handler: route.handler,
+              checkpoint: route.invalidate[0] || 'prepare',
+              constraints: [systemBlock.evidence],
+              materialApproach: nextMaterialApproach('contract', priorEpochs),
+            }, 'failure');
+            await repairVerificationContractFn(sessionDir, ticketId, {
+              strategy,
+              timeoutMs: options.timeoutMs,
+              assertDurableOwnership: ownership.assertOwned,
+            });
+            ownership.assertOwned();
+            appendRunnerLog(
+              sessionDir,
+              options.runnerMode || 'pickle',
+              `Citadel material verification-contract recovery rebuilt ${ticketId} with strategy ${strategy.materialApproach}.`,
+            );
+          }
+          exitReason = 'success';
+          continue;
+        }
+        if (systemBlock.next_action === 'retry_phase') continue;
+        const deterministicRecovery = consumeDeterministicCheckFailure(sessionDir, systemBlock);
+        if (deterministicRecovery.kind === 'diagnostic_recovery_scheduled') {
+          const diagnostic = await (deps.runDeterministicRecoveryDiagnostic ?? runDeterministicRecoveryDiagnostic)(
+            sessionDir,
+            { timeoutMs: options.timeoutMs, assertDurableOwnership: ownership.assertOwned },
+          );
+          ownership.assertOwned();
+          appendRunnerLog(
+            sessionDir,
+            options.runnerMode || 'pickle',
+            diagnostic.kind === 'resolved'
+              ? `Deterministic diagnostic mapped recovery to ${diagnostic.ticket_ids.join(', ')}.`
+              : `Deterministic diagnostic retained a bounded retry: ${diagnostic.reason}`,
+          );
+        }
+        appendRunnerLog(
+          sessionDir,
+          options.runnerMode || 'pickle',
+          deterministicRecovery.kind === 'verification_repair_scheduled'
+            ? `Scheduled ${deterministicRecovery.strategy_id} for exact deterministic-check owner ${deterministicRecovery.ticket_id}.`
+            : `Scheduled autonomous ${deterministicRecovery.strategy_id}: ${deterministicRecovery.reason}`,
+        );
+        exitReason = 'citadel_system_recovery_scheduled';
+        exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });
+        break;
       }
       exitReason = citadelExit;
       exitMuxRunnerPhase(new StateManager(), path.join(sessionDir, 'state.json'), { exitReason });

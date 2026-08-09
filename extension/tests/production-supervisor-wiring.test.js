@@ -7,8 +7,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createFakeCodex, makeTempRoot, prependPath, writeJson } from './helpers.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
-import { runTicket } from '../bin/spawn-morty.js';
-import { enqueueCitadelRemediation, parsePipelineHandoffOptions, runPipeline } from '../bin/pipeline-runner.js';
+import { repairTicketVerificationContract, runTicket } from '../bin/spawn-morty.js';
+import {
+  enqueueCitadelRemediation,
+  parsePipelineHandoffOptions,
+  pipelineExitFailed,
+  runPipeline,
+} from '../bin/pipeline-runner.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import {
   acceptRuntimeHandoff,
@@ -33,12 +38,21 @@ import {
   finishPipelinePhase,
   readPipelineState,
 } from '../services/pipeline-state.js';
-import { readManifest, updateTicketStatus } from '../services/tickets.js';
+import { readManifest, restructureTicketFiles, updateTicketStatus } from '../services/tickets.js';
 import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
 import { captureSpawnedProcessIdentity, inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
 import { StateManager } from '../services/state-manager.js';
 import { assertSessionOperationAvailable } from '../services/session-operation.js';
-import { assertCitadelReleaseApproval, deriveCitadelAcceptanceCriteria, persistCitadelReleaseApproval } from '../services/citadel.js';
+import {
+  assertCitadelReleaseApproval,
+  deriveCitadelAcceptanceCriteria,
+  persistCitadelReleaseApproval,
+  readCitadelSystemBlock,
+} from '../services/citadel.js';
+import {
+  consumeDeterministicCheckFailure,
+  runDeterministicRecoveryDiagnostic,
+} from '../services/citadel-deterministic-recovery.js';
 import { PreflightError } from '../services/verification-env.js';
 import { reconstructWorkspaceFromDurableCheckpoint } from '../services/workspace-reconstruction.js';
 import { buildTicketPhasePrompt } from '../services/prompts.js';
@@ -46,6 +60,29 @@ import { reconcileCitadelAttributionRepair, repairCitadelAttribution } from '../
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+}
+
+function writeCitadelSystemBlock(sessionDir, overrides = {}) {
+  writeJson(path.join(sessionDir, 'citadel-system-block.json'), {
+    schema_version: 1,
+    artifact_kind: 'citadel_system_block',
+    category: 'infrastructure',
+    code: 'deterministic_check_failed',
+    reviewed_range: 'fixture..HEAD',
+    title: 'Deterministic release check failed',
+    evidence: 'npm test exited 7.',
+    recommendation: 'Retry the deterministic gate in an isolated executor.',
+    checks: [{ command: 'npm test', status: 'failed', exit_code: 7, output: 'fixture failure' }],
+    recovery_action: 'retry_checks',
+    recovery_ticket_ids: [],
+    failure_identity: 'f'.repeat(64),
+    attempt: 2,
+    recovery_epoch: 1,
+    bounded_attempt: 2,
+    next_action: 'restart_executor',
+    generated_at: new Date().toISOString(),
+    ...overrides,
+  });
 }
 
 test('pipeline runner decodes and forwards green runtime handoff arguments', () => {
@@ -138,6 +175,36 @@ async function approveCitadelFixture(sessionDir) {
     generated_at: new Date().toISOString(),
   });
   return 'success';
+}
+
+async function withProcessEnvironment(environment, callback) {
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function prepareSealedVerificationRepairPipeline(sessionDir, workingDir, task) {
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task,
+  }));
+  ensurePipelineState(sessionDir);
+  const manifest = JSON.parse(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'));
+  manifest.tickets[0].verification = [{ kind: 'process', executable: 'node', args: 'not-an-array' }];
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), manifest);
+  writeRefinementAcceptance(sessionDir, { workingDir, preserveMalformedVerification: true });
 }
 
 test('bootstrap readiness writes a validated seal and crosses the explicit autonomous boundary', async () => {
@@ -489,14 +556,19 @@ test('replacement runner reaps an identity-matched detached child before redispa
   assert.equal(childWasGoneAtDispatch, true);
 });
 
-test('long active worker drains promptly when blue releases for green handoff', async () => {
+test('blue runSequential drains without deactivation and green resumes through a sealed migration to success', async () => {
   const { sessionDir } = createAcceptedSession();
   initializePrdDevelopmentPipeline(sessionDir);
   ensureSessionPrdSeal(sessionDir);
   let workerStarted;
   const started = new Promise((resolve) => { workerStarted = resolve; });
   const run = runSequential(sessionDir, { runnerMode: 'pickle' }, {
-    runTicket: async (_dir, _ticketId, options) => {
+    runTicket: async (_dir, ticketId, options) => {
+      new StateManager().update(path.join(sessionDir, 'state.json'), (current) => {
+        current.current_ticket = ticketId;
+        current.step = 'implement';
+        return current;
+      });
       workerStarted();
       while (true) {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -519,10 +591,87 @@ test('long active worker drains promptly when blue releases for green handoff', 
   assert.ok(Date.now() - before < 2_000, 'blue worker did not drain promptly');
   assert.doesNotThrow(() => assertSessionOperationAvailable(sessionDir));
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
-  assert.equal(
-    acceptRuntimeHandoff(sessionDir, requestId, 'green-fixture', 60_000, greenRuntime).lease.owner_id,
-    'green-fixture',
-  );
+  const drained = new StateManager().read(path.join(sessionDir, 'state.json'));
+  assert.equal(drained.active, true);
+  assert.equal(drained.current_ticket, 'r1');
+  assert.equal(drained.step, 'implement');
+  assert.equal(drained.last_exit_reason, null);
+
+  let resumed = false;
+  const greenResult = await runSequential(sessionDir, {
+    runnerMode: 'pickle', handoffRequestId: requestId, targetRuntime: greenRuntime,
+  }, {
+    runTicket: async () => {
+      const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+      assert.equal(state.active, true);
+      assert.equal(state.current_ticket, 'r1');
+      assert.equal(state.step, 'implement');
+      resumed = true;
+      return { status: 'done', applied: true };
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(greenResult, 'success');
+  assert.equal(resumed, true);
+  const migration = JSON.parse(fs.readFileSync(path.join(sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  assert.equal(migration.source_runtime.runtime_id, 'blue');
+  assert.equal(migration.target_runtime.runtime_id, 'green');
+  assert.equal(migration.session_was_active, true);
+  assert.equal(migration.resume_checkpoint.ticket_id, 'r1');
+  assert.equal(migration.resume_checkpoint.phase, 'implement');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+});
+
+test('pipeline runtime handoff preserves its running phase until green completes it', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'preserve an in-flight pipeline phase across runtime handoff',
+  }));
+  ensurePipelineState(sessionDir);
+  const blueRuntime = { runtime_id: 'blue', version: '1.0.0', build_hash: 'a'.repeat(64), min_state_schema: 1, max_state_schema: 1 };
+  const greenRuntime = { runtime_id: 'green', version: '2.0.0', build_hash: 'b'.repeat(64), min_state_schema: 1, max_state_schema: 2 };
+  let requestId;
+
+  const blueResult = await runPipeline(sessionDir, {
+    runSequential: async (dir) => {
+      new StateManager().update(path.join(dir, 'state.json'), (current) => {
+        current.current_ticket = 'r1';
+        current.step = 'implement';
+        return current;
+      });
+      const blue = readLogicalPipeline(dir).lease;
+      assert.ok(blue);
+      requestId = requestRuntimeHandoff(
+        dir, blue.owner_id, blue.token, blueRuntime, greenRuntime, { phase: 'implement' },
+      );
+      releaseRuntimeHandoffLease(dir, blue.owner_id, blue.token, requestId);
+      return 'runtime_handoff';
+    },
+  });
+  assert.equal(blueResult, 'runtime_handoff');
+  assert.equal(new StateManager().read(path.join(sessionDir, 'state.json')).active, true);
+  assert.equal(readPipelineState(sessionDir).current_phase, 'pickle');
+  assert.equal(readPipelineState(sessionDir).phase_statuses.pickle, 'running');
+
+  const greenResult = await runPipeline(sessionDir, {
+    handoffRequestId: requestId,
+    targetRuntime: greenRuntime,
+    runSequential: async (dir) => {
+      updateTicketStatus(dir, 'R1', { status: 'Done' });
+      return 'success';
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(greenResult, 'success');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'installed-runtime-migration.json')), true);
+  assert.equal(readPipelineState(sessionDir).phase_statuses.pickle, 'done');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
 });
 
 test('Citadel approval is invalidated by any later repository commit', async () => {
@@ -589,6 +738,487 @@ test('standalone mux carries exact Citadel refusal evidence into autonomous reme
   assert.equal(fs.readdirSync(path.join(sessionDir, 'citadel-remediation')).length, 1);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-current.json')), true);
   assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('standalone mux keeps unowned deterministic system blocks in autonomous diagnostic recovery', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  let citadelRuns = 0;
+  const result = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runCitadel: async (dir) => {
+      citadelRuns += 1;
+      writeCitadelSystemBlock(dir);
+      return 'citadel-system-blocked';
+    },
+    runDeterministicRecoveryDiagnostic: async () => ({ kind: 'retry_scheduled', reason: 'fixture diagnostic retry' }),
+  });
+
+  assert.equal(result, 'citadel_system_recovery_scheduled');
+  assert.equal(muxRunnerExitFailed(result), false);
+  assert.equal(citadelRuns, 1, 'restart_executor escalation must not hot-loop in one executor');
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Done');
+  assert.notEqual(readLogicalPipeline(sessionDir).control_state, 'prd_revision_required');
+  const diagnostic = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-deterministic-recovery.json'), 'utf8',
+  ));
+  assert.equal(diagnostic.status, 'diagnostic_scheduled');
+  assert.match(diagnostic.diagnostic_reason, /no ticket owner/i);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-attribution-repair.json')), false);
+});
+
+test('unowned deterministic diagnostic isolates malicious mutations and enqueues strict narrow recovery', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  writeCitadelSystemBlock(sessionDir, {
+    evidence: 'global check output points to the runtime ownership ticket',
+    checks: [{ command: 'npm test', status: 'failed', exit_code: 9, output: 'runtime ownership fixture failed' }],
+  });
+  const block = readCitadelSystemBlock(sessionDir);
+  assert.equal(consumeDeterministicCheckFailure(sessionDir, block).kind, 'diagnostic_recovery_scheduled');
+  let calls = 0;
+  const diagnosticWorktrees = [];
+  const liveHead = git(workingDir, ['rev-parse', 'HEAD']);
+  const liveReadme = fs.readFileSync(path.join(workingDir, 'README.md'), 'utf8');
+  const diagnostic = await runDeterministicRecoveryDiagnostic(sessionDir, {
+    runCodex: async ({ cwd, prompt }) => {
+      calls += 1;
+      diagnosticWorktrees.push(cwd);
+      assert.notEqual(cwd, workingDir);
+      fs.writeFileSync(path.join(cwd, 'README.md'), `malicious diagnostic mutation ${calls}\n`);
+      fs.writeFileSync(path.join(cwd, 'diagnostic-malware.txt'), 'must be discarded\n');
+      execFileSync('git', ['add', 'README.md', 'diagnostic-malware.txt'], { cwd });
+      execFileSync('git', [
+        '-c', 'user.name=Malicious Diagnostic', '-c', 'user.email=malicious@example.invalid',
+        'commit', '-qm', `malicious diagnostic commit ${calls}`,
+      ], { cwd });
+      const artifactPath = prompt.match(/Write diagnostic mapping artifact: ([^\n]+)/)?.[1]?.trim();
+      const failureIdentity = prompt.match(/Failure identity: ([a-f0-9]+)/)?.[1];
+      fs.writeFileSync(artifactPath, JSON.stringify(calls === 1 ? {
+        schema_version: 1,
+        failure_identity: failureIdentity,
+        mappings: [{ ticket_id: 'missing-ticket' }],
+      } : {
+        schema_version: 1,
+        failure_identity: failureIdentity,
+        mappings: [{
+          ticket_id: 'R1',
+          check_commands: ['npm test'],
+          acceptance_criteria: ['The launched runner renews exclusive durable ownership.'],
+          paths: ['README.md'],
+          rationale: 'The global test diagnostic names the runtime ownership fixture implemented by R1.',
+        }],
+      }));
+      return {
+        command: 'codex', args: [], exitCode: 0, stdout: '', stderr: '', timedOut: false,
+        durationMs: 1, lastMessage: '',
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usageReported: true, terminatedAfterSuccess: false, cancelled: false,
+        outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+      };
+    },
+  });
+  assert.deepEqual(diagnostic, { kind: 'resolved', ticket_ids: ['r1'] });
+  assert.equal(calls, 2);
+  assert.equal(git(workingDir, ['rev-parse', 'HEAD']), liveHead);
+  assert.equal(git(workingDir, ['status', '--porcelain']), '');
+  assert.equal(fs.readFileSync(path.join(workingDir, 'README.md'), 'utf8'), liveReadme);
+  assert.equal(fs.existsSync(path.join(workingDir, 'diagnostic-malware.txt')), false);
+  assert.equal(diagnosticWorktrees.every((worktree) => !fs.existsSync(worktree)), true);
+  const ticket = readManifest(sessionDir).tickets[0];
+  assert.equal(ticket.status, 'Todo');
+  assert.match(ticket.recovery_task, /runtime ownership fixture failed/);
+  assert.match(ticket.recovery_task, /README\.md/);
+  const journal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-deterministic-recovery.json'), 'utf8',
+  ));
+  assert.deepEqual(journal.diagnostic_attempts.map(({ status }) => status), ['rejected', 'resolved']);
+  assert.notEqual(journal.diagnostic_attempts[0].strategy_hash, journal.diagnostic_attempts[1].strategy_hash);
+  assert.deepEqual(journal.resolved_mappings[0].check_commands, ['npm test']);
+});
+
+test('deterministic system recovery uses five material ticket strategies then a novel autonomous diagnostic', () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  writeCitadelSystemBlock(sessionDir, {
+    evidence: 'node verification emitted exact diagnostic alpha',
+    checks: [{
+      command: "node -e 'process.exit(0)'",
+      status: 'failed',
+      exit_code: 7,
+      output: 'exact diagnostic alpha',
+    }],
+  });
+  const block = readCitadelSystemBlock(sessionDir);
+  const strategies = [];
+  for (let restart = 0; restart < 5; restart += 1) {
+    const recovery = consumeDeterministicCheckFailure(sessionDir, block);
+    assert.equal(recovery.kind, 'verification_repair_scheduled');
+    strategies.push(recovery.strategy_hash);
+    const ticket = readManifest(sessionDir).tickets[0];
+    assert.equal(ticket.status, 'Todo');
+    assert.match(ticket.recovery_task, /exact diagnostic alpha/);
+    assert.match(ticket.recovery_task, /node -e 'process\.exit\(0\)'/);
+  }
+  assert.equal(new Set(strategies).size, 5);
+  const boundary = consumeDeterministicCheckFailure(sessionDir, block);
+  assert.equal(boundary.kind, 'diagnostic_recovery_scheduled');
+  assert.match(boundary.reason, /strategies are exhausted/i);
+  const journal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-deterministic-recovery.json'), 'utf8',
+  ));
+  assert.equal(journal.status, 'diagnostic_scheduled');
+  assert.equal(journal.attempts.length, 6);
+  assert.match(journal.evidence, /exact diagnostic alpha/);
+  assert.equal(journal.failed_checks[0].output, 'exact diagnostic alpha');
+
+  writeCitadelSystemBlock(sessionDir, {
+    evidence: 'node verification emitted exact diagnostic beta',
+    checks: [{
+      command: "node -e 'process.exit(0)'", status: 'failed', exit_code: 7, output: 'exact diagnostic beta',
+    }],
+  });
+  const changedEvidence = consumeDeterministicCheckFailure(sessionDir, readCitadelSystemBlock(sessionDir));
+  assert.equal(changedEvidence.kind, 'verification_repair_scheduled');
+  const changedJournal = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'citadel-deterministic-recovery.json'), 'utf8',
+  ));
+  assert.notEqual(changedJournal.failure_identity, journal.failure_identity);
+  assert.equal(changedJournal.attempts.length, 1);
+});
+
+test('mixed owned and unowned failed commands require diagnostic attribution', () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  writeCitadelSystemBlock(sessionDir, {
+    evidence: 'one ticket check and one global check failed together',
+    checks: [
+      { command: "node -e 'process.exit(0)'", status: 'failed', exit_code: 7, output: 'owned failure' },
+      { command: 'npm test', status: 'failed', exit_code: 8, output: 'unowned failure' },
+    ],
+  });
+  const recovery = consumeDeterministicCheckFailure(sessionDir, readCitadelSystemBlock(sessionDir));
+  assert.equal(recovery.kind, 'diagnostic_recovery_scheduled');
+  assert.match(recovery.reason, /at least one failed deterministic command has no ticket owner/i);
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Done');
+});
+
+test('replacement diagnostic reaps orphan and resumes with a unique durable ordinal', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  writeCitadelSystemBlock(sessionDir, {
+    evidence: 'orphaned global diagnostic needs replacement',
+    checks: [{ command: 'npm test', status: 'failed', exit_code: 9, output: 'orphaned diagnostic' }],
+  });
+  consumeDeterministicCheckFailure(sessionDir, readCitadelSystemBlock(sessionDir));
+  const journalPath = path.join(sessionDir, 'citadel-deterministic-recovery.json');
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  journal.diagnostic_attempts = [{
+    ordinal: 1,
+    strategy_id: 'strict-evidence-attribution-1',
+    strategy_hash: 'a'.repeat(64),
+    status: 'started',
+    artifact_path: path.join(sessionDir, 'stale-diagnostic.json'),
+    attempted_at: new Date().toISOString(),
+  }];
+  fs.writeFileSync(journalPath, JSON.stringify(journal));
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const identity = captureSpawnedProcessIdentity(child.pid);
+  assert.ok(identity);
+  new StateManager().update(path.join(sessionDir, 'state.json'), (current) => {
+    current.active_child_pid = child.pid;
+    current.active_child_kind = 'codex';
+    current.active_child_command = 'citadel-deterministic-diagnostic-1';
+    current.active_child_identity = identity;
+    current.active_child_controller_pid = 999999;
+    return current;
+  });
+
+  const result = await runDeterministicRecoveryDiagnostic(sessionDir, {
+    runCodex: async ({ prompt }) => {
+      const artifactPath = prompt.match(/Write diagnostic mapping artifact: ([^\n]+)/)?.[1]?.trim();
+      const failureIdentity = prompt.match(/Failure identity: ([a-f0-9]+)/)?.[1];
+      fs.writeFileSync(artifactPath, JSON.stringify({
+        schema_version: 1,
+        failure_identity: failureIdentity,
+        mappings: [{
+          ticket_id: 'R1', check_commands: ['npm test'],
+          acceptance_criteria: ['The launched runner renews exclusive durable ownership.'],
+          paths: ['README.md'], rationale: 'The preserved diagnostic identifies R1 ownership.',
+        }],
+      }));
+      return {
+        command: 'codex', args: [], exitCode: 0, stdout: '', stderr: '', timedOut: false,
+        durationMs: 1, lastMessage: '',
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usageReported: true, terminatedAfterSuccess: false, cancelled: false,
+        outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+      };
+    },
+  });
+  assert.deepEqual(result, { kind: 'resolved', ticket_ids: ['r1'] });
+  assert.notEqual(inspectProcessLivenessIdentity(identity), 'matched');
+  const recovered = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  assert.deepEqual(recovered.diagnostic_attempts.map(({ ordinal, status }) => ({ ordinal, status })), [
+    { ordinal: 1, status: 'interrupted' },
+    { ordinal: 2, status: 'resolved' },
+  ]);
+  assert.equal(new StateManager().read(path.join(sessionDir, 'state.json')).active_child_pid, null);
+});
+
+test('standalone mux converges across restart after exact-owner deterministic recovery', async () => {
+  const { sessionDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const firstRun = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runCitadel: async (dir) => {
+      writeCitadelSystemBlock(dir, {
+        evidence: 'exact owner diagnostic from sealed verification',
+        checks: [{
+          command: "node -e 'process.exit(0)'",
+          status: 'failed',
+          exit_code: 7,
+          output: 'exact owner diagnostic from sealed verification',
+        }],
+      });
+      return 'citadel-system-blocked';
+    },
+  });
+  assert.equal(firstRun, 'citadel_system_recovery_scheduled');
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+
+  let repairedTickets = 0;
+  const secondRun = await runSequential(sessionDir, { runnerMode: 'pickle' }, {
+    runTicket: async (dir, ticketId) => {
+      repairedTickets += 1;
+      const ticket = readManifest(dir).tickets.find((candidate) => candidate.id === ticketId);
+      assert.match(ticket.recovery_task, /exact owner diagnostic from sealed verification/);
+      updateTicketStatus(dir, ticketId, { status: 'Done' });
+      return { status: 'done' };
+    },
+    runCitadel: approveCitadelFixture,
+  });
+  assert.equal(secondRun, 'success');
+  assert.equal(repairedTickets, 1);
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Done');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('pipeline routes Citadel PRD-contract system blocks to the authorized human boundary', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'route a Citadel PRD contract failure',
+  }));
+  ensurePipelineState(sessionDir);
+
+  const result = await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel: async (dir) => {
+      writeCitadelSystemBlock(dir, {
+        category: 'contract',
+        code: 'acceptance_criteria_missing',
+        title: 'Citadel has no acceptance criteria to verify',
+        evidence: 'The accepted PRD contract contains no acceptance criteria.',
+        recommendation: 'Approve a revised PRD with machine-checkable acceptance criteria.',
+        checks: [],
+        recovery_action: 'request_prd_revision',
+        attempt: 1,
+        bounded_attempt: 1,
+        next_action: 'retry_phase',
+      });
+      return 'citadel-system-blocked';
+    },
+  });
+
+  assert.equal(result, 'prd_revision_required');
+  assert.equal(pipelineExitFailed(result), false);
+  assert.equal(readLogicalPipeline(sessionDir).control_state, 'prd_revision_required');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Done');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('pipeline resumes a material Citadel verification-contract repair across executor restart', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'recover an unavailable deterministic gate',
+  }));
+  ensurePipelineState(sessionDir);
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const missing = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  delete missing.tickets[0].verification;
+  writeJson(manifestPath, missing);
+  let repairCalls = 0;
+
+  await assert.rejects(() => runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel: async (dir) => {
+      writeCitadelSystemBlock(dir, {
+        code: 'deterministic_gate_unavailable',
+        title: 'Citadel deterministic gate unavailable',
+        evidence: 'R1 has no substantive verification command.',
+        recommendation: 'Reconstruct R1 verification from its sealed contract.',
+        checks: [{ command: 'git diff --check', status: 'passed', exit_code: 0, output: '' }],
+        recovery_action: 'repair_verification_contract',
+        recovery_ticket_ids: ['R1'],
+        attempt: 1,
+        bounded_attempt: 1,
+        next_action: 'retry_phase',
+      });
+      return 'citadel-system-blocked';
+    },
+    repairTicketVerificationContract: async (dir, ticketId, options) => {
+      repairCalls += 1;
+      assert.equal(ticketId, 'R1');
+      assert.ok(options.strategy?.strategyHash);
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.tickets[0].verification = ['node -e "process.exit(0)"'];
+      manifest.tickets[0].status = 'Todo';
+      writeJson(manifestPath, manifest);
+      restructureTicketFiles(dir, manifest);
+      throw new Error('simulated executor loss after durable materialization');
+    },
+  }), /simulated executor loss/);
+  assert.equal(readManifest(sessionDir).tickets[0].status, 'Todo');
+  assert.equal(readManifest(sessionDir).tickets[0].verification.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-system-block.json'), 'utf8')).recovery_action, 'repair_verification_contract');
+
+  const rerunTickets = [];
+  const result = await runPipeline(sessionDir, {
+    runSequential: async (dir) => {
+      assert.equal(readPipelineState(dir).current_phase, 'pickle');
+      assert.equal(readManifest(dir).tickets[0].status, 'Todo');
+      for (const ticket of readManifest(dir).tickets.filter(({ status }) => status === 'Todo')) {
+        rerunTickets.push(ticket.id);
+        updateTicketStatus(dir, ticket.id, { status: 'Done' });
+      }
+      return 'success';
+    },
+    runCitadel: approveCitadelFixture,
+  });
+
+  assert.equal(result, 'success');
+  assert.equal(repairCalls, 1);
+  assert.deepEqual(rerunTickets, ['r1']);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-remediation-pending.json')), false);
+});
+
+test('sealed pipeline repairs a malformed authorized verifier and reaches real Citadel approval', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  prepareSealedVerificationRepairPipeline(
+    sessionDir,
+    workingDir,
+    'repair a malformed sealed verifier and complete the real release gate',
+  );
+  const fakeBin = makeTempRoot('production-supervisor-citadel-repair-bin-');
+  const dataRoot = makeTempRoot('production-supervisor-citadel-repair-data-');
+  createFakeCodex(fakeBin);
+  const rerunTickets = [];
+  let sequentialRuns = 0;
+
+  const result = await withProcessEnvironment(prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot }), async () => (
+    await runPipeline(sessionDir, {
+      runSequential: async (dir) => {
+        sequentialRuns += 1;
+        if (sequentialRuns === 1) return 'success';
+        for (const ticket of readManifest(dir).tickets.filter(({ status }) => status === 'Todo')) {
+          rerunTickets.push(ticket.id);
+          updateTicketStatus(dir, ticket.id, { status: 'Done' });
+        }
+        return 'success';
+      },
+    })
+  ));
+
+  assert.equal(result, 'success');
+  assert.equal(sequentialRuns, 2);
+  assert.deepEqual(rerunTickets, ['r1']);
+  assert.deepEqual(readManifest(sessionDir).tickets[0].verification, [
+    { kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] },
+  ]);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  assert.equal(readCitadelSystemBlock(sessionDir), null);
+  assert.doesNotThrow(() => assertCitadelReleaseApproval(sessionDir));
+});
+
+test('pipeline re-enters durable sealed verification repair after a crash before materialization', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  prepareSealedVerificationRepairPipeline(
+    sessionDir,
+    workingDir,
+    'survive a contract-repair crash before manifest materialization',
+  );
+  const fakeBin = makeTempRoot('production-supervisor-pre-materialization-bin-');
+  const dataRoot = makeTempRoot('production-supervisor-pre-materialization-data-');
+  createFakeCodex(fakeBin);
+  const transactionPath = path.join(sessionDir, 'verification-contract-repair-transaction.json');
+  let repairCalls = 0;
+  const crashOnceRepair = async (dir, ticketId, options) => {
+    repairCalls += 1;
+    return await repairTicketVerificationContract(dir, ticketId, {
+      ...options,
+      ...(repairCalls === 1
+        ? { beforeMaterialization: () => { throw new Error('simulated crash before materialization'); } }
+        : {}),
+    });
+  };
+  const environment = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+
+  await assert.rejects(
+    () => withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+      runSequential: async () => 'success',
+      repairTicketVerificationContract: crashOnceRepair,
+    })),
+    /simulated crash before materialization/,
+  );
+  assert.equal(repairCalls, 1);
+  assert.equal(fs.existsSync(transactionPath), true);
+  const interruptedManifest = JSON.parse(fs.readFileSync(
+    path.join(sessionDir, 'refinement_manifest.json'),
+    'utf8',
+  ));
+  assert.equal(typeof interruptedManifest.tickets[0].verification[0].args, 'string');
+  assert.equal(readCitadelSystemBlock(sessionDir)?.recovery_action, 'repair_verification_contract');
+
+  const rerunTickets = [];
+  const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+    repairTicketVerificationContract: crashOnceRepair,
+    runSequential: async (dir) => {
+      for (const ticket of readManifest(dir).tickets.filter(({ status }) => status === 'Todo')) {
+        rerunTickets.push(ticket.id);
+        updateTicketStatus(dir, ticket.id, { status: 'Done' });
+      }
+      return 'success';
+    },
+  }));
+
+  assert.equal(result, 'success');
+  assert.equal(repairCalls, 2);
+  assert.deepEqual(rerunTickets, ['r1']);
+  assert.equal(fs.existsSync(transactionPath), false);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  assert.equal(readCitadelSystemBlock(sessionDir), null);
+  assert.doesNotThrow(() => assertCitadelReleaseApproval(sessionDir));
+  assert.match(
+    fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8'),
+    /Re-entered durable Citadel verification-contract repair before phase dispatch/,
+  );
 });
 
 test('standalone mux durably resumes unattributed Citadel repair and preserves unrelated Done checkpoints', async () => {

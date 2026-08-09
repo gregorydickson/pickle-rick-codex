@@ -64,6 +64,7 @@ import {
   restoreRejectedCandidateCheckpoint,
 } from '../services/candidate-recovery.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
+import { createDisposableDetachedWorktree } from '../services/disposable-worktree.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
   normalizeTicketId,
@@ -723,6 +724,7 @@ export async function repairTicketVerificationContract(
     timeoutMs?: number;
     diagnosticOnly?: boolean;
     assertDurableOwnership?: () => void;
+    beforeMaterialization?: () => void;
     afterMaterialization?: () => void;
   } = {},
 ): Promise<VerificationStep[]> {
@@ -755,10 +757,11 @@ export async function repairTicketVerificationContract(
   const lastMessagePath = path.join(sessionDir, `${normalizedTicketId}.contract-repair.last-message.txt`);
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true, mode: 0o700 });
   fs.rmSync(artifactPath, { force: true });
+  const isolated = createDisposableDetachedWorktree(workingDir, 'pickle-contract-repair-');
   const prompt = [
     'You are the autonomous verification contract repair worker.',
     `Session dir: ${sessionDir}`,
-    `Working directory: ${workingDir}`,
+    `Disposable repository checkpoint: ${isolated.workingDir}`,
     `Ticket ID: ${normalizedTicketId}`,
     `Contract repair artifact path: ${artifactPath}`,
     `Immutable acceptance criteria JSON: ${acceptanceIdentity}`,
@@ -777,7 +780,7 @@ export async function repairTicketVerificationContract(
   let result;
   try {
     result = await runCodexExecMonitored({
-      execArgs: ['--sandbox', 'workspace-write'], cwd: workingDir, prompt,
+      execArgs: ['--sandbox', 'workspace-write'], cwd: isolated.workingDir, prompt,
       timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
       outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [sessionDir], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CONTRACT_REPAIR_COMPLETE') || hasPromiseToken(lastMessage, 'CONTRACT_REPAIR_COMPLETE'),
@@ -786,8 +789,16 @@ export async function repairTicketVerificationContract(
     });
     assertOwnership();
   } finally {
-    if (!ownershipDrainError) {
-      updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
+    try {
+      isolated.assertLiveUnchanged();
+    } finally {
+      try {
+        isolated.cleanup();
+      } finally {
+        if (!ownershipDrainError) {
+          updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
+        }
+      }
     }
   }
   assertCodexSucceeded(result, `Verification contract repair failed for ${normalizedTicketId}`);
@@ -848,6 +859,7 @@ export async function repairTicketVerificationContract(
       prepared_at: new Date().toISOString(),
     };
     atomicWriteJson(path.join(sessionDir, VERIFICATION_REPAIR_TRANSACTION_FILE), transaction);
+    options.beforeMaterialization?.();
     runTicketTransaction(
       sessionDir,
       'repair-sealed-verification-contract',

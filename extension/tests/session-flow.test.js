@@ -3894,9 +3894,11 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     () => runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir }),
     /Command failed/,
   );
-  const report = readJsonFile(path.join(sessionDir, 'citadel-report.json'));
-  assert.equal(report.verdict, 'block');
-  assert.match(report.findings[0].title, /no acceptance criteria/i);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+  const systemBlock = readJsonFile(path.join(sessionDir, 'citadel-system-block.json'));
+  assert.equal(systemBlock.artifact_kind, 'citadel_system_block');
+  assert.equal(systemBlock.code, 'acceptance_criteria_missing');
+  assert.match(systemBlock.title, /no acceptance criteria/i);
 });
 
 test('Citadel rejects deterministic check and reviewer index mutations', () => {
@@ -4035,7 +4037,7 @@ for (const [name, extraEnv, expectedEvidence] of [
   });
 }
 
-test('Citadel runs the repository whitespace check when no project script exists', () => {
+test('Citadel records hygiene but blocks when no substantive deterministic gate exists', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -4053,12 +4055,17 @@ test('Citadel runs the repository whitespace check when no project script exists
     tickets: [{ acceptance_criteria: ['A deterministic release check executes.'] }],
   });
 
-  runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir });
+  assert.throws(
+    () => runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir }),
+    /Command failed/,
+  );
   const checks = readJsonFile(path.join(sessionDir, 'citadel-checks.json')).checks;
-  const report = readJsonFile(path.join(sessionDir, 'citadel-report.json'));
+  const systemBlock = readJsonFile(path.join(sessionDir, 'citadel-system-block.json'));
   assert.deepEqual(checks.map((check) => check.status), ['skipped', 'skipped', 'skipped', 'passed']);
   assert.equal(checks.at(-1).command, 'git diff --check');
-  assert.equal(report.verdict, 'approve');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+  assert.equal(systemBlock.code, 'deterministic_gate_unavailable');
+  assert.equal(systemBlock.recovery_action, 'request_prd_revision');
 });
 
 test('Citadel cancellation reaps a mutating deterministic check and restores the clean checkpoint', async () => {

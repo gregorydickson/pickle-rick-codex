@@ -22,7 +22,10 @@ import {
   verificationStepCommand,
   verificationStepIdentity,
 } from './verification-env.js';
-import { assertAllTicketVerificationBoundToSeal } from './verification-seal-contract.js';
+import {
+  assertAllTicketVerificationBoundToSeal,
+  resolveSealedVerificationAuthorization,
+} from './verification-seal-contract.js';
 import type { CodexSpawnResult, VerificationStep } from '../types/index.js';
 
 export type CitadelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -31,12 +34,12 @@ export interface CitadelFinding {
   severity: CitadelSeverity;
   title: string;
   evidence: string;
-  file?: string | null;
-  line?: number | null;
-  recommendation?: string | null;
-  ticket_ids?: string[];
-  acceptance_criteria?: string[];
-  paths?: string[];
+  file: string | null;
+  line: number | null;
+  recommendation: string | null;
+  ticket_ids: string[];
+  acceptance_criteria: string[];
+  paths: string[];
 }
 
 export interface CitadelReport {
@@ -53,6 +56,32 @@ export interface CitadelCheckResult {
   status: 'passed' | 'failed' | 'skipped';
   exit_code: number | null;
   output: string;
+}
+
+export type CitadelSystemBlockCode =
+  | 'scope_contract_invalid'
+  | 'acceptance_criteria_missing'
+  | 'deterministic_check_failed'
+  | 'deterministic_gate_unavailable';
+
+export interface CitadelSystemBlockArtifact {
+  schema_version: 1;
+  artifact_kind: 'citadel_system_block';
+  category: 'contract' | 'infrastructure';
+  code: CitadelSystemBlockCode;
+  reviewed_range: string;
+  title: string;
+  evidence: string;
+  recommendation: string;
+  checks: CitadelCheckResult[];
+  recovery_action: 'request_prd_revision' | 'retry_checks' | 'repair_verification_contract';
+  recovery_ticket_ids: string[];
+  failure_identity: string;
+  attempt: number;
+  recovery_epoch: number;
+  bounded_attempt: number;
+  next_action: 'retry_phase' | 'restart_executor';
+  generated_at: string;
 }
 
 export class CitadelReviewerArtifactError extends Error {
@@ -123,25 +152,52 @@ function criteriaFromSeal(sessionDir: string): string[] | null {
   return seal.acceptance_criteria.map((criterion) => `${criterion.id}: ${criterion.text}`);
 }
 
-function verificationStepsFromManifest(sessionDir: string, workingDir: string): VerificationStep[] {
-  assertAllTicketVerificationBoundToSeal(sessionDir, workingDir);
+function verificationGateFromManifest(
+  sessionDir: string,
+  workingDir: string,
+): { steps: VerificationStep[]; repairTicketIds: string[]; repairBeforeChecks: boolean } {
   const manifest = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'refinement_manifest.json'), null);
-  if (!Array.isArray(manifest?.tickets)) return [];
+  if (!Array.isArray(manifest?.tickets)) {
+    return { steps: [], repairTicketIds: [], repairBeforeChecks: false };
+  }
+  const sealed = fs.existsSync(path.join(sessionDir, 'prd.lock.json'));
+  const repairTicketIds: string[] = [];
   const steps = manifest.tickets.flatMap((ticket) => {
     if (!ticket || typeof ticket !== 'object' || Array.isArray(ticket)) return [];
     const record = ticket as Record<string, unknown>;
-    return normalizeVerificationSteps(record.verification, {
-      verify: typeof record.verify === 'string' ? record.verify : undefined,
-      cwd: workingDir,
-    });
+    const ticketId = typeof record.id === 'string' ? record.id.trim() : '';
+    const authorization = sealed && ticketId
+      ? resolveSealedVerificationAuthorization(sessionDir, ticketId)
+      : null;
+    try {
+      const normalized = normalizeVerificationSteps(record.verification, {
+        verify: typeof record.verify === 'string' ? record.verify : undefined,
+        cwd: workingDir,
+      });
+      if (normalized.length === 0 && ticketId && (authorization || !sealed)) {
+        repairTicketIds.push(ticketId);
+        return [];
+      }
+      return normalized;
+    } catch (error) {
+      if (ticketId && authorization) {
+        repairTicketIds.push(ticketId);
+        return [];
+      }
+      throw error;
+    }
   });
+  if (sealed && repairTicketIds.length > 0) {
+    return { steps: [], repairTicketIds: uniqueStrings(repairTicketIds), repairBeforeChecks: true };
+  }
+  assertAllTicketVerificationBoundToSeal(sessionDir, workingDir);
   const seen = new Set<string>();
-  return steps.filter((step) => {
+  return { steps: steps.filter((step) => {
     const identity = verificationStepIdentity([step]);
     if (seen.has(identity)) return false;
     seen.add(identity);
     return true;
-  });
+  }), repairTicketIds: uniqueStrings(repairTicketIds), repairBeforeChecks: false };
 }
 
 function criteriaFromPrd(markdown: string): string[] {
@@ -186,6 +242,53 @@ export function deriveCitadelAcceptanceCriteria(sessionDir: string): string[] {
 
 export function citadelReportPath(sessionDir: string): string {
   return path.join(sessionDir, 'citadel-report.json');
+}
+
+export function citadelSystemBlockPath(sessionDir: string): string {
+  return path.join(sessionDir, 'citadel-system-block.json');
+}
+
+export function readCitadelSystemBlock(sessionDir: string): CitadelSystemBlockArtifact | null {
+  const raw = readJsonFile<Record<string, unknown>>(citadelSystemBlockPath(sessionDir), null);
+  if (!raw) return null;
+  const requiredKeys = [
+    'schema_version', 'artifact_kind', 'category', 'code', 'reviewed_range', 'title', 'evidence',
+    'recommendation', 'checks', 'recovery_action', 'recovery_ticket_ids', 'failure_identity', 'attempt',
+    'recovery_epoch', 'bounded_attempt', 'next_action', 'generated_at',
+  ];
+  if (Object.keys(raw).sort().join('\0') !== [...requiredKeys].sort().join('\0')) {
+    throw new Error('Invalid Citadel system block artifact: schema keys do not match the canonical contract.');
+  }
+  const codes = new Set<CitadelSystemBlockCode>([
+    'scope_contract_invalid', 'acceptance_criteria_missing',
+    'deterministic_check_failed', 'deterministic_gate_unavailable',
+  ]);
+  const checks = raw.checks;
+  const validChecks = Array.isArray(checks) && checks.every((check) => {
+    if (!check || typeof check !== 'object' || Array.isArray(check)) return false;
+    const value = check as Record<string, unknown>;
+    return typeof value.command === 'string' && value.command.trim().length > 0
+      && ['passed', 'failed', 'skipped'].includes(String(value.status))
+      && (value.exit_code === null || Number.isInteger(value.exit_code))
+      && typeof value.output === 'string';
+  });
+  const positiveInteger = (value: unknown): boolean => Number.isInteger(value) && Number(value) > 0;
+  if (raw.schema_version !== 1 || raw.artifact_kind !== 'citadel_system_block'
+    || !['contract', 'infrastructure'].includes(String(raw.category))
+    || !codes.has(raw.code as CitadelSystemBlockCode)
+    || !['reviewed_range', 'title', 'evidence', 'recommendation', 'failure_identity', 'generated_at']
+      .every((field) => typeof raw[field] === 'string' && String(raw[field]).trim().length > 0)
+    || !validChecks
+    || !['request_prd_revision', 'retry_checks', 'repair_verification_contract']
+      .includes(String(raw.recovery_action))
+    || !Array.isArray(raw.recovery_ticket_ids)
+    || !raw.recovery_ticket_ids.every((entry) => typeof entry === 'string' && entry.trim().length > 0)
+    || !positiveInteger(raw.attempt) || !positiveInteger(raw.recovery_epoch)
+    || ![1, 2].includes(Number(raw.bounded_attempt))
+    || !['retry_phase', 'restart_executor'].includes(String(raw.next_action))) {
+    throw new Error('Invalid Citadel system block artifact: field values do not match the canonical contract.');
+  }
+  return raw as unknown as CitadelSystemBlockArtifact;
 }
 
 export function getCitadelRepositoryFingerprint(workingDir: string): string {
@@ -275,6 +378,14 @@ function normalizeFinding(value: unknown, index: number): CitadelFinding {
     throw new Error(`Invalid Citadel finding ${index}: expected an object.`);
   }
   const raw = value as Record<string, unknown>;
+  const requiredFields = [
+    'severity', 'title', 'evidence', 'file', 'line', 'recommendation',
+    'ticket_ids', 'acceptance_criteria', 'paths',
+  ] as const;
+  const missingFields = requiredFields.filter((field) => !Object.hasOwn(raw, field));
+  if (missingFields.length > 0) {
+    throw new Error(`Invalid Citadel finding ${index}: missing required fields: ${missingFields.join(', ')}.`);
+  }
   const severity = String(raw.severity || '').toLowerCase() as CitadelSeverity;
   if (!SEVERITIES.has(severity)) {
     throw new Error(`Invalid Citadel finding ${index}: unsupported severity ${JSON.stringify(raw.severity)}.`);
@@ -284,27 +395,43 @@ function normalizeFinding(value: unknown, index: number): CitadelFinding {
   if (!title || !evidence) {
     throw new Error(`Invalid Citadel finding ${index}: title and evidence are required.`);
   }
+  if (raw.file !== null && typeof raw.file !== 'string') {
+    throw new Error(`Invalid Citadel finding ${index}: file must be a string or null.`);
+  }
+  if (raw.line !== null && (!Number.isInteger(raw.line) || Number(raw.line) <= 0)) {
+    throw new Error(`Invalid Citadel finding ${index}: line must be a positive integer or null.`);
+  }
+  if (raw.recommendation !== null && typeof raw.recommendation !== 'string') {
+    throw new Error(`Invalid Citadel finding ${index}: recommendation must be a string or null.`);
+  }
   for (const field of ['ticket_ids', 'acceptance_criteria', 'paths'] as const) {
-    if (raw[field] !== undefined && (!Array.isArray(raw[field])
-      || !(raw[field] as unknown[]).every((entry) => typeof entry === 'string' && entry.trim()))) {
+    const value = raw[field];
+    if (!Array.isArray(value)
+      || !value.every((entry) => typeof entry === 'string' && entry.trim().length > 0)) {
       throw new Error(`Invalid Citadel finding ${index}: ${field} must contain non-empty strings.`);
     }
   }
   const ticketIds = stringArray(raw.ticket_ids);
   const acceptanceCriteria = stringArray(raw.acceptance_criteria);
   const paths = stringArray(raw.paths);
+  if ((severity === 'critical' || severity === 'high')
+    && (ticketIds.length === 0 || acceptanceCriteria.length === 0 || paths.length === 0)) {
+    throw new Error(
+      `Invalid Citadel finding ${index}: critical/high findings require non-empty ticket_ids, acceptance_criteria, and paths.`,
+    );
+  }
   return {
     severity,
     title,
     evidence,
     file: typeof raw.file === 'string' && raw.file.trim() ? raw.file.trim() : null,
-    line: Number.isInteger(raw.line) && Number(raw.line) > 0 ? Number(raw.line) : null,
+    line: raw.line === null ? null : Number(raw.line),
     recommendation: typeof raw.recommendation === 'string' && raw.recommendation.trim()
       ? raw.recommendation.trim()
       : null,
-    ...(ticketIds.length > 0 ? { ticket_ids: ticketIds } : {}),
-    ...(acceptanceCriteria.length > 0 ? { acceptance_criteria: acceptanceCriteria } : {}),
-    ...(paths.length > 0 ? { paths } : {}),
+    ticket_ids: ticketIds,
+    acceptance_criteria: acceptanceCriteria,
+    paths,
   };
 }
 
@@ -375,7 +502,9 @@ interface CitadelReviewAttemptState {
   candidate_hash?: string;
   approval_signal?: boolean;
   strategy_id: string;
+  material_strategy_hash: string;
   strategy_hash: string;
+  retry_feedback: string | null;
   model_attempt_id?: number;
   telemetry_status?: 'started' | 'finalized';
   telemetry_result?: CodexSpawnResult;
@@ -397,16 +526,39 @@ function writeCitadelReviewState(filePath: string, state: CitadelReviewState): v
   atomicWriteJson(filePath, state);
 }
 
-function citadelReviewerStrategy(epoch: number): { id: string; instruction: string; hash: string } {
-  const variants = [
-    { id: 'standard-schema-review', instruction: 'Perform the standard evidence-grounded Citadel review.' },
-    { id: 'strict-minimal-json', instruction: 'Use a strict minimal JSON construction pass: build only the required keys and arrays, then verify each type before writing.' },
-    { id: 'independent-fresh-review', instruction: 'Start an independent fresh review from the deterministic evidence; do not reuse or repair a prior candidate.' },
-    { id: 'artifact-normalization', instruction: 'Normalize the complete report in memory against the required schema before one final atomic write.' },
-  ];
-  const selected = variants[Math.min(Math.max(epoch - 1, 0), variants.length - 1)];
-  const instruction = `${selected.instruction} Recovery epoch: ${epoch}.`;
-  return { id: selected.id, instruction, hash: reportHash({ id: selected.id, instruction }) };
+const CITADEL_REVIEWER_STRATEGIES = [
+  { id: 'standard-schema-review', instruction: 'Perform an evidence-grounded review, then serialize the complete report schema.' },
+  { id: 'strict-minimal-json', instruction: 'Construct only the required JSON keys and arrays, validating every value type before writing.' },
+  { id: 'independent-fresh-review', instruction: 'Discard prior candidate reasoning and independently re-read the deterministic evidence before producing a fresh report.' },
+  { id: 'typed-intermediate-model', instruction: 'Build a typed in-memory checklist for range, criteria, and findings, then serialize that checked model exactly once.' },
+  { id: 'adversarial-two-pass', instruction: 'Use separate author and validator passes: draft the report, audit it against every schema invariant, then write only the audited result.' },
+] as const;
+
+function citadelReviewerStrategy(
+  strategyId: string,
+): { id: string; instruction: string; hash: string } {
+  const selected = CITADEL_REVIEWER_STRATEGIES.find((entry) => entry.id === strategyId)
+    ?? CITADEL_REVIEWER_STRATEGIES[0];
+  return {
+    ...selected,
+    hash: reportHash({ id: selected.id, instruction: selected.instruction }),
+  };
+}
+
+function normalizeCitadelRetryFeedback(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const message = (value instanceof Error ? value.message : String(value)).replace(/\s+/g, ' ').trim();
+  return message ? message.slice(0, 1_000) : null;
+}
+
+function citadelReviewerAttemptHash(
+  strategy: { id: string; instruction: string },
+  retryFeedback: string | null,
+): string {
+  return reportHash({
+    material_approach: { id: strategy.id, instruction: strategy.instruction },
+    retry_feedback: retryFeedback,
+  });
 }
 
 function readBoundedReviewerCandidateBytes(
@@ -850,7 +1002,7 @@ function buildCitadelPrompt(
     `Citadel report path: ${reportPath}`,
     'Write exactly one JSON object there with keys: schema_version, verdict, reviewed_range, acceptance_criteria_checked, findings, generated_at.',
     'Each finding must have severity (critical|high|medium|low|info), title, evidence, file, line, recommendation, ticket_ids, acceptance_criteria, and paths.',
-    'For every blocking finding, attribute the exact affected ticket ids, criteria, and repository-relative paths; use empty arrays only when that dimension genuinely does not apply.',
+    'For every critical/high finding, ticket_ids, acceptance_criteria, and paths must each be non-empty and identify the exact affected tickets, criteria, and repository-relative paths.',
     'Use verdict block when any critical/high finding exists; otherwise approve.',
     'After writing the report, return <promise>THE_CITADEL_APPROVES</promise>.',
     ...(retryFeedback ? [`The previous candidate was rejected: ${retryFeedback}. Write a complete fresh candidate.`] : []),
@@ -882,20 +1034,48 @@ function restoreMutatedCitadelCheckpoint(
   return true;
 }
 
-function blockedEvidenceReport(
-  reviewedRange: string,
-  expectedAcceptanceCriteria: string[],
-  title: string,
-  evidence: string,
-): CitadelReport {
-  return {
+function persistCitadelSystemBlock(
+  sessionDir: string,
+  input: Pick<CitadelSystemBlockArtifact,
+    'category' | 'code' | 'reviewed_range' | 'title' | 'evidence' | 'recommendation' | 'checks'
+    | 'recovery_action' | 'recovery_ticket_ids'>,
+): CitadelSystemBlockArtifact {
+  const failureIdentity = reportHash({
+    category: input.category,
+    code: input.code,
+    reviewed_range: input.reviewed_range,
+    title: input.title,
+    evidence: input.evidence.replace(/\s+/g, ' ').trim(),
+    recommendation: input.recommendation,
+    recovery_action: input.recovery_action,
+    recovery_ticket_ids: input.recovery_ticket_ids,
+    checks: input.checks.map(({ command, status, exit_code, output }) => ({ command, status, exit_code, output })),
+  });
+  const prior = readCitadelSystemBlock(sessionDir);
+  const attempt = prior?.failure_identity === failureIdentity ? prior.attempt + 1 : 1;
+  const boundedAttempt = ((attempt - 1) % 2) + 1;
+  const artifact: CitadelSystemBlockArtifact = {
     schema_version: 1,
-    verdict: 'block',
-    reviewed_range: reviewedRange,
-    acceptance_criteria_checked: expectedAcceptanceCriteria,
-    findings: [{ severity: 'high', title, evidence, file: null, line: null, recommendation: 'Supply complete, executable Citadel evidence before release.' }],
+    artifact_kind: 'citadel_system_block',
+    category: input.category,
+    code: input.code,
+    reviewed_range: input.reviewed_range,
+    title: input.title,
+    evidence: input.evidence,
+    recommendation: input.recommendation,
+    checks: input.checks,
+    recovery_action: input.recovery_action,
+    recovery_ticket_ids: input.recovery_ticket_ids,
+    failure_identity: failureIdentity,
+    attempt,
+    recovery_epoch: Math.ceil(attempt / 2),
+    bounded_attempt: boundedAttempt,
+    next_action: boundedAttempt === 1 ? 'retry_phase' : 'restart_executor',
     generated_at: new Date().toISOString(),
   };
+  fs.rmSync(citadelReportPath(sessionDir), { force: true });
+  atomicWriteJson(citadelSystemBlockPath(sessionDir), artifact);
+  return readCitadelSystemBlock(sessionDir)!;
 }
 
 function reachableCitadelBase(workingDir: string, candidate: unknown): string | null {
@@ -943,7 +1123,7 @@ export async function runCitadel(
     assertDurableOwnership?: () => void;
     faultInjection?: (point: 'validated-before-telemetry') => void;
   } = {},
-): Promise<'success' | 'citadel-blocked' | 'cancelled'> {
+): Promise<'success' | 'citadel-blocked' | 'citadel-system-blocked' | 'cancelled'> {
   let ownershipDrainError: unknown = null;
   const assertOwnership = (): void => {
     if (ownershipDrainError) throw ownershipDrainError;
@@ -978,23 +1158,33 @@ export async function runCitadel(
   const scopeFailure = auditPersistedScopeForCitadel(sessionDir, workingDir);
   if (scopeFailure) {
     assertOwnership();
-    atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
-      reviewedRange,
-      expectedAcceptanceCriteria,
-      'Citadel scope contract is invalid',
-      scopeFailure,
-    ));
-    return 'citadel-blocked';
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'contract',
+      code: 'scope_contract_invalid',
+      reviewed_range: reviewedRange,
+      title: 'Citadel scope contract is invalid',
+      evidence: scopeFailure,
+      recommendation: 'Repair and revalidate the persisted scope contract before release review.',
+      checks: [],
+      recovery_action: 'request_prd_revision',
+      recovery_ticket_ids: [],
+    });
+    return 'citadel-system-blocked';
   }
   if (expectedAcceptanceCriteria.length === 0) {
     assertOwnership();
-    atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
-      reviewedRange,
-      [],
-      'Citadel has no acceptance criteria to verify',
-      'Neither the refinement manifest nor the session PRD declares acceptance criteria.',
-    ));
-    return 'citadel-blocked';
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'contract',
+      code: 'acceptance_criteria_missing',
+      reviewed_range: reviewedRange,
+      title: 'Citadel has no acceptance criteria to verify',
+      evidence: 'Neither the refinement manifest nor the session PRD declares acceptance criteria.',
+      recommendation: 'Restore the accepted PRD or refinement acceptance-criteria contract before release review.',
+      checks: [],
+      recovery_action: 'request_prd_revision',
+      recovery_ticket_ids: [],
+    });
+    return 'citadel-system-blocked';
   }
   const checkpointHead = getHeadSha(workingDir);
   const releaseCheckpointFingerprint = getCitadelRepositoryFingerprint(workingDir);
@@ -1026,7 +1216,24 @@ export async function runCitadel(
   };
   try {
   const checksPath = path.join(sessionDir, 'citadel-checks.json');
-  const verificationSteps = verificationStepsFromManifest(sessionDir, citadelWorkingDir);
+  const verificationGate = verificationGateFromManifest(sessionDir, citadelWorkingDir);
+  if (verificationGate.repairBeforeChecks) {
+    assertOwnership();
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'infrastructure',
+      code: 'deterministic_gate_unavailable',
+      reviewed_range: reviewedRange,
+      title: 'Citadel ticket verification contract is missing or malformed',
+      evidence: `Seal-bound deterministic verification cannot execute for: ${verificationGate.repairTicketIds.join(', ')}.`,
+      recommendation: 'Reconstruct each identified manifest verifier from its exact sealed authorization before release review.',
+      checks: [],
+      recovery_action: 'repair_verification_contract',
+      recovery_ticket_ids: verificationGate.repairTicketIds,
+    });
+    assertReleaseWorkspaceUnchanged();
+    return 'citadel-system-blocked';
+  }
+  const verificationSteps = verificationGate.steps;
   const checksBinding = {
     checkpoint_head: checkpointHead,
     release_fingerprint: releaseCheckpointFingerprint,
@@ -1106,38 +1313,45 @@ export async function runCitadel(
     throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.');
   }
   if (checks.some((check) => check.status === 'failed')) {
-    const report: CitadelReport = {
-      schema_version: 1,
-      verdict: 'block',
+    const failedChecks = checks.filter((check) => check.status === 'failed');
+    assertOwnership();
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'infrastructure',
+      code: 'deterministic_check_failed',
       reviewed_range: reviewedRange,
-      acceptance_criteria_checked: [],
-      findings: checks
-        .filter((check) => check.status === 'failed')
-        .map((check) => ({
-          severity: 'high',
-          title: `Deterministic check failed: ${check.command}`,
-          evidence: check.output || `exit code ${check.exit_code}`,
-          file: null,
-          line: null,
-          recommendation: `Fix ${check.command} before continuing the pipeline.`,
-        })),
-      generated_at: new Date().toISOString(),
-    };
-    assertOwnership();
-    atomicWriteJson(citadelReportPath(sessionDir), report);
+      title: 'Citadel deterministic checks failed before reviewer attribution',
+      evidence: failedChecks
+        .map((check) => `${check.command}: ${check.output || `exit code ${check.exit_code}`}`)
+        .join('\n\n'),
+      recommendation: 'Retry the deterministic gate, then escalate through an isolated executor restart if it remains red.',
+      checks: failedChecks,
+      recovery_action: 'retry_checks',
+      recovery_ticket_ids: [],
+    });
     assertReleaseWorkspaceUnchanged();
-    return 'citadel-blocked';
+    return 'citadel-system-blocked';
   }
-  if (!checks.some((check) => check.status === 'passed')) {
+  const hasSubstantiveDeterministicGate = checks.some((check) => (
+    check.status === 'passed' && check.command !== 'git diff --check'
+  ));
+  if (!hasSubstantiveDeterministicGate) {
+    const repairTicketIds = verificationGate.repairTicketIds;
     assertOwnership();
-    atomicWriteJson(citadelReportPath(sessionDir), blockedEvidenceReport(
-      reviewedRange,
-      expectedAcceptanceCriteria,
-      'Citadel deterministic gate unavailable',
-      'No declared deterministic typecheck, lint, or test command executed.',
-    ));
+    persistCitadelSystemBlock(sessionDir, {
+      category: 'infrastructure',
+      code: 'deterministic_gate_unavailable',
+      reviewed_range: reviewedRange,
+      title: 'Citadel deterministic gate unavailable',
+      evidence: 'No declared substantive typecheck, lint, test, or ticket verification command executed; repository hygiene alone is not a release gate.',
+      recommendation: repairTicketIds.length > 0
+        ? 'Reconstruct each identified manifest verifier before release review.'
+        : 'Approve a revised PRD contract that assigns deterministic verification to an exact ticket.',
+      checks,
+      recovery_action: repairTicketIds.length > 0 ? 'repair_verification_contract' : 'request_prd_revision',
+      recovery_ticket_ids: repairTicketIds,
+    });
     assertReleaseWorkspaceUnchanged();
-    return 'citadel-blocked';
+    return 'citadel-system-blocked';
   }
 
   const reportPath = citadelReportPath(sessionDir);
@@ -1161,11 +1375,26 @@ export async function runCitadel(
     attempts: [],
     updated_at: new Date().toISOString(),
   };
+  const usedStrategyIds = new Set(reviewState.attempts.map((attempt) => attempt.strategy_id));
+  let strategyCatalogExhausted = false;
   if (sameReview && reviewState.status === 'exhausted') {
-    reviewState.recovery_epoch += 1;
-    reviewState.status = 'running';
+    const nextStrategy = CITADEL_REVIEWER_STRATEGIES.find((entry) => !usedStrategyIds.has(entry.id));
+    if (nextStrategy) {
+      reviewState.recovery_epoch += 1;
+      reviewState.strategy_id = nextStrategy.id;
+      reviewState.status = 'running';
+    } else {
+      strategyCatalogExhausted = true;
+    }
   }
-  const reviewStrategy = citadelReviewerStrategy(reviewState.recovery_epoch);
+  const reviewStrategy = strategyCatalogExhausted
+    ? {
+        id: reviewState.strategy_id,
+        instruction: CITADEL_REVIEWER_STRATEGIES.find((entry) => entry.id === reviewState.strategy_id)?.instruction
+          ?? CITADEL_REVIEWER_STRATEGIES[0].instruction,
+        hash: reviewState.strategy_hash,
+      }
+    : citadelReviewerStrategy(reviewState.strategy_id);
   reviewState.strategy_id = reviewStrategy.id;
   reviewState.strategy_hash = reviewStrategy.hash;
   for (const priorAttempt of reviewState.attempts) {
@@ -1217,8 +1446,12 @@ export async function runCitadel(
   let report: CitadelReport | null = recoveredReport;
   let finalValidationError: unknown = [...reviewState.attempts].reverse()
     .find((entry) => entry.validation_error)?.validation_error ?? null;
-  let retryFeedback: string | null = finalValidationError
-    ? String(finalValidationError).slice(0, 1_000) : null;
+  if (strategyCatalogExhausted) {
+    finalValidationError = new Error(
+      'Citadel reviewer artifact recovery exhausted: no unused material reviewer strategy remains for unchanged evidence.',
+    );
+  }
+  let retryFeedback = normalizeCitadelRetryFeedback(finalValidationError);
   for (let attempt = usedAttempts + 1; !report && attempt <= CITADEL_REVIEWER_MAX_ATTEMPTS; attempt += 1) {
     result = null;
     const ordinal = nextAttemptOrdinal;
@@ -1230,6 +1463,7 @@ export async function runCitadel(
     const attemptChecksPath = path.join(attemptDir, 'citadel-checks.json');
     fs.copyFileSync(checksPath, attemptChecksPath);
     const attemptChecksHash = fileHash(attemptChecksPath);
+    const attemptStrategyHash = citadelReviewerAttemptHash(reviewStrategy, retryFeedback);
     const outputLastMessagePath = path.join(sessionDir, `citadel-review-attempt-${attemptKey}.last-message.txt`);
     fs.rmSync(outputLastMessagePath, { force: true });
     fs.rmSync(candidatePath, { force: true });
@@ -1240,7 +1474,9 @@ export async function runCitadel(
       candidate_path: candidatePath,
       status: 'started',
       strategy_id: reviewStrategy.id,
-      strategy_hash: reviewStrategy.hash,
+      material_strategy_hash: reviewStrategy.hash,
+      strategy_hash: attemptStrategyHash,
+      retry_feedback: retryFeedback,
       started_at: new Date().toISOString(),
     };
     reviewState.attempts.push(journalAttempt);
@@ -1261,7 +1497,7 @@ export async function runCitadel(
     const attemptStartedAt = Date.now();
     const telemetryReservation = reserveModelCallTelemetry(sessionDir, {
       ticketId: 'pipeline', phase: 'citadel', recoveryEpoch: reviewState.recovery_epoch,
-      strategyHash: reviewStrategy.hash,
+      strategyHash: attemptStrategyHash,
     });
     journalAttempt.model_attempt_id = telemetryReservation.model_attempt_id;
     journalAttempt.telemetry_status = 'started';
@@ -1383,7 +1619,7 @@ export async function runCitadel(
       finalizeAttempt(result, 'failed');
       finishJournalAttempt('rejected', error);
       finalValidationError = error;
-      retryFeedback = (error instanceof Error ? error.message : String(error)).slice(0, 1_000);
+      retryFeedback = normalizeCitadelRetryFeedback(error);
       report = null;
       preserveInvalidReviewerAttempt(
         sessionDir, attempt, attemptKey, reviewedRange, checkpointHead, result, candidatePath, error,
@@ -1412,6 +1648,7 @@ export async function runCitadel(
     );
   }
   assertOwnership();
+  fs.rmSync(citadelSystemBlockPath(sessionDir), { force: true });
   atomicWriteJson(reportPath, report);
   const acceptedAttempt = [...reviewState.attempts].reverse().find((entry) => (
     entry.epoch === reviewState.recovery_epoch && entry.status === 'validated'

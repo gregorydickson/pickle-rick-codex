@@ -220,6 +220,7 @@ export function reapOwnedOrphanProcessGroup(
   try {
     signalGroup(initial.pgid, 'SIGKILL');
     signals.push('SIGKILL');
+    wait(50);
     return { status: 'reaped', pid, pgid: initial.pgid, reason: 'owned process group received TERM then KILL', signals };
   } catch (error) {
     return { status: 'signal-failed', pid, pgid: initial.pgid, reason: error instanceof Error ? error.message : String(error), signals };
@@ -274,6 +275,7 @@ export function reapRecordedLiveProcessGroup(
   try {
     signalGroup(persisted.pgid, 'SIGKILL');
     signals.push('SIGKILL');
+    wait(50);
     return { status: 'reaped', pid: persisted.pid, pgid: persisted.pgid, reason: 'recorded process group received TERM then KILL', signals };
   } catch (error) {
     return { status: 'signal-failed', pid: persisted.pid, pgid: persisted.pgid, reason: error instanceof Error ? error.message : String(error), signals };

@@ -25,6 +25,12 @@ function fixture(sealedVerification, manifestVerification = sealedVerification, 
   const dataRoot = makeTempRoot('verification-seal-data-');
   const workingDir = makeTempRoot('verification-seal-repo-');
   const sessionDir = makeTempRoot('verification-seal-session-');
+  execFileSync('git', ['init', '-q'], { cwd: workingDir });
+  execFileSync('git', ['config', 'user.name', 'Verification Seal Test'], { cwd: workingDir });
+  execFileSync('git', ['config', 'user.email', 'seal@example.com'], { cwd: workingDir });
+  fs.writeFileSync(path.join(workingDir, 'package.json'), '{"scripts":{"test":"node -e \\\"process.exit(0)\\\""}}\n');
+  execFileSync('git', ['add', 'package.json'], { cwd: workingDir });
+  execFileSync('git', ['commit', '-qm', 'baseline'], { cwd: workingDir });
   writeJson(path.join(sessionDir, 'state.json'), {
     schema_version: 1, active: true, working_dir: workingDir, worker_timeout_seconds: 10,
   });
@@ -38,12 +44,6 @@ function fixture(sealedVerification, manifestVerification = sealedVerification, 
   const prd = '# Sealed verification fixture\n';
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
   if (accepted) {
-    execFileSync('git', ['init'], { cwd: workingDir });
-    execFileSync('git', ['config', 'user.name', 'Verification Seal Test'], { cwd: workingDir });
-    execFileSync('git', ['config', 'user.email', 'seal@example.com'], { cwd: workingDir });
-    fs.writeFileSync(path.join(workingDir, 'package.json'), '{"scripts":{"test":"node -e \\\"process.exit(0)\\\""}}\n');
-    execFileSync('git', ['add', 'package.json'], { cwd: workingDir });
-    execFileSync('git', ['commit', '-m', 'baseline'], { cwd: workingDir });
     fs.writeFileSync(path.join(sessionDir, 'prd_refined.md'), '# Refined sealed verification fixture\n');
     writeRefinementAcceptance(sessionDir, { workingDir, preserveMalformedVerification: true });
   }
@@ -81,6 +81,9 @@ const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(pre
 const verification = process.env.REPAIR_MODE === 'always-pass'
   ? [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }]
   : JSON.parse(value('Authorized sealed verification steps JSON: '));
+if (process.env.REPAIR_MODE === 'mutate-workspace') {
+  fs.writeFileSync('malicious-contract-repair.txt', 'must remain isolated\\n');
+}
 fs.writeFileSync(value('Contract repair artifact path: '), JSON.stringify({
   schema_version: 1, ticket_id: value('Ticket ID: '), verification, rationale: 'deterministic sealed reconstruction',
 }));
@@ -125,6 +128,27 @@ test('representation-only legacy malformation is reconstructed with a crash-reco
   assert.equal(fs.existsSync(path.join(sessionDir, 'verification-contract-repair-transaction.json')), false);
   assert.equal(fs.existsSync(verificationRepairReceiptPath(sessionDir, 'r1')), true);
   assert.doesNotThrow(() => assertTicketVerificationBoundToSeal(sessionDir, 'r1', workingDir));
+});
+
+test('verification contract repair confines malicious repository mutation to a disposable worktree', async () => {
+  const sealed = [{ kind: 'process', executable: 'node', args: ['--version'] }];
+  const { dataRoot, workingDir, sessionDir } = fixture(sealed, sealed, true);
+  const headBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
+  const statusBefore = execFileSync('git', ['status', '--porcelain'], { cwd: workingDir, encoding: 'utf8' });
+  const worktreesBefore = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+    cwd: workingDir, encoding: 'utf8',
+  });
+
+  await withEnvironment({ PICKLE_DATA_ROOT: dataRoot, ...fakeRepairWorker('mutate-workspace') }, () => (
+    repairTicketVerificationContract(sessionDir, 'r1')
+  ));
+
+  assert.equal(fs.existsSync(path.join(workingDir, 'malicious-contract-repair.txt')), false);
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim(), headBefore);
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: workingDir, encoding: 'utf8' }), statusBefore);
+  assert.equal(execFileSync('git', ['worktree', 'list', '--porcelain'], {
+    cwd: workingDir, encoding: 'utf8',
+  }), worktreesBefore);
 });
 
 test('adopted trap/mktemp repair atomically rebinds acceptance and restart can begin ticket execution', async () => {

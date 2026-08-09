@@ -6,7 +6,9 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import {
   deriveCitadelAcceptanceCriteria,
+  citadelSystemBlockPath,
   getCitadelRepositoryFingerprint,
+  readCitadelSystemBlock,
   runCitadel,
   runCitadelChecks,
   recoverCitadelStartCommit,
@@ -44,12 +46,12 @@ function makeCitadelLifecycleSession(criterion) {
     worker_timeout_seconds: 10,
   }));
   fs.writeFileSync(path.join(sessionDir, 'refinement_manifest.json'), JSON.stringify({
-    tickets: [{ acceptance_criteria: [criterion] }],
+    tickets: [{ id: 'T-1', acceptance_criteria: [criterion] }],
   }));
   return { cwd, sessionDir };
 }
 
-function sealCitadelSession(sessionDir, cwd, id, text) {
+function sealCitadelSession(sessionDir, cwd, id, text, ticketVerification = null) {
   const prd = '# Approved release PRD\n';
   fs.writeFileSync(path.join(sessionDir, 'prd.md'), prd);
   writePrdSeal(sessionDir, {
@@ -62,7 +64,9 @@ function sealCitadelSession(sessionDir, cwd, id, text) {
     decision_precedence: [],
     preservation_and_rollback: {},
     completion_definition: {},
-    release_gates: [],
+    release_gates: ticketVerification
+      ? { ticket_verification: [{ ticket_id: 't-1', acceptance_criteria: [text], verification: ticketVerification }] }
+      : [],
   });
 }
 
@@ -228,12 +232,23 @@ test('Citadel rejects representation drift without a valid seal-bound repair rec
 test('validateCitadelReport derives a fail-closed verdict from severity', () => {
   const report = validateCitadelReport({
     reviewed_range: 'abc..HEAD',
-    findings: [{ severity: 'high', title: 'Broken contract', evidence: 'src/a.ts:4 contradicts src/b.ts:9' }],
+    findings: [{
+      severity: 'high', title: 'Broken contract', evidence: 'src/a.ts:4 contradicts src/b.ts:9',
+      file: 'src/a.ts', line: 4, recommendation: 'Repair the contract mismatch.',
+      ticket_ids: ['R1'], acceptance_criteria: ['AC-1'], paths: ['src/a.ts', 'src/b.ts'],
+    }],
     acceptance_criteria_checked: ['AC-1'],
   }, 'abc..HEAD', ['AC-1']);
   assert.equal(report.verdict, 'block');
   assert.equal(report.findings[0].severity, 'high');
-  assert.throws(() => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [{ severity: 'urgent' }] }, 'abc..HEAD', ['AC-1']), /unsupported severity/);
+  assert.throws(() => validateCitadelReport({
+    reviewed_range: 'abc..HEAD',
+    findings: [{
+      severity: 'urgent', title: 'Unknown severity', evidence: 'Evidence', file: null, line: null,
+      recommendation: null, ticket_ids: [], acceptance_criteria: [], paths: [],
+    }],
+    acceptance_criteria_checked: ['AC-1'],
+  }, 'abc..HEAD', ['AC-1']), /unsupported severity/);
 });
 
 test('validateCitadelReport rejects empty and incomplete acceptance-criteria evidence', () => {
@@ -254,10 +269,13 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
       /expected an object|findings must be an array/,
     );
   }
-  for (const finding of [null, [], {}, { severity: 'low', title: ' ', evidence: 'proof' }]) {
+  for (const finding of [null, [], {}, {
+    severity: 'low', title: ' ', evidence: 'proof', file: null, line: null, recommendation: null,
+    ticket_ids: [], acceptance_criteria: [], paths: [],
+  }]) {
     assert.throws(
       () => validateCitadelReport({ reviewed_range: 'abc..HEAD', findings: [finding], acceptance_criteria_checked: ['AC-1'] }, 'abc..HEAD', ['AC-1']),
-      /expected an object|unsupported severity|title and evidence are required/,
+      /expected an object|missing required fields|title and evidence are required/,
     );
   }
 
@@ -295,7 +313,10 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
 
   const defaults = validateCitadelReport({
     reviewed_range: 'abc..HEAD',
-    findings: [{ severity: 'low', title: 'Advisory', evidence: 'Observed', file: '', line: 0, recommendation: '' }],
+    findings: [{
+      severity: 'low', title: 'Advisory', evidence: 'Observed', file: '', line: null, recommendation: '',
+      ticket_ids: [], acceptance_criteria: [], paths: [],
+    }],
     acceptance_criteria_checked: ['AC-1'],
   }, 'abc..HEAD', ['AC-1']);
   assert.deepEqual(
@@ -303,6 +324,47 @@ test('validateCitadelReport rejects malformed findings and normalizes optional e
     { file: null, line: null, recommendation: null },
   );
   assert.equal(Number.isNaN(Date.parse(defaults.generated_at)), false);
+});
+
+test('validateCitadelReport rejects every missing finding-schema key', () => {
+  const complete = {
+    severity: 'low', title: 'Complete advisory', evidence: 'Concrete evidence.',
+    file: null, line: null, recommendation: null,
+    ticket_ids: [], acceptance_criteria: [], paths: [],
+  };
+  for (const field of [
+    'severity', 'title', 'evidence', 'file', 'line', 'recommendation',
+    'ticket_ids', 'acceptance_criteria', 'paths',
+  ]) {
+    const finding = { ...complete };
+    delete finding[field];
+    assert.throws(
+      () => validateCitadelReport({
+        reviewed_range: 'abc..HEAD', findings: [finding], acceptance_criteria_checked: ['AC-1'],
+      }, 'abc..HEAD', ['AC-1']),
+      new RegExp(`missing required fields:.*${field}`),
+      field,
+    );
+  }
+});
+
+test('validateCitadelReport requires concrete attribution arrays for every critical or high finding', () => {
+  const complete = {
+    severity: 'high', title: 'Blocking defect', evidence: 'src/a.ts:4 proves the defect.',
+    file: 'src/a.ts', line: 4, recommendation: 'Repair the affected behavior.',
+    ticket_ids: ['R1'], acceptance_criteria: ['AC-1'], paths: ['src/a.ts'],
+  };
+  for (const field of ['ticket_ids', 'acceptance_criteria', 'paths']) {
+    assert.throws(
+      () => validateCitadelReport({
+        reviewed_range: 'abc..HEAD',
+        findings: [{ ...complete, [field]: [] }],
+        acceptance_criteria_checked: ['AC-1'],
+      }, 'abc..HEAD', ['AC-1']),
+      /critical\/high findings require non-empty ticket_ids, acceptance_criteria, and paths/,
+      field,
+    );
+  }
 });
 
 test('deriveCitadelAcceptanceCriteria prefers refined ticket criteria and falls back to the PRD', () => {
@@ -525,10 +587,14 @@ test('runCitadel fails closed before monitored checks when release evidence is u
     working_dir: cwd,
     start_commit: startCommit,
   }));
-  assert.equal(await runCitadel(noCriteria), 'citadel-blocked');
-  const noCriteriaReport = JSON.parse(fs.readFileSync(path.join(noCriteria, 'citadel-report.json'), 'utf8'));
-  assert.equal(noCriteriaReport.verdict, 'block');
-  assert.match(noCriteriaReport.findings[0].title, /no acceptance criteria/i);
+  assert.equal(await runCitadel(noCriteria), 'citadel-system-blocked');
+  const noCriteriaBlock = readCitadelSystemBlock(noCriteria);
+  assert.equal(noCriteriaBlock.code, 'acceptance_criteria_missing');
+  assert.equal(noCriteriaBlock.recovery_action, 'request_prd_revision');
+  assert.equal(noCriteriaBlock.next_action, 'retry_phase');
+  assert.equal(fs.existsSync(path.join(noCriteria, 'citadel-report.json')), false);
+  assert.equal(await runCitadel(noCriteria), 'citadel-system-blocked');
+  assert.equal(readCitadelSystemBlock(noCriteria).next_action, 'restart_executor');
 
   const malformedScope = makeTempRoot('pickle-citadel-malformed-scope-');
   fs.writeFileSync(path.join(malformedScope, 'state.json'), JSON.stringify({
@@ -540,11 +606,95 @@ test('runCitadel fails closed before monitored checks when release evidence is u
     tickets: [{ id: 'T-1', acceptance_criteria: ['Release evidence is complete.'] }],
   }));
   fs.writeFileSync(path.join(malformedScope, 'scope.json'), '{}');
-  assert.equal(await runCitadel(malformedScope), 'citadel-blocked');
-  const scopeReport = JSON.parse(fs.readFileSync(path.join(malformedScope, 'citadel-report.json'), 'utf8'));
-  assert.equal(scopeReport.verdict, 'block');
-  assert.match(scopeReport.findings[0].title, /scope contract is invalid/i);
-  assert.match(scopeReport.findings[0].evidence, /scope\.json identity is malformed/);
+  assert.equal(await runCitadel(malformedScope), 'citadel-system-blocked');
+  const scopeBlock = readCitadelSystemBlock(malformedScope);
+  assert.equal(scopeBlock.code, 'scope_contract_invalid');
+  assert.equal(scopeBlock.recovery_action, 'request_prd_revision');
+  assert.match(scopeBlock.evidence, /scope\.json identity is malformed/);
+  assert.equal(fs.existsSync(path.join(malformedScope, 'citadel-report.json')), false);
+  assert.equal(citadelSystemBlockPath(malformedScope), path.join(malformedScope, 'citadel-system-block.json'));
+});
+
+test('runCitadel persists deterministic failures as typed system recovery, never canonical findings', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('The deterministic release gate passes.');
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].verification = ['npm test'];
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: 'node -e "process.stderr.write(\'deterministic failure\\n\'); process.exit(7)"' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'make deterministic gate fail'], { cwd });
+
+  assert.equal(await runCitadel(sessionDir), 'citadel-system-blocked');
+  const systemBlock = readCitadelSystemBlock(sessionDir);
+  assert.equal(systemBlock.code, 'deterministic_check_failed');
+  assert.equal(systemBlock.recovery_action, 'retry_checks');
+  assert.equal(systemBlock.checks.some((check) => check.status === 'failed'), true);
+  assert.match(systemBlock.evidence, /deterministic failure/);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+  assert.equal(await runCitadel(sessionDir), 'citadel-system-blocked');
+  const repeated = readCitadelSystemBlock(sessionDir);
+  assert.equal(repeated.failure_identity, systemBlock.failure_identity);
+  assert.equal(repeated.attempt, 2);
+  assert.equal(repeated.bounded_attempt, 2);
+
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: 'node -e "process.stderr.write(\'changed deterministic evidence\\n\'); process.exit(7)"' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'change deterministic diagnostic evidence'], { cwd });
+  assert.equal(await runCitadel(sessionDir), 'citadel-system-blocked');
+  const changedEvidence = readCitadelSystemBlock(sessionDir);
+  assert.notEqual(changedEvidence.failure_identity, systemBlock.failure_identity);
+  assert.match(changedEvidence.checks.find((check) => check.status === 'failed').output, /changed deterministic evidence/);
+  assert.equal(changedEvidence.attempt, 1);
+  assert.equal(changedEvidence.bounded_attempt, 1);
+});
+
+test('runCitadel assigns an unavailable substantive gate to exact verification-contract repair tickets', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession('The ticket declares a substantive deterministic gate.');
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({ name: 'no-release-gate-fixture' }));
+  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'remove package release gate'], { cwd });
+
+  assert.equal(await runCitadel(sessionDir), 'citadel-system-blocked');
+  const systemBlock = readCitadelSystemBlock(sessionDir);
+  assert.equal(systemBlock.code, 'deterministic_gate_unavailable');
+  assert.equal(systemBlock.recovery_action, 'repair_verification_contract');
+  assert.deepEqual(systemBlock.recovery_ticket_ids, ['T-1']);
+  assert.equal(systemBlock.checks.find((check) => check.command === 'git diff --check').status, 'passed');
+  assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+});
+
+test('sealed Citadel classifies a malformed authorized manifest verifier for repair without weakening drift checks', async () => {
+  const criterion = 'The sealed deterministic verifier remains mandatory.';
+  const authorized = [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }];
+  const malformed = makeCitadelLifecycleSession(criterion);
+  fs.writeFileSync(path.join(malformed.sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{
+      id: 'T-1', acceptance_criteria: [criterion],
+      verification: [{ kind: 'process', executable: 'node', args: 'not-an-array' }],
+    }],
+  }));
+  sealCitadelSession(malformed.sessionDir, malformed.cwd, 'AC-SEALED-01', criterion, authorized);
+
+  assert.equal(await runCitadel(malformed.sessionDir), 'citadel-system-blocked');
+  const systemBlock = readCitadelSystemBlock(malformed.sessionDir);
+  assert.equal(systemBlock.code, 'deterministic_gate_unavailable');
+  assert.equal(systemBlock.recovery_action, 'repair_verification_contract');
+  assert.deepEqual(systemBlock.recovery_ticket_ids, ['T-1']);
+
+  const drift = makeCitadelLifecycleSession(criterion);
+  fs.writeFileSync(path.join(drift.sessionDir, 'refinement_manifest.json'), JSON.stringify({
+    tickets: [{
+      id: 'T-1', acceptance_criteria: [criterion],
+      verification: [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(9)'] }],
+    }],
+  }));
+  sealCitadelSession(drift.sessionDir, drift.cwd, 'AC-SEALED-01', criterion, authorized);
+  await assert.rejects(() => runCitadel(drift.sessionDir), /sealed-verification-semantic-drift/);
 });
 
 test('runCitadel monitors checks and enforces reviewer evidence and approval signals', async () => {
@@ -564,12 +714,18 @@ fs.writeFileSync(countPath, String(count));
 let findings = [];
 if (mode.includes('malformed once') && count === 1) findings = {};
 if (mode.includes('repeated malformed') && !prompt.includes('strict-minimal-json')) findings = {};
+if (mode.includes('catalog exhaustion')) findings = {};
 if (mode.includes('oversize artifact')) findings = ['x'.repeat(1024 * 1024 + 1)];
 if (mode.includes('substantive block')) findings = [{
   severity: 'high',
   title: 'Release invariant is violated',
   evidence: 'A valid blocking finding.',
-  recommendation: 'Fix the release invariant.'
+  file: 'package.json',
+  line: 1,
+  recommendation: 'Fix the release invariant.',
+  ticket_ids: ['T-1'],
+  acceptance_criteria: criteria,
+  paths: ['package.json']
 }];
 const candidate = JSON.stringify({
   schema_version: 1,
@@ -618,12 +774,21 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: approved.cwd, encoding: 'utf8' }), '');
 
     const invalid = makeCitadelLifecycleSession('invalid evidence');
+    fs.writeFileSync(path.join(invalid.sessionDir, 'refinement_manifest.json'), JSON.stringify({
+      tickets: [{ acceptance_criteria: ['invalid evidence', `Long criterion ${'x   '.repeat(600)}`] }],
+    }));
     await assert.rejects(() => runCitadel(invalid.sessionDir), (error) => {
       assert.equal(error.code, 'CITADEL_REVIEWER_ARTIFACT_INVALID');
       assert.match(error.message, /coverage is incomplete/i);
       return true;
     });
     assert.equal(fs.readFileSync(path.join(invalid.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+    const invalidState = JSON.parse(fs.readFileSync(
+      path.join(invalid.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    assert.equal(invalidState.attempts[1].retry_feedback.length, 1_000);
+    assert.doesNotMatch(invalidState.attempts[1].retry_feedback, /\s{2,}/);
+    assert.notEqual(invalidState.attempts[0].strategy_hash, invalidState.attempts[1].strategy_hash);
 
     const missingPromise = makeCitadelLifecycleSession('missing promise');
     await assert.rejects(() => runCitadel(missingPromise.sessionDir), /approval signal is missing/i);
@@ -752,6 +917,46 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     ));
     assert.ok(resolvedFailure.resolved_at);
 
+    const catalog = makeCitadelLifecycleSession('catalog exhaustion remains malformed');
+    for (let epoch = 1; epoch <= 5; epoch += 1) {
+      await assert.rejects(() => runCitadel(catalog.sessionDir), /findings must be an array/i);
+      const catalogState = JSON.parse(fs.readFileSync(
+        path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
+      ));
+      assert.equal(catalogState.recovery_epoch, epoch);
+      assert.equal(catalogState.status, 'exhausted');
+    }
+    assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '10');
+    await assert.rejects(
+      () => runCitadel(catalog.sessionDir),
+      /no unused material reviewer strategy remains/i,
+    );
+    assert.equal(fs.readFileSync(path.join(catalog.sessionDir, 'citadel-review-count'), 'utf8'), '10');
+    const catalogState = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    assert.equal(catalogState.attempts.length, 10);
+    assert.equal(new Set(catalogState.attempts.map((entry) => entry.strategy_id)).size, 5);
+    assert.equal(new Set(catalogState.attempts.map((entry) => entry.material_strategy_hash)).size, 5);
+    assert.equal(new Set(catalogState.attempts.map((entry) => entry.strategy_hash)).size, 6);
+    assert.equal(catalogState.attempts[0].retry_feedback, null);
+    assert.match(catalogState.attempts[1].retry_feedback, /findings must be an array/i);
+    assert.notEqual(catalogState.attempts[0].strategy_hash, catalogState.attempts[1].strategy_hash);
+    for (const epoch of [2, 3, 4, 5]) {
+      const attempts = catalogState.attempts.filter((entry) => entry.epoch === epoch);
+      assert.equal(attempts.length, 2);
+      assert.equal(attempts[0].retry_feedback, attempts[1].retry_feedback);
+      assert.equal(attempts[0].strategy_hash, attempts[1].strategy_hash);
+      assert.notEqual(attempts[0].material_strategy_hash, catalogState.attempts[0].material_strategy_hash);
+    }
+    const catalogTelemetry = JSON.parse(fs.readFileSync(
+      path.join(catalog.sessionDir, 'execution-telemetry.json'), 'utf8',
+    )).events.filter((event) => event.phase === 'citadel');
+    assert.deepEqual(
+      catalogTelemetry.map((event) => event.strategy_hash),
+      catalogState.attempts.map((entry) => entry.strategy_hash),
+    );
+
     for (const criterion of ['oversize artifact is rejected', 'symlink artifact is rejected']) {
       const unsafe = makeCitadelLifecycleSession(criterion);
       await assert.rejects(() => runCitadel(unsafe.sessionDir), /reviewer did not produce a valid artifact/i);
@@ -769,7 +974,16 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.equal(await runCitadel(blocked.sessionDir), 'citadel-blocked');
     assert.equal(fs.readFileSync(path.join(blocked.sessionDir, 'citadel-review-count'), 'utf8'), '1');
     const blockedReport = JSON.parse(fs.readFileSync(path.join(blocked.sessionDir, 'citadel-report.json'), 'utf8'));
+    assert.deepEqual(
+      validateCitadelReport(
+        blockedReport,
+        blockedReport.reviewed_range,
+        deriveCitadelAcceptanceCriteria(blocked.sessionDir),
+      ),
+      blockedReport,
+    );
     assert.equal(blockedReport.findings[0].title, 'Release invariant is violated');
+    assert.equal(fs.existsSync(citadelSystemBlockPath(blocked.sessionDir)), false);
     assert.equal(
       fs.readdirSync(blocked.sessionDir).some((name) => /^citadel-review-attempt-.*\.json$/.test(name)),
       false,

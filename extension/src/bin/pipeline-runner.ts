@@ -9,6 +9,7 @@ import {
   cancelPipelineSession,
   ensurePipelineState,
   finishPipelinePhase,
+  resetPipelineForAutonomousRemediation,
 } from '../services/pipeline-state.js';
 import {
   preparePipelineAnatomyParkPhase,
@@ -22,9 +23,24 @@ import { finalizeTerminalState } from '../services/state-terminal.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
 import { runLoop } from './loop-runner.js';
 import { runSequential } from './mux-runner.js';
-import { runCitadel } from '../services/citadel.js';
+import { readCitadelSystemBlock, runCitadel } from '../services/citadel.js';
+import {
+  consumeDeterministicCheckFailure,
+  runDeterministicRecoveryDiagnostic,
+} from '../services/citadel-deterministic-recovery.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { requestPrdRevision } from '../services/durable-supervisor.js';
+import { repairTicketVerificationContract } from './spawn-morty.js';
+import {
+  beginRecoveryStrategyEpoch,
+  nextMaterialApproach,
+  readUnresolvedRecoveryStrategyEpochs,
+  recoveryRoute,
+} from '../services/productive-autonomy.js';
+import { normalizeVerificationSteps } from '../services/verification-env.js';
+import { reconcileVerificationRepairTransaction } from '../services/verification-seal-contract.js';
+import { normalizeTicketId } from '../services/tickets.js';
 import { finalizeLiveSessionMigrationAfterHandoff } from '../services/live-session-migration.js';
 import {
   enqueueCitadelRemediationResult,
@@ -45,6 +61,8 @@ interface RunPipelineOptions {
   runSequential?: typeof runSequential;
   runCitadel?: typeof runCitadel;
   repairCitadelAttribution?: typeof repairCitadelAttribution;
+  repairTicketVerificationContract?: typeof repairTicketVerificationContract;
+  runDeterministicRecoveryDiagnostic?: typeof runDeterministicRecoveryDiagnostic;
   [key: string]: unknown;
 }
 
@@ -99,7 +117,9 @@ function isBlockingExitReason(exitReason: string): boolean {
 export function pipelineExitFailed(exitReason: string): boolean {
   return exitReason !== 'success'
     && exitReason !== 'dependency_repair_scheduled'
-    && exitReason !== 'citadel_attribution_repair_scheduled';
+    && exitReason !== 'citadel_attribution_repair_scheduled'
+    && exitReason !== 'citadel_system_recovery_scheduled'
+    && exitReason !== 'prd_revision_required';
 }
 
 function readSessionExitReason(sessionDir: string): string {
@@ -125,6 +145,11 @@ async function runPipelinePhase(
   beginPipelinePhase(sessionDir, phase, { runnerPid: process.pid, runStartedAtMs });
   try {
     const exitReason = await executePhase();
+    if (exitReason === 'runtime_handoff') {
+      // Runtime handoff transfers the in-flight phase to the green executor.
+      // Keep both session and pipeline phase state live until it accepts.
+      return exitReason;
+    }
     if (exitReason === 'cancelled') {
       cancelPipelineSession(sessionDir, {
         phase,
@@ -186,10 +211,75 @@ async function runPipelineWithLease(
   const runSequentialFn = options.runSequential ?? runSequential;
   const runCitadelFn = options.runCitadel ?? runCitadel;
   const repairAttributionFn = options.repairCitadelAttribution ?? repairCitadelAttribution;
+  const repairVerificationContractFn = options.repairTicketVerificationContract ?? repairTicketVerificationContract;
+  const repairSystemVerification = async (
+    systemBlock: NonNullable<ReturnType<typeof readCitadelSystemBlock>>,
+  ): Promise<void> => {
+    for (const ticketId of systemBlock.recovery_ticket_ids) {
+      const priorEpochs = readUnresolvedRecoveryStrategyEpochs(sessionDir, ticketId).length;
+      const route = recoveryRoute('contract');
+      const strategy = beginRecoveryStrategyEpoch(sessionDir, {
+        ticketId,
+        domain: 'contract',
+        handler: route.handler,
+        checkpoint: route.invalidate[0] || 'prepare',
+        constraints: [systemBlock.evidence],
+        materialApproach: nextMaterialApproach('contract', priorEpochs),
+      }, 'failure');
+      await repairVerificationContractFn(sessionDir, ticketId, {
+        strategy,
+        timeoutMs: Number(options.timeoutMs) || undefined,
+        assertDurableOwnership: options.assertDurableOwnership,
+      });
+      options.assertDurableOwnership?.();
+      appendRunnerLog(
+        sessionDir,
+        `Citadel material verification-contract recovery rebuilt ${ticketId} with strategy ${strategy.materialApproach}.`,
+      );
+    }
+  };
   appendRunnerLog(sessionDir, getRunnerDescriptor('pipeline').runnerStartMarker);
   try {
     const pipeline = readPipelineContract(sessionDir);
     let pipelineState = ensurePipelineState(sessionDir, pipeline);
+    const verificationRepairReconciliation = reconcileVerificationRepairTransaction(sessionDir);
+    const pendingSystemBlock = readCitadelSystemBlock(sessionDir);
+    if (pendingSystemBlock?.recovery_action === 'repair_verification_contract') {
+      const manifest = readJsonFile<{ tickets?: Array<Record<string, unknown>> }>(
+        path.join(sessionDir, 'refinement_manifest.json'),
+        {},
+      );
+      const repaired = pendingSystemBlock.recovery_ticket_ids.length > 0
+        && pendingSystemBlock.recovery_ticket_ids.every((ticketId) => {
+          const ticket = manifest?.tickets?.find((entry) => (
+            normalizeTicketId(String(entry.id || ''), '') === normalizeTicketId(ticketId, ticketId)
+          ));
+          if (!ticket || String(ticket.status || '').toLowerCase() !== 'todo') return false;
+          try {
+            return normalizeVerificationSteps(ticket.verification, {
+              verify: typeof ticket.verify === 'string' ? ticket.verify : undefined,
+            }).length > 0;
+          } catch {
+            return false;
+          }
+        });
+      if (repaired) {
+        resetPipelineForAutonomousRemediation(
+          sessionDir,
+          `Recovered Citadel verification-contract repair${verificationRepairReconciliation ? ` (${verificationRepairReconciliation})` : ''}.`,
+        );
+        pipelineState = ensurePipelineState(sessionDir, pipeline);
+        appendRunnerLog(sessionDir, 'Recovered material Citadel verification-contract repair before phase dispatch.');
+      } else {
+        resetPipelineForAutonomousRemediation(
+          sessionDir,
+          `Re-entered Citadel verification-contract repair after ${verificationRepairReconciliation || 'executor interruption'}.`,
+        );
+        pipelineState = ensurePipelineState(sessionDir, pipeline);
+        await repairSystemVerification(pendingSystemBlock);
+        appendRunnerLog(sessionDir, 'Re-entered durable Citadel verification-contract repair before phase dispatch.');
+      }
+    }
     if (reconcileCitadelRemediation(sessionDir)) {
       pipelineState = ensurePipelineState(sessionDir, pipeline);
       appendRunnerLog(sessionDir, 'Recovered pending Citadel remediation intent.');
@@ -277,6 +367,52 @@ async function runPipelineWithLease(
         pipelineState = ensurePipelineState(sessionDir, pipeline);
         nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
         continue;
+      }
+
+      if (nextPhase === 'citadel' && exitReason === 'citadel-system-blocked') {
+        const systemBlock = readCitadelSystemBlock(sessionDir);
+        if (!systemBlock) throw new Error('Citadel system block result is missing its typed recovery artifact.');
+        appendRunnerLog(
+          sessionDir,
+          `Citadel system block ${systemBlock.code} selected ${systemBlock.recovery_action}; attempt ${systemBlock.bounded_attempt}/2 in recovery epoch ${systemBlock.recovery_epoch}.`,
+        );
+        if (systemBlock.recovery_action === 'request_prd_revision') {
+          requestPrdRevision(sessionDir, systemBlock.evidence, systemBlock.recommendation);
+          return 'prd_revision_required';
+        }
+        if (systemBlock.recovery_action === 'repair_verification_contract') {
+          resetPipelineForAutonomousRemediation(sessionDir, systemBlock.title);
+          pipelineState = ensurePipelineState(sessionDir, pipeline);
+          await repairSystemVerification(systemBlock);
+          nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
+          continue;
+        }
+        if (systemBlock.next_action === 'retry_phase') {
+          pipelineState = ensurePipelineState(sessionDir, pipeline);
+          nextPhase = resolveNextPipelinePhase(pipeline, pipelineState);
+          continue;
+        }
+        const deterministicRecovery = consumeDeterministicCheckFailure(sessionDir, systemBlock);
+        if (deterministicRecovery.kind === 'diagnostic_recovery_scheduled') {
+          const diagnostic = await (options.runDeterministicRecoveryDiagnostic ?? runDeterministicRecoveryDiagnostic)(
+            sessionDir,
+            { timeoutMs: Number(options.timeoutMs) || undefined, assertDurableOwnership: options.assertDurableOwnership },
+          );
+          options.assertDurableOwnership?.();
+          appendRunnerLog(
+            sessionDir,
+            diagnostic.kind === 'resolved'
+              ? `Deterministic diagnostic mapped recovery to ${diagnostic.ticket_ids.join(', ')}.`
+              : `Deterministic diagnostic retained a bounded retry: ${diagnostic.reason}`,
+          );
+        }
+        appendRunnerLog(
+          sessionDir,
+          deterministicRecovery.kind === 'verification_repair_scheduled'
+            ? `Scheduled ${deterministicRecovery.strategy_id} for exact deterministic-check owner ${deterministicRecovery.ticket_id}.`
+            : `Scheduled autonomous ${deterministicRecovery.strategy_id}: ${deterministicRecovery.reason}`,
+        );
+        return 'citadel_system_recovery_scheduled';
       }
 
       if (exitReason !== 'success') {
