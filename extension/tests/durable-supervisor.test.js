@@ -107,6 +107,7 @@ test('watchdog replaces a killed executor and resumes from the durable journal c
     ticket_id: 'ticket-7',
     phase: 'implement',
     artifact: 'candidate-42',
+    lease_generation: 1,
   });
   assert.equal(result.state.executor_restart_count, 1);
   assert.deepEqual(result.state.events.slice(-2).map((event) => event.kind), ['executor_lost', 'lease_recovered']);

@@ -13,11 +13,14 @@ import {
   nextMaterialApproach,
   nextMaterialRecoveryPlan,
   planSchedulerContinuity,
+  reconcileInterruptedModelCallTelemetry,
   readRecoveryStrategyEpochs,
   readUnresolvedRecoveryStrategyEpochs,
   recordRecoveryStrategyProgress,
   recordExecutionControlTelemetry,
   recordExecutionTelemetry,
+  reserveModelCallTelemetry,
+  finalizeModelCallTelemetry,
   recordUnexpectedNoncompletionTermination,
   recoveryRoute,
   resolveAutonomousRecovery,
@@ -252,6 +255,7 @@ test('telemetry includes failed calls and separates attempts, epochs, and discar
     phaseAttempts: 2,
     recoveryEpochs: 1,
     failedCalls: 1,
+    interruptedCalls: 0,
     successfulCalls: 1,
     timedOutCalls: 0,
     cancelledCalls: 0,
@@ -272,6 +276,134 @@ test('telemetry includes failed calls and separates attempts, epochs, and discar
     qualityScore: 1,
     unexpectedNoncompletionTermination: false,
   });
+});
+
+test('executor recovery atomically finalizes orphaned model attempts with honest unavailable usage', () => {
+  const sessionDir = makeTempRoot('pickle-interrupted-telemetry-');
+  const reservation = reserveModelCallTelemetry(sessionDir, {
+    ticketId: 'r1', phase: 'implement', ticketAttempt: 3, phaseAttempt: 2, recoveryEpoch: 1,
+  });
+  const journalPath = path.join(sessionDir, 'execution-telemetry.json');
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  journal.model_attempts[0].started_at = '2026-08-08T20:00:00.000Z';
+  fs.writeFileSync(journalPath, JSON.stringify(journal));
+
+  const reconciled = reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason: 'dead_executor', sourceOwnerId: 'runner:41:old', leaseGeneration: 7,
+    now: new Date('2026-08-08T20:00:05.250Z'),
+  });
+  assert.equal(reconciled.length, 1);
+  assert.deepEqual(reconciled[0], {
+    sequence: 1,
+    model_attempt_id: reservation.model_attempt_id,
+    ticket_id: 'r1',
+    phase: 'implement',
+    ticket_attempt: 3,
+    phase_attempt: 2,
+    recovery_epoch: 1,
+    strategy_hash: null,
+    outcome: 'failed',
+    telemetry_status: 'telemetry_unavailable',
+    telemetry_failure: 'executor_interrupted',
+    duration_ms: 5_250,
+    input_tokens: null,
+    cached_input_tokens: null,
+    cache_creation_input_tokens: null,
+    output_tokens: null,
+    productive_work: 0,
+    discarded_work: 1,
+    interruption: { reason: 'dead_executor', source_owner_id: 'runner:41:old', lease_generation: 7 },
+    recorded_at: '2026-08-08T20:00:05.250Z',
+  });
+  assert.deepEqual(reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason: 'dead_executor', sourceOwnerId: 'runner:41:old', leaseGeneration: 7,
+    now: new Date('2026-08-08T20:00:06.000Z'),
+  }), []);
+
+  const persisted = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  assert.equal(persisted.events.length, 1);
+  assert.equal(persisted.model_attempts[0].status, 'finalized');
+  const summary = executionTelemetrySummary(sessionDir);
+  assert.equal(summary.ticketAttempts, 1);
+  assert.equal(summary.phaseAttempts, 1);
+  assert.equal(summary.failedCalls, 0);
+  assert.equal(summary.interruptedCalls, 1);
+  assert.equal(summary.successfulCalls + summary.failedCalls + summary.interruptedCalls
+    + summary.timedOutCalls + summary.cancelledCalls, summary.phaseAttempts);
+  assert.equal(summary.durationMs, 5_250);
+  assert.equal(summary.inputTokens, 0);
+  assert.equal(summary.outputTokens, 0);
+  assert.equal(summary.productiveWork, 0);
+  assert.equal(summary.discardedWork, 1);
+});
+
+test('model finalization and executor recovery races cannot duplicate an attempt', () => {
+  const sessionDir = makeTempRoot('pickle-telemetry-finalizer-race-');
+  const result = {
+    command: 'codex', args: [], exitCode: 0, stdout: '', stderr: '', timedOut: false,
+    durationMs: 25, lastMessage: '', usage: {
+      input_tokens: 3, output_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 1,
+    }, usageReported: true, terminatedAfterSuccess: false, cancelled: false,
+    outputFormat: 'jsonl', assistantContent: '', toolCalls: [],
+  };
+  const finalizedFirst = reserveModelCallTelemetry(sessionDir, { ticketId: 'r1', phase: 'research' });
+  finalizeModelCallTelemetry(sessionDir, finalizedFirst, { result });
+  assert.deepEqual(reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason: 'supervised_executor_exit', now: new Date(),
+  }), []);
+
+  const recoveredFirst = reserveModelCallTelemetry(sessionDir, { ticketId: 'r1', phase: 'plan' });
+  reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason: 'supervised_executor_exit', sourceOwnerId: 'process:42', now: new Date(),
+  });
+  assert.throws(
+    () => finalizeModelCallTelemetry(sessionDir, recoveredFirst, { result }),
+    /model-call-telemetry-reservation-finalized/,
+  );
+  const persisted = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8'));
+  assert.equal(persisted.events.length, 2);
+  assert.deepEqual(persisted.events.map((event) => event.model_attempt_id), [1, 2]);
+});
+
+test('telemetry recovery creates a missing journal but classifies persisted corruption as fatal', () => {
+  const absent = makeTempRoot('pickle-telemetry-absent-recovery-');
+  assert.deepEqual(reconcileInterruptedModelCallTelemetry(absent, {
+    reason: 'supervised_executor_exit', now: new Date('2026-08-08T20:00:00.000Z'),
+  }), []);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(absent, 'execution-telemetry.json'), 'utf8')), {
+    schema_version: 1, events: [], model_attempts: [], next_model_attempt_id: 1,
+  });
+
+  const corrupt = makeTempRoot('pickle-telemetry-corrupt-recovery-');
+  fs.writeFileSync(path.join(corrupt, 'execution-telemetry.json'), '{broken');
+  assert.throws(
+    () => reconcileInterruptedModelCallTelemetry(corrupt, {
+      reason: 'dead_executor', sourceOwnerId: 'runner:99:dead', now: new Date(),
+    }),
+    (error) => error?.code === 'EXECUTION_TELEMETRY_CORRUPT',
+  );
+  assert.equal(fs.readFileSync(path.join(corrupt, 'execution-telemetry.json'), 'utf8'), '{broken');
+  const corruption = JSON.parse(fs.readFileSync(path.join(corrupt, 'execution-telemetry-corruption.json'), 'utf8'));
+  assert.equal(corruption.schema_version, 1);
+  assert.match(corruption.reason, /execution-telemetry-corrupt/);
+  const summary = executionTelemetrySummary(corrupt);
+  assert.equal(summary.unexpectedNoncompletionTermination, true);
+  assert.equal(summary.unexpectedTerminalExits, 1);
+  assert.equal(summary.autonomyScore, 0);
+  assert.equal(summary.reliabilityScore, 0);
+  assert.equal(summary.qualityScore, 0);
+
+  const malformedShape = makeTempRoot('pickle-telemetry-malformed-shape-recovery-');
+  fs.writeFileSync(path.join(malformedShape, 'execution-telemetry.json'), JSON.stringify({
+    schema_version: 1, events: 'not-an-array',
+  }));
+  assert.throws(
+    () => reconcileInterruptedModelCallTelemetry(malformedShape, {
+      reason: 'expired_lease', sourceOwnerId: 'runner:100:dead', leaseGeneration: 2, now: new Date(),
+    }),
+    (error) => error?.code === 'EXECUTION_TELEMETRY_CORRUPT',
+  );
+  assert.equal(executionTelemetrySummary(malformedShape).reliabilityScore, 0);
 });
 
 test('unexpected non-completion persistently zeroes autonomy, reliability, and quality', () => {

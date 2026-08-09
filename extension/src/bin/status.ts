@@ -186,7 +186,7 @@ export async function renderStatus(cwd: string, options: RenderStatusOptions = {
     currentStrategy ? `Recovery Strategy: ${currentStrategy.materialApproach} (${currentStrategy.strategyHash.slice(0, 12)})` : null,
     `Work: productive ${telemetry.productiveWork} | discarded ${telemetry.discardedWork}`,
     `Model Time: ${formatDuration(Math.floor(telemetry.durationMs / 1000))}`,
-    `Model Calls: success ${telemetry.successfulCalls} | failed ${telemetry.failedCalls} | timed out ${telemetry.timedOutCalls} | cancelled ${telemetry.cancelledCalls}`,
+    `Model Calls: success ${telemetry.successfulCalls} | failed ${telemetry.failedCalls} | interrupted ${telemetry.interruptedCalls} | timed out ${telemetry.timedOutCalls} | cancelled ${telemetry.cancelledCalls}`,
     `Model Tokens: in ${telemetry.inputTokens} | cache-created ${telemetry.cacheCreationInputTokens} | cached ${telemetry.cachedInputTokens} | out ${telemetry.outputTokens}`,
     `Autonomy Score: ${autonomyScore} | post-seal human interventions ${postSealHumanInterventions}`,
     `Reliability Score: ${reliabilityScore} | unexpected terminal exits ${unexpectedTerminalExits}`,

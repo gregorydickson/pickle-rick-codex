@@ -7,7 +7,9 @@ import path from 'node:path';
 import { CodexCancelCheckError, runCodexExecMonitored } from '../services/codex.js';
 import {
   executionTelemetrySummary,
+  reconcileInterruptedModelCallTelemetry,
   recordExecutionControlTelemetry,
+  reserveModelCallTelemetry,
 } from '../services/productive-autonomy.js';
 import { fileURLToPath } from 'node:url';
 import { makeTempRoot, repoRoot } from './helpers.js';
@@ -321,6 +323,10 @@ test('status exposes durable executor restarts, checkpoint counters, and zero-in
   }));
   fs.writeFileSync(path.join(sessionDir, 'logical-pipeline.json'), JSON.stringify({ executor_restart_count: 3 }));
   recordExecutionControlTelemetry(sessionDir, { checkpoints_reused: 4, checkpoints_invalidated: 1 });
+  reserveModelCallTelemetry(sessionDir, { ticketId: 'T1', phase: 'review' });
+  reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason: 'supervised_executor_exit', sourceOwnerId: 'process:77', now: new Date(),
+  });
 
   const output = execFileSync(process.execPath, [path.join(repoRoot, 'bin/status.js'), '--session-dir', sessionDir], {
     cwd: projectDir,
@@ -328,6 +334,9 @@ test('status exposes durable executor restarts, checkpoint counters, and zero-in
   });
   assert.match(output, /Executor Restarts: 3/);
   assert.match(output, /Checkpoints: reused 4 \| invalidated 1/);
+  assert.match(output, /Phase Attempts: 1/);
+  assert.match(output, /Work: productive 0 \| discarded 1/);
+  assert.match(output, /Model Calls: success 0 \| failed 0 \| interrupted 1 \| timed out 0 \| cancelled 0/);
   assert.match(output, /Autonomy Score: 1 \| post-seal human interventions 0/);
   assert.match(output, /Reliability Score: 1 \| unexpected terminal exits 0/);
   assert.match(output, /Quality Score: 1 \| unexpected non-completion no/);

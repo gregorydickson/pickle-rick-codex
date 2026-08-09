@@ -8,8 +8,13 @@ import {
   replacePrdSealAfterRevision,
 } from './prd-seal.js';
 import { StateManager } from './state-manager.js';
-import { inspectProcessLivenessIdentity, type PersistedProcessIdentity } from './orphan-reaper.js';
+import {
+  assertRecordedActiveChildRecovered,
+  inspectProcessLivenessIdentity,
+  type PersistedProcessIdentity,
+} from './orphan-reaper.js';
 import { assertCitadelReleaseApproval } from './citadel.js';
+import { reconcileInterruptedModelCallTelemetry } from './productive-autonomy.js';
 
 export const LOGICAL_PIPELINE_SCHEMA_VERSION = 1;
 export const LOGICAL_PIPELINE_FILE_NAME = 'logical-pipeline.json';
@@ -127,6 +132,23 @@ function statePath(sessionDir: string): string {
 
 function iso(nowMs: number): string {
   return new Date(nowMs).toISOString();
+}
+
+function reconcileLostExecutorTelemetry(
+  sessionDir: string,
+  lease: SupervisorLease,
+  reason: string,
+  nowMs: number,
+): void {
+  if (fs.existsSync(path.join(sessionDir, 'state.json'))) {
+    assertRecordedActiveChildRecovered(sessionDir, new StateManager());
+  }
+  reconcileInterruptedModelCallTelemetry(sessionDir, {
+    reason,
+    sourceOwnerId: lease.owner_id,
+    leaseGeneration: lease.generation,
+    now: new Date(nowMs),
+  });
 }
 
 function requireNonEmpty(value: unknown, field: string): asserts value is string {
@@ -481,9 +503,10 @@ export function acquireSupervisorLease(sessionDir: string, options: AcquireLease
     if (state.lease && Date.parse(state.lease.expires_at) > nowMs) {
       throw new Error(`Supervisor lease is held by ${state.lease.owner_id}.`);
     }
-    const expiredOwner = state.lease?.owner_id ?? null;
-    if (expiredOwner) {
-      appendEvent(state, 'executor_lost', { owner_id: expiredOwner, reason: 'expired_lease' }, nowMs);
+    const expiredLease = state.lease;
+    if (expiredLease) {
+      reconcileLostExecutorTelemetry(sessionDir, expiredLease, 'expired_lease', nowMs);
+      appendEvent(state, 'executor_lost', { owner_id: expiredLease.owner_id, reason: 'expired_lease' }, nowMs);
       state.executor_restart_count += 1;
     }
     const generation = state.lease_generation + 1;
@@ -556,12 +579,15 @@ export function recordSupervisorCheckpoint(
 ): LogicalPipelineState {
   return mutate(sessionDir, (state) => {
     const nowMs = options.nowMs ?? Date.now();
+    let lease: SupervisorLease;
     try {
-      assertLeaseFence(state, ownerId, token, nowMs);
+      lease = assertLeaseFence(state, ownerId, token, nowMs);
     } catch (error) {
       throw new Error(`Only the active supervisor lease may checkpoint: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
-    appendEvent(state, 'checkpoint_recorded', { checkpoint }, nowMs);
+    appendEvent(state, 'checkpoint_recorded', {
+      checkpoint: { ...checkpoint, lease_generation: lease.generation },
+    }, nowMs);
   });
 }
 
@@ -606,6 +632,12 @@ export function abortExpiredRuntimeHandoff(
         ? inspectProcessLivenessIdentity(state.lease.owner_identity) !== 'matched'
         : false;
       if (!expired && !identityDead) return;
+      reconcileLostExecutorTelemetry(
+        sessionDir,
+        state.lease,
+        expired ? 'expired_lease_during_handoff' : 'dead_source_during_handoff',
+        nowMs,
+      );
       appendEvent(state, 'executor_lost', {
         owner_id: state.lease.owner_id,
         reason: expired ? 'expired_lease_during_handoff' : 'dead_source_during_handoff',
@@ -700,6 +732,7 @@ export function acceptRuntimeHandoff(
       throw new Error(`Runtime handoff is fenced by live owner ${current.lease.owner_id}.`);
     }
     if (current.lease) {
+      reconcileLostExecutorTelemetry(sessionDir, current.lease, 'expired_lease', nowMs);
       appendEvent(current, 'executor_lost', { owner_id: current.lease.owner_id, reason: 'expired_lease' }, nowMs);
       current.executor_restart_count += 1;
     }
@@ -748,6 +781,7 @@ export function watchdogRecoverSupervisor(
     reason = previous ? (expired ? 'expired_lease' : 'dead_executor') : 'missing_lease';
     resumeCheckpoint = latestCheckpoint(current);
     if (previous) {
+      reconcileLostExecutorTelemetry(sessionDir, previous, reason, nowMs);
       appendEvent(current, 'executor_lost', { owner_id: previous.owner_id, reason }, nowMs);
       current.executor_restart_count += 1;
     }

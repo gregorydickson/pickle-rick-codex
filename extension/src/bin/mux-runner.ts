@@ -78,6 +78,8 @@ interface RunSequentialOptions {
   timeoutMs?: number;
   durableOwnershipHeld?: boolean;
   assertDurableOwnership?: () => void;
+  recordDurableCheckpoint?: (checkpoint: Record<string, unknown>) => void;
+  resumeCheckpoint?: Record<string, unknown> | null;
   handoffRequestId?: string;
   targetRuntime?: import('../services/durable-supervisor.js').InstalledRuntimeDescriptor;
   holdActiveForReleaseGate?: boolean;
@@ -963,6 +965,8 @@ export async function runSequential(
         onFailure: 'retry',
         durableOwnershipHeld: true,
         assertDurableOwnership: ownership.assertOwned,
+        recordDurableCheckpoint: ownership.recordCheckpoint,
+        resumeCheckpoint: ownership.resumeCheckpoint(),
         runStartedAtMs,
         holdActiveForReleaseGate: options.runnerMode !== 'pipeline',
       }, deps);

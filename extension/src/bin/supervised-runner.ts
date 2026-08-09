@@ -4,8 +4,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { abortExpiredRuntimeHandoff, hasPendingRuntimeHandoff, readLogicalPipeline } from '../services/durable-supervisor.js';
-import { recordUnexpectedNoncompletionTermination } from '../services/productive-autonomy.js';
-import { captureProcessLivenessIdentity, type PersistedProcessIdentity } from '../services/orphan-reaper.js';
+import {
+  reconcileInterruptedModelCallTelemetry,
+  recordUnexpectedNoncompletionTermination,
+} from '../services/productive-autonomy.js';
+import {
+  assertRecordedActiveChildRecovered,
+  captureProcessLivenessIdentity,
+  type PersistedProcessIdentity,
+} from '../services/orphan-reaper.js';
+import { StateManager } from '../services/state-manager.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
 
@@ -79,6 +87,11 @@ export async function runSupervisedRunner(
     });
     testOptions.onExecutorIdentity?.(child.pid ? captureProcessLivenessIdentity(child.pid) : null);
     const exitCode = await waitForExit(child);
+    assertRecordedActiveChildRecovered(sessionDir, new StateManager());
+    reconcileInterruptedModelCallTelemetry(sessionDir, {
+      reason: 'supervised_executor_exit',
+      sourceOwnerId: child.pid ? `process:${child.pid}` : null,
+    });
     const decision = supervisedRunnerDecision(sessionDir);
     appendLog(sessionDir, `${runnerBin} exited code=${exitCode}; decision=${decision}`);
     if (decision === 'completed') return 0;

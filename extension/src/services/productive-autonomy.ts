@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteJson } from './pickle-utils.js';
-import { StateManager } from './state-manager.js';
+import { StateError, StateManager } from './state-manager.js';
 import type { Ticket } from '../types/index.js';
 import type { CodexSpawnResult } from '../types/index.js';
 import type { WorkerLifecyclePhase } from './worker-lifecycle.js';
@@ -103,7 +103,7 @@ export interface ExecutionTelemetryEvent {
   strategy_hash: string | null;
   outcome: 'success' | 'failed' | 'cancelled' | 'timed_out';
   telemetry_status?: 'reported' | 'telemetry_unavailable';
-  telemetry_failure?: 'completed_without_usage' | 'call_ended_without_usage' | null;
+  telemetry_failure?: 'completed_without_usage' | 'call_ended_without_usage' | 'executor_interrupted' | null;
   duration_ms: number;
   input_tokens: number | null;
   cached_input_tokens: number | null;
@@ -111,6 +111,11 @@ export interface ExecutionTelemetryEvent {
   output_tokens: number | null;
   productive_work: number;
   discarded_work: number;
+  interruption?: {
+    reason: string;
+    source_owner_id: string | null;
+    lease_generation: number | null;
+  };
   recorded_at: string;
 }
 
@@ -131,6 +136,21 @@ interface ExecutionTelemetryJournal {
     executor_identity: PersistedProcessIdentity;
     recorded_at: string;
   };
+}
+
+interface ExecutionTelemetryCorruption {
+  schema_version: 1;
+  reason: string;
+  recorded_at: string;
+}
+
+export class ExecutionTelemetryCorruptionError extends Error {
+  readonly code = 'EXECUTION_TELEMETRY_CORRUPT';
+
+  constructor(message = 'execution-telemetry-corrupt') {
+    super(message);
+    this.name = 'ExecutionTelemetryCorruptionError';
+  }
 }
 
 export interface ModelCallTelemetryReservation {
@@ -159,6 +179,7 @@ export interface ExecutionTelemetrySummary {
   phaseAttempts: number;
   recoveryEpochs: number;
   failedCalls: number;
+  interruptedCalls: number;
   successfulCalls: number;
   timedOutCalls: number;
   cancelledCalls: number;
@@ -182,6 +203,7 @@ export interface ExecutionTelemetrySummary {
 
 const STRATEGY_FILE = 'recovery-strategies.json';
 const TELEMETRY_FILE = 'execution-telemetry.json';
+const TELEMETRY_CORRUPTION_FILE = 'execution-telemetry-corruption.json';
 
 const DOMAIN_POLICIES: Record<FailureDomain, Omit<FailureRoute, 'domain'>> = {
   contract: {
@@ -268,6 +290,24 @@ function strategyPath(sessionDir: string): string {
 
 function telemetryPath(sessionDir: string): string {
   return path.join(sessionDir, TELEMETRY_FILE);
+}
+
+function telemetryCorruptionPath(sessionDir: string): string {
+  return path.join(sessionDir, TELEMETRY_CORRUPTION_FILE);
+}
+
+function recordTelemetryCorruption(sessionDir: string, error: unknown): ExecutionTelemetryCorruptionError {
+  const classified = error instanceof ExecutionTelemetryCorruptionError
+    ? error
+    : new ExecutionTelemetryCorruptionError(
+      error instanceof Error ? `execution-telemetry-corrupt: ${error.message}` : 'execution-telemetry-corrupt',
+    );
+  atomicWriteJson(telemetryCorruptionPath(sessionDir), {
+    schema_version: 1,
+    reason: classified.message,
+    recorded_at: new Date().toISOString(),
+  } satisfies ExecutionTelemetryCorruption);
+  return classified;
 }
 
 export function classifyFailure(input: {
@@ -604,7 +644,8 @@ export function finalizeModelCallTelemetry(
     const persisted = journal.model_attempts.find((candidate) => (
       candidate.model_attempt_id === reservation.model_attempt_id
     ));
-    if (!persisted || persisted.status !== 'started') throw new Error('model-call-telemetry-reservation-missing');
+    if (!persisted) throw new Error('model-call-telemetry-reservation-missing');
+    if (persisted.status !== 'started') throw new Error('model-call-telemetry-reservation-finalized');
     const outcome = input.outcome ?? (input.result.cancelled
       ? 'cancelled'
       : input.result.timedOut
@@ -642,6 +683,96 @@ export function finalizeModelCallTelemetry(
   });
   if (!event) throw new Error('model-call-telemetry-finalize-failed');
   return event;
+}
+
+/** Finalize reservations whose owning executor has been proven dead. The
+ * reservation and event transition share one telemetry-journal write, making
+ * recovery idempotent and fencing any late finalizer from double counting. */
+export function reconcileInterruptedModelCallTelemetry(
+  sessionDir: string,
+  authority: {
+    reason: string;
+    sourceOwnerId?: string | null;
+    leaseGeneration?: number | null;
+    now?: Date;
+  },
+): ExecutionTelemetryEvent[] {
+  const now = authority.now ?? new Date();
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) throw new Error('model-call-telemetry-recovery-time-invalid');
+  if (!authority.reason.trim()) throw new Error('model-call-telemetry-recovery-reason-invalid');
+  const filePath = telemetryPath(sessionDir);
+  const stateManager = new StateManager();
+  const reconciled: ExecutionTelemetryEvent[] = [];
+  try {
+    stateManager.update(filePath, (raw) => {
+      const journal = raw as unknown as ExecutionTelemetryJournal;
+      if (journal.schema_version !== 1 || !Array.isArray(journal.events)) {
+        throw new ExecutionTelemetryCorruptionError();
+      }
+      if (journal.model_attempts !== undefined && !Array.isArray(journal.model_attempts)) {
+        throw new ExecutionTelemetryCorruptionError();
+      }
+      journal.model_attempts = Array.isArray(journal.model_attempts) ? journal.model_attempts : [];
+      let sequence = Math.max(0, ...journal.events.map((candidate) => Number(candidate.sequence || 0)));
+      const recordedAt = now.toISOString();
+      for (const reservation of journal.model_attempts) {
+        if (!Number.isInteger(reservation.model_attempt_id) || reservation.model_attempt_id <= 0
+          || typeof reservation.ticket_id !== 'string' || !reservation.ticket_id
+          || typeof reservation.phase !== 'string' || !reservation.phase
+          || !Number.isInteger(reservation.ticket_attempt) || reservation.ticket_attempt <= 0
+          || !Number.isInteger(reservation.phase_attempt) || reservation.phase_attempt <= 0
+          || !Number.isInteger(reservation.recovery_epoch) || reservation.recovery_epoch < 0
+          || !['started', 'finalized'].includes(reservation.status)) {
+          throw new ExecutionTelemetryCorruptionError();
+        }
+        if (reservation.status !== 'started') continue;
+        const startedAtMs = Date.parse(reservation.started_at);
+        if (!Number.isFinite(startedAtMs)) throw new ExecutionTelemetryCorruptionError();
+        const event: ExecutionTelemetryEvent = {
+          sequence: ++sequence,
+          model_attempt_id: reservation.model_attempt_id,
+          ticket_id: reservation.ticket_id,
+          phase: reservation.phase,
+          ticket_attempt: reservation.ticket_attempt,
+          phase_attempt: reservation.phase_attempt,
+          recovery_epoch: reservation.recovery_epoch,
+          strategy_hash: reservation.strategy_hash,
+          outcome: 'failed',
+          telemetry_status: 'telemetry_unavailable',
+          telemetry_failure: 'executor_interrupted',
+          duration_ms: Math.max(0, nowMs - startedAtMs),
+          input_tokens: null,
+          cached_input_tokens: null,
+          cache_creation_input_tokens: null,
+          output_tokens: null,
+          productive_work: 0,
+          discarded_work: 1,
+          interruption: {
+            reason: authority.reason,
+            source_owner_id: authority.sourceOwnerId ?? null,
+            lease_generation: Number.isInteger(authority.leaseGeneration) && Number(authority.leaseGeneration) > 0
+              ? Number(authority.leaseGeneration) : null,
+          },
+          recorded_at: recordedAt,
+        };
+        journal.events.push(event);
+        reservation.status = 'finalized';
+        reservation.finalized_at = recordedAt;
+        reconciled.push(event);
+      }
+      return journal as unknown as Record<string, unknown>;
+    }, fs.existsSync(filePath)
+      ? {}
+      : { createDefault: () => ({ schema_version: 1, events: [], model_attempts: [], next_model_attempt_id: 1 }) });
+  } catch (error) {
+    if (error instanceof ExecutionTelemetryCorruptionError
+      || (error instanceof StateError && error.code === 'CORRUPT')) {
+      throw recordTelemetryCorruption(sessionDir, error);
+    }
+    throw error;
+  }
+  return reconciled;
 }
 
 export function recordModelCallTelemetry(
@@ -795,20 +926,37 @@ export function recordUnexpectedNoncompletionTermination(
 }
 
 export function executionTelemetrySummary(sessionDir: string, ticketId?: string): ExecutionTelemetrySummary {
-  const journal = readJournal<ExecutionTelemetryJournal>(telemetryPath(sessionDir), { schema_version: 1, events: [] });
+  const corruption = readJournal<ExecutionTelemetryCorruption | null>(telemetryCorruptionPath(sessionDir), null);
+  let journal: ExecutionTelemetryJournal;
+  try {
+    journal = readJournal<ExecutionTelemetryJournal>(telemetryPath(sessionDir), { schema_version: 1, events: [] });
+  } catch (error) {
+    if (!corruption) throw error;
+    journal = { schema_version: 1, events: [] };
+  }
+  if (!Array.isArray(journal.events)) {
+    if (!corruption) throw new ExecutionTelemetryCorruptionError();
+    journal = { schema_version: 1, events: [] };
+  }
   const events = journal.events
     .filter((event) => !ticketId || event.ticket_id === ticketId);
   const controls = { ...EMPTY_CONTROLS, ...(journal.controls || {}) };
-  const unexpectedNoncompletionTermination = Boolean(journal.unexpected_noncompletion_termination);
+  if (corruption) controls.unexpected_terminal_exits = Math.max(1, controls.unexpected_terminal_exits);
+  const unexpectedNoncompletionTermination = Boolean(journal.unexpected_noncompletion_termination || corruption);
   const zeroedByUnexpectedTermination = unexpectedNoncompletionTermination || controls.unexpected_terminal_exits > 0;
   return {
     ticketAttempts: new Set(events.map((event) => `${event.ticket_id}\0${event.ticket_attempt}`)).size,
     phaseAttempts: events.length,
     recoveryEpochs: new Set(events.filter((event) => event.recovery_epoch > 0).map((event) => `${event.ticket_id}\0${event.recovery_epoch}`)).size,
-    failedCalls: events.filter((event) => event.outcome === 'failed').length,
-    successfulCalls: events.filter((event) => event.outcome === 'success').length,
-    timedOutCalls: events.filter((event) => event.outcome === 'timed_out').length,
-    cancelledCalls: events.filter((event) => event.outcome === 'cancelled').length,
+    failedCalls: events.filter((event) => event.outcome === 'failed'
+      && event.telemetry_failure !== 'executor_interrupted').length,
+    interruptedCalls: events.filter((event) => event.telemetry_failure === 'executor_interrupted').length,
+    successfulCalls: events.filter((event) => event.outcome === 'success'
+      && event.telemetry_failure !== 'executor_interrupted').length,
+    timedOutCalls: events.filter((event) => event.outcome === 'timed_out'
+      && event.telemetry_failure !== 'executor_interrupted').length,
+    cancelledCalls: events.filter((event) => event.outcome === 'cancelled'
+      && event.telemetry_failure !== 'executor_interrupted').length,
     durationMs: events.reduce((sum, event) => sum + event.duration_ms, 0),
     inputTokens: events.reduce((sum, event) => sum + Number(event.input_tokens || 0), 0),
     cachedInputTokens: events.reduce((sum, event) => sum + Number(event.cached_input_tokens || 0), 0),

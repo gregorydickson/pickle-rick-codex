@@ -5,16 +5,19 @@ import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeTempRoot, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, writeJson } from './helpers.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
+import { runTicket } from '../bin/spawn-morty.js';
 import { enqueueCitadelRemediation, parsePipelineHandoffOptions, runPipeline } from '../bin/pipeline-runner.js';
 import { startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import {
   acceptRuntimeHandoff,
   acquireSupervisorLease,
+  recordSupervisorCheckpoint,
   readLogicalPipeline,
   releaseRuntimeHandoffLease,
   requestRuntimeHandoff,
+  watchdogRecoverSupervisor,
 } from '../services/durable-supervisor.js';
 import { readPrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from '../services/session-prd-seal.js';
@@ -175,6 +178,188 @@ test('runtime heartbeat owns, renews, excludes a second runner, and releases rec
   ownership.finish('error');
   assert.equal(readLogicalPipeline(sessionDir).lease, null);
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+});
+
+test('two consecutive executor losses preserve an authenticated older checkpoint generation', () => {
+  const { sessionDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const dead = acquireSupervisorLease(sessionDir, {
+    ownerId: 'runner:2147483646:dead',
+    ttlMs: 60_000,
+  });
+  recordSupervisorCheckpoint(sessionDir, dead.owner_id, dead.token, {
+    schema_version: 1,
+    kind: 'worker_phase',
+    ticket_id: 'r1',
+    lease_generation: 99,
+  });
+  const persistedCheckpoint = readLogicalPipeline(sessionDir).events.at(-1).details.checkpoint;
+  assert.equal(persistedCheckpoint.lease_generation, 1);
+  const second = watchdogRecoverSupervisor(sessionDir, {
+    ownerId: 'runner:2147483645:dead-second',
+    ttlMs: 60_000,
+    executorAlive: () => false,
+  });
+  assert.equal(second.lease.generation, 2);
+  assert.equal(second.resume_checkpoint.lease_generation, 1);
+  const third = watchdogRecoverSupervisor(sessionDir, {
+    ownerId: 'runner:2147483644:dead-third',
+    ttlMs: 60_000,
+    executorAlive: () => false,
+  });
+  assert.equal(third.lease.generation, 3);
+  assert.equal(third.resume_checkpoint.lease_generation, 1);
+  const replacement = startDurableRuntimeOwnership(sessionDir, {
+    ownerId: `runner:${process.pid}:replacement`,
+  });
+  assert.equal(replacement.lease().generation, 4);
+  assert.equal(replacement.resumeCheckpoint().lease_generation, 1);
+  replacement.finish('error');
+});
+
+test('replacement executor reuses a real fenced plan checkpoint and completes without replaying prior phases', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.active = true;
+  writeJson(statePath, state);
+  const fakeBin = makeTempRoot('production-supervisor-checkpoint-bin-');
+  createFakeCodex(fakeBin);
+  const invocationLog = path.join(sessionDir, 'checkpoint-invocations.jsonl');
+  const env = {
+    ...process.env,
+    ...prependPath(fakeBin),
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+  };
+  const moduleRoot = path.resolve(new URL('..', import.meta.url).pathname);
+  const executorScript = `
+    import { startDurableRuntimeOwnership } from ${JSON.stringify(new URL('../services/durable-runtime.js', import.meta.url).href)};
+    import { runTicket } from ${JSON.stringify(new URL('../bin/spawn-morty.js', import.meta.url).href)};
+    const sessionDir = ${JSON.stringify(sessionDir)};
+    const ownership = startDurableRuntimeOwnership(sessionDir);
+    await runTicket(sessionDir, 'R1', {
+      runnerMode: 'pickle',
+      assertDurableOwnership: ownership.assertOwned,
+      recordDurableCheckpoint: (checkpoint) => {
+        ownership.recordCheckpoint(checkpoint);
+        if (checkpoint.completed_phase === 'plan_review') process.kill(process.pid, 'SIGKILL');
+      },
+    });
+  `;
+  const first = spawn(process.execPath, ['--input-type=module', '-e', executorScript], {
+    cwd: moduleRoot,
+    env,
+    stdio: 'ignore',
+  });
+  const firstExit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('first executor did not reach its checkpoint')), 15_000);
+    first.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.equal(firstExit.signal, 'SIGKILL');
+  const afterKill = readLogicalPipeline(sessionDir);
+  const checkpointEvent = [...afterKill.events].reverse().find((event) => event.kind === 'checkpoint_recorded');
+  assert.equal(checkpointEvent.details.checkpoint.completed_phase, 'plan_review');
+  assert.deepEqual(checkpointEvent.details.checkpoint.completed_phases, ['research', 'research_review', 'plan', 'plan_review']);
+  assert.equal(checkpointEvent.details.checkpoint.lease_generation, 1);
+  assert.equal(git(workingDir, ['status', '--porcelain']), '');
+  const secondExecutorScript = `
+    import { startDurableRuntimeOwnership } from ${JSON.stringify(new URL('../services/durable-runtime.js', import.meta.url).href)};
+    const ownership = startDurableRuntimeOwnership(${JSON.stringify(sessionDir)});
+    const checkpoint = ownership.resumeCheckpoint();
+    if (!checkpoint || checkpoint.completed_phase !== 'plan_review' || checkpoint.lease_generation !== 1) process.exit(8);
+    process.kill(process.pid, 'SIGKILL');
+  `;
+  const second = spawn(process.execPath, ['--input-type=module', '-e', secondExecutorScript], {
+    cwd: moduleRoot,
+    env,
+    stdio: 'ignore',
+  });
+  const secondExit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('second executor did not recover the older checkpoint')), 10_000);
+    second.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.deepEqual(secondExit, { code: null, signal: 'SIGKILL' });
+  const replacement = spawn(process.execPath, [path.join(moduleRoot, 'bin', 'mux-runner.js'), sessionDir, '--on-failure=retry'], {
+    cwd: moduleRoot,
+    env,
+    stdio: 'ignore',
+  });
+  const replacementExit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      replacement.kill('SIGKILL');
+      reject(new Error('replacement executor did not complete'));
+    }, 20_000);
+    replacement.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.deepEqual(replacementExit, { code: 0, signal: null });
+  const prompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line).prompt);
+  const phases = prompts.map((prompt) => prompt.match(/You are executing the "([^"]+)" phase/)?.[1]).filter(Boolean);
+  for (const phase of ['research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'conformance']) {
+    assert.equal(phases.filter((candidate) => candidate === phase).length, 1, phase);
+  }
+  const completed = readLogicalPipeline(sessionDir);
+  assert.equal(completed.executor_restart_count, 2);
+  assert.equal(completed.terminal_state, 'completed');
+  assert.equal(completed.events.some((event) => event.kind === 'pipeline_cancelled'), false);
+  assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /reused durable supervisor checkpoint through plan_review/);
+});
+
+test('tampered canonical supervisor evidence forces phase replay instead of context-cache fallback', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession();
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, { ...JSON.parse(fs.readFileSync(statePath, 'utf8')), active: true });
+  const fakeBin = makeTempRoot('production-supervisor-tamper-bin-');
+  createFakeCodex(fakeBin);
+  const invocationLog = path.join(sessionDir, 'tamper-invocations.jsonl');
+  const originalEnv = {
+    PATH: process.env.PATH,
+    PICKLE_TEST_MODE: process.env.PICKLE_TEST_MODE,
+    PICKLE_TEST_QUALITY_COMMANDS: process.env.PICKLE_TEST_QUALITY_COMMANDS,
+    FAKE_CODEX_INVOCATION_LOG: process.env.FAKE_CODEX_INVOCATION_LOG,
+  };
+  Object.assign(process.env, prependPath(fakeBin, { FAKE_CODEX_INVOCATION_LOG: invocationLog }));
+  try {
+    let planCheckpoint = null;
+    await runTicket(sessionDir, 'R1', {
+      runnerMode: 'pickle',
+      recordDurableCheckpoint: (checkpoint) => {
+        if (checkpoint.completed_phase === 'plan_review') planCheckpoint = { ...checkpoint, lease_generation: 1 };
+      },
+    });
+    assert.ok(planCheckpoint);
+    updateTicketStatus(sessionDir, 'R1', { status: 'In Progress' });
+    beginRefinementRepositoryAdvance({
+      sessionDir,
+      workingDir,
+      ticketId: 'r1',
+      requiresCleanCommit: false,
+    });
+    const researchPath = path.join(sessionDir, 'worker-lifecycle', 'r1', 'research.json');
+    fs.writeFileSync(researchPath, '{"tampered":true}\n');
+    await runTicket(sessionDir, 'R1', {
+      runnerMode: 'pickle',
+      resumeCheckpoint: planCheckpoint,
+    });
+    const prompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line).prompt);
+    const phases = prompts.map((prompt) => prompt.match(/You are executing the "([^"]+)" phase/)?.[1]).filter(Boolean);
+    for (const phase of ['research', 'research_review', 'plan', 'plan_review']) {
+      assert.equal(phases.filter((candidate) => candidate === phase).length, 2, phase);
+    }
+    const restored = JSON.parse(fs.readFileSync(researchPath, 'utf8'));
+    assert.equal(restored.phase, 'research');
+    assert.equal(restored.ticket_id, 'r1');
+    assert.match(restored.summary, /approved research/);
+  } finally {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('verified repository advance does not mutate the sealed execution-base identity', () => {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -695,6 +696,8 @@ interface RunTicketOptions {
   strategyHash?: string | null;
   recoveryStrategy?: RecoveryStrategyEpoch | null;
   assertDurableOwnership?: () => void;
+  recordDurableCheckpoint?: (checkpoint: Record<string, unknown>) => void;
+  resumeCheckpoint?: Record<string, unknown> | null;
   [key: string]: unknown;
 }
 
@@ -702,6 +705,14 @@ interface RunTicketResult {
   status: string;
   applied: boolean;
   reason?: string;
+}
+
+function durableCheckpointDigest(value: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function fileDigest(filePath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
 export async function repairTicketVerificationContract(
@@ -920,25 +931,34 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   };
 
   let verificationReady: VerificationEnvResult;
-  let baselineFingerprint: string;
-  let baselineTrackedClean: boolean;
-  let baselineUntrackedFiles: string[];
-  let baselineHeadSha: string;
-  let workspaceBaseline: WorkspaceSnapshot;
-  let qualityBaseline: QualityBaseline;
+  let baselineFingerprint!: string;
+  let baselineTrackedClean!: boolean;
+  let baselineUntrackedFiles!: string[];
+  let baselineHeadSha!: string;
+  let workspaceBaseline!: WorkspaceSnapshot;
+  let qualityBaseline!: QualityBaseline;
   let mutationBoundary: WorkerMutationBoundary | null = null;
+  let validatedResumeCheckpoint: Record<string, unknown> | null = null;
+  const supervisorCheckpointPresented = options.resumeCheckpoint?.kind === 'worker_phase'
+    && normalizeTicketId(String(options.resumeCheckpoint.ticket_id || ''), '') === normalizedTicketId;
   const lifecycleArtifacts: WorkerLifecycleArtifact[] = [];
   const refusalPhases: WorkerLifecyclePhase[] = ['research_review', 'plan_review', 'review', 'conformance'];
   const remediationFeedback = refusalPhases
     .flatMap((phase) => {
       const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
       if (!fs.existsSync(artifactPath)) return [];
-      const artifact = readAndValidateWorkerLifecycleArtifact(
-        artifactPath,
-        phase,
-        normalizedTicketId,
-        normalizedTicket.acceptance_criteria || [],
-      );
+      let artifact: WorkerLifecycleArtifact;
+      try {
+        artifact = readAndValidateWorkerLifecycleArtifact(
+          artifactPath,
+          phase,
+          normalizedTicketId,
+          normalizedTicket.acceptance_criteria || [],
+        );
+      } catch (error) {
+        if (supervisorCheckpointPresented) return [];
+        throw error;
+      }
       return artifact.verdict === 'changes_requested'
         ? [{ artifact, mtimeMs: fs.statSync(artifactPath).mtimeMs }]
         : [];
@@ -1076,42 +1096,103 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
       });
     }
     verificationSteps = verificationReady.steps;
-    if (isGitRepo(workingDir) && isWorkingTreeDirty(workingDir)) {
-      throw new Error('pre-existing-dirt: worker requires a completely clean working tree; commit, stash, or remove existing tracked and untracked changes first');
-    }
-    baselineFingerprint = getWorkingTreeFingerprint(workingDir);
-    baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
-    baselineUntrackedFiles = isGitRepo(workingDir) ? listUntrackedFiles(workingDir) : [];
-    baselineHeadSha = isGitRepo(workingDir) ? getHeadSha(workingDir) : '';
-    if (baselineHeadSha) {
-      mutationBoundary = {
-        head: baselineHeadSha,
-        fingerprint: repositoryMutationFingerprint(workingDir),
-        untracked: baselineUntrackedFiles,
-        allowedPaths: [],
-      };
-    }
-    workspaceBaseline = captureWorkspaceSnapshot(workingDir);
-    const ticketScope = persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
-    if (mutationBoundary) mutationBoundary.allowedPaths = ticketScope.declared_paths;
-    assertOwnership();
-    updateTicketStatus(sessionDir, normalizedTicketId, {
-      status: 'In Progress',
-      started_at: new Date().toISOString(),
-      failure_reason: null,
-      failure_kind: null,
-      failed_at: null,
-    }, {
-      transactionPaths: [refinementRepositoryAdvancePath(sessionDir)],
-      afterWrite: () => beginRefinementRepositoryAdvance({
-        sessionDir,
-        workingDir,
-        ticketId: normalizedTicketId,
-        requiresCleanCommit: tmuxMode,
-      }),
-    });
     const persistedQualityBaseline = manager.read(statePath).quality_baseline;
-    try {
+    const resume = options.resumeCheckpoint;
+    if (resume?.schema_version === 1 && resume.kind === 'worker_phase'
+      && normalizeTicketId(String(resume.ticket_id || ''), '') === normalizedTicketId
+      && Number.isInteger(resume.lease_generation) && Number(resume.lease_generation) > 0
+      && (!isGitRepo(workingDir) || !isWorkingTreeDirty(workingDir))
+      && resume.repository_mutation_fingerprint === repositoryMutationFingerprint(workingDir)
+      && resume.quality_baseline_digest === durableCheckpointDigest(persistedQualityBaseline)
+      && resume.workspace_baseline && typeof resume.workspace_baseline === 'object'
+      && !Array.isArray(resume.workspace_baseline)
+      && Array.isArray(resume.baseline_untracked_files)
+      && typeof resume.baseline_fingerprint === 'string'
+      && typeof resume.baseline_tracked_clean === 'boolean') {
+      const candidateBaseline = resume.workspace_baseline as unknown as WorkspaceSnapshot;
+      const candidateMutationBoundary = resume.mutation_boundary as WorkerMutationBoundary | null;
+      const candidateInputHash = lifecycleContextInputHash(normalizedTicket, candidateBaseline.headSha);
+      const advance = readJsonFile<Record<string, unknown>>(refinementRepositoryAdvancePath(sessionDir), null);
+      const artifactDigests = Array.isArray(resume.artifact_digests) ? resume.artifact_digests : [];
+      const completedPhases = Array.isArray(resume.completed_phases) ? resume.completed_phases.map(String) : [];
+      const allowedCheckpointPhases: WorkerLifecyclePhase[] = ['research', 'research_review', 'plan', 'plan_review'];
+      const phasePrefixValid = completedPhases.length > 0
+        && completedPhases.length <= allowedCheckpointPhases.length
+        && JSON.stringify(completedPhases) === JSON.stringify(allowedCheckpointPhases.slice(0, completedPhases.length));
+      const digestPhases = artifactDigests.map((entry) => (
+        entry && typeof entry === 'object' && !Array.isArray(entry) ? String((entry as Record<string, unknown>).phase || '') : ''
+      ));
+      const artifactsValid = artifactDigests.length > 0
+        && JSON.stringify(digestPhases) === JSON.stringify(completedPhases)
+        && artifactDigests.every((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+        const record = entry as Record<string, unknown>;
+        const phase = String(record.phase || '') as WorkerLifecyclePhase;
+        const artifactPath = workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase);
+        return typeof record.sha256 === 'string' && fs.existsSync(artifactPath)
+          && fileDigest(artifactPath) === record.sha256;
+        });
+      if (candidateBaseline && typeof candidateBaseline.headSha === 'string'
+        && candidateBaseline.files && typeof candidateBaseline.files === 'object'
+        && resume.input_hash === candidateInputHash
+        && candidateMutationBoundary && typeof candidateMutationBoundary.fingerprint === 'string'
+        && candidateMutationBoundary.fingerprint === resume.repository_mutation_fingerprint
+        && JSON.stringify(candidateBaseline) === JSON.stringify(captureWorkspaceSnapshot(workingDir))
+        && resume.baseline_fingerprint === getWorkingTreeFingerprint(workingDir)
+        && resume.baseline_tracked_clean === true
+        && JSON.stringify(resume.baseline_untracked_files) === JSON.stringify(listUntrackedFiles(workingDir))
+        && phasePrefixValid
+        && artifactsValid
+        && advance?.schema_version === 1 && advance.phase === 'started'
+        && normalizeTicketId(String(advance.ticket_id || ''), '') === normalizedTicketId
+        && advance.baseline_head_sha === candidateBaseline.headSha) {
+        workspaceBaseline = structuredClone(candidateBaseline);
+        mutationBoundary = structuredClone(candidateMutationBoundary);
+        baselineHeadSha = candidateBaseline.headSha;
+        baselineFingerprint = String(resume.baseline_fingerprint);
+        baselineTrackedClean = Boolean(resume.baseline_tracked_clean);
+        baselineUntrackedFiles = resume.baseline_untracked_files.map(String);
+        qualityBaseline = assertQualityBaselineFresh(persistedQualityBaseline, workingDir);
+        validatedResumeCheckpoint = resume;
+      }
+    }
+    if (!validatedResumeCheckpoint) {
+      if (isGitRepo(workingDir) && isWorkingTreeDirty(workingDir)) {
+        throw new Error('pre-existing-dirt: worker requires a completely clean working tree; commit, stash, or remove existing tracked and untracked changes first');
+      }
+      baselineFingerprint = getWorkingTreeFingerprint(workingDir);
+      baselineTrackedClean = !isGitRepo(workingDir) || !hasTrackedWorkingTreeChanges(workingDir);
+      baselineUntrackedFiles = isGitRepo(workingDir) ? listUntrackedFiles(workingDir) : [];
+      baselineHeadSha = isGitRepo(workingDir) ? getHeadSha(workingDir) : '';
+      if (baselineHeadSha) {
+        mutationBoundary = {
+          head: baselineHeadSha,
+          fingerprint: repositoryMutationFingerprint(workingDir),
+          untracked: baselineUntrackedFiles,
+          allowedPaths: [],
+        };
+      }
+      workspaceBaseline = captureWorkspaceSnapshot(workingDir);
+      const ticketScope = persistTicketScope(sessionDir, normalizedTicket, normalizedTicketId, workspaceBaseline.headSha);
+      if (mutationBoundary) mutationBoundary.allowedPaths = ticketScope.declared_paths;
+      assertOwnership();
+      updateTicketStatus(sessionDir, normalizedTicketId, {
+        status: 'In Progress',
+        started_at: new Date().toISOString(),
+        failure_reason: null,
+        failure_kind: null,
+        failed_at: null,
+      }, {
+        transactionPaths: [refinementRepositoryAdvancePath(sessionDir)],
+        afterWrite: () => beginRefinementRepositoryAdvance({
+          sessionDir,
+          workingDir,
+          ticketId: normalizedTicketId,
+          requiresCleanCommit: tmuxMode,
+        }),
+      });
+    }
+    if (!validatedResumeCheckpoint) try {
       qualityBaseline = assertQualityBaselineFresh(persistedQualityBaseline, workingDir);
     } catch (error) {
       if (!(error instanceof QualityBaselineError) || error.kind === 'quality-baseline-write-failed') throw error;
@@ -1172,8 +1253,38 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
     });
 
     const contextInputHash = lifecycleContextInputHash(normalizedTicket, baselineHeadSha);
+    const resumeCheckpoint = validatedResumeCheckpoint;
+    const supervisorCheckpointRejected = supervisorCheckpointPresented && !validatedResumeCheckpoint;
+    if (resumeCheckpoint?.schema_version === 1
+      && resumeCheckpoint.kind === 'worker_phase'
+      && normalizeTicketId(String(resumeCheckpoint.ticket_id || ''), '') === normalizedTicketId
+      && resumeCheckpoint.input_hash === contextInputHash
+      && Array.isArray(resumeCheckpoint.completed_phases)) {
+      const completedPhases = resumeCheckpoint.completed_phases.map(String);
+      const expectedPrefix = WORKER_LIFECYCLE_PHASES.slice(0, completedPhases.length);
+      if (JSON.stringify(completedPhases) === JSON.stringify(expectedPrefix)) {
+        try {
+          for (const phase of expectedPrefix) {
+            const artifact = readAndValidateWorkerLifecycleArtifact(
+              workerLifecycleArtifactPath(sessionDir, normalizedTicketId, phase),
+              phase,
+              normalizedTicketId,
+              normalizedTicket.acceptance_criteria || [],
+            );
+            if (artifact.verdict === 'changes_requested') throw new Error(`checkpoint contains refused ${phase}`);
+            lifecycleArtifacts.push(artifact);
+          }
+          if (expectedPrefix.length > 0) {
+            appendRunnerLog(sessionDir, runnerMode, `reused durable supervisor checkpoint through ${expectedPrefix.at(-1)}`);
+            recordExecutionControlTelemetry(sessionDir, { checkpoints_reused: expectedPrefix.length });
+          }
+        } catch {
+          lifecycleArtifacts.length = 0;
+        }
+      }
+    }
     const cachedContext = readLifecycleContextCheckpoint(sessionDir, normalizedTicketId, contextInputHash);
-    if (cachedContext) {
+    if (cachedContext && lifecycleArtifacts.length === 0 && !supervisorCheckpointRejected) {
       const expectedContextPhases: WorkerLifecyclePhase[] = ['research', 'research_review', 'plan', 'plan_review'];
       try {
         for (const phase of expectedContextPhases) {
@@ -1374,9 +1485,28 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         assertOwnership();
         writeLifecycleContextCheckpoint(sessionDir, normalizedTicketId, contextInputHash, lifecycleArtifacts.slice(0, 4));
       }
+      if (phase === 'implement') await runDeterministicVerification();
+      if (['research', 'research_review', 'plan', 'plan_review'].includes(phase)) options.recordDurableCheckpoint?.({
+        schema_version: 1,
+        kind: 'worker_phase',
+        ticket_id: normalizedTicketId,
+        input_hash: contextInputHash,
+        completed_phases: lifecycleArtifacts.map((entry) => entry.phase),
+        completed_phase: phase,
+        artifact_digests: lifecycleArtifacts.map((entry) => ({
+          phase: entry.phase,
+          sha256: fileDigest(workerLifecycleArtifactPath(sessionDir, normalizedTicketId, entry.phase)),
+        })),
+        repository_mutation_fingerprint: repositoryMutationFingerprint(workingDir),
+        workspace_baseline: workspaceBaseline,
+        mutation_boundary: mutationBoundary,
+        baseline_fingerprint: baselineFingerprint,
+        baseline_tracked_clean: baselineTrackedClean,
+        baseline_untracked_files: baselineUntrackedFiles,
+        quality_baseline_digest: durableCheckpointDigest(qualityBaseline),
+      });
       assertOwnership();
       recordIteration(sessionDir, manager.read(statePath) as unknown as CircuitIterationState);
-      if (phase === 'implement') await runDeterministicVerification();
     }
 
     assertOwnership();

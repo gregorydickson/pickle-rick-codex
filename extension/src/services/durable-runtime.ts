@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import {
   acquireSupervisorLease,
   acceptRuntimeHandoff,
+  recordSupervisorCheckpoint,
   readLogicalPipeline,
   releaseSupervisorLease,
   renewSupervisorLease,
@@ -32,6 +33,8 @@ export function isDurableOwnershipDrainError(error: unknown): error is DurableOw
 export interface DurableRuntimeOwnership {
   readonly ownerId: string;
   lease(): SupervisorLease;
+  resumeCheckpoint(): Record<string, unknown> | null;
+  recordCheckpoint(checkpoint: Record<string, unknown>): void;
   assertOwned(): void;
   finish(exitReason: string): void;
 }
@@ -79,6 +82,7 @@ export function startDurableRuntimeOwnership(
   }
 
   let activeLease: SupervisorLease;
+  let recoveredCheckpoint: Record<string, unknown> | null = null;
   if (!current.lease && options.handoffRequestId && options.targetRuntime) {
     activeLease = acceptRuntimeHandoff(
       sessionDir,
@@ -96,6 +100,12 @@ export function startDurableRuntimeOwnership(
       throw new Error(`Logical pipeline is already owned by live executor ${current.lease.owner_id}.`);
     }
     activeLease = recovery.lease;
+    const checkpointGeneration = Number(recovery.resume_checkpoint?.lease_generation);
+    recoveredCheckpoint = Number.isInteger(checkpointGeneration)
+      && checkpointGeneration > 0
+      && checkpointGeneration < activeLease.generation
+      ? recovery.resume_checkpoint
+      : null;
   }
 
   let renewalError: Error | null = null;
@@ -127,6 +137,11 @@ export function startDurableRuntimeOwnership(
   return {
     ownerId,
     lease: () => activeLease,
+    resumeCheckpoint: () => recoveredCheckpoint,
+    recordCheckpoint(checkpoint: Record<string, unknown>): void {
+      assertOwned();
+      recordSupervisorCheckpoint(sessionDir, ownerId, activeLease.token, checkpoint);
+    },
     assertOwned,
     finish(exitReason: string): void {
       if (finished) return;
