@@ -18,6 +18,7 @@ import {
 import { updateTicketStatus, writeTicketFiles } from '../services/tickets.js';
 import {
   assertBootstrapSessionNotRunning,
+  capturePipelineVerificationBaselines,
   copyPrdIntoSession,
   createBootstrapSession,
   ensureBootstrapSessionReady,
@@ -119,6 +120,19 @@ test('bootstrap creation validates its source before setup', async () => {
     () => createBootstrapSession({ prdPath: '/tmp/pipeline-bootstrap-missing-prd.md' }),
     /PRD file not found/,
   );
+});
+
+test('ordinary sessions without a durable journal do not acquire pipeline baselines', () => {
+  const sessionDir = makeTempRoot('pipeline-bootstrap-ordinary-');
+  const state = runnerState({ working_dir: sessionDir });
+  writeJson(path.join(sessionDir, 'state.json'), state);
+
+  assert.equal(capturePipelineVerificationBaselines(sessionDir, {
+    state,
+    summary: { queued: 0, done: 0, blocked: 0, skipped: 0, total: 0, runnable: [], tickets: [] },
+    config: {},
+  }), null);
+  assert.equal(readJsonFile(path.join(sessionDir, 'state.json')).verification_baselines, undefined);
 });
 
 test('task bootstrap creation and explicit resume materialize local session state', async () => {
