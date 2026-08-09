@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
@@ -13,7 +14,9 @@ import {
   markLegacyContractRepairComplete,
 } from '../services/legacy-session-adoption.js';
 import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
-import { writePrdSeal } from '../services/prd-seal.js';
+import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
+import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
+import { refinementRepositoryIdentity } from '../services/refinement-artifacts.js';
 import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recovery.js';
 import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
@@ -94,6 +97,45 @@ function seal(sessionDir) {
   beginAutonomousExecution(sessionDir);
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => [key, stableValue(entry)]));
+}
+
+function installLegacyRefinementAcceptance(value) {
+  const refined = '# Legacy refined PRD\n\n## AC-1: Adopt safely\n';
+  fs.writeFileSync(path.join(value.sessionDir, 'prd_refined.md'), refined);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.start_commit = git(value.repo, ['rev-parse', 'HEAD']);
+  writeJson(statePath, state);
+  const manifest = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'refinement_manifest.json'), 'utf8'));
+  const contractFields = new Set([
+    'id', 'title', 'description', 'complexity_tier', 'verification', 'verification_env', 'depends_on',
+    'acceptance_criteria', 'priority', 'phase', 'output_artifacts', 'proof_corpus', 'allowed_paths',
+    'freeze_contract', 'contract_decision', 'formatter', 'formatter_ticket',
+  ]);
+  const tickets = manifest.tickets.map((ticket) => Object.fromEntries(
+    Object.entries(ticket).filter(([field]) => contractFields.has(field)),
+  ));
+  writeJson(path.join(value.sessionDir, 'refinement-acceptance.json'), {
+    schema_version: 3,
+    prompt_contract_version: 3,
+    prd_sha256: sha256(fs.readFileSync(path.join(value.sessionDir, 'prd.md'))),
+    refined_prd_sha256: sha256(refined),
+    manifest_sha256: sha256(JSON.stringify(stableValue({ source: null, tickets }))),
+    repository_identity: refinementRepositoryIdentity(value.repo, value.sessionDir),
+    accepted_at: '2026-08-08T19:00:00.000Z',
+  });
+}
+
 function depsFor(value, actions = []) {
   let tmuxLive = true;
   const canonicalSession = fs.realpathSync(value.sessionDir);
@@ -157,6 +199,25 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   assert.equal(launches, 1);
   launchAdoptedLegacySession(value.sessionDir, value.targetRoot, { launch: () => { launches += 1; } });
   assert.equal(launches, 1);
+});
+
+test('default sealing preserves malformed verification only after the legacy owner is durably fenced', () => {
+  const value = fixture();
+  installLegacyRefinementAcceptance(value);
+  assert.throws(
+    () => ensureSessionPrdSeal(value.sessionDir),
+    /verification-contract-failed/,
+  );
+  const deps = depsFor(value);
+  delete deps.sealSession;
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.equal(record.status, 'adopted');
+  const sealRecord = readPrdSeal(value.sessionDir);
+  assert.deepEqual(sealRecord.release_gates.ticket_verification, [{
+    ticket_id: 'r1',
+    acceptance_criteria: ['Adopt safely.'],
+    verification: ['node -e "const x = `legacy`"'],
+  }]);
 });
 
 test('watchdog prefers the canonical deployed runtime and records its owner root', () => {

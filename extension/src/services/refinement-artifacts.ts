@@ -24,6 +24,7 @@ import { readFreshTicketScope } from './scope-contract.js';
 import { resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
 import type { RefinementManifest } from '../types/index.js';
+import { isVerificationContractError } from './verification-env.js';
 
 export const REFINEMENT_PROMPT_CONTRACT_VERSION = 3;
 export const REFINEMENT_ACCEPTANCE_SCHEMA_VERSION = 3;
@@ -111,10 +112,30 @@ function stableValue(value: unknown): unknown {
   );
 }
 
-function manifestContractSha256(manifestPath: string): string {
+function manifestContractSha256(manifestPath: string, preserveMalformedVerification = false): string {
   const manifest = readJsonFile<{ source?: unknown; tickets?: unknown }>(manifestPath, null);
   if (!manifest || !Array.isArray(manifest.tickets)) return '';
-  const canonical = enrichRefinementManifest(structuredClone(manifest) as RefinementManifest).manifest;
+  let canonical: RefinementManifest;
+  try {
+    canonical = enrichRefinementManifest(structuredClone(manifest) as RefinementManifest).manifest;
+  } catch (error) {
+    if (!preserveMalformedVerification || !isVerificationContractError(error)) throw error;
+    const raw = structuredClone(manifest) as RefinementManifest;
+    const verificationRepresentations = raw.tickets.map((ticket) => ticket.verification ?? ticket.verify);
+    const sanitized = {
+      ...raw,
+      tickets: raw.tickets.map((ticket) => {
+        const next = { ...ticket, verification: [] };
+        delete next.verify;
+        return next;
+      }),
+    };
+    canonical = enrichRefinementManifest(sanitized).manifest;
+    canonical.tickets = canonical.tickets.map((ticket, index) => ({
+      ...ticket,
+      verification: verificationRepresentations[index],
+    }));
+  }
   const tickets = canonical.tickets.map((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
     const ticket = entry as Record<string, unknown>;
@@ -361,7 +382,7 @@ export function refreshAcceptedRefinementRepositoryIdentity(
 
 export function validateRefinementAcceptance(
   sessionDir: string,
-  options: { workingDir?: string; verifyRepository?: boolean } = {},
+  options: { workingDir?: string; verifyRepository?: boolean; preserveMalformedVerification?: boolean } = {},
 ): RefinementAcceptanceVerdict {
   for (const [name, filePath] of [
     ['prd.md', path.join(sessionDir, 'prd.md')],
@@ -385,7 +406,10 @@ export function validateRefinementAcceptance(
   const expected = {
     prd_sha256: fileSha256(path.join(sessionDir, 'prd.md')),
     refined_prd_sha256: fileSha256(path.join(sessionDir, 'prd_refined.md')),
-    manifest_sha256: manifestContractSha256(path.join(sessionDir, 'refinement_manifest.json')),
+    manifest_sha256: manifestContractSha256(
+      path.join(sessionDir, 'refinement_manifest.json'),
+      options.preserveMalformedVerification === true,
+    ),
   };
   for (const [field, actual] of Object.entries(expected)) {
     if (!actual || receipt[field as keyof typeof expected] !== actual) {

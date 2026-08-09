@@ -18,9 +18,92 @@ import {
 } from './prd-seal.js';
 import { readJsonFile } from './pickle-utils.js';
 import { validateRefinementAcceptance } from './refinement-artifacts.js';
-import { readManifest, ticketDependencyIds } from './tickets.js';
+import { enrichRefinementManifest, readManifest, ticketDependencyIds } from './tickets.js';
 import type { PersistedState } from './state-manager.js';
 import { recordExecutionControlTelemetry } from './productive-autonomy.js';
+import { isVerificationContractError } from './verification-env.js';
+import type { RefinementManifest, Ticket } from '../types/index.js';
+
+interface LegacyAdoptionSealTransaction {
+  schema_version: 1;
+  stage: string;
+  session_id: string;
+  migration_content_hash?: string;
+}
+
+interface LegacyAdoptionMigration {
+  content_hash: string;
+  resume_checkpoint?: { phase?: string };
+}
+
+function readManifestForFencedLegacyAdoption(
+  sessionDir: string,
+  expectedMigrationContentHash: string,
+  state: PersistedState,
+): RefinementManifest {
+  assertFencedLegacyAdoptionSeal(sessionDir, expectedMigrationContentHash, state);
+
+  try {
+    return readManifest(sessionDir);
+  } catch (error) {
+    if (!isVerificationContractError(error)) throw error;
+  }
+
+  const manifestPath = path.join(sessionDir, 'refinement_manifest.json');
+  const raw = readJsonFile<RefinementManifest>(manifestPath, null);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Array.isArray(raw.tickets)) {
+    throw new Error(`Invalid refinement manifest JSON: ${manifestPath}`);
+  }
+  const verificationRepresentations = raw.tickets.map((ticket) => (
+    ticket.verification ?? ticket.verify
+  ));
+  const safeToEnrich: RefinementManifest = {
+    ...structuredClone(raw),
+    tickets: raw.tickets.map((ticket) => {
+      const sanitized = { ...structuredClone(ticket), verification: [] } as Ticket;
+      delete sanitized.verify;
+      return sanitized;
+    }),
+  };
+  const enriched = enrichRefinementManifest(safeToEnrich).manifest;
+  enriched.tickets = enriched.tickets.map((ticket, index) => ({
+    ...ticket,
+    verification: verificationRepresentations[index],
+  }));
+  return enriched;
+}
+
+function assertFencedLegacyAdoptionSeal(
+  sessionDir: string,
+  expectedMigrationContentHash: string,
+  state: PersistedState,
+): void {
+  const transaction = readJsonFile<LegacyAdoptionSealTransaction>(
+    path.join(sessionDir, 'legacy-session-adoption-transaction.json'),
+    null,
+  );
+  const migration = readJsonFile<LegacyAdoptionMigration>(
+    path.join(sessionDir, 'installed-runtime-migration.json'),
+    null,
+  );
+  if (!transaction
+    || transaction.schema_version !== 1
+    || transaction.stage !== 'migrated'
+    || transaction.session_id !== path.basename(sessionDir)
+    || transaction.migration_content_hash !== expectedMigrationContentHash
+    || !migration
+    || migration.content_hash !== expectedMigrationContentHash
+    || migration.resume_checkpoint?.phase !== 'verification_contract_repair'
+    || state.active !== true
+    || Number(state.tmux_runner_pid) > 0
+    || Number(state.worker_pid) > 0
+    || Number(state.active_child_pid) > 0
+    || state.active_child_identity
+    || state.step !== 'verification_contract_repair'
+    || state.failure_kind !== 'verification_contract_failed') {
+    throw new Error('Legacy adoption PRD sealing requires an exact quiesced migration repair fence.');
+  }
+}
 
 export function initializePrdDevelopmentPipeline(sessionDir: string): void {
   const journalPath = path.join(sessionDir, 'logical-pipeline.json');
@@ -56,14 +139,22 @@ export function extractAuthoritativeAcceptanceCriteria(markdown: string): PrdAcc
   return criteria;
 }
 
-function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): PrdSeal {
+function resolveSessionPrdSeal(
+  sessionDir: string,
+  approveRevision: boolean,
+  legacyAdoptionMigrationHash?: string,
+): PrdSeal {
   const state = readJsonFile<PersistedState>(path.join(sessionDir, 'state.json'), null);
   if (!state || typeof state.working_dir !== 'string' || !state.working_dir) {
     throw new Error('Cannot seal PRD without a valid session working directory.');
   }
+  if (legacyAdoptionMigrationHash) {
+    assertFencedLegacyAdoptionSeal(sessionDir, legacyAdoptionMigrationHash, state);
+  }
   const acceptance = validateRefinementAcceptance(sessionDir, {
     workingDir: state.working_dir,
     verifyRepository: true,
+    preserveMalformedVerification: Boolean(legacyAdoptionMigrationHash),
   });
   if (!acceptance.ok || !acceptance.receipt) {
     throw new Error(`Cannot seal an unaccepted refinement: ${acceptance.reason}.`);
@@ -72,7 +163,9 @@ function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): Pr
   const prd = fs.readFileSync(prdPath, 'utf8');
   const refinedPrdPath = path.join(sessionDir, 'prd_refined.md');
   const refinedPrd = fs.existsSync(refinedPrdPath) ? fs.readFileSync(refinedPrdPath, 'utf8') : '';
-  const manifest = readManifest(sessionDir);
+  const manifest = legacyAdoptionMigrationHash
+    ? readManifestForFencedLegacyAdoption(sessionDir, legacyAdoptionMigrationHash, state)
+    : readManifest(sessionDir);
   const executionBase = String(state.start_commit || 'unversioned');
   const authoritativeCriteria = extractAuthoritativeAcceptanceCriteria(refinedPrd);
   const sourceCriteria = authoritativeCriteria.length > 0
@@ -177,6 +270,13 @@ function resolveSessionPrdSeal(sessionDir: string, approveRevision: boolean): Pr
 
 export function ensureSessionPrdSeal(sessionDir: string): PrdSeal {
   return resolveSessionPrdSeal(sessionDir, false);
+}
+
+export function ensureFencedLegacyAdoptionPrdSeal(
+  sessionDir: string,
+  migrationContentHash: string,
+): PrdSeal {
+  return resolveSessionPrdSeal(sessionDir, false, migrationContentHash);
 }
 
 /** Explicit operator action used only after reviewing a persisted PRD revision request. */

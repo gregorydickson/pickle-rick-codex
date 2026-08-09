@@ -10,7 +10,7 @@ import {
   type PersistedProcessIdentity,
 } from './orphan-reaper.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
-import { ensureSessionPrdSeal } from './session-prd-seal.js';
+import { ensureFencedLegacyAdoptionPrdSeal } from './session-prd-seal.js';
 import { StateManager } from './state-manager.js';
 import { assertOwnedTmuxSession, killTmuxSessionById, runTmux, tmuxSessionExists } from './tmux.js';
 import {
@@ -490,7 +490,8 @@ export function adoptActiveLegacyMuxSession(
     if (!migration || migration.content_hash !== transaction.migration_content_hash) throw new Error('Legacy migration transaction is incomplete.');
     verifyLiveSessionMigration(sessionDir, migration);
     if (transaction.stage === 'migrated') {
-      (deps.sealSession || ensureSessionPrdSeal)(sessionDir);
+      if (deps.sealSession) deps.sealSession(sessionDir);
+      else ensureFencedLegacyAdoptionPrdSeal(sessionDir, migration.content_hash);
       transaction = { ...transaction, stage: 'sealed', updated_at: (deps.now?.() ?? new Date()).toISOString() };
       atomicWriteJson(transactionPath, transaction);
       deps.checkpoint?.('sealed');
