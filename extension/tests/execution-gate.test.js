@@ -208,17 +208,42 @@ test('quality gate executes checks introduced after baseline capture', async () 
 
 test('quality command timeout escalates from TERM to KILL', { skip: process.platform === 'win32' }, async () => {
   const root = tempRepo();
-  const started = Date.now();
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-quality-timeout-'));
+  const readyMarker = path.join(fixtureRoot, 'ready');
+  const termMarker = path.join(fixtureRoot, 'term');
+  const fixturePath = path.join(fixtureRoot, 'ignore-term.cjs');
+  fs.writeFileSync(fixturePath, [
+    "const fs = require('node:fs');",
+    `process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(termMarker)}, 'term'); });`,
+    `fs.writeFileSync(${JSON.stringify(readyMarker)}, 'ready');`,
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  const commandTimeoutMs = 250;
+  const killGraceMs = 1_000;
+  let readyAt = 0;
+  let childPid;
   const result = await runQualityCommand(
-    `node -e "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"`,
+    `${JSON.stringify(process.execPath)} ${JSON.stringify(fixturePath)}`,
     root,
-    250,
+    commandTimeoutMs,
+    {
+      onSpawn: (pid) => {
+        childPid = pid;
+        const deadline = Date.now() + 5_000;
+        while (!fs.existsSync(readyMarker) && Date.now() < deadline) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+        assert.equal(fs.readFileSync(readyMarker, 'utf8'), 'ready');
+        readyAt = Date.now();
+      },
+    },
   );
-  const elapsed = Date.now() - started;
   assert.equal(result.ok, false);
   assert.match(result.output, /quality gate timed out/);
-  assert.ok(elapsed >= 1_000, 'TERM-ignoring command should survive until the KILL grace period');
-  assert.ok(elapsed < 3_000, 'TERM-ignoring command should be killed after the grace period');
+  assert.equal(fs.readFileSync(termMarker, 'utf8'), 'term');
+  assert.ok(Date.now() - readyAt >= commandTimeoutMs + killGraceMs - 50,
+    'TERM-ignoring command must receive the complete KILL grace period');
+  assert.throws(() => process.kill(-childPid, 0), /ESRCH/);
 });
 
 test('workspace snapshot subtracts unchanged pre-existing dirt and identifies ticket changes', () => {

@@ -6,12 +6,15 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import {
+  deduplicateCitadelCheckExecutions,
   deriveCitadelAcceptanceCriteria,
   citadelSystemBlockPath,
   getCitadelRepositoryFingerprint,
   readCitadelSystemBlock,
   runCitadel,
   runCitadelChecks,
+  runCitadelChecksMonitored,
+  runMonitoredCitadelCheck,
   recoverCitadelStartCommit,
   reconcileValidatedCitadelTelemetry,
   persistCitadelReleaseApproval,
@@ -19,6 +22,7 @@ import {
   validateCitadelReport,
 } from '../services/citadel.js';
 import { reconcileInterruptedModelCallTelemetry } from '../services/productive-autonomy.js';
+import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot, writeExecutable } from './helpers.js';
@@ -499,28 +503,211 @@ test('runCitadelChecks deduplicates and records declared ticket verification com
   assert.match(checks[4].output, /ticket failed/);
 });
 
+test('Citadel deduplicates exact auto-discovered and ticket executions by structured identity', async () => {
+  const cwd = makeTempRoot('pickle-citadel-structured-dedupe-');
+  const sessionDir = makeTempRoot('pickle-citadel-structured-dedupe-session-');
+  const marker = path.join(cwd, 'execution-count');
+  fs.writeFileSync(path.join(cwd, 'count.cjs'), [
+    "const fs = require('node:fs');",
+    `const marker = ${JSON.stringify(marker)};`,
+    "const count = fs.existsSync(marker) ? Number(fs.readFileSync(marker, 'utf8')) : 0;",
+    "fs.writeFileSync(marker, String(count + 1));",
+  ].join('\n'));
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({ scripts: { test: 'node count.cjs' } }));
+  execFileSync('git', ['init', '-q'], { cwd });
+  const descriptors = [
+    { command: 'npm run test', executable: 'npm', args: ['run', 'test'] },
+    {
+      command: 'ticket T-1 verification',
+      executable: 'npm',
+      args: ['run', 'test'],
+      cwd: '.',
+      verificationStep: { kind: 'process', executable: 'npm', args: ['run', 'test'] },
+    },
+  ];
+
+  const deduplicated = deduplicateCitadelCheckExecutions(descriptors, cwd);
+  const results = await runCitadelChecksMonitored(cwd, sessionDir, [{
+    kind: 'package_script', manager: 'npm', script: 'test',
+  }], {
+    timeoutMs: 10_000,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+  });
+
+  assert.equal(deduplicated.length, 1);
+  assert.equal(deduplicated[0], descriptors[0]);
+  assert.equal(fs.readFileSync(marker, 'utf8'), '1');
+  assert.deepEqual(results.map(({ command }) => command), [
+    'npm run typecheck', 'npm run lint', 'npm run test', 'git diff --check',
+  ]);
+});
+
+test('Citadel structured deduplication retains distinct cwd, env, argv, and skip semantics', () => {
+  const cwd = makeTempRoot('pickle-citadel-structured-retention-');
+  const nested = path.join(cwd, 'nested');
+  fs.mkdirSync(nested);
+  const base = { command: 'base', executable: 'node', args: ['--version'], env: { PATH: process.env.PATH, MODE: 'a' } };
+  const descriptors = [
+    base,
+    { ...base, command: 'cwd', cwd: nested },
+    { ...base, command: 'env', env: { PATH: process.env.PATH, MODE: 'b' } },
+    { ...base, command: 'argv', args: ['--help'] },
+    { ...base, command: 'skipped', skipped: true },
+  ];
+
+  assert.deepEqual(deduplicateCitadelCheckExecutions(descriptors, cwd), descriptors);
+});
+
+test('Citadel snapshots cancellation at close before the cancellation poll can run', async () => {
+  const cwd = makeTempRoot('pickle-citadel-close-cancel-race-');
+  let cancellationChecks = 0;
+  let drainCalls = 0;
+  let exitOutcome = null;
+
+  await assert.rejects(
+    () => runMonitoredCitadelCheck({
+      command: 'immediate close',
+      executable: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+    }, cwd, {
+      timeoutMs: 10_000,
+      cancelPollMs: 60_000,
+      isCancelled: () => ++cancellationChecks === 2,
+      onSpawn: () => {},
+      onExit: (outcome) => { exitOutcome = outcome; },
+      drainProcessTree: async () => { drainCalls += 1; return true; },
+    }),
+    /deterministic checks cancelled/i,
+  );
+
+  assert.equal(cancellationChecks, 2, 'cancellation must be checked once before spawn and once at close');
+  assert.equal(drainCalls, 1, 'close-observed cancellation must use the awaited drain path');
+  assert.deepEqual(exitOutcome, { quiescent: true, cancelled: true, timedOut: false });
+});
+
+test('Citadel timeout drains its ready process tree and suppresses every subsequent check', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const cwd = makeTempRoot('pickle-citadel-timeout-quiescence-');
+  const sessionDir = makeTempRoot('pickle-citadel-timeout-session-');
+  const marker = path.join(cwd, 'subsequent-check-ran');
+  const readyMarker = path.join(cwd, 'timed-check-ready');
+  fs.writeFileSync(path.join(cwd, 'timeout-fixture.cjs'), [
+    "const fs = require('node:fs');",
+    "process.on('SIGTERM', () => {});",
+    `fs.writeFileSync(${JSON.stringify(readyMarker)}, 'ready');`,
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: 'node timeout-fixture.cjs' },
+  }));
+  let childPid = null;
+  let childIdentity = null;
+  let readyBeforeTimeout = false;
+  const results = await runCitadelChecksMonitored(cwd, sessionDir, [{
+    kind: 'process',
+    executable: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`],
+  }], {
+    timeoutMs: 100,
+    isCancelled: () => false,
+    onSpawn: (child) => {
+      childPid = Number(child.pid);
+      const deadline = Date.now() + 5_000;
+      while (!fs.existsSync(readyMarker) && Date.now() < deadline) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      readyBeforeTimeout = fs.existsSync(readyMarker);
+      const captured = captureSpawnedProcessIdentity(childPid);
+      childIdentity = captured ? Object.freeze({ ...captured }) : null;
+    },
+    onExit: () => {},
+  });
+
+  assert.equal(readyBeforeTimeout, true, 'timeout must start only after the inner command is ready');
+  assert.ok(Number.isInteger(childPid) && childPid > 0);
+  assert.ok(childIdentity, 'the active group leader must have an immutable recovery identity');
+  assert.equal(Object.isFrozen(childIdentity), true);
+  assert.equal(childIdentity.pid, childPid);
+  assert.equal(childIdentity.pgid, childPid, 'the captured child must be the exact process-group leader');
+  assert.deepEqual(results.map(({ status }) => status), ['skipped', 'skipped', 'failed']);
+  assert.equal(results.at(-1).command, 'npm run test');
+  assert.equal(results.at(-1).timed_out, true);
+  assert.notEqual(results.at(-1).process_tree_quiescent, false);
+  assert.match(results.at(-1).output, /timed out/);
+  assert.doesNotMatch(results.at(-1).output, /did not quiesce/);
+  assert.equal(fs.existsSync(marker), false);
+  assert.throws(
+    () => process.kill(-childIdentity.pgid, 0),
+    (error) => error?.code === 'ESRCH',
+    'the exact captured process group must be dead before the result is returned',
+  );
+});
+
+test('Citadel preserves the active child fence and suppresses later checks when drain cannot prove quiescence', async () => {
+  const cwd = makeTempRoot('pickle-citadel-nonquiescent-');
+  const sessionDir = makeTempRoot('pickle-citadel-nonquiescent-session-');
+  const marker = path.join(cwd, 'subsequent-check-ran');
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"` },
+  }));
+  let activeFence = null;
+  let exitOutcome = null;
+  const results = await runCitadelChecksMonitored(cwd, sessionDir, [{
+    kind: 'process',
+    executable: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`],
+  }], {
+    timeoutMs: 100,
+    isCancelled: () => false,
+    onSpawn: (child, command) => {
+      activeFence = Object.freeze({ pid: child.pid, command });
+    },
+    onExit: (outcome) => {
+      exitOutcome = outcome;
+      if (outcome.quiescent) activeFence = null;
+    },
+    drainProcessTree: async () => false,
+  });
+
+  assert.equal(results.at(-1).process_tree_quiescent, false);
+  assert.match(results.at(-1).output, /did not quiesce/);
+  assert.deepEqual(exitOutcome, { quiescent: false, cancelled: false, timedOut: true });
+  assert.equal(activeFence.command, 'npm run test');
+  assert.equal(fs.existsSync(marker), false);
+});
+
 test('Citadel cooperatively terminates a long deterministic check after lease loss', async () => {
   const { cwd, sessionDir } = makeCitadelLifecycleSession('The handoff drains Citadel.');
+  const startedMarker = path.join(sessionDir, 'citadel-check-started');
+  const drainedMarker = path.join(sessionDir, 'citadel-check-drained');
+  fs.writeFileSync(path.join(cwd, 'citadel-drain-fixture.cjs'), [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(startedMarker)}, 'started');`,
+    `process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(drainedMarker)}, 'drained'); process.exit(0); });`,
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
   fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
-    scripts: { test: 'node -e "setTimeout(() => {}, 10000)"' },
+    scripts: { test: 'node citadel-drain-fixture.cjs' },
   }));
-  execFileSync('git', ['add', 'package.json'], { cwd });
+  execFileSync('git', ['add', 'package.json', 'citadel-drain-fixture.cjs'], { cwd });
   execFileSync('git', ['commit', '-qm', 'long check fixture'], { cwd });
   const statePath = path.join(sessionDir, 'state.json');
   new StateManager().update(statePath, (state) => {
     state.start_commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
     return state;
   });
-  const startedAt = Date.now();
   await assert.rejects(
     () => runCitadel(sessionDir, {
       assertDurableOwnership: () => {
-        if (Date.now() - startedAt > 1_500) throw new Error('fixture lease ownership changed');
+        if (fs.existsSync(startedMarker)) throw new Error('fixture lease ownership changed');
       },
     }),
     /fixture lease ownership changed/,
   );
-  assert.ok(Date.now() - startedAt < 4_000, 'Citadel did not drain its child promptly');
+  assert.equal(fs.readFileSync(drainedMarker, 'utf8'), 'drained');
   const state = new StateManager().read(statePath);
   assert.ok(Number.isInteger(state.active_child_pid), 'stale owner must preserve the child recovery identity for green');
   assert.ok(state.active_child_identity);

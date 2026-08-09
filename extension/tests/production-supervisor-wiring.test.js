@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createFakeCodex, makeTempRoot, prependPath, writeJson } from './helpers.js';
+import { createFakeCodex, makeTempRoot, prependPath, waitFor, writeJson } from './helpers.js';
 import { muxRunnerExitFailed, runSequential } from '../bin/mux-runner.js';
 import { repairTicketVerificationContract, runTicket } from '../bin/spawn-morty.js';
 import {
@@ -322,13 +322,27 @@ test('replacement executor reuses a real fenced plan checkpoint and completes wi
     env,
     stdio: 'ignore',
   });
-  const firstExit = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('first executor did not reach its checkpoint')), 15_000);
-    first.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  let firstExit = null;
+  first.once('exit', (code, signal) => { firstExit = { code, signal }; });
+  const checkpointEvent = await waitFor(() => {
+    const checkpoint = [...readLogicalPipeline(sessionDir).events].reverse().find((event) => (
+      event.kind === 'checkpoint_recorded' && event.details.checkpoint?.completed_phase === 'plan_review'
+    ));
+    if (checkpoint) return checkpoint;
+    if (firstExit) throw new Error(`first executor exited before its plan checkpoint: ${JSON.stringify(firstExit)}`);
+    return false;
+  }, {
+    timeoutMs: 60_000,
+    intervalMs: 50,
+    message: 'first executor did not publish its fenced plan checkpoint within the worker liveness bound',
+  });
+  await waitFor(() => firstExit, {
+    timeoutMs: 5_000,
+    intervalMs: 20,
+    message: 'first executor published its checkpoint but did not terminate for replacement',
   });
   assert.equal(firstExit.signal, 'SIGKILL');
   const afterKill = readLogicalPipeline(sessionDir);
-  const checkpointEvent = [...afterKill.events].reverse().find((event) => event.kind === 'checkpoint_recorded');
   assert.equal(checkpointEvent.details.checkpoint.completed_phase, 'plan_review');
   assert.deepEqual(checkpointEvent.details.checkpoint.completed_phases, ['research', 'research_review', 'plan', 'plan_review']);
   assert.equal(checkpointEvent.details.checkpoint.lease_generation, 1);

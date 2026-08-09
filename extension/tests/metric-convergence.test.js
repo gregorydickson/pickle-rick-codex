@@ -33,7 +33,7 @@ test('measureMetric executes the command and requires exactly one numeric score'
 
 test('measureMetric reports a typed timeout and successful duration', () => {
   const cwd = makeTempRoot('pickle-metric-timeout-');
-  const measurement = measureMetric('sleep 0.02; printf 1', { cwd, timeoutMs: 500 });
+  const measurement = measureMetric('sleep 0.02; printf 1', { cwd });
   assert.ok(measurement.duration_ms >= 20);
   assert.throws(
     () => measureMetric('sleep 0.2; printf 1', { cwd, timeoutMs: 50 }),

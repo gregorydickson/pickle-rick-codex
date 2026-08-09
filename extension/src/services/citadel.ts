@@ -56,6 +56,8 @@ export interface CitadelCheckResult {
   status: 'passed' | 'failed' | 'skipped';
   exit_code: number | null;
   output: string;
+  timed_out?: boolean;
+  process_tree_quiescent?: false;
 }
 
 export type CitadelSystemBlockCode =
@@ -97,11 +99,19 @@ export class CitadelReviewerArtifactError extends Error {
   }
 }
 
-interface CitadelCheckRunOptions {
+export interface CitadelCheckExitOutcome {
+  quiescent: boolean;
+  cancelled: boolean;
+  timedOut: boolean;
+}
+
+export interface CitadelCheckRunOptions {
   timeoutMs: number;
   isCancelled: () => boolean;
   onSpawn: (child: ChildProcess, command: string) => void;
-  onExit: () => void;
+  onExit: (outcome: CitadelCheckExitOutcome) => void;
+  cancelPollMs?: number;
+  drainProcessTree?: (child: ChildProcess) => Promise<boolean>;
 }
 
 class CitadelChecksCancelledError extends Error {
@@ -1271,14 +1281,54 @@ export function runCitadelChecks(
   return [...packageChecks, ...ticketChecks];
 }
 
-interface CitadelCheckDescriptor {
+export interface CitadelCheckDescriptor {
   command: string;
   executable: string;
   args: string[];
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
   skipped?: boolean;
   verificationStep?: VerificationStep;
   allowedRoots?: string[];
+}
+
+function canonicalCitadelCheckCwd(workingDir: string, requestedCwd?: string): string {
+  const candidate = path.resolve(workingDir, requestedCwd || '.');
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return candidate;
+  }
+}
+
+function canonicalCitadelCheckEnv(env: NodeJS.ProcessEnv): Array<[string, string | null]> {
+  return Object.keys(env).sort().map((name) => [name, env[name] ?? null]);
+}
+
+export function citadelCheckExecutionIdentity(
+  descriptor: Pick<CitadelCheckDescriptor, 'executable' | 'args' | 'cwd' | 'env' | 'skipped'>,
+  workingDir: string,
+): string {
+  return JSON.stringify({
+    cwd: canonicalCitadelCheckCwd(workingDir, descriptor.cwd),
+    executable: descriptor.executable,
+    args: descriptor.args,
+    env: canonicalCitadelCheckEnv(descriptor.env || process.env),
+    skipped: descriptor.skipped === true,
+  });
+}
+
+export function deduplicateCitadelCheckExecutions<T extends CitadelCheckDescriptor>(
+  descriptors: T[],
+  workingDir: string,
+): T[] {
+  const seen = new Set<string>();
+  return descriptors.filter((descriptor) => {
+    const identity = citadelCheckExecutionIdentity(descriptor, workingDir);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 export function resolveCitadelCheckCwd(workingDir: string, requestedCwd: string): string {
@@ -1343,7 +1393,28 @@ function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   try { child.kill(signal); } catch { /* process already exited */ }
 }
 
-async function runMonitoredCitadelCheck(
+function processGroupAlive(child: ChildProcess): boolean {
+  const pid = Number(child.pid || 0);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform === 'win32') return child.exitCode === null && child.signalCode === null;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM');
+  }
+}
+
+async function drainProcessTree(child: ChildProcess, timeoutMs = 2_000): Promise<boolean> {
+  signalProcessTree(child, 'SIGKILL');
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupAlive(child) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !processGroupAlive(child);
+}
+
+export async function runMonitoredCitadelCheck(
   descriptor: CitadelCheckDescriptor,
   workingDir: string,
   options: CitadelCheckRunOptions,
@@ -1364,9 +1435,10 @@ async function runMonitoredCitadelCheck(
     let settled = false;
     let timedOut = false;
     let cancelled = false;
+    let killEscalation: NodeJS.Timeout | null = null;
     const child = spawn(descriptor.executable, descriptor.args, {
       cwd: descriptor.cwd || workingDir,
-      env: process.env,
+      env: descriptor.env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     });
@@ -1374,9 +1446,13 @@ async function runMonitoredCitadelCheck(
 
     const terminate = (): void => {
       signalProcessTree(child, 'SIGTERM');
-      setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) signalProcessTree(child, 'SIGKILL');
-      }, 1_000).unref?.();
+      if (killEscalation) return;
+      killEscalation = setTimeout(() => {
+        // The leader may exit while descendants retain its pipes and process group.
+        // Always target the owned group; signalProcessTree safely tolerates ESRCH.
+        signalProcessTree(child, 'SIGKILL');
+      }, 1_000);
+      killEscalation.unref?.();
     };
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -1386,11 +1462,12 @@ async function runMonitoredCitadelCheck(
       if (!options.isCancelled()) return;
       cancelled = true;
       terminate();
-    }, 100);
+    }, options.cancelPollMs ?? 100);
     const cleanup = (): void => {
       clearTimeout(timeout);
       clearInterval(cancelPoll);
-      options.onExit();
+      if (killEscalation) clearTimeout(killEscalation);
+      options.onExit({ quiescent: true, cancelled, timedOut });
     };
     const finish = (fn: () => void): void => {
       if (settled) return;
@@ -1401,11 +1478,23 @@ async function runMonitoredCitadelCheck(
     child.stdout?.on('data', (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
     child.stderr?.on('data', (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
     child.on('error', (error) => finish(() => reject(error)));
-    child.on('close', (code) => finish(() => {
-      if (cancelled || options.isCancelled()) {
-        // The state canceller may have signalled only the leader. Reap the owned
-        // process group once more so a shell/test descendant cannot escape.
-        signalProcessTree(child, 'SIGKILL');
+    child.on('close', async (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(cancelPoll);
+      if (killEscalation) clearTimeout(killEscalation);
+      // Snapshot cancellation before deciding whether the process tree must be
+      // drained. Calling isCancelled after onExit can erase the recovery fence
+      // before an ownership loss is observed.
+      const cancellationRequestedAtClose = options.isCancelled();
+      const cancelledAtClose = cancelled || cancellationRequestedAtClose;
+      const requiresDrain = timedOut || cancelledAtClose || processGroupAlive(child);
+      const drained = requiresDrain
+        ? await (options.drainProcessTree || drainProcessTree)(child)
+        : true;
+      options.onExit({ quiescent: drained, cancelled: cancelledAtClose, timedOut });
+      if (cancelledAtClose) {
         reject(new CitadelChecksCancelledError());
         return;
       }
@@ -1414,23 +1503,33 @@ async function runMonitoredCitadelCheck(
         .slice(-100_000);
       resolve({
         command: descriptor.command,
-        status: !timedOut && code === 0 ? 'passed' : 'failed',
+        status: !timedOut && drained && code === 0 ? 'passed' : 'failed',
         exit_code: code,
-        output: timedOut ? `${output}\nCitadel check timed out after ${options.timeoutMs}ms`.trim() : output,
+        output: [output,
+          ...(timedOut ? [`Citadel check timed out after ${options.timeoutMs}ms`] : []),
+          ...(drained ? [] : ['Citadel process tree did not quiesce; subsequent checks were suppressed.'])]
+          .filter(Boolean).join('\n'),
+        ...(timedOut ? { timed_out: true } : {}),
+        ...(drained ? {} : { process_tree_quiescent: false as const }),
       });
-    }));
+    });
   });
 }
 
-async function runCitadelChecksMonitored(
+export async function runCitadelChecksMonitored(
   workingDir: string,
   sessionDir: string,
   ticketVerificationSteps: VerificationStep[],
   options: CitadelCheckRunOptions,
 ): Promise<CitadelCheckResult[]> {
   const results: CitadelCheckResult[] = [];
-  for (const descriptor of citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps)) {
-    results.push(await runMonitoredCitadelCheck(descriptor, workingDir, options));
+  const descriptors = deduplicateCitadelCheckExecutions(
+    citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps), workingDir,
+  );
+  for (const descriptor of descriptors) {
+    const result = await runMonitoredCitadelCheck(descriptor, workingDir, options);
+    results.push(result);
+    if (result.timed_out || result.process_tree_quiescent === false) break;
   }
   return results;
 }
@@ -1830,8 +1929,10 @@ export async function runCitadel(
             return current;
           });
         },
-        onExit: () => {
-          if (ownershipDrainError) return;
+        onExit: ({ quiescent }) => {
+          // A live or unproven process tree remains owned by this immutable
+          // identity/fence so the succeeding recovery owner can validate and reap it.
+          if (!quiescent || ownershipDrainError) return;
           manager.update(path.join(sessionDir, 'state.json'), (current) => {
             current.active_child_pid = null;
             current.active_child_kind = null;
