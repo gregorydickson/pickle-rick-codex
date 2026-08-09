@@ -254,8 +254,9 @@ if (prompt.includes('You are the autonomous Citadel criterion-shard review worke
   const shardCounterPath = process.env.FAKE_CRITERION_SHARD_COUNTER || '';
   const shardAttempt = shardCounterPath && fs.existsSync(shardCounterPath)
     ? Number(fs.readFileSync(shardCounterPath, 'utf8')) : 0;
+  const malformedAttempts = Number(process.env.FAKE_CRITERION_SHARD_MALFORMED_ATTEMPTS || '1');
   if (shardCounterPath) fs.writeFileSync(shardCounterPath, String(shardAttempt + 1));
-  if (shardCounterPath && shardAttempt === 0) {
+  if (shardCounterPath && shardAttempt < malformedAttempts) {
     fs.writeFileSync(artifactPath, JSON.stringify({
       schema_version: 1,
       shard_id: shardId,
@@ -280,6 +281,17 @@ if (prompt.includes('You are the autonomous Citadel criterion-shard review worke
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, shardDelayMs);
     }
     try {
+      const strategyId = extractPathAfter('Execution strategy ID: ');
+      const strategyArtifactPath = extractPathAfter('Authenticated strategy artifact: ');
+      const strategyArtifactSha256 = extractPathAfter('Authenticated strategy artifact SHA-256: ');
+      if (strategyId !== 'direct_repository_evidence') {
+        const strategyArtifact = JSON.parse(fs.readFileSync(strategyArtifactPath, 'utf8'));
+        const actualStrategyArtifactSha256 = crypto.createHash('sha256')
+          .update(fs.readFileSync(strategyArtifactPath)).digest('hex');
+        if (actualStrategyArtifactSha256 !== strategyArtifactSha256 || !strategyArtifact.artifact_kind) {
+          throw new Error('criterion shard strategy artifact is not authenticated');
+        }
+      }
       const insideWorktree = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
         cwd: process.cwd(), encoding: 'utf8',
       }).trim();

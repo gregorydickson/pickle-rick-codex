@@ -35,6 +35,10 @@ import { isPreflightError, type PreflightError } from '../services/verification-
 import type { TicketSummary } from '../services/tickets.js';
 import type { PipelineContract } from '../types/index.js';
 
+export function recordPicklePipelineManagerRelaunch(sessionDir: string): number {
+  return recordCodexManagerRelaunch(sessionDir, 'pickle-pipeline');
+}
+
 interface PicklePipelineArgs {
   taskPrompt: string | null;
   resume: string | null;
@@ -298,7 +302,7 @@ async function main(argv: string[]): Promise<void> {
 
     assertBootstrapSessionNotRunning(sessionDir);
     if (parsed.resume) {
-      recordCodexManagerRelaunch(sessionDir, 'pickle-pipeline');
+      recordPicklePipelineManagerRelaunch(sessionDir);
     }
     previousSessionDir = getSessionForCwd(state.working_dir as string);
     await updateSessionMap(state.working_dir as string, sessionDir);

@@ -27,6 +27,10 @@ import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js
 import { isPreflightError, type PreflightError } from '../services/verification-env.js';
 import type { TicketSummary } from '../services/tickets.js';
 
+export function recordPickleTmuxManagerRelaunch(sessionDir: string): number {
+  return recordCodexManagerRelaunch(sessionDir, 'pickle-tmux');
+}
+
 interface PickleTmuxArgs {
   resume: string | null;
   prdPath: string | null;
@@ -185,7 +189,7 @@ async function main(argv: string[]): Promise<void> {
     }
     assertBootstrapSessionNotRunning(sessionDir);
     if (parsed.resume) {
-      recordCodexManagerRelaunch(sessionDir, 'pickle-tmux');
+      recordPickleTmuxManagerRelaunch(sessionDir);
     }
     previousSessionDir = getSessionForCwd(state.working_dir as string);
     await updateSessionMap(state.working_dir as string, sessionDir);

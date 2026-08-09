@@ -30,6 +30,7 @@ import {
 } from '../services/citadel-deterministic-recovery.js';
 import type { PipelineContract, PipelinePhase } from '../types/index.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
+import { activatePreparedManagerRelaunchRecovery, consumeManagerRelaunchRecovery } from '../services/manager-relaunch-integrity.js';
 import { requestPrdRevision } from '../services/durable-supervisor.js';
 import { repairTicketVerificationContract } from './spawn-morty.js';
 import {
@@ -488,6 +489,8 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
     && fs.existsSync(path.join(sessionDir, 'logical-pipeline.json'));
   if (!durableRuntime) {
     try {
+      activatePreparedManagerRelaunchRecovery(sessionDir);
+      consumeManagerRelaunchRecovery(sessionDir);
       return await runPipelineWithLease(sessionDir, options, runStartedAtMs);
     } finally {
       releaseOperation();
@@ -500,6 +503,8 @@ export async function runPipeline(sessionDir: string, options: RunPipelineOption
       handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
       targetRuntime: options.targetRuntime,
     });
+    activatePreparedManagerRelaunchRecovery(sessionDir);
+    consumeManagerRelaunchRecovery(sessionDir);
     if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
       ownership.assertOwned();
       finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);

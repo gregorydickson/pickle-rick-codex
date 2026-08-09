@@ -920,6 +920,7 @@ export function beginPipelinePhase(
     }
     sessionState.step = phase;
     appendHistoryEntry(sessionState, phase, (sessionState.current_ticket as string | null) || undefined);
+    appendHistoryEntry(sessionState, 'pipeline_phase_started', phase);
   }, options);
 }
 
@@ -962,7 +963,7 @@ export function finishPipelinePhase(
     appendHistoryEntry(
       sessionState,
       exitReason === 'success' ? 'pipeline_phase_done' : 'pipeline_phase_failed',
-      (sessionState.current_ticket as string | null) || undefined,
+      phase,
     );
     if (nextPhase == null && exitReason === 'success') {
       appendHistoryEntry(sessionState, 'complete');

@@ -13,6 +13,10 @@ import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { recordCodexManagerRelaunch } from './manager-relaunch-integrity.js';
 import { assertSessionOperationAvailable } from './session-operation.js';
 
+export function recordDetachedLoopManagerRelaunch(sessionDir: string): number {
+  return recordCodexManagerRelaunch(sessionDir, 'detached-loop');
+}
+
 interface LoopConfig {
   mode: string;
   target?: string | number;
@@ -359,7 +363,7 @@ export async function launchDetachedLoop({
     const existingConfig = readJsonFile<ExistingLoopConfig>(path.join(sessionDir, 'loop_config.json'), {}) || {};
     if (resumed) {
       assertResumeTargetUnchanged(sessionDir, loopConfig, existingConfig);
-      recordCodexManagerRelaunch(sessionDir, 'detached-loop');
+      recordDetachedLoopManagerRelaunch(sessionDir);
     }
     const mergedConfig = Object.fromEntries(
       Object.entries({ ...existingConfig, ...loopConfig }).filter(([, value]) => value !== null && value !== undefined && value !== ''),

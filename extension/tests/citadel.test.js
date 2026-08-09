@@ -1181,11 +1181,186 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
       fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
       return { shard_id: result.shard_id, path: resultPath, sha256: digest(resultPath) };
     });
+    const directInstruction = 'Read the eligible changed files directly, hash their bytes, and construct the shard result from repository evidence.';
+    const citationInstruction = 'Complete the runtime-provided citation scaffold only after independently checking every preseeded repository identity.';
+    const diffInstruction = 'First audit the authenticated diff inventory against the repository; then perform an independent criterion decision pass and serialize only the audited result.';
+    const replanInstruction = 'Use the authenticated rejection ledger to avoid every prior material approach, re-derive evidence from exact repository bytes, and produce a new independently checked result.';
+    const strategyMaterialHash = (result, strategy, artifactSha256) => crypto.createHash('sha256')
+      .update(JSON.stringify({
+        id: strategy.id,
+        route: strategy.route,
+        epoch: strategy.epoch,
+        instruction: strategy.instruction,
+        artifact_sha256: artifactSha256,
+        checkpoint_head: shardCheckpointHead,
+        reviewed_range: catalogBlock.reviewed_range,
+        shard_id: result.shard_id,
+        criterion: result.criterion,
+      })).digest('hex');
+    const writeShardRuntimeJson = (fileName, value) => {
+      const filePath = path.join(shardRuntimeDir, fileName);
+      fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+      return { path: filePath, sha256: digest(filePath) };
+    };
+    const shardFileInventory = shardRepositoryPaths.map((repositoryPath) => ({
+      path: repositoryPath,
+      sha256: digest(path.join(catalogWorkingDir, repositoryPath)),
+    }));
+    const shardDiff = execFileSync('git', ['diff', '--binary', catalogBlock.reviewed_range], {
+      cwd: catalogWorkingDir, encoding: 'utf8',
+    });
+    const strategyExecutions = shardResults.map((result, index) => {
+      const directStrategy = {
+        id: 'direct_repository_evidence', route: 'direct_review', epoch: 1, instruction: directInstruction,
+      };
+      if (index > 0) return {
+        shard_id: result.shard_id,
+        attempts: [{
+          ordinal: 1,
+          strategy_id: directStrategy.id,
+          evidence_route: directStrategy.route,
+          strategy_epoch: directStrategy.epoch,
+          strategy_instruction: directStrategy.instruction,
+          strategy_material_hash: strategyMaterialHash(result, directStrategy, null),
+          strategy_artifact: null,
+          candidate: { path: shardResultFiles[index].path, sha256: shardResultFiles[index].sha256 },
+          status: 'resolved',
+          error: null,
+        }],
+      };
+      const rejectedDirect = writeShardRuntimeJson('criterion-1-rejected-direct.json', {});
+      const citationArtifact = writeShardRuntimeJson('criterion-1-citation-scaffold.json', {
+        schema_version: 1,
+        artifact_kind: 'criterion_citation_scaffold',
+        shard_id: result.shard_id,
+        criterion: result.criterion,
+        checkpoint_head: shardCheckpointHead,
+        reviewed_range: catalogBlock.reviewed_range,
+        eligible_repository_evidence: shardFileInventory,
+        eligible_checks: catalogBlock.checks.map((check) => check.command),
+        required_observation: '<concrete observation from exact file bytes>',
+      });
+      const rejectedCitation = writeShardRuntimeJson('criterion-1-rejected-citation.json', {});
+      const diffArtifact = writeShardRuntimeJson('criterion-1-diff-inventory.json', {
+        schema_version: 1,
+        artifact_kind: 'authenticated_diff_inventory',
+        shard_id: result.shard_id,
+        checkpoint_head: shardCheckpointHead,
+        reviewed_range: catalogBlock.reviewed_range,
+        diff_sha256: crypto.createHash('sha256').update(shardDiff).digest('hex'),
+        files: shardFileInventory,
+        deterministic_checks: catalogBlock.checks.map((check) => check.command),
+      });
+      const rejectedDiff = writeShardRuntimeJson('criterion-1-rejected-diff.json', {});
+      const citationStrategy = {
+        id: 'runtime_citation_scaffold', route: 'preseeded_citation', epoch: 1,
+        instruction: citationInstruction,
+      };
+      const diffStrategy = {
+        id: 'authenticated_diff_inventory_two_pass', route: 'diff_inventory', epoch: 1,
+        instruction: diffInstruction,
+      };
+      const directMaterialHash = strategyMaterialHash(result, directStrategy, null);
+      const citationMaterialHash = strategyMaterialHash(result, citationStrategy, citationArtifact.sha256);
+      const diffMaterialHash = strategyMaterialHash(result, diffStrategy, diffArtifact.sha256);
+      const replanStrategy = {
+        id: 'failure_bound_evidence_replan', route: 'replanned_evidence_inventory', epoch: 1,
+        instruction: replanInstruction,
+      };
+      const replanArtifact = writeShardRuntimeJson('criterion-1-evidence-replan.json', {
+        schema_version: 1,
+        artifact_kind: 'criterion_evidence_replan',
+        shard_id: result.shard_id,
+        checkpoint_head: shardCheckpointHead,
+        reviewed_range: catalogBlock.reviewed_range,
+        evidence_inventory: shardFileInventory,
+        deterministic_checks: catalogBlock.checks.map((check) => check.command),
+        rejected_candidates: [
+          {
+            ordinal: 1,
+            strategy_id: directStrategy.id,
+            material_hash: directMaterialHash,
+            candidate_sha256: rejectedDirect.sha256,
+            error: 'generic direct result rejected',
+          },
+          {
+            ordinal: 2,
+            strategy_id: citationStrategy.id,
+            material_hash: citationMaterialHash,
+            candidate_sha256: rejectedCitation.sha256,
+            error: 'generic scaffold result rejected',
+          },
+          {
+            ordinal: 3,
+            strategy_id: diffStrategy.id,
+            material_hash: diffMaterialHash,
+            candidate_sha256: rejectedDiff.sha256,
+            error: 'generic diff result rejected',
+          },
+        ],
+        replan_epoch: 1,
+      });
+      return {
+        shard_id: result.shard_id,
+        attempts: [
+          {
+            ordinal: 1,
+            strategy_id: directStrategy.id,
+            evidence_route: directStrategy.route,
+            strategy_epoch: directStrategy.epoch,
+            strategy_instruction: directStrategy.instruction,
+            strategy_material_hash: directMaterialHash,
+            strategy_artifact: null,
+            candidate: rejectedDirect,
+            status: 'rejected',
+            error: 'generic direct result rejected',
+          },
+          {
+            ordinal: 2,
+            strategy_id: citationStrategy.id,
+            evidence_route: citationStrategy.route,
+            strategy_epoch: citationStrategy.epoch,
+            strategy_instruction: citationStrategy.instruction,
+            strategy_material_hash: citationMaterialHash,
+            strategy_artifact: citationArtifact,
+            candidate: rejectedCitation,
+            status: 'rejected',
+            error: 'generic scaffold result rejected',
+          },
+          {
+            ordinal: 3,
+            strategy_id: diffStrategy.id,
+            evidence_route: diffStrategy.route,
+            strategy_epoch: diffStrategy.epoch,
+            strategy_instruction: diffStrategy.instruction,
+            strategy_material_hash: diffMaterialHash,
+            strategy_artifact: diffArtifact,
+            candidate: rejectedDiff,
+            status: 'rejected',
+            error: 'generic diff result rejected',
+          },
+          {
+            ordinal: 4,
+            strategy_id: replanStrategy.id,
+            evidence_route: replanStrategy.route,
+            strategy_epoch: replanStrategy.epoch,
+            strategy_instruction: replanStrategy.instruction,
+            strategy_material_hash: strategyMaterialHash(result, replanStrategy, replanArtifact.sha256),
+            strategy_artifact: replanArtifact,
+            candidate: { path: shardResultFiles[index].path, sha256: shardResultFiles[index].sha256 },
+            status: 'resolved',
+            error: null,
+          },
+        ],
+      };
+    });
     fs.writeFileSync(shardBundlePath, JSON.stringify({
       schema_version: 1,
       review_identity: bundleState.review_identity,
       diagnostic_identity: shardDiagnosticIdentity,
       shard_plan_identity: shardPlanIdentity,
+      bounded_strategy_limit: 3,
+      replan_after_attempt: 3,
       checkpoint_head: shardCheckpointHead,
       reviewed_range: catalogBlock.reviewed_range,
       repository_paths: shardRepositoryPaths,
@@ -1194,6 +1369,7 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
       failed_candidate_hashes: failedCandidateHashes,
       validator_invariants: ['findings is an array', 'acceptance criteria exactly match the sealed contract'],
       result_files: shardResultFiles,
+      strategy_executions: strategyExecutions,
       results: shardResults,
     }));
     fs.copyFileSync(validatorPath, shardValidatorPath);
@@ -1257,6 +1433,49 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.match(attempt13Prompt, /independently reviewed typed criterion shards/);
     assert.match(attempt13Prompt, /Cover every exact acceptance criterion once/);
     assert.doesNotMatch(attempt13Prompt, /This prose cannot substitute for executed criterion shard work/);
+
+    const resetShardValidationState = (epochOffset) => {
+      const retryState = structuredClone(shardState);
+      retryState.recovery_epoch += epochOffset;
+      retryState.status = 'running';
+      fs.rmSync(path.join(catalog.sessionDir, 'citadel-report.json'), { force: true });
+      fs.writeFileSync(
+        path.join(catalog.sessionDir, 'citadel-review-state.json'),
+        JSON.stringify(retryState),
+      );
+    };
+    const citationArtifactBytes = fs.readFileSync(
+      strategyExecutions[0].attempts[1].strategy_artifact.path,
+    );
+    const rejectedCandidatePath = strategyExecutions[0].attempts[0].candidate.path;
+    const rejectedCandidateBytes = fs.readFileSync(rejectedCandidatePath);
+    fs.appendFileSync(rejectedCandidatePath, '\nmutated after rejection\n');
+    resetShardValidationState(1);
+    await assert.rejects(
+      () => runCitadel(catalog.sessionDir),
+      /criterion shard bundle|strategy|candidate/i,
+    );
+    fs.writeFileSync(rejectedCandidatePath, rejectedCandidateBytes);
+
+    fs.appendFileSync(strategyExecutions[0].attempts[1].strategy_artifact.path, '\ntampered\n');
+    resetShardValidationState(2);
+    await assert.rejects(
+      () => runCitadel(catalog.sessionDir),
+      /criterion shard bundle|runtime manifest|strategy artifact/i,
+    );
+    fs.writeFileSync(strategyExecutions[0].attempts[1].strategy_artifact.path, citationArtifactBytes);
+
+    const historyTamperBundle = JSON.parse(fs.readFileSync(shardBundlePath, 'utf8'));
+    historyTamperBundle.strategy_executions[0].attempts[1].evidence_route = 'direct_review';
+    fs.writeFileSync(shardBundlePath, JSON.stringify(historyTamperBundle));
+    const historyTamperManifest = JSON.parse(fs.readFileSync(shardManifestPath, 'utf8'));
+    historyTamperManifest.criterion_shards.sha256 = digest(shardBundlePath);
+    fs.writeFileSync(shardManifestPath, JSON.stringify(historyTamperManifest));
+    resetShardValidationState(3);
+    await assert.rejects(
+      () => runCitadel(catalog.sessionDir),
+      /criterion shard bundle|strategy/i,
+    );
 
     for (const criterion of ['oversize artifact is rejected', 'symlink artifact is rejected']) {
       const unsafe = makeCitadelLifecycleSession(criterion);

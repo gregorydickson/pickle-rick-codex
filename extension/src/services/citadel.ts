@@ -607,6 +607,176 @@ function assertRuntimeArtifactFile(sessionDir: string, filePath: string): string
   return resolved;
 }
 
+const CITADEL_SHARD_STRATEGIES = [
+  {
+    id: 'direct_repository_evidence',
+    route: 'direct_review',
+    instruction: 'Read the eligible changed files directly, hash their bytes, and construct the shard result from repository evidence.',
+  },
+  {
+    id: 'runtime_citation_scaffold',
+    route: 'preseeded_citation',
+    instruction: 'Complete the runtime-provided citation scaffold only after independently checking every preseeded repository identity.',
+  },
+  {
+    id: 'authenticated_diff_inventory_two_pass',
+    route: 'diff_inventory',
+    instruction: 'First audit the authenticated diff inventory against the repository; then perform an independent criterion decision pass and serialize only the audited result.',
+  },
+] as const;
+const CITADEL_SHARD_REPLAN_STRATEGY = {
+  id: 'failure_bound_evidence_replan',
+  route: 'replanned_evidence_inventory',
+  instruction: 'Use the authenticated rejection ledger to avoid every prior material approach, re-derive evidence from exact repository bytes, and produce a new independently checked result.',
+} as const;
+
+function expectedCitadelShardStrategy(ordinal: number) {
+  const bounded = CITADEL_SHARD_STRATEGIES[ordinal - 1];
+  return bounded
+    ? { ...bounded, epoch: 1 }
+    : { ...CITADEL_SHARD_REPLAN_STRATEGY, epoch: ordinal - CITADEL_SHARD_STRATEGIES.length };
+}
+
+function validateCitadelShardStrategyExecution(
+  sessionDir: string,
+  workingDir: string,
+  checkpointHead: string,
+  reviewedRange: string,
+  repositoryPaths: string[],
+  checkCommands: string[],
+  criterion: string,
+  execution: Record<string, unknown>,
+): boolean {
+  const attempts = Array.isArray(execution.attempts)
+    ? execution.attempts as Array<Record<string, unknown>> : [];
+  if (Object.keys(execution).sort().join('\0') !== ['attempts', 'shard_id'].sort().join('\0')
+    || typeof execution.shard_id !== 'string' || !execution.shard_id || attempts.length === 0) return false;
+  const fileInventory = repositoryPaths.map((repositoryPath) => ({
+    path: repositoryPath,
+    sha256: fileHash(path.join(workingDir, repositoryPath)),
+  }));
+  const materialHashes: string[] = [];
+  const validated: Array<{
+    ordinal: number;
+    strategy_id: string;
+    material_hash: string;
+    candidate_sha256: string | null;
+    status: string;
+    error: string | null;
+  }> = [];
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attempt = attempts[index];
+    const ordinal = index + 1;
+    const expected = expectedCitadelShardStrategy(ordinal);
+    if (Object.keys(attempt).sort().join('\0') !== [
+      'ordinal', 'strategy_id', 'evidence_route', 'strategy_epoch', 'strategy_instruction',
+      'strategy_material_hash', 'strategy_artifact', 'candidate', 'status', 'error',
+    ].sort().join('\0')
+      || attempt.ordinal !== ordinal || attempt.strategy_id !== expected.id
+      || attempt.evidence_route !== expected.route || attempt.strategy_epoch !== expected.epoch
+      || attempt.strategy_instruction !== expected.instruction
+      || typeof attempt.strategy_material_hash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(attempt.strategy_material_hash)
+      || !['interrupted', 'rejected', 'resolved'].includes(String(attempt.status))
+      || (attempt.error !== null && typeof attempt.error !== 'string')) return false;
+    let candidateSha256: string | null = null;
+    if (attempt.candidate !== null) {
+      if (!attempt.candidate || typeof attempt.candidate !== 'object' || Array.isArray(attempt.candidate)) return false;
+      const candidate = attempt.candidate as Record<string, unknown>;
+      if (Object.keys(candidate).sort().join('\0') !== ['path', 'sha256'].sort().join('\0')
+        || typeof candidate.path !== 'string' || typeof candidate.sha256 !== 'string'
+        || !/^[a-f0-9]{64}$/.test(candidate.sha256)) return false;
+      const candidatePath = assertRuntimeArtifactFile(sessionDir, candidate.path);
+      if (fileHash(candidatePath) !== candidate.sha256) return false;
+      candidateSha256 = candidate.sha256;
+    }
+    let artifactSha256: string | null = null;
+    let artifactValue: Record<string, unknown> | null = null;
+    if (attempt.strategy_artifact !== null) {
+      if (!attempt.strategy_artifact || typeof attempt.strategy_artifact !== 'object'
+        || Array.isArray(attempt.strategy_artifact)) return false;
+      const strategyArtifact = attempt.strategy_artifact as Record<string, unknown>;
+      if (Object.keys(strategyArtifact).sort().join('\0') !== ['path', 'sha256'].sort().join('\0')
+        || typeof strategyArtifact.path !== 'string' || typeof strategyArtifact.sha256 !== 'string'
+        || !/^[a-f0-9]{64}$/.test(strategyArtifact.sha256)) return false;
+      const artifactPath = assertRuntimeArtifactFile(sessionDir, strategyArtifact.path);
+      if (fileHash(artifactPath) !== strategyArtifact.sha256) return false;
+      artifactSha256 = strategyArtifact.sha256;
+      artifactValue = readJsonFile<Record<string, unknown>>(artifactPath, null);
+    }
+    let expectedArtifact: Record<string, unknown> | null = null;
+    if (expected.id === 'runtime_citation_scaffold') {
+      expectedArtifact = {
+        schema_version: 1,
+        artifact_kind: 'criterion_citation_scaffold',
+        shard_id: execution.shard_id,
+        criterion,
+        checkpoint_head: checkpointHead,
+        reviewed_range: reviewedRange,
+        eligible_repository_evidence: fileInventory,
+        eligible_checks: checkCommands,
+        required_observation: '<concrete observation from exact file bytes>',
+      };
+    } else if (expected.id === 'authenticated_diff_inventory_two_pass') {
+      const diff = execFileSync('git', ['diff', '--binary', reviewedRange], {
+        cwd: workingDir, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
+      });
+      expectedArtifact = {
+        schema_version: 1,
+        artifact_kind: 'authenticated_diff_inventory',
+        shard_id: execution.shard_id,
+        checkpoint_head: checkpointHead,
+        reviewed_range: reviewedRange,
+        diff_sha256: crypto.createHash('sha256').update(diff).digest('hex'),
+        files: fileInventory,
+        deterministic_checks: checkCommands,
+      };
+    } else if (expected.id === 'failure_bound_evidence_replan') {
+      expectedArtifact = {
+        schema_version: 1,
+        artifact_kind: 'criterion_evidence_replan',
+        shard_id: execution.shard_id,
+        checkpoint_head: checkpointHead,
+        reviewed_range: reviewedRange,
+        evidence_inventory: fileInventory,
+        deterministic_checks: checkCommands,
+        rejected_candidates: validated.filter((prior) => prior.status === 'rejected').map((prior) => ({
+          ordinal: prior.ordinal,
+          strategy_id: prior.strategy_id,
+          material_hash: prior.material_hash,
+          candidate_sha256: prior.candidate_sha256,
+          error: prior.error,
+        })),
+        replan_epoch: expected.epoch,
+      };
+    }
+    if (JSON.stringify(artifactValue) !== JSON.stringify(expectedArtifact)) return false;
+    const materialHash = crypto.createHash('sha256').update(JSON.stringify({
+      id: expected.id,
+      route: expected.route,
+      epoch: expected.epoch,
+      instruction: expected.instruction,
+      artifact_sha256: artifactSha256,
+      checkpoint_head: checkpointHead,
+      reviewed_range: reviewedRange,
+      shard_id: execution.shard_id,
+      criterion,
+    })).digest('hex');
+    if (attempt.strategy_material_hash !== materialHash) return false;
+    materialHashes.push(materialHash);
+    validated.push({
+      ordinal,
+      strategy_id: expected.id,
+      material_hash: materialHash,
+      candidate_sha256: candidateSha256,
+      status: String(attempt.status),
+      error: attempt.error as string | null,
+    });
+  }
+  return attempts.at(-1)?.status === 'resolved'
+    && new Set(materialHashes).size === materialHashes.length;
+}
+
 function artifactContractExecution(
   sessionDir: string,
   workingDir: string,
@@ -671,6 +841,8 @@ function artifactContractExecution(
     const shardResults = Array.isArray(bundle?.results) ? bundle.results as Array<Record<string, unknown>> : [];
     const resultFiles = Array.isArray(bundle?.result_files)
       ? bundle.result_files as Array<Record<string, unknown>> : [];
+    const strategyExecutions = Array.isArray(bundle?.strategy_executions)
+      ? bundle.strategy_executions as Array<Record<string, unknown>> : [];
     const repositoryPaths = Array.isArray(bundle?.repository_paths)
       ? bundle.repository_paths.filter((entry): entry is string => typeof entry === 'string') : [];
     let expectedRepositoryPaths = execFileSync('git', ['diff', '--name-only', reviewedRange], {
@@ -684,6 +856,20 @@ function artifactContractExecution(
     const checkCommands = checks.map((check) => check.command);
     const shardPlanIdentity = typeof bundle?.shard_plan_identity === 'string'
       ? bundle.shard_plan_identity : '';
+    const strategyExecutionsValid = strategyExecutions.length === shardResults.length
+      && strategyExecutions.every((execution, index) => (
+        execution.shard_id === shardResults[index].shard_id
+        && validateCitadelShardStrategyExecution(
+          sessionDir,
+          workingDir,
+          checkpointHead,
+          reviewedRange,
+          repositoryPaths,
+          checkCommands,
+          String(shardResults[index].criterion || ''),
+          execution,
+        )
+      ));
     let resultFilesValid = resultFiles.length === shardResults.length;
     for (let index = 0; resultFilesValid && index < resultFiles.length; index += 1) {
       const entry = resultFiles[index];
@@ -734,6 +920,7 @@ function artifactContractExecution(
       || bundle.diagnostic_identity !== recovery.diagnostic_identity
       || !/^[a-f0-9]{64}$/.test(shardPlanIdentity)
       || selected?.shard_plan_identity !== shardPlanIdentity
+      || bundle.bounded_strategy_limit !== 3 || bundle.replan_after_attempt !== 3
       || bundle.checkpoint_head !== checkpointHead
       || bundle.reviewed_range !== reviewedRange
       || repositoryPaths.length === 0
@@ -743,7 +930,7 @@ function artifactContractExecution(
       || JSON.stringify(bundle.failed_candidate_hashes) !== JSON.stringify(recovery.failed_candidate_hashes)
       || JSON.stringify(bundle.validator_invariants) !== JSON.stringify(recovery.validator_invariants)
       || shardResults.length !== expectedAcceptanceCriteria.length
-      || !resultFilesValid || !repositoryEvidenceValid
+      || !resultFilesValid || !strategyExecutionsValid || !repositoryEvidenceValid
       || JSON.stringify(shardResults.map((result) => result.criterion)) !== JSON.stringify(expectedAcceptanceCriteria)
       || shardResults.some((result) => (
         Object.keys(result).sort().join('\0') !== [

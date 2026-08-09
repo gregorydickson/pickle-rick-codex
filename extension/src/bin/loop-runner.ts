@@ -89,6 +89,7 @@ import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { scrubWorkerOutput } from '../services/worker-output.js';
 import { captureSpawnedProcessIdentity } from '../services/orphan-reaper.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
+import { activatePreparedManagerRelaunchRecovery, consumeManagerRelaunchRecovery } from '../services/manager-relaunch-integrity.js';
 import type {
   Config,
   ProgressSnapshot,
@@ -1451,7 +1452,9 @@ async function runLoopWithLease(sessionDir: string, runStartedAtMs: number): Pro
   const loopConfig = readLoopConfig(sessionDir);
   const initialState = manager.read(statePath);
 
+  activatePreparedManagerRelaunchRecovery(sessionDir);
   claimLoopRunnerStartup(manager, statePath, { runStartedAtMs });
+  consumeManagerRelaunchRecovery(sessionDir);
   appendRunnerLog(sessionDir, `loop-runner started (${loopConfig.mode})`);
   assertControlPlaneOutsideWorkerCwd(sessionDir, initialState.working_dir as string);
   if (isMeasuredMicroverse(loopConfig)) {

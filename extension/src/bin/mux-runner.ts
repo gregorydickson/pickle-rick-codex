@@ -50,6 +50,7 @@ import {
 import { isVerificationCommandError, repairTicketVerificationContract, runTicket } from './spawn-morty.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { assertRecordedActiveChildRecovered } from '../services/orphan-reaper.js';
+import { activatePreparedManagerRelaunchRecovery, consumeManagerRelaunchRecovery } from '../services/manager-relaunch-integrity.js';
 import { readCitadelSystemBlock, runCitadel } from '../services/citadel.js';
 import {
   consumeDeterministicCheckFailure,
@@ -190,6 +191,7 @@ async function runSequentialWithLease(
     markRunStart,
     runStartedAtMs: Number(options.runStartedAtMs),
   });
+  consumeManagerRelaunchRecovery(sessionDir);
   if (resumeStrategyExhaustionAfterUpgrade(manager, statePath)) {
     appendRunnerLog(sessionDir, runnerMode, 'resumed obsolete strategy-exhaustion stop through autonomous escalation');
   }
@@ -966,6 +968,7 @@ export async function runSequential(
     && fs.existsSync(path.join(sessionDir, 'logical-pipeline.json'));
   if (!durableRuntime) {
     try {
+      activatePreparedManagerRelaunchRecovery(sessionDir);
       return await runSequentialWithLease(sessionDir, { ...options, runStartedAtMs }, deps);
     } finally {
       releaseOperation();
@@ -979,6 +982,7 @@ export async function runSequential(
       handoffRequestId: typeof options.handoffRequestId === 'string' ? options.handoffRequestId : undefined,
       targetRuntime: options.targetRuntime,
     });
+    activatePreparedManagerRelaunchRecovery(sessionDir);
     if (typeof options.handoffRequestId === 'string' && options.targetRuntime) {
       ownership.assertOwned();
       finalizeLiveSessionMigrationAfterHandoff(sessionDir, options.handoffRequestId, options.targetRuntime);

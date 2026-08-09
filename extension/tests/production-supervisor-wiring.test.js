@@ -1328,6 +1328,7 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
     PICKLE_DATA_ROOT: dataRoot,
     FAKE_CODEX_INVOCATION_LOG: invocationLog,
     FAKE_CRITERION_SHARD_COUNTER: shardCounter,
+    FAKE_CRITERION_SHARD_MALFORMED_ATTEMPTS: '3',
   });
   let citadelRuns = 0;
   const runCitadel = async (dir) => {
@@ -1501,6 +1502,40 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   ), 'utf8'));
   assert.equal(pendingShardJournal.status, 'pending');
   assert.deepEqual(pendingShardJournal.shards[0].attempts.map(({ status }) => status), ['rejected']);
+  assert.equal(pendingShardJournal.shards[0].attempts[0].strategy_id, 'direct_repository_evidence');
+  for (const expectedAttempts of [2, 3]) {
+    const continued = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+      runSequential: async () => 'success',
+      runCitadel,
+      repairCitadelReviewerArtifactContract: crashOnceRecovery,
+    }));
+    assert.equal(continued, 'citadel_system_recovery_scheduled');
+    assert.equal(readLogicalPipeline(sessionDir).terminal_state, null);
+    const continuedShardJournal = JSON.parse(fs.readFileSync(path.join(
+      sessionDir,
+      'citadel-reviewer-contract-runtime',
+      pendingRecovery.diagnostic_identity,
+      'criterion-shard-journal.json',
+    ), 'utf8'));
+    assert.equal(continuedShardJournal.shards[0].attempts.length, expectedAttempts);
+    assert.equal(continuedShardJournal.shards[0].attempts.at(-1).status, 'rejected');
+  }
+  const preRebootShardJournal = JSON.parse(fs.readFileSync(path.join(
+    sessionDir,
+    'citadel-reviewer-contract-runtime',
+    pendingRecovery.diagnostic_identity,
+    'criterion-shard-journal.json',
+  ), 'utf8'));
+  assert.equal(preRebootShardJournal.shards[0].attempts.every((attempt) => (
+    path.resolve(attempt.candidate_path).startsWith(`${path.resolve(sessionDir)}${path.sep}`)
+    && (attempt.strategy_artifact_path === null
+      || path.resolve(attempt.strategy_artifact_path).startsWith(`${path.resolve(sessionDir)}${path.sep}`))
+  )), true);
+  for (const attempt of preRebootShardJournal.shards[0].attempts) {
+    if (attempt.worktree_path && !path.resolve(attempt.worktree_path).startsWith(`${path.resolve(sessionDir)}${path.sep}`)) {
+      fs.rmSync(path.dirname(attempt.worktree_path), { recursive: true, force: true });
+    }
+  }
   const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
     runSequential: async () => 'success',
     runCitadel,
@@ -1508,7 +1543,7 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   }));
   assert.equal(result, 'success');
   assert.equal(citadelRuns, 4);
-  assert.equal(recoveryCalls, 5);
+  assert.equal(recoveryCalls, 7);
   const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n')
     .map((line) => JSON.parse(line));
   const recoveryPrompts = invocations
@@ -1517,7 +1552,44 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   assert.equal(recoveryPrompts.length, 3);
   const shardInvocations = invocations
     .filter(({ prompt }) => prompt.includes('criterion-shard review worker'));
-  assert.equal(shardInvocations.length, deriveCitadelAcceptanceCriteria(sessionDir).length + 1);
+  assert.equal(shardInvocations.length, deriveCitadelAcceptanceCriteria(sessionDir).length + 3);
+  assert.deepEqual(
+    shardInvocations.slice(0, 4).map(({ prompt }) => (
+      prompt.match(/Execution strategy ID: ([^\n]+)/)?.[1]
+    )),
+    [
+      'direct_repository_evidence',
+      'runtime_citation_scaffold',
+      'authenticated_diff_inventory_two_pass',
+      'failure_bound_evidence_replan',
+    ],
+  );
+  assert.equal(new Set(shardInvocations.slice(0, 4).map(({ prompt }) => (
+    prompt.match(/Strategy material hash: ([a-f0-9]{64})/)?.[1]
+  ))).size, 4);
+  const finalShardJournal = JSON.parse(fs.readFileSync(path.join(
+    sessionDir,
+    'citadel-reviewer-contract-runtime',
+    pendingRecovery.diagnostic_identity,
+    'criterion-shard-journal.json',
+  ), 'utf8'));
+  const firstShardAttempts = finalShardJournal.shards[0].attempts;
+  assert.equal(finalShardJournal.bounded_strategy_limit, 3);
+  assert.equal(finalShardJournal.replan_after_attempt, 3);
+  assert.deepEqual(firstShardAttempts.map(({ status }) => status), [
+    'rejected', 'rejected', 'rejected', 'resolved',
+  ]);
+  assert.equal(firstShardAttempts.every((attempt) => (
+    /^[a-f0-9]{64}$/.test(attempt.candidate_sha256)
+    && (fs.statSync(attempt.candidate_path).mode & 0o777) === 0o400
+  )), true);
+  assert.equal(new Set(firstShardAttempts.map(({ strategy_material_hash }) => strategy_material_hash)).size, 4);
+  assert.deepEqual(firstShardAttempts.map(({ evidence_route }) => evidence_route), [
+    'direct_review', 'preseeded_citation', 'diff_inventory', 'replanned_evidence_inventory',
+  ]);
+  assert.equal(firstShardAttempts.slice(1).every((attempt) => (
+    fs.existsSync(attempt.strategy_artifact_path) && /^[a-f0-9]{64}$/.test(attempt.strategy_artifact_sha256)
+  )), true);
   for (const invocation of shardInvocations) {
     assert.notEqual(invocation.cwd, workingDir);
     assert.equal(fs.existsSync(invocation.cwd), false);

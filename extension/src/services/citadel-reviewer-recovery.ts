@@ -82,8 +82,16 @@ interface CriterionShardAttempt {
   ordinal: number;
   status: 'started' | 'interrupted' | 'rejected' | 'resolved';
   candidate_path: string;
+  candidate_sha256: string | null;
   worktree_path?: string;
   worktree_checkpoint_head?: string;
+  strategy_id: string;
+  strategy_material_hash: string;
+  evidence_route: string;
+  strategy_epoch: number;
+  strategy_instruction: string;
+  strategy_artifact_path: string | null;
+  strategy_artifact_sha256: string | null;
   started_at: string;
   completed_at?: string;
   error?: string;
@@ -103,6 +111,8 @@ interface CriterionShardJournal {
   review_identity: string;
   diagnostic_identity: string;
   shard_plan_identity: string;
+  bounded_strategy_limit: number;
+  replan_after_attempt: number;
   status: 'pending' | 'running' | 'resolved';
   shards: CriterionShardWork[];
   updated_at: string;
@@ -133,6 +143,37 @@ const MECHANISMS: RecoveryMechanism[] = [
   'evidence_bundle_reconstruction',
   'criterion_sharded_reconstruction',
 ];
+const BOUNDED_CRITERION_SHARD_STRATEGY_LIMIT = 3;
+const CRITERION_SHARD_STRATEGY_INSTRUCTIONS = {
+  direct_repository_evidence: 'Read the eligible changed files directly, hash their bytes, and construct the shard result from repository evidence.',
+  runtime_citation_scaffold: 'Complete the runtime-provided citation scaffold only after independently checking every preseeded repository identity.',
+  authenticated_diff_inventory_two_pass: 'First audit the authenticated diff inventory against the repository; then perform an independent criterion decision pass and serialize only the audited result.',
+  failure_bound_evidence_replan: 'Use the authenticated rejection ledger to avoid every prior material approach, re-derive evidence from exact repository bytes, and produce a new independently checked result.',
+} as const;
+
+function expectedCriterionShardStrategy(ordinal: number): {
+  id: keyof typeof CRITERION_SHARD_STRATEGY_INSTRUCTIONS;
+  route: string;
+  epoch: number;
+  instruction: string;
+} {
+  if (ordinal === 1) return {
+    id: 'direct_repository_evidence', route: 'direct_review', epoch: 1,
+    instruction: CRITERION_SHARD_STRATEGY_INSTRUCTIONS.direct_repository_evidence,
+  };
+  if (ordinal === 2) return {
+    id: 'runtime_citation_scaffold', route: 'preseeded_citation', epoch: 1,
+    instruction: CRITERION_SHARD_STRATEGY_INSTRUCTIONS.runtime_citation_scaffold,
+  };
+  if (ordinal === 3) return {
+    id: 'authenticated_diff_inventory_two_pass', route: 'diff_inventory', epoch: 1,
+    instruction: CRITERION_SHARD_STRATEGY_INSTRUCTIONS.authenticated_diff_inventory_two_pass,
+  };
+  return {
+    id: 'failure_bound_evidence_replan', route: 'replanned_evidence_inventory', epoch: ordinal - 3,
+    instruction: CRITERION_SHARD_STRATEGY_INSTRUCTIONS.failure_bound_evidence_replan,
+  };
+}
 class ReviewerRecoveryFault extends Error {}
 class ReviewerRecoveryPending extends Error {}
 const VALIDATOR_INVARIANTS = [
@@ -374,6 +415,241 @@ function fileSha256(filePath: string): string {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function freezeCriterionShardCandidate(candidatePath: string): string | null {
+  if (!fs.existsSync(candidatePath)) return null;
+  const stat = fs.lstatSync(candidatePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('Criterion shard candidate must be a regular non-symlink file before transition.');
+  }
+  const digest = fileSha256(candidatePath);
+  fs.chmodSync(candidatePath, 0o400);
+  return digest;
+}
+
+function recordCriterionShardCandidateDigest(attempt: CriterionShardAttempt): void {
+  const digest = freezeCriterionShardCandidate(attempt.candidate_path);
+  if (attempt.candidate_sha256 !== null && attempt.candidate_sha256 !== digest) {
+    throw new Error('Criterion shard candidate changed after its transition digest was recorded.');
+  }
+  attempt.candidate_sha256 = digest;
+}
+
+interface CriterionShardExecutionStrategy {
+  id: string;
+  route: string;
+  epoch: number;
+  instruction: string;
+  artifactPath: string | null;
+  artifactSha256: string | null;
+  materialHash: string;
+}
+
+function createCriterionShardStrategy(
+  shard: CriterionShardWork,
+  candidateDir: string,
+  repositoryContext: ReturnType<typeof criterionRepositoryContext>,
+): CriterionShardExecutionStrategy {
+  const strategyOrdinal = shard.attempts.length;
+  const rejectedCandidates = shard.attempts
+    .filter((attempt) => attempt.status === 'rejected')
+    .map((attempt) => ({
+      ordinal: attempt.ordinal,
+      strategy_id: attempt.strategy_id,
+      material_hash: attempt.strategy_material_hash,
+      candidate_sha256: attempt.candidate_sha256,
+      error: attempt.error || null,
+    }));
+  const fileInventory = repositoryContext.repositoryPaths.map((repositoryPath) => ({
+    path: repositoryPath,
+    sha256: fileSha256(path.join(repositoryContext.workingDir, repositoryPath)),
+  }));
+  const { id, route, epoch, instruction } = expectedCriterionShardStrategy(strategyOrdinal + 1);
+  let artifactPayload: Record<string, unknown> | null = null;
+  if (id === 'runtime_citation_scaffold') {
+    artifactPayload = {
+      schema_version: 1,
+      artifact_kind: 'criterion_citation_scaffold',
+      shard_id: shard.shard_id,
+      criterion: shard.criterion,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      eligible_repository_evidence: fileInventory,
+      eligible_checks: repositoryContext.checks,
+      required_observation: '<concrete observation from exact file bytes>',
+    };
+  } else if (id === 'authenticated_diff_inventory_two_pass') {
+    const diff = execFileSync('git', ['diff', '--binary', repositoryContext.reviewedRange], {
+      cwd: repositoryContext.workingDir,
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    artifactPayload = {
+      schema_version: 1,
+      artifact_kind: 'authenticated_diff_inventory',
+      shard_id: shard.shard_id,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      diff_sha256: crypto.createHash('sha256').update(diff).digest('hex'),
+      files: fileInventory,
+      deterministic_checks: repositoryContext.checks,
+    };
+  } else if (id === 'failure_bound_evidence_replan') {
+    artifactPayload = {
+      schema_version: 1,
+      artifact_kind: 'criterion_evidence_replan',
+      shard_id: shard.shard_id,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      evidence_inventory: fileInventory,
+      deterministic_checks: repositoryContext.checks,
+      rejected_candidates: rejectedCandidates,
+      replan_epoch: epoch,
+    };
+  }
+  const artifactPath = artifactPayload
+    ? path.join(candidateDir, `${id}.json`) : null;
+  if (artifactPath) {
+    atomicWriteJson(artifactPath, artifactPayload);
+    fs.chmodSync(artifactPath, 0o400);
+  }
+  const artifactSha256 = artifactPath ? fileSha256(artifactPath) : null;
+  const materialHash = sha256({
+    id,
+    route,
+    epoch,
+    instruction,
+    artifact_sha256: artifactSha256,
+    checkpoint_head: repositoryContext.checkpointHead,
+    reviewed_range: repositoryContext.reviewedRange,
+    shard_id: shard.shard_id,
+    criterion: shard.criterion,
+  });
+  if (shard.attempts.some((attempt) => attempt.strategy_material_hash === materialHash)) {
+    throw new Error(`Criterion shard ${shard.shard_id} refused to repeat strategy material ${materialHash}.`);
+  }
+  return { id, route, epoch, instruction, artifactPath, artifactSha256, materialHash };
+}
+
+function validatePersistedCriterionShardStrategy(
+  shard: CriterionShardWork,
+  attempt: CriterionShardAttempt,
+  repositoryContext: ReturnType<typeof criterionRepositoryContext>,
+  artifactDir: string,
+): void {
+  const expectedStrategy = expectedCriterionShardStrategy(attempt.ordinal);
+  if (attempt.strategy_id !== expectedStrategy.id || attempt.evidence_route !== expectedStrategy.route
+    || attempt.strategy_epoch !== expectedStrategy.epoch
+    || attempt.strategy_instruction !== expectedStrategy.instruction) {
+    throw new Error(`Criterion shard ${shard.shard_id} has invalid persisted strategy identity.`);
+  }
+  const candidatePath = path.resolve(attempt.candidate_path);
+  const durableAttemptRoot = `${path.resolve(artifactDir, 'criterion-shard-attempts')}${path.sep}`;
+  if (!candidatePath.startsWith(durableAttemptRoot)) {
+    throw new Error(`Criterion shard ${shard.shard_id} candidate is not session-durable.`);
+  }
+  if (fs.existsSync(candidatePath)) {
+    const candidateStat = fs.lstatSync(candidatePath);
+    if (!candidateStat.isFile() || candidateStat.isSymbolicLink()
+      || typeof attempt.candidate_sha256 !== 'string'
+      || !/^[a-f0-9]{64}$/.test(attempt.candidate_sha256)
+      || fileSha256(candidatePath) !== attempt.candidate_sha256) {
+      throw new Error(`Criterion shard ${shard.shard_id} candidate transition digest or durable file contract changed.`);
+    }
+  } else if (attempt.candidate_sha256 !== null) {
+    throw new Error(`Criterion shard ${shard.shard_id} lost its transition-time candidate bytes.`);
+  }
+  const fileInventory = repositoryContext.repositoryPaths.map((repositoryPath) => ({
+    path: repositoryPath,
+    sha256: fileSha256(path.join(repositoryContext.workingDir, repositoryPath)),
+  }));
+  let expectedArtifact: Record<string, unknown> | null = null;
+  if (expectedStrategy.id === 'runtime_citation_scaffold') {
+    expectedArtifact = {
+      schema_version: 1,
+      artifact_kind: 'criterion_citation_scaffold',
+      shard_id: shard.shard_id,
+      criterion: shard.criterion,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      eligible_repository_evidence: fileInventory,
+      eligible_checks: repositoryContext.checks,
+      required_observation: '<concrete observation from exact file bytes>',
+    };
+  } else if (expectedStrategy.id === 'authenticated_diff_inventory_two_pass') {
+    const diff = execFileSync('git', ['diff', '--binary', repositoryContext.reviewedRange], {
+      cwd: repositoryContext.workingDir,
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    expectedArtifact = {
+      schema_version: 1,
+      artifact_kind: 'authenticated_diff_inventory',
+      shard_id: shard.shard_id,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      diff_sha256: crypto.createHash('sha256').update(diff).digest('hex'),
+      files: fileInventory,
+      deterministic_checks: repositoryContext.checks,
+    };
+  } else if (expectedStrategy.id === 'failure_bound_evidence_replan') {
+    expectedArtifact = {
+      schema_version: 1,
+      artifact_kind: 'criterion_evidence_replan',
+      shard_id: shard.shard_id,
+      checkpoint_head: repositoryContext.checkpointHead,
+      reviewed_range: repositoryContext.reviewedRange,
+      evidence_inventory: fileInventory,
+      deterministic_checks: repositoryContext.checks,
+      rejected_candidates: shard.attempts
+        .filter((prior) => prior.ordinal < attempt.ordinal && prior.status === 'rejected')
+        .map((prior) => ({
+          ordinal: prior.ordinal,
+          strategy_id: prior.strategy_id,
+          material_hash: prior.strategy_material_hash,
+          candidate_sha256: prior.candidate_sha256,
+          error: prior.error || null,
+        })),
+      replan_epoch: expectedStrategy.epoch,
+    };
+  }
+  if (attempt.strategy_artifact_path === null) {
+    if (expectedArtifact !== null || attempt.strategy_artifact_sha256 !== null) {
+      throw new Error(`Criterion shard ${shard.shard_id} direct strategy artifact contract is invalid.`);
+    }
+  } else {
+    const artifactPath = path.resolve(attempt.strategy_artifact_path);
+    const candidateRoot = `${path.resolve(path.dirname(attempt.candidate_path))}${path.sep}`;
+    if (!artifactPath.startsWith(candidateRoot) || typeof attempt.strategy_artifact_sha256 !== 'string') {
+      throw new Error(`Criterion shard ${shard.shard_id} strategy artifact path is not attempt-local.`);
+    }
+    const stat = fs.lstatSync(artifactPath);
+    if (!stat.isFile() || stat.isSymbolicLink()
+      || fileSha256(artifactPath) !== attempt.strategy_artifact_sha256) {
+      throw new Error(`Criterion shard ${shard.shard_id} strategy artifact authentication failed.`);
+    }
+    if (JSON.stringify(readJsonFile<Record<string, unknown>>(artifactPath, null))
+      !== JSON.stringify(expectedArtifact)) {
+      throw new Error(`Criterion shard ${shard.shard_id} strategy artifact semantics changed.`);
+    }
+  }
+  const expectedMaterialHash = sha256({
+    id: attempt.strategy_id,
+    route: attempt.evidence_route,
+    epoch: attempt.strategy_epoch,
+    instruction: attempt.strategy_instruction,
+    artifact_sha256: attempt.strategy_artifact_sha256,
+    checkpoint_head: repositoryContext.checkpointHead,
+    reviewed_range: repositoryContext.reviewedRange,
+    shard_id: shard.shard_id,
+    criterion: shard.criterion,
+  });
+  if (attempt.strategy_material_hash !== expectedMaterialHash) {
+    throw new Error(`Criterion shard ${shard.shard_id} strategy material identity is not authentic.`);
+  }
+}
+
 function cleanupPersistedCriterionWorktree(liveWorkingDir: string, attempt: CriterionShardAttempt): void {
   if (!attempt.worktree_path) return;
   const workingDir = path.resolve(attempt.worktree_path);
@@ -431,6 +707,8 @@ async function executeCriterionShards(
       review_identity: state.review_identity,
       diagnostic_identity: artifact.diagnostic_identity,
       shard_plan_identity: shardPlanIdentity,
+      bounded_strategy_limit: BOUNDED_CRITERION_SHARD_STRATEGY_LIMIT,
+      replan_after_attempt: BOUNDED_CRITERION_SHARD_STRATEGY_LIMIT,
       status: 'pending',
       shards: criteria.map((criterion, index) => ({
         shard_id: `criterion-${index + 1}`,
@@ -466,6 +744,10 @@ async function executeCriterionShards(
     if (prior?.status === 'started' && fs.existsSync(prior.candidate_path)) {
       try {
         cleanupPersistedCriterionWorktree(liveWorkingDir, prior);
+        recordCriterionShardCandidateDigest(prior);
+        journal.updated_at = new Date().toISOString();
+        atomicWriteJson(journalPath, journal);
+        validatePersistedCriterionShardStrategy(shard, prior, planRepositoryContext, artifactDir);
         const recovered = validateCriterionShard(
           readJsonFile(prior.candidate_path, null), shard.shard_id, shard.criterion, planRepositoryContext,
         );
@@ -485,23 +767,52 @@ async function executeCriterionShards(
       }
     } else if (prior?.status === 'started') {
       cleanupPersistedCriterionWorktree(liveWorkingDir, prior);
+      prior.candidate_sha256 = null;
       prior.status = 'interrupted';
       prior.error = 'Prior criterion shard worker ended before writing its candidate.';
       prior.completed_at = new Date().toISOString();
       journal.updated_at = prior.completed_at;
       atomicWriteJson(journalPath, journal);
     }
-    const candidateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-citadel-criterion-shard-'));
+    const attemptOrdinal = shard.attempts.length + 1;
+    const candidateDir = fs.mkdtempSync(path.join(ensureDir(path.join(
+      artifactDir, 'criterion-shard-attempts', shard.shard_id,
+    )), `attempt-${attemptOrdinal}-`));
     const candidatePath = path.join(candidateDir, 'criterion-shard-result.json');
     const lastMessagePath = path.join(candidateDir, 'last-message.txt');
     const isolated = createDisposableDetachedWorktree(liveWorkingDir, 'pickle-citadel-criterion-shard-');
     const isolatedFingerprint = getWorkingTreeFingerprint(isolated.workingDir);
+    let repositoryContext: ReturnType<typeof criterionRepositoryContext>;
+    let strategy: CriterionShardExecutionStrategy;
+    try {
+      repositoryContext = criterionRepositoryContext(isolated.workingDir, block);
+      if (repositoryContext.checkpointHead !== planRepositoryContext.checkpointHead) {
+        throw new Error(`Criterion shard ${shard.shard_id} isolated checkpoint does not match its durable plan.`);
+      }
+      for (const priorAttempt of shard.attempts) {
+        validatePersistedCriterionShardStrategy(
+          shard, priorAttempt, repositoryContext, artifactDir,
+        );
+      }
+      strategy = createCriterionShardStrategy(shard, candidateDir, repositoryContext);
+    } catch (error) {
+      isolated.cleanup();
+      throw error;
+    }
     const attempt: CriterionShardAttempt = {
-      ordinal: shard.attempts.length + 1,
+      ordinal: attemptOrdinal,
       status: 'started',
       candidate_path: candidatePath,
+      candidate_sha256: null,
       worktree_path: isolated.workingDir,
       worktree_checkpoint_head: isolated.checkpointHead,
+      strategy_id: strategy.id,
+      strategy_material_hash: strategy.materialHash,
+      evidence_route: strategy.route,
+      strategy_epoch: strategy.epoch,
+      strategy_instruction: strategy.instruction,
+      strategy_artifact_path: strategy.artifactPath,
+      strategy_artifact_sha256: strategy.artifactSha256,
       started_at: new Date().toISOString(),
     };
     shard.attempts.push(attempt);
@@ -512,10 +823,6 @@ async function executeCriterionShards(
     let preserveActiveChild = false;
     const startedAt = Date.now();
     try {
-      const repositoryContext = criterionRepositoryContext(isolated.workingDir, block);
-      if (repositoryContext.checkpointHead !== planRepositoryContext.checkpointHead) {
-        throw new Error(`Criterion shard ${shard.shard_id} isolated checkpoint does not match its durable plan.`);
-      }
       const prompt = [
         'You are the autonomous Citadel criterion-shard review worker.',
         `Review identity: ${state.review_identity}`,
@@ -523,6 +830,13 @@ async function executeCriterionShards(
         `Shard plan identity: ${shardPlanIdentity}`,
         `Shard ID: ${shard.shard_id}`,
         `Exact acceptance criterion JSON: ${JSON.stringify(shard.criterion)}`,
+        `Execution strategy ID: ${strategy.id}`,
+        `Evidence route: ${strategy.route}`,
+        `Strategy epoch: ${strategy.epoch}`,
+        `Strategy material hash: ${strategy.materialHash}`,
+        `Materially distinct execution instruction: ${strategy.instruction}`,
+        `Authenticated strategy artifact: ${strategy.artifactPath || 'none; use direct repository inspection'}`,
+        `Authenticated strategy artifact SHA-256: ${strategy.artifactSha256 || 'none'}`,
         'Inspect the repository at the exact detached checkpoint before deciding this shard.',
         `Expected repository HEAD: ${repositoryContext.checkpointHead}`,
         `Immutable reviewed range: ${repositoryContext.reviewedRange}`,
@@ -563,6 +877,12 @@ async function executeCriterionShards(
       });
       options.assertDurableOwnership?.();
       assertCodexSucceeded(result, `Citadel criterion shard ${shard.shard_id} failed`);
+      recordCriterionShardCandidateDigest(attempt);
+      journal.updated_at = new Date().toISOString();
+      atomicWriteJson(journalPath, journal);
+      if (strategy.artifactPath && fileSha256(strategy.artifactPath) !== strategy.artifactSha256) {
+        throw new Error(`Criterion shard ${shard.shard_id} modified its authenticated strategy artifact.`);
+      }
       if (getHeadSha(isolated.workingDir) !== isolated.checkpointHead
         || getWorkingTreeFingerprint(isolated.workingDir) !== isolatedFingerprint) {
         throw new Error(`Criterion shard ${shard.shard_id} modified its detached review checkpoint.`);
@@ -584,8 +904,13 @@ async function executeCriterionShards(
         preserveActiveChild = true;
         throw ownershipDrain;
       }
+      try {
+        recordCriterionShardCandidateDigest(attempt);
+      } catch (candidateError) {
+        attempt.error = candidateError instanceof Error ? candidateError.message : String(candidateError);
+      }
       attempt.status = 'rejected';
-      attempt.error = error instanceof Error ? error.message : String(error);
+      attempt.error ||= error instanceof Error ? error.message : String(error);
       attempt.completed_at = new Date().toISOString();
       shard.status = 'pending';
       journal.status = 'pending';
@@ -614,6 +939,16 @@ async function executeCriterionShards(
   journal.updated_at = new Date().toISOString();
   atomicWriteJson(journalPath, journal);
   const results = journal.shards.map((shard) => {
+    const materialHashes = shard.attempts.map((attempt) => attempt.strategy_material_hash);
+    if (materialHashes.some((hash) => !/^[a-f0-9]{64}$/.test(hash))
+      || new Set(materialHashes).size !== materialHashes.length) {
+      throw new Error(`Criterion shard ${shard.shard_id} repeated or lost a persisted strategy identity.`);
+    }
+    const resolvedAttempt = shard.attempts.findLast((attempt) => attempt.status === 'resolved');
+    if (!resolvedAttempt) throw new Error(`Criterion shard ${shard.shard_id} has no resolved strategy attempt.`);
+    for (const attempt of shard.attempts) {
+      validatePersistedCriterionShardStrategy(shard, attempt, planRepositoryContext, artifactDir);
+    }
     if (!shard.result_sha256 || fileSha256(shard.result_path) !== shard.result_sha256) {
       throw new Error(`Criterion shard ${shard.shard_id} result changed before bundle assembly.`);
     }
@@ -627,6 +962,8 @@ async function executeCriterionShards(
     review_identity: state.review_identity,
     diagnostic_identity: artifact.diagnostic_identity,
     shard_plan_identity: shardPlanIdentity,
+    bounded_strategy_limit: BOUNDED_CRITERION_SHARD_STRATEGY_LIMIT,
+    replan_after_attempt: BOUNDED_CRITERION_SHARD_STRATEGY_LIMIT,
     checkpoint_head: planRepositoryContext.checkpointHead,
     reviewed_range: block.reviewed_range,
     repository_paths: planRepositoryContext.repositoryPaths,
@@ -638,6 +975,27 @@ async function executeCriterionShards(
       shard_id: shard.shard_id,
       path: shard.result_path,
       sha256: shard.result_sha256,
+    })),
+    strategy_executions: journal.shards.map((shard) => ({
+      shard_id: shard.shard_id,
+      attempts: shard.attempts.map((attempt) => ({
+        ordinal: attempt.ordinal,
+        strategy_id: attempt.strategy_id,
+        evidence_route: attempt.evidence_route,
+        strategy_epoch: attempt.strategy_epoch,
+        strategy_instruction: attempt.strategy_instruction,
+        strategy_material_hash: attempt.strategy_material_hash,
+        strategy_artifact: attempt.strategy_artifact_path ? {
+          path: attempt.strategy_artifact_path,
+          sha256: attempt.strategy_artifact_sha256,
+        } : null,
+        candidate: attempt.candidate_sha256 ? {
+          path: attempt.candidate_path,
+          sha256: attempt.candidate_sha256,
+        } : null,
+        status: attempt.status,
+        error: attempt.error || null,
+      })),
     })),
     results,
   });

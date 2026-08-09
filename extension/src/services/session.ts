@@ -97,6 +97,9 @@ export function createInitialState({
     quality_baseline: null,
     manager_relaunch_count: 0,
     manager_relaunch_history: [],
+    manager_relaunch_recovery_epoch: 1,
+    manager_relaunch_recovery_route: 'standard_relaunch',
+    manager_relaunch_strategy_hash: null,
     ...overrides,
   };
   if (state.active === false) {
