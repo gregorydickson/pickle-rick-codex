@@ -12,13 +12,18 @@ import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
 import {
+  finalizeModelCallTelemetry,
+  reserveModelCallTelemetry,
+  type ModelCallTelemetryReservation,
+} from './productive-autonomy.js';
+import {
   assertVerificationStepSafe,
   normalizeVerificationSteps,
   verificationStepCommand,
   verificationStepIdentity,
 } from './verification-env.js';
 import { assertAllTicketVerificationBoundToSeal } from './verification-seal-contract.js';
-import type { VerificationStep } from '../types/index.js';
+import type { CodexSpawnResult, VerificationStep } from '../types/index.js';
 
 export type CitadelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
@@ -50,6 +55,17 @@ export interface CitadelCheckResult {
   output: string;
 }
 
+export class CitadelReviewerArtifactError extends Error {
+  readonly code = 'CITADEL_REVIEWER_ARTIFACT_INVALID';
+  readonly attempts: number;
+
+  constructor(message: string, attempts: number, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'CitadelReviewerArtifactError';
+    this.attempts = attempts;
+  }
+}
+
 interface CitadelCheckRunOptions {
   timeoutMs: number;
   isCancelled: () => boolean;
@@ -63,6 +79,8 @@ class CitadelChecksCancelledError extends Error {
     this.name = 'CitadelChecksCancelledError';
   }
 }
+
+class CitadelFaultInjectionError extends Error {}
 
 const SEVERITIES = new Set<CitadelSeverity>(['critical', 'high', 'medium', 'low', 'info']);
 
@@ -321,6 +339,11 @@ export function validateCitadelReport(
   if (missing.length > 0) {
     throw new Error(`Invalid Citadel report: acceptance criteria coverage is incomplete; missing: ${missing.join(' | ')}`);
   }
+  const expectedSet = new Set(expected);
+  const unexpected = acceptanceCriteria.filter((criterion) => !expectedSet.has(criterion));
+  if (unexpected.length > 0 || acceptanceCriteria.length !== expected.length) {
+    throw new Error(`Invalid Citadel report: acceptance criteria must exactly match the release contract; unexpected: ${unexpected.join(' | ') || 'duplicate criteria'}`);
+  }
   const blocking = findings.some((finding) => finding.severity === 'critical' || finding.severity === 'high');
   return {
     schema_version: 1,
@@ -336,6 +359,199 @@ export function validateCitadelReport(
 
 const CITADEL_RELEASE_APPROVAL_FILE = 'citadel-release-approval.json';
 export const CITADEL_ISOLATION_QUARANTINE_FILE = 'citadel-isolation-quarantine.json';
+const CITADEL_REVIEWER_MAX_ATTEMPTS = 2;
+const CITADEL_REVIEWER_MAX_ARTIFACT_BYTES = 1024 * 1024;
+const CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT = 100_000;
+
+interface CitadelReviewAttemptState {
+  ordinal: number;
+  epoch: number;
+  attempt: number;
+  candidate_path: string;
+  status: 'started' | 'interrupted' | 'rejected' | 'validated' | 'accepted';
+  started_at: string;
+  completed_at?: string;
+  validation_error?: string;
+  candidate_hash?: string;
+  approval_signal?: boolean;
+  strategy_id: string;
+  strategy_hash: string;
+  model_attempt_id?: number;
+  telemetry_status?: 'started' | 'finalized';
+  telemetry_result?: CodexSpawnResult;
+}
+
+interface CitadelReviewState {
+  schema_version: 1;
+  review_identity: string;
+  recovery_epoch: number;
+  strategy_id: string;
+  strategy_hash: string;
+  status: 'running' | 'exhausted' | 'accepted';
+  attempts: CitadelReviewAttemptState[];
+  updated_at: string;
+}
+
+function writeCitadelReviewState(filePath: string, state: CitadelReviewState): void {
+  state.updated_at = new Date().toISOString();
+  atomicWriteJson(filePath, state);
+}
+
+function citadelReviewerStrategy(epoch: number): { id: string; instruction: string; hash: string } {
+  const variants = [
+    { id: 'standard-schema-review', instruction: 'Perform the standard evidence-grounded Citadel review.' },
+    { id: 'strict-minimal-json', instruction: 'Use a strict minimal JSON construction pass: build only the required keys and arrays, then verify each type before writing.' },
+    { id: 'independent-fresh-review', instruction: 'Start an independent fresh review from the deterministic evidence; do not reuse or repair a prior candidate.' },
+    { id: 'artifact-normalization', instruction: 'Normalize the complete report in memory against the required schema before one final atomic write.' },
+  ];
+  const selected = variants[Math.min(Math.max(epoch - 1, 0), variants.length - 1)];
+  const instruction = `${selected.instruction} Recovery epoch: ${epoch}.`;
+  return { id: selected.id, instruction, hash: reportHash({ id: selected.id, instruction }) };
+}
+
+function readBoundedReviewerCandidateBytes(
+  reportPath: string,
+  expectedAttemptDir: string,
+): Buffer {
+  const expectedPath = path.join(path.resolve(expectedAttemptDir), 'citadel-review-candidate.json');
+  if (path.resolve(reportPath) !== expectedPath) {
+    throw new Error('Invalid Citadel reviewer artifact: candidate path escapes its assigned attempt directory.');
+  }
+  const directoryStat = fs.lstatSync(expectedAttemptDir);
+  const stat = fs.lstatSync(reportPath);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('Invalid Citadel reviewer artifact: candidate must be a regular non-symlink file.');
+  }
+  if (stat.size > CITADEL_REVIEWER_MAX_ARTIFACT_BYTES) {
+    throw new Error(`Invalid Citadel reviewer artifact: candidate exceeds ${CITADEL_REVIEWER_MAX_ARTIFACT_BYTES} bytes.`);
+  }
+  const fd = fs.openSync(reportPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const openedStat = fs.fstatSync(fd);
+    if (!openedStat.isFile() || openedStat.size > CITADEL_REVIEWER_MAX_ARTIFACT_BYTES) {
+      throw new Error(`Invalid Citadel reviewer artifact: candidate exceeds ${CITADEL_REVIEWER_MAX_ARTIFACT_BYTES} bytes or is not regular.`);
+    }
+    const bytes = fs.readFileSync(fd);
+    if (bytes.length > CITADEL_REVIEWER_MAX_ARTIFACT_BYTES) {
+      throw new Error(`Invalid Citadel reviewer artifact: candidate exceeds ${CITADEL_REVIEWER_MAX_ARTIFACT_BYTES} bytes.`);
+    }
+    return bytes;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readReviewerCandidate(
+  reportPath: string,
+  expectedAttemptDir: string,
+): { value: unknown; hash: string } {
+  const bytes = readBoundedReviewerCandidateBytes(reportPath, expectedAttemptDir);
+  return {
+    value: JSON.parse(bytes.toString('utf8')) as unknown,
+    hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+  };
+}
+
+function fileHash(reportPath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(reportPath)).digest('hex');
+}
+
+export function reconcileValidatedCitadelTelemetry(sessionDir: string): number {
+  const statePath = path.join(sessionDir, 'citadel-review-state.json');
+  const reviewState = readJsonFile<CitadelReviewState>(statePath, null);
+  if (!reviewState || reviewState.schema_version !== 1 || !Array.isArray(reviewState.attempts)) return 0;
+  let reconciled = 0;
+  for (const attempt of reviewState.attempts) {
+    if (!['validated', 'accepted'].includes(attempt.status)
+      || attempt.telemetry_status === 'finalized'
+      || !attempt.model_attempt_id || !attempt.telemetry_result || !attempt.candidate_hash) continue;
+    const expectedAttemptDir = path.join(
+      sessionDir, 'citadel-review-attempts', `${reviewState.review_identity.slice(0, 12)}-${attempt.ordinal}`,
+    );
+    const candidate = readReviewerCandidate(attempt.candidate_path, expectedAttemptDir);
+    if (candidate.hash !== attempt.candidate_hash || attempt.approval_signal !== true) {
+      throw new Error('Validated Citadel telemetry evidence no longer matches its durable candidate.');
+    }
+    const telemetry = readJsonFile<Record<string, unknown>>(
+      path.join(sessionDir, 'execution-telemetry.json'), null,
+    );
+    const reservations = Array.isArray(telemetry?.model_attempts) ? telemetry.model_attempts : [];
+    const events = Array.isArray(telemetry?.events) ? telemetry.events : [];
+    const reservation = reservations.find((entry) => (
+      entry && typeof entry === 'object'
+      && (entry as Record<string, unknown>).model_attempt_id === attempt.model_attempt_id
+    )) as ModelCallTelemetryReservation | undefined;
+    const event = events.find((entry) => (
+      entry && typeof entry === 'object'
+      && (entry as Record<string, unknown>).model_attempt_id === attempt.model_attempt_id
+    )) as Record<string, unknown> | undefined;
+    if (reservation?.status === 'started') {
+      finalizeModelCallTelemetry(sessionDir, reservation, {
+        result: attempt.telemetry_result,
+        outcome: 'success',
+        productiveWork: 1,
+        discardedWork: 0,
+      });
+    } else if (reservation?.status !== 'finalized'
+      || event?.outcome !== 'success' || event?.productive_work !== 1) {
+      throw new Error('Validated Citadel telemetry reservation cannot be reconciled safely.');
+    }
+    attempt.telemetry_status = 'finalized';
+    reconciled += 1;
+  }
+  if (reconciled > 0) writeCitadelReviewState(statePath, reviewState);
+  return reconciled;
+}
+
+function failedReviewerResult(error: unknown, durationMs: number): CodexSpawnResult {
+  return {
+    command: 'codex', args: [], exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error),
+    timedOut: false, durationMs, lastMessage: '',
+    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    usageReported: false, terminatedAfterSuccess: false, cancelled: false,
+    outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+  };
+}
+
+function compactTelemetryResult(result: CodexSpawnResult): CodexSpawnResult {
+  return { ...result, stdout: '', stderr: '', lastMessage: '', assistantContent: '', toolCalls: [] };
+}
+
+function preserveInvalidReviewerAttempt(
+  sessionDir: string,
+  attempt: number,
+  attemptKey: string,
+  reviewedRange: string,
+  checkpointHead: string,
+  result: CodexSpawnResult,
+  reportPath: string,
+  error: unknown,
+): void {
+  let rawReport: string | null = null;
+  try {
+    rawReport = readBoundedReviewerCandidateBytes(reportPath, path.dirname(reportPath)).toString('utf8');
+  } catch {
+    // A missing report is itself evidence and is represented by null.
+  }
+  atomicWriteJson(path.join(sessionDir, `citadel-review-attempt-${attemptKey}.json`), {
+    schema_version: 1,
+    attempt,
+    reviewed_range: reviewedRange,
+    checkpoint_head: checkpointHead,
+    checkpoint_restored: true,
+    validation_error: error instanceof Error ? error.message : String(error),
+    raw_report: rawReport?.slice(-CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT) ?? null,
+    reviewer: {
+      exit_code: result.exitCode,
+      timed_out: result.timedOut,
+      cancelled: result.cancelled,
+      last_message: result.lastMessage.slice(-CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT),
+      stdout: result.stdout.slice(-CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT),
+      stderr: result.stderr.slice(-CITADEL_REVIEWER_EVIDENCE_TEXT_LIMIT),
+    },
+    preserved_at: new Date().toISOString(),
+  });
+}
 
 function reportHash(report: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(report)).digest('hex');
@@ -618,8 +834,10 @@ function buildCitadelPrompt(
   reviewedRange: string,
   checksPath: string,
   expectedAcceptanceCriteria: string[],
+  reportPath: string = citadelReportPath(sessionDir),
+  retryFeedback: string | null = null,
+  recoveryStrategy: string | null = null,
 ): string {
-  const reportPath = citadelReportPath(sessionDir);
   return [
     'You are the Citadel release reviewer for a Pickle Rick pipeline.',
     'This is a read-only adversarial review. Do not modify, stage, commit, or revert repository files.',
@@ -635,6 +853,8 @@ function buildCitadelPrompt(
     'For every blocking finding, attribute the exact affected ticket ids, criteria, and repository-relative paths; use empty arrays only when that dimension genuinely does not apply.',
     'Use verdict block when any critical/high finding exists; otherwise approve.',
     'After writing the report, return <promise>THE_CITADEL_APPROVES</promise>.',
+    ...(retryFeedback ? [`The previous candidate was rejected: ${retryFeedback}. Write a complete fresh candidate.`] : []),
+    ...(recoveryStrategy ? [`Recovery strategy: ${recoveryStrategy}`] : []),
   ].join('\n\n');
 }
 
@@ -719,7 +939,10 @@ export function recoverCitadelStartCommit(
 
 export async function runCitadel(
   sessionDir: string,
-  options: { assertDurableOwnership?: () => void } = {},
+  options: {
+    assertDurableOwnership?: () => void;
+    faultInjection?: (point: 'validated-before-telemetry') => void;
+  } = {},
 ): Promise<'success' | 'citadel-blocked' | 'cancelled'> {
   let ownershipDrainError: unknown = null;
   const assertOwnership = (): void => {
@@ -802,13 +1025,33 @@ export async function runCitadel(
     }
   };
   try {
+  const checksPath = path.join(sessionDir, 'citadel-checks.json');
+  const verificationSteps = verificationStepsFromManifest(sessionDir, citadelWorkingDir);
+  const checksBinding = {
+    checkpoint_head: checkpointHead,
+    release_fingerprint: releaseCheckpointFingerprint,
+    reviewed_range: reviewedRange,
+    verification_hash: reportHash(verificationSteps),
+    acceptance_criteria_hash: reportHash(expectedAcceptanceCriteria),
+  };
+  const cachedChecks = readJsonFile<Record<string, unknown>>(checksPath, null);
+  const cachedResults = Array.isArray(cachedChecks?.checks)
+    ? cachedChecks.checks as CitadelCheckResult[] : null;
+  const cachedChecksHash = cachedResults ? reportHash(cachedResults) : null;
+  const canReuseChecks = JSON.stringify(cachedChecks?.binding) === JSON.stringify(checksBinding)
+    && cachedChecks?.checks_hash === cachedChecksHash
+    && cachedResults?.some((check) => check.status === 'passed')
+    && !cachedResults.some((check) => check.status === 'failed');
   let checks: CitadelCheckResult[];
+  if (canReuseChecks && cachedResults) {
+    checks = cachedResults;
+  } else {
   try {
     assertOwnership();
     checks = await runCitadelChecksMonitored(
       citadelWorkingDir,
       sessionDir,
-      verificationStepsFromManifest(sessionDir, citadelWorkingDir),
+      verificationSteps,
       {
         timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
         isCancelled: shouldCancel,
@@ -849,9 +1092,15 @@ export async function runCitadel(
     }
     throw error;
   }
-  const checksPath = path.join(sessionDir, 'citadel-checks.json');
+  }
   assertOwnership();
-  atomicWriteJson(checksPath, { schema_version: 1, reviewed_range: reviewedRange, checks });
+  atomicWriteJson(checksPath, {
+    schema_version: 1,
+    reviewed_range: reviewedRange,
+    binding: checksBinding,
+    checks_hash: reportHash(checks),
+    checks,
+  });
   if (restoreIsolatedCheckpoint('deterministic-check')) {
     assertReleaseWorkspaceUnchanged();
     throw new Error('A deterministic Citadel check modified the target repository; the clean checkpoint was restored.');
@@ -891,87 +1140,295 @@ export async function runCitadel(
     return 'citadel-blocked';
   }
 
-  const outputLastMessagePath = path.join(sessionDir, 'citadel.last-message.txt');
-  fs.rmSync(outputLastMessagePath, { force: true });
-  let result;
-  let reviewerError: unknown = null;
-  try {
-    assertOwnership();
-    result = await runCodexExecMonitored({
-      telemetry: { sessionDir, ticketId: 'pipeline', phase: 'citadel' },
-      cwd: citadelWorkingDir,
-      prompt: buildCitadelPrompt(sessionDir, reviewedRange, checksPath, expectedAcceptanceCriteria),
-      timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
-      outputLastMessagePath,
-      progressArtifactPaths: [citadelReportPath(sessionDir)],
-      addDirs: [sessionDir],
-      successCheck: () => fs.existsSync(citadelReportPath(sessionDir)),
-      onSpawn: (child) => {
-        manager.update(path.join(sessionDir, 'state.json'), (current) => {
-          current.active_child_pid = child.pid;
-          current.active_child_kind = 'codex';
-          current.active_child_command = 'citadel';
-          current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
-          current.active_child_controller_pid = process.pid;
-          return current;
-        });
-      },
-      cancelCheck: shouldCancel,
-    });
-    assertOwnership();
-  } catch (error) {
-    assertOwnership();
-    reviewerError = error;
-  } finally {
-    if (!ownershipDrainError) {
-      manager.update(path.join(sessionDir, 'state.json'), (current) => {
-        current.active_child_pid = null;
-        current.active_child_kind = null;
-        current.active_child_command = null;
-        current.active_child_identity = null;
-        current.active_child_controller_pid = null;
-        return current;
-      });
+  const reportPath = citadelReportPath(sessionDir);
+  const reviewIdentity = crypto.createHash('sha256').update(JSON.stringify({
+    reviewed_range: reviewedRange,
+    checkpoint_head: checkpointHead,
+    checks_hash: reportHash(checks),
+    acceptance_criteria_hash: reportHash(expectedAcceptanceCriteria),
+  })).digest('hex');
+  const reviewStatePath = path.join(sessionDir, 'citadel-review-state.json');
+  const priorReviewState = readJsonFile<CitadelReviewState>(reviewStatePath, null);
+  const sameReview = priorReviewState?.schema_version === 1
+    && priorReviewState.review_identity === reviewIdentity;
+  const reviewState: CitadelReviewState = sameReview ? priorReviewState : {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 1,
+    strategy_id: 'standard-schema-review',
+    strategy_hash: '',
+    status: 'running',
+    attempts: [],
+    updated_at: new Date().toISOString(),
+  };
+  if (sameReview && reviewState.status === 'exhausted') {
+    reviewState.recovery_epoch += 1;
+    reviewState.status = 'running';
+  }
+  const reviewStrategy = citadelReviewerStrategy(reviewState.recovery_epoch);
+  reviewState.strategy_id = reviewStrategy.id;
+  reviewState.strategy_hash = reviewStrategy.hash;
+  for (const priorAttempt of reviewState.attempts) {
+    if (priorAttempt.epoch === reviewState.recovery_epoch && priorAttempt.status === 'started') {
+      priorAttempt.status = 'interrupted';
+      priorAttempt.completed_at = new Date().toISOString();
+      priorAttempt.validation_error = 'Reviewer attempt was interrupted before durable validation completed.';
     }
   }
-  if (restoreIsolatedCheckpoint('reviewer')) {
+  if (reviewState.status !== 'exhausted' && reviewState.status !== 'accepted') reviewState.status = 'running';
+  writeCitadelReviewState(reviewStatePath, reviewState);
+  const usedAttempts = reviewState.attempts.filter((entry) => entry.epoch === reviewState.recovery_epoch).length;
+  let nextAttemptOrdinal = Math.max(0, ...reviewState.attempts.map((entry) => entry.ordinal)) + 1;
+  const recoverableAttempt = [...reviewState.attempts].reverse().find((entry) => (
+    entry.epoch === reviewState.recovery_epoch
+    && (entry.status === 'validated' || entry.status === 'accepted')
+  ));
+  let recoveredReport: CitadelReport | null = null;
+  if (recoverableAttempt?.candidate_hash && fs.existsSync(recoverableAttempt.candidate_path)) {
+    try {
+      const expectedAttemptDir = path.join(
+        sessionDir, 'citadel-review-attempts', `${reviewIdentity.slice(0, 12)}-${recoverableAttempt.ordinal}`,
+      );
+      const recoveredCandidate = readReviewerCandidate(recoverableAttempt.candidate_path, expectedAttemptDir);
+      if (recoveredCandidate.hash !== recoverableAttempt.candidate_hash) {
+        throw new Error('Persisted Citadel candidate digest changed before promotion.');
+      }
+      recoveredReport = validateCitadelReport(
+        recoveredCandidate.value, reviewedRange, expectedAcceptanceCriteria,
+      );
+      if (recoveredReport.verdict === 'approve' && recoverableAttempt.approval_signal !== true) {
+        throw new Error('Persisted Citadel candidate lacks durable approval-token evidence.');
+      }
+      if (recoverableAttempt.model_attempt_id && recoverableAttempt.telemetry_result
+        && recoverableAttempt.telemetry_status !== 'finalized') {
+        reconcileValidatedCitadelTelemetry(sessionDir);
+        recoverableAttempt.telemetry_status = 'finalized';
+        writeCitadelReviewState(reviewStatePath, reviewState);
+      }
+    } catch (error) {
+      recoverableAttempt.status = 'rejected';
+      recoverableAttempt.validation_error = error instanceof Error ? error.message : String(error);
+      recoverableAttempt.completed_at = new Date().toISOString();
+      recoveredReport = null;
+      writeCitadelReviewState(reviewStatePath, reviewState);
+    }
+  }
+  let result: CodexSpawnResult | null = null;
+  let report: CitadelReport | null = recoveredReport;
+  let finalValidationError: unknown = [...reviewState.attempts].reverse()
+    .find((entry) => entry.validation_error)?.validation_error ?? null;
+  let retryFeedback: string | null = finalValidationError
+    ? String(finalValidationError).slice(0, 1_000) : null;
+  for (let attempt = usedAttempts + 1; !report && attempt <= CITADEL_REVIEWER_MAX_ATTEMPTS; attempt += 1) {
+    result = null;
+    const ordinal = nextAttemptOrdinal;
+    nextAttemptOrdinal += 1;
+    const attemptKey = `${reviewIdentity.slice(0, 12)}-${ordinal}`;
+    const attemptDir = path.join(sessionDir, 'citadel-review-attempts', attemptKey);
+    fs.mkdirSync(attemptDir, { recursive: true, mode: 0o700 });
+    const candidatePath = path.join(attemptDir, 'citadel-review-candidate.json');
+    const attemptChecksPath = path.join(attemptDir, 'citadel-checks.json');
+    fs.copyFileSync(checksPath, attemptChecksPath);
+    const attemptChecksHash = fileHash(attemptChecksPath);
+    const outputLastMessagePath = path.join(sessionDir, `citadel-review-attempt-${attemptKey}.last-message.txt`);
+    fs.rmSync(outputLastMessagePath, { force: true });
+    fs.rmSync(candidatePath, { force: true });
+    const journalAttempt: CitadelReviewAttemptState = {
+      ordinal,
+      epoch: reviewState.recovery_epoch,
+      attempt,
+      candidate_path: candidatePath,
+      status: 'started',
+      strategy_id: reviewStrategy.id,
+      strategy_hash: reviewStrategy.hash,
+      started_at: new Date().toISOString(),
+    };
+    reviewState.attempts.push(journalAttempt);
+    writeCitadelReviewState(reviewStatePath, reviewState);
+    const finishJournalAttempt = (
+      status: CitadelReviewAttemptState['status'],
+      validationError?: unknown,
+    ): void => {
+      journalAttempt.status = status;
+      journalAttempt.completed_at = new Date().toISOString();
+      if (validationError !== undefined) {
+        journalAttempt.validation_error = validationError instanceof Error
+          ? validationError.message : String(validationError);
+      }
+      writeCitadelReviewState(reviewStatePath, reviewState);
+    };
+    let reviewerError: unknown = null;
+    const attemptStartedAt = Date.now();
+    const telemetryReservation = reserveModelCallTelemetry(sessionDir, {
+      ticketId: 'pipeline', phase: 'citadel', recoveryEpoch: reviewState.recovery_epoch,
+      strategyHash: reviewStrategy.hash,
+    });
+    journalAttempt.model_attempt_id = telemetryReservation.model_attempt_id;
+    journalAttempt.telemetry_status = 'started';
+    writeCitadelReviewState(reviewStatePath, reviewState);
+    let telemetryFinalized = false;
+    const finalizeAttempt = (
+      attemptResult: CodexSpawnResult,
+      outcome: 'success' | 'failed' | 'cancelled' | 'timed_out',
+    ): void => {
+      if (telemetryFinalized) return;
+      finalizeModelCallTelemetry(sessionDir, telemetryReservation, {
+        result: attemptResult,
+        outcome,
+        productiveWork: outcome === 'success' ? 1 : 0,
+        discardedWork: outcome === 'success' ? 0 : 1,
+      });
+      telemetryFinalized = true;
+    };
+    try {
+      assertOwnership();
+      result = await runCodexExecMonitored({
+        cwd: citadelWorkingDir,
+        prompt: buildCitadelPrompt(
+          sessionDir, reviewedRange, attemptChecksPath, expectedAcceptanceCriteria, candidatePath, retryFeedback,
+          `${reviewStrategy.id}: ${reviewStrategy.instruction}`,
+        ),
+        timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
+        outputLastMessagePath,
+        progressArtifactPaths: [candidatePath],
+        addDirs: [attemptDir],
+        onSpawn: (child) => {
+          manager.update(path.join(sessionDir, 'state.json'), (current) => {
+            current.active_child_pid = child.pid;
+            current.active_child_kind = 'codex';
+            current.active_child_command = `citadel-attempt-${attempt}`;
+            current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+            current.active_child_controller_pid = process.pid;
+            return current;
+          });
+        },
+        cancelCheck: shouldCancel,
+      });
+      assertOwnership();
+    } catch (error) {
+      finalizeAttempt(result ?? failedReviewerResult(error, Date.now() - attemptStartedAt), 'failed');
+      finishJournalAttempt('interrupted', error);
+      assertOwnership();
+      reviewerError = error;
+    } finally {
+      if (!ownershipDrainError) {
+        manager.update(path.join(sessionDir, 'state.json'), (current) => {
+          current.active_child_pid = null;
+          current.active_child_kind = null;
+          current.active_child_command = null;
+          current.active_child_identity = null;
+          current.active_child_controller_pid = null;
+          return current;
+        });
+      }
+    }
+    if (restoreIsolatedCheckpoint(`reviewer-attempt-${attempt}`)) {
+      finalizeAttempt(
+        result ?? failedReviewerResult(reviewerError, Date.now() - attemptStartedAt), 'failed',
+      );
+      finishJournalAttempt('interrupted', reviewerError ?? 'Reviewer mutated the isolated checkpoint.');
+      assertReleaseWorkspaceUnchanged();
+      throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);
+    }
+    assertOwnership();
     assertReleaseWorkspaceUnchanged();
-    throw new Error('Citadel reviewer modified the target repository during a read-only review; the clean checkpoint was restored.', reviewerError ? { cause: reviewerError } : undefined);
+    if (reviewerError) throw reviewerError;
+    if (!result) throw new Error('Citadel reviewer returned no execution result.');
+    if (result.cancelled) {
+      finalizeAttempt(result, 'cancelled');
+      finishJournalAttempt('interrupted', 'Reviewer attempt was cancelled.');
+      return 'cancelled';
+    }
+    try {
+      assertCodexSucceeded(result, 'Citadel review failed');
+    } catch (error) {
+      finalizeAttempt(result, result.timedOut ? 'timed_out' : 'failed');
+      finishJournalAttempt('interrupted', error);
+      throw error;
+    }
+    try {
+      if (fileHash(attemptChecksPath) !== attemptChecksHash) {
+        throw new Error('Invalid Citadel reviewer artifact: immutable deterministic evidence was modified.');
+      }
+      const candidate = readReviewerCandidate(candidatePath, attemptDir);
+      report = validateCitadelReport(
+        candidate.value,
+        reviewedRange,
+        expectedAcceptanceCriteria,
+      );
+      if (report.verdict === 'approve' && !(
+        hasPromiseToken(result.lastMessage, 'THE_CITADEL_APPROVES')
+        || hasPromiseToken(result.stdout, 'THE_CITADEL_APPROVES')
+      )) {
+        throw new Error('Invalid Citadel reviewer artifact: required approval signal is missing.');
+      }
+      journalAttempt.candidate_hash = candidate.hash;
+      journalAttempt.approval_signal = report.verdict === 'block' || (
+        hasPromiseToken(result.lastMessage, 'THE_CITADEL_APPROVES')
+        || hasPromiseToken(result.stdout, 'THE_CITADEL_APPROVES')
+      );
+      journalAttempt.telemetry_result = compactTelemetryResult(result);
+      finishJournalAttempt('validated');
+      try {
+        options.faultInjection?.('validated-before-telemetry');
+      } catch (error) {
+        throw new CitadelFaultInjectionError('Injected fault after durable candidate validation.', { cause: error });
+      }
+      finalizeAttempt(result, 'success');
+      journalAttempt.telemetry_status = 'finalized';
+      writeCitadelReviewState(reviewStatePath, reviewState);
+      break;
+    } catch (error) {
+      if (error instanceof CitadelFaultInjectionError) throw error;
+      finalizeAttempt(result, 'failed');
+      finishJournalAttempt('rejected', error);
+      finalValidationError = error;
+      retryFeedback = (error instanceof Error ? error.message : String(error)).slice(0, 1_000);
+      report = null;
+      preserveInvalidReviewerAttempt(
+        sessionDir, attempt, attemptKey, reviewedRange, checkpointHead, result, candidatePath, error,
+      );
+    }
+  }
+  if (!report) {
+    const message = finalValidationError instanceof Error ? finalValidationError.message : String(finalValidationError);
+    reviewState.status = 'exhausted';
+    writeCitadelReviewState(reviewStatePath, reviewState);
+    atomicWriteJson(path.join(sessionDir, 'citadel-reviewer-artifact-failure.json'), {
+      schema_version: 1,
+      code: 'CITADEL_REVIEWER_ARTIFACT_INVALID',
+      attempts: CITADEL_REVIEWER_MAX_ATTEMPTS,
+      review_identity: reviewIdentity,
+      recovery_epoch: reviewState.recovery_epoch,
+      reviewed_range: reviewedRange,
+      checkpoint_head: checkpointHead,
+      error: message,
+      failed_at: new Date().toISOString(),
+    });
+    throw new CitadelReviewerArtifactError(
+      `Citadel reviewer did not produce a valid artifact after ${CITADEL_REVIEWER_MAX_ATTEMPTS} attempts: ${message}`,
+      CITADEL_REVIEWER_MAX_ATTEMPTS,
+      finalValidationError ? { cause: finalValidationError } : undefined,
+    );
   }
   assertOwnership();
-  assertReleaseWorkspaceUnchanged();
-  if (reviewerError) throw reviewerError;
-  if (!result) throw new Error('Citadel reviewer returned no execution result.');
-  if (result.cancelled) return 'cancelled';
-  assertCodexSucceeded(result, 'Citadel review failed');
-  let report: CitadelReport;
-  try {
-    report = validateCitadelReport(
-      readJsonFile(citadelReportPath(sessionDir), null),
-      reviewedRange,
-      expectedAcceptanceCriteria,
-    );
-  } catch (error) {
-    report = blockedEvidenceReport(
-      reviewedRange,
-      expectedAcceptanceCriteria,
-      'Citadel report evidence is invalid',
-      error instanceof Error ? error.message : String(error),
-    );
+  atomicWriteJson(reportPath, report);
+  const acceptedAttempt = [...reviewState.attempts].reverse().find((entry) => (
+    entry.epoch === reviewState.recovery_epoch && entry.status === 'validated'
+  ));
+  if (acceptedAttempt) acceptedAttempt.status = 'accepted';
+  reviewState.status = 'accepted';
+  writeCitadelReviewState(reviewStatePath, reviewState);
+  const priorFailure = readJsonFile<Record<string, unknown>>(
+    path.join(sessionDir, 'citadel-reviewer-artifact-failure.json'), null,
+  );
+  if (priorFailure?.review_identity === reviewIdentity && !priorFailure.resolved_at) {
+    atomicWriteJson(path.join(sessionDir, 'citadel-reviewer-artifact-failure.json'), {
+      ...priorFailure,
+      resolved_at: new Date().toISOString(),
+      resolved_by_epoch: reviewState.recovery_epoch,
+    });
   }
-  if (report.verdict === 'approve' && !(
-    hasPromiseToken(result.lastMessage, 'THE_CITADEL_APPROVES')
-    || hasPromiseToken(result.stdout, 'THE_CITADEL_APPROVES')
-  )) {
-    report = blockedEvidenceReport(
-      reviewedRange,
-      expectedAcceptanceCriteria,
-      'Citadel approval signal missing',
-      'The reviewer did not emit the required <promise>THE_CITADEL_APPROVES</promise> token.',
-    );
-  }
-  assertOwnership();
-  atomicWriteJson(citadelReportPath(sessionDir), report);
   if (report.verdict === 'approve') {
     assertOwnership();
     persistCitadelReleaseApproval(sessionDir, report);

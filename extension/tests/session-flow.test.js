@@ -3983,11 +3983,11 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.ok(runGit(reviewerProject, ['show-ref', '--verify', `refs/pickle/salvage/${path.basename(reviewerSession)}`]));
 });
 
-for (const [name, extraEnv, expectedTitle] of [
-  ['incomplete acceptance-criteria coverage', { FAKE_CITADEL_INCOMPLETE_COVERAGE: '1' }, /report evidence is invalid/i],
-  ['missing approval promise', { FAKE_CITADEL_NO_PROMISE: '1' }, /approval signal missing/i],
+for (const [name, extraEnv, expectedEvidence] of [
+  ['incomplete acceptance-criteria coverage', { FAKE_CITADEL_INCOMPLETE_COVERAGE: '1' }, /coverage is incomplete/i],
+  ['missing approval promise', { FAKE_CITADEL_NO_PROMISE: '1' }, /approval signal is missing/i],
 ]) {
-  test(`Citadel blocks ${name}`, () => {
+  test(`Citadel records bounded reviewer-artifact failure for ${name}`, () => {
     const dataRoot = makeTempRoot();
     const projectDir = makeTempRoot('pickle-rick-project-');
     const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -4009,11 +4009,28 @@ for (const [name, extraEnv, expectedTitle] of [
 
     assert.throws(
       () => runNode([path.join(repoRoot, 'bin/citadel.js'), sessionDir], { env, cwd: projectDir }),
-      /Command failed/,
+      (error) => {
+        assert.match(String(error.stderr || error.message), /did not produce a valid artifact after 2 attempts/i);
+        assert.match(String(error.stderr || error.message), expectedEvidence);
+        return true;
+      },
     );
-    const report = readJsonFile(path.join(sessionDir, 'citadel-report.json'));
-    assert.equal(report.verdict, 'block');
-    assert.match(report.findings[0].title, expectedTitle);
+    assert.equal(fs.existsSync(path.join(sessionDir, 'citadel-report.json')), false);
+    const failure = readJsonFile(path.join(sessionDir, 'citadel-reviewer-artifact-failure.json'));
+    assert.equal(failure.code, 'CITADEL_REVIEWER_ARTIFACT_INVALID');
+    assert.equal(failure.attempts, 2);
+    assert.match(failure.error, expectedEvidence);
+    const reviewState = readJsonFile(path.join(sessionDir, 'citadel-review-state.json'));
+    assert.equal(reviewState.status, 'exhausted');
+    assert.deepEqual(reviewState.attempts.map(({ status }) => status), ['rejected', 'rejected']);
+    for (const remediationPath of [
+      'citadel-remediation-pending.json',
+      'citadel-remediation-current.json',
+      'citadel-remediation-attribution-blocked.json',
+      'citadel-remediation',
+    ]) {
+      assert.equal(fs.existsSync(path.join(sessionDir, remediationPath)), false);
+    }
     assert.equal(runGit(projectDir, ['status', '--porcelain']), '');
   });
 }

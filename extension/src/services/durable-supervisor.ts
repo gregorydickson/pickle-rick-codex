@@ -13,7 +13,7 @@ import {
   inspectProcessLivenessIdentity,
   type PersistedProcessIdentity,
 } from './orphan-reaper.js';
-import { assertCitadelReleaseApproval } from './citadel.js';
+import { assertCitadelReleaseApproval, reconcileValidatedCitadelTelemetry } from './citadel.js';
 import { reconcileInterruptedModelCallTelemetry } from './productive-autonomy.js';
 
 export const LOGICAL_PIPELINE_SCHEMA_VERSION = 1;
@@ -143,6 +143,7 @@ function reconcileLostExecutorTelemetry(
   if (fs.existsSync(path.join(sessionDir, 'state.json'))) {
     assertRecordedActiveChildRecovered(sessionDir, new StateManager());
   }
+  reconcileValidatedCitadelTelemetry(sessionDir);
   reconcileInterruptedModelCallTelemetry(sessionDir, {
     reason,
     sourceOwnerId: lease.owner_id,

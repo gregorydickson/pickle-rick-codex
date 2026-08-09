@@ -10,10 +10,12 @@ import {
   runCitadel,
   runCitadelChecks,
   recoverCitadelStartCommit,
+  reconcileValidatedCitadelTelemetry,
   persistCitadelReleaseApproval,
   resolveCitadelCheckCwd,
   validateCitadelReport,
 } from '../services/citadel.js';
+import { reconcileInterruptedModelCallTelemetry } from '../services/productive-autonomy.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot, writeExecutable } from './helpers.js';
@@ -549,20 +551,39 @@ test('runCitadel monitors checks and enforces reviewer evidence and approval sig
   const fakeBin = makeTempRoot('pickle-citadel-lifecycle-bin-');
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
 const fs = require('node:fs');
+const path = require('node:path');
 const args = process.argv.slice(2);
 const prompt = fs.readFileSync(0, 'utf8');
 const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
 const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
 const mode = criteria[0] || '';
 const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
-fs.writeFileSync(reportPath, JSON.stringify({
+const countPath = path.join(path.dirname(path.dirname(reportPath)), '..', 'citadel-review-count');
+const count = fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, 'utf8')) + 1 : 1;
+fs.writeFileSync(countPath, String(count));
+let findings = [];
+if (mode.includes('malformed once') && count === 1) findings = {};
+if (mode.includes('repeated malformed') && !prompt.includes('strict-minimal-json')) findings = {};
+if (mode.includes('oversize artifact')) findings = ['x'.repeat(1024 * 1024 + 1)];
+if (mode.includes('substantive block')) findings = [{
+  severity: 'high',
+  title: 'Release invariant is violated',
+  evidence: 'A valid blocking finding.',
+  recommendation: 'Fix the release invariant.'
+}];
+const candidate = JSON.stringify({
   schema_version: 1,
   verdict: 'approve',
   reviewed_range: reviewedRange,
   acceptance_criteria_checked: mode.includes('invalid evidence') ? [] : criteria,
-  findings: [],
+  findings,
   generated_at: '2026-07-18T00:00:00.000Z'
-}));
+});
+if (mode.includes('partial delayed artifact')) {
+  fs.writeFileSync(reportPath, '{"schema_version":');
+  setTimeout(() => fs.writeFileSync(reportPath, candidate), 75);
+} else if (mode.includes('symlink artifact')) fs.symlinkSync(countPath, reportPath);
+else fs.writeFileSync(reportPath, candidate);
 const message = mode.includes('missing promise') ? 'review complete' : '<promise>THE_CITADEL_APPROVES</promise>';
 const outputIndex = args.indexOf('--output-last-message');
 if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], message);
@@ -597,15 +618,162 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: approved.cwd, encoding: 'utf8' }), '');
 
     const invalid = makeCitadelLifecycleSession('invalid evidence');
-    assert.equal(await runCitadel(invalid.sessionDir), 'citadel-blocked');
-    const invalidReport = JSON.parse(fs.readFileSync(path.join(invalid.sessionDir, 'citadel-report.json'), 'utf8'));
-    assert.match(invalidReport.findings[0].title, /report evidence is invalid/i);
-    assert.match(invalidReport.findings[0].evidence, /coverage is incomplete/i);
+    await assert.rejects(() => runCitadel(invalid.sessionDir), (error) => {
+      assert.equal(error.code, 'CITADEL_REVIEWER_ARTIFACT_INVALID');
+      assert.match(error.message, /coverage is incomplete/i);
+      return true;
+    });
+    assert.equal(fs.readFileSync(path.join(invalid.sessionDir, 'citadel-review-count'), 'utf8'), '2');
 
     const missingPromise = makeCitadelLifecycleSession('missing promise');
-    assert.equal(await runCitadel(missingPromise.sessionDir), 'citadel-blocked');
-    const missingPromiseReport = JSON.parse(fs.readFileSync(path.join(missingPromise.sessionDir, 'citadel-report.json'), 'utf8'));
-    assert.match(missingPromiseReport.findings[0].title, /approval signal missing/i);
+    await assert.rejects(() => runCitadel(missingPromise.sessionDir), /approval signal is missing/i);
+    assert.equal(fs.readFileSync(path.join(missingPromise.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+
+    const delayed = makeCitadelLifecycleSession('partial delayed artifact completes before process exit');
+    assert.equal(await runCitadel(delayed.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(delayed.sessionDir, 'citadel-review-count'), 'utf8'), '1');
+
+    const telemetryCrash = makeCitadelLifecycleSession('validated telemetry survives a controller crash');
+    await assert.rejects(() => runCitadel(telemetryCrash.sessionDir, {
+      faultInjection: () => { throw new Error('fixture crash'); },
+    }), /after durable candidate validation/i);
+    const crashedState = JSON.parse(fs.readFileSync(
+      path.join(telemetryCrash.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    assert.equal(crashedState.attempts[0].status, 'validated');
+    assert.equal(crashedState.attempts[0].telemetry_status, 'started');
+    assert.equal(reconcileValidatedCitadelTelemetry(telemetryCrash.sessionDir), 1);
+    assert.deepEqual(reconcileInterruptedModelCallTelemetry(telemetryCrash.sessionDir, {
+      reason: 'fixture-supervisor-recovery',
+    }), []);
+    assert.equal(await runCitadel(telemetryCrash.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(telemetryCrash.sessionDir, 'citadel-review-count'), 'utf8'), '1');
+    const crashTelemetry = JSON.parse(fs.readFileSync(
+      path.join(telemetryCrash.sessionDir, 'execution-telemetry.json'), 'utf8',
+    ));
+    assert.deepEqual(
+      crashTelemetry.events.filter((event) => event.phase === 'citadel')
+        .map(({ outcome, productive_work, discarded_work }) => ({ outcome, productive_work, discarded_work })),
+      [{ outcome: 'success', productive_work: 1, discarded_work: 0 }],
+    );
+
+    for (const corruption of ['symlink', 'oversize']) {
+      const recoveredUnsafe = makeCitadelLifecycleSession(`recovered ${corruption} candidate is rejected safely`);
+      assert.equal(await runCitadel(recoveredUnsafe.sessionDir), 'success');
+      const unsafeStatePath = path.join(recoveredUnsafe.sessionDir, 'citadel-review-state.json');
+      const unsafeState = JSON.parse(fs.readFileSync(unsafeStatePath, 'utf8'));
+      unsafeState.status = 'running';
+      unsafeState.attempts[0].status = 'validated';
+      const unsafeCandidate = unsafeState.attempts[0].candidate_path;
+      fs.rmSync(unsafeCandidate, { force: true });
+      if (corruption === 'symlink') {
+        fs.symlinkSync(path.join(recoveredUnsafe.sessionDir, 'citadel-review-count'), unsafeCandidate);
+      } else {
+        fs.writeFileSync(unsafeCandidate, 'x'.repeat(1024 * 1024 + 1));
+      }
+      fs.writeFileSync(unsafeStatePath, JSON.stringify(unsafeState));
+      assert.equal(await runCitadel(recoveredUnsafe.sessionDir), 'success');
+      assert.equal(fs.readFileSync(path.join(recoveredUnsafe.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+      const repairedState = JSON.parse(fs.readFileSync(unsafeStatePath, 'utf8'));
+      assert.equal(repairedState.attempts[0].status, 'rejected');
+      assert.match(repairedState.attempts[0].validation_error, corruption === 'symlink' ? /non-symlink/i : /exceeds/i);
+      assert.equal(repairedState.attempts[1].status, 'accepted');
+    }
+
+    const recovered = makeCitadelLifecycleSession('malformed once then approve');
+    assert.equal(await runCitadel(recovered.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(recovered.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+    const recoveredAttemptFiles = fs.readdirSync(recovered.sessionDir)
+      .filter((name) => /^citadel-review-attempt-.*\.json$/.test(name));
+    assert.equal(recoveredAttemptFiles.length, 1);
+    const recoveredAttempt = JSON.parse(fs.readFileSync(
+      path.join(recovered.sessionDir, recoveredAttemptFiles[0]), 'utf8',
+    ));
+    assert.match(recoveredAttempt.validation_error, /findings must be an array/i);
+    assert.equal(recoveredAttempt.checkpoint_restored, true);
+    assert.match(recoveredAttempt.raw_report, /"findings":\{\}/);
+    const recoveredTelemetry = JSON.parse(fs.readFileSync(
+      path.join(recovered.sessionDir, 'execution-telemetry.json'), 'utf8',
+    )).events.filter((event) => event.phase === 'citadel');
+    assert.deepEqual(
+      recoveredTelemetry.map(({ outcome, productive_work, discarded_work }) => ({ outcome, productive_work, discarded_work })),
+      [
+        { outcome: 'failed', productive_work: 0, discarded_work: 1 },
+        { outcome: 'success', productive_work: 1, discarded_work: 0 },
+      ],
+    );
+    const recoveryStatePath = path.join(recovered.sessionDir, 'citadel-review-state.json');
+    const recoveryState = JSON.parse(fs.readFileSync(recoveryStatePath, 'utf8'));
+    recoveryState.status = 'running';
+    recoveryState.attempts.at(-1).status = 'validated';
+    fs.writeFileSync(recoveryStatePath, JSON.stringify(recoveryState));
+    fs.rmSync(path.join(recovered.sessionDir, 'citadel-report.json'), { force: true });
+    assert.equal(await runCitadel(recovered.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(recovered.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+
+    const exhausted = makeCitadelLifecycleSession('repeated malformed reviewer evidence');
+    await assert.rejects(() => runCitadel(exhausted.sessionDir), (error) => {
+      assert.equal(error.code, 'CITADEL_REVIEWER_ARTIFACT_INVALID');
+      assert.equal(error.attempts, 2);
+      assert.match(error.message, /findings must be an array/i);
+      return true;
+    });
+    assert.equal(fs.readFileSync(path.join(exhausted.sessionDir, 'citadel-review-count'), 'utf8'), '2');
+    assert.equal(fs.existsSync(path.join(exhausted.sessionDir, 'citadel-report.json')), false);
+    const failure = JSON.parse(fs.readFileSync(
+      path.join(exhausted.sessionDir, 'citadel-reviewer-artifact-failure.json'), 'utf8',
+    ));
+    assert.equal(failure.code, 'CITADEL_REVIEWER_ARTIFACT_INVALID');
+    const exhaustedTelemetry = JSON.parse(fs.readFileSync(
+      path.join(exhausted.sessionDir, 'execution-telemetry.json'), 'utf8',
+    )).events.filter((event) => event.phase === 'citadel');
+    assert.deepEqual(exhaustedTelemetry.map((event) => event.outcome), ['failed', 'failed']);
+    const exhaustedAttemptFiles = fs.readdirSync(exhausted.sessionDir)
+      .filter((name) => /^citadel-review-attempt-.*\.json$/.test(name));
+    assert.equal(exhaustedAttemptFiles.length, 2);
+    for (const attemptFile of exhaustedAttemptFiles) {
+      assert.match(
+        JSON.parse(fs.readFileSync(path.join(exhausted.sessionDir, attemptFile), 'utf8')).validation_error,
+        /findings must be an array/i,
+      );
+    }
+    assert.equal(await runCitadel(exhausted.sessionDir), 'success');
+    assert.equal(fs.readFileSync(path.join(exhausted.sessionDir, 'citadel-review-count'), 'utf8'), '3');
+    const exhaustedState = JSON.parse(fs.readFileSync(
+      path.join(exhausted.sessionDir, 'citadel-review-state.json'), 'utf8',
+    ));
+    assert.equal(exhaustedState.status, 'accepted');
+    assert.equal(exhaustedState.recovery_epoch, 2);
+    assert.deepEqual(exhaustedState.attempts.map((entry) => entry.ordinal), [1, 2, 3]);
+    assert.deepEqual(exhaustedState.attempts.map((entry) => entry.epoch), [1, 1, 2]);
+    assert.notEqual(exhaustedState.attempts[0].strategy_hash, exhaustedState.attempts[2].strategy_hash);
+    const resolvedFailure = JSON.parse(fs.readFileSync(
+      path.join(exhausted.sessionDir, 'citadel-reviewer-artifact-failure.json'), 'utf8',
+    ));
+    assert.ok(resolvedFailure.resolved_at);
+
+    for (const criterion of ['oversize artifact is rejected', 'symlink artifact is rejected']) {
+      const unsafe = makeCitadelLifecycleSession(criterion);
+      await assert.rejects(() => runCitadel(unsafe.sessionDir), /reviewer did not produce a valid artifact/i);
+      const unsafeEvidenceFiles = fs.readdirSync(unsafe.sessionDir)
+        .filter((name) => /^citadel-review-attempt-.*\.json$/.test(name));
+      assert.equal(unsafeEvidenceFiles.length, 2);
+      for (const fileName of unsafeEvidenceFiles) {
+        const evidence = JSON.parse(fs.readFileSync(path.join(unsafe.sessionDir, fileName), 'utf8'));
+        assert.equal(evidence.raw_report, null);
+      }
+      assert.equal(fs.existsSync(path.join(unsafe.sessionDir, 'citadel-report.json')), false);
+    }
+
+    const blocked = makeCitadelLifecycleSession('substantive block requires repair');
+    assert.equal(await runCitadel(blocked.sessionDir), 'citadel-blocked');
+    assert.equal(fs.readFileSync(path.join(blocked.sessionDir, 'citadel-review-count'), 'utf8'), '1');
+    const blockedReport = JSON.parse(fs.readFileSync(path.join(blocked.sessionDir, 'citadel-report.json'), 'utf8'));
+    assert.equal(blockedReport.findings[0].title, 'Release invariant is violated');
+    assert.equal(
+      fs.readdirSync(blocked.sessionDir).some((name) => /^citadel-review-attempt-.*\.json$/.test(name)),
+      false,
+    );
   } finally {
     process.env.PATH = originalPath;
   }

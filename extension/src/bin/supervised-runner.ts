@@ -14,6 +14,7 @@ import {
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
 import { StateManager } from '../services/state-manager.js';
+import { reconcileValidatedCitadelTelemetry } from '../services/citadel.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js']);
 
@@ -88,6 +89,7 @@ export async function runSupervisedRunner(
     testOptions.onExecutorIdentity?.(child.pid ? captureProcessLivenessIdentity(child.pid) : null);
     const exitCode = await waitForExit(child);
     assertRecordedActiveChildRecovered(sessionDir, new StateManager());
+    reconcileValidatedCitadelTelemetry(sessionDir);
     reconcileInterruptedModelCallTelemetry(sessionDir, {
       reason: 'supervised_executor_exit',
       sourceOwnerId: child.pid ? `process:${child.pid}` : null,
