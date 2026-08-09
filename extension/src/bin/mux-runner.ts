@@ -664,21 +664,24 @@ async function runSequentialWithLease(
       try {
         if (pendingContractRepair) {
           options.assertDurableOwnership?.();
+          const adoptedRepairPending = legacyContractRepairPending(sessionDir, ticket.id);
           let alreadyRepaired = false;
-          try {
-            assertTicketVerificationBoundToSeal(
-              sessionDir,
-              ticket.id,
-              String(manager.read(statePath).working_dir || ''),
-            );
-            alreadyRepaired = true;
-          } catch {
-            // The exact seal-bound receipt is the only authority for skipping repair.
+          if (adoptedRepairPending) {
+            try {
+              assertTicketVerificationBoundToSeal(
+                sessionDir,
+                ticket.id,
+                String(manager.read(statePath).working_dir || ''),
+              );
+              alreadyRepaired = true;
+            } catch {
+              // The exact seal-bound receipt is the only authority for skipping an adopted restart repair.
+            }
           }
           if (!alreadyRepaired) {
             await repairContractFn(sessionDir, ticket.id, { strategy: activeStrategy, timeoutMs: options.timeoutMs, assertDurableOwnership: options.assertDurableOwnership });
           }
-          completeAdoptedVerificationRepair(ticket.id);
+          if (adoptedRepairPending) completeAdoptedVerificationRepair(ticket.id);
           pendingContractRepair = false;
           options.assertDurableOwnership?.();
         }
