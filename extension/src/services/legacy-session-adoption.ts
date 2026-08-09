@@ -290,26 +290,52 @@ function attributableCandidatePaths(sessionDir: string, workingDir: string, tick
 
 function archiveAttributableCandidate(sessionDir: string, workingDir: string, ticketId: string | null): { paths: string[]; staged_paths: string[]; ref: string | null } {
   const archivePath = path.join(sessionDir, 'legacy-candidate-archive.json');
-  type CandidateTxn = { schema_version: 1; ticket_id: string; base_head: string; paths: string[]; staged_paths: string[]; ref: string; cleanup_complete: boolean };
+  type CandidateTxn = {
+    schema_version: 1; ticket_id: string; base_head: string; paths: string[]; staged_paths: string[]; ref: string;
+    staged_patch_base64?: string; staged_patch_sha256?: string; cleanup_complete: boolean;
+  };
   let archived = readJsonFile<CandidateTxn>(archivePath, null);
   const paths = archived?.paths || attributableCandidatePaths(sessionDir, workingDir, ticketId);
   if (paths.length === 0) return { paths: [], staged_paths: [], ref: null };
   if (!ticketId) throw new Error('Legacy candidate archive lost its active ticket identity.');
   if (!archived) {
+    const baseHead = getHeadSha(workingDir);
     const stagedPaths = execFileSync('git', ['diff', '--cached', '--name-only', '-z', '--', ...paths], {
       cwd: workingDir, encoding: 'utf8', timeout: 30_000,
     }).split('\0').filter(Boolean).sort();
+    const stagedPatch = execFileSync('git', ['diff', '--cached', '--binary', baseHead, '--', ...paths], {
+      cwd: workingDir, encoding: 'buffer', timeout: 30_000,
+    });
     const ref = stashUnattributableRemainder(workingDir, sessionDir, () => undefined);
     if (!ref) throw new Error('Legacy adoption could not archive the attributable active candidate.');
-    archived = { schema_version: 1, ticket_id: ticketId, base_head: getHeadSha(workingDir), paths,
-      staged_paths: stagedPaths, ref, cleanup_complete: false };
+    archived = {
+      schema_version: 1, ticket_id: ticketId, base_head: baseHead, paths, staged_paths: stagedPaths, ref,
+      ...(stagedPatch.length > 0 ? {
+        staged_patch_base64: stagedPatch.toString('base64'),
+        staged_patch_sha256: crypto.createHash('sha256').update(stagedPatch).digest('hex'),
+      } : {}),
+      cleanup_complete: false,
+    };
     atomicWriteJson(archivePath, archived);
   }
   if (archived.ticket_id.toLowerCase() !== ticketId.toLowerCase() || archived.base_head !== getHeadSha(workingDir)) {
     throw new Error('Legacy candidate archive identity changed during adoption.');
   }
-  persistRejectedCandidateCheckpoint({ sessionDir, workingDir, ticketId, baseHead: archived.base_head, recoveryRef: archived.ref,
-    evidencePath: archivePath, stagedPaths: archived.staged_paths });
+  let stagedPatch: Buffer | undefined;
+  if (archived.staged_patch_base64 !== undefined || archived.staged_patch_sha256 !== undefined) {
+    if (typeof archived.staged_patch_base64 !== 'string' || typeof archived.staged_patch_sha256 !== 'string') {
+      throw new Error('Legacy candidate archive staged evidence is incomplete.');
+    }
+    stagedPatch = Buffer.from(archived.staged_patch_base64, 'base64');
+    if (stagedPatch.toString('base64') !== archived.staged_patch_base64
+      || crypto.createHash('sha256').update(stagedPatch).digest('hex') !== archived.staged_patch_sha256) {
+      throw new Error('Legacy candidate archive staged evidence hash does not match.');
+    }
+  }
+  persistRejectedCandidateCheckpoint({
+    sessionDir, workingDir, ticketId, baseHead: archived.base_head, recoveryRef: archived.ref,
+    evidencePath: archivePath, stagedPaths: archived.staged_paths, stagedPatch,
+  });
   const compositePatch = execFileSync('git', ['diff', '--binary', archived.base_head, archived.ref, '--', ...archived.paths], { cwd: workingDir, encoding: 'buffer' });
   const worktreeDirty = spawnSync('git', ['diff', '--quiet', '--', ...archived.paths], { cwd: workingDir }).status !== 0
     || execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', ...archived.paths], { cwd: workingDir, encoding: 'utf8' }).length > 0;

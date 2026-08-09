@@ -17,6 +17,7 @@ import { beginAutonomousExecution, createLogicalPipeline, readLogicalPipeline } 
 import { readPrdSeal, writePrdSeal } from '../services/prd-seal.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import {
+  beginRefinementRepositoryAdvance,
   reconcileArchivedCandidateRefinementBoundary,
   refinementRepositoryIdentity,
   validateRefinementAcceptance,
@@ -691,6 +692,132 @@ test('legacy adoption atomically rebinds a started refinement boundary after arc
     verifyRepository: true,
     preserveMalformedVerification: true,
   }).ok, true);
+});
+
+test('mixed dirty accepted boundary adopts, resumes, and restores its exact archived candidate', async () => {
+  const value = fixture();
+  const qualityCommand = 'node -e "process.exit(0)"';
+  const qualityRunCommand = 'npm run test';
+  fs.writeFileSync(path.join(value.repo, 'install.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(value.repo, 'package.json'), JSON.stringify({
+    scripts: { test: qualityCommand },
+  }, null, 2));
+  git(value.repo, ['add', 'install.sh', 'package.json']);
+  git(value.repo, ['commit', '-m', 'add quality prerequisite']);
+  const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].allowed_paths.push('candidate-new.txt');
+  manifest.tickets[0].verification = [{
+    kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'],
+  }];
+  writeJson(manifestPath, manifest);
+  installLegacyRefinementAcceptance(value);
+  fs.mkdirSync(path.join(value.sessionDir, 'r1'), { recursive: true });
+  fs.writeFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), [
+    '---', 'id: r1', 'title: Legacy ticket 1', 'status: In Progress', '---', '',
+  ].join('\n'));
+  for (const phase of ['research', 'plan']) {
+    const artifactPath = path.join(value.sessionDir, 'worker-lifecycle', 'r1', `${phase}.json`);
+    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    if (phase === 'research') artifact.evidence = ['legacy candidate evidence remains archived'];
+    else artifact.steps = ['resume from the clean archived candidate boundary'];
+    writeJson(artifactPath, artifact);
+  }
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.worker_timeout_seconds = 10;
+  state.quality_baseline = {
+    head_sha: git(value.repo, ['rev-parse', 'HEAD']),
+    captured_at: '2026-08-08T19:30:00.000Z',
+    commands: [{ command: qualityRunCommand, ok: true, exitCode: 0, signature: 'success', output: '' }],
+    command_contract: { [qualityRunCommand]: qualityCommand },
+  };
+  writeJson(statePath, state);
+
+  fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'staged candidate\n');
+  git(value.repo, ['add', 'tracked.txt']);
+  fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'unstaged candidate\n');
+  fs.writeFileSync(path.join(value.repo, 'candidate-new.txt'), 'untracked candidate\n');
+  const dirtyAcceptance = writeRefinementAcceptance(value.sessionDir, { workingDir: value.repo });
+  const dirtyIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+  assert.equal(dirtyAcceptance.repository_identity, dirtyIdentity);
+  assert.equal(validateRefinementAcceptance(value.sessionDir, {
+    workingDir: value.repo, verifyRepository: true,
+  }).ok, true);
+  const advance = beginRefinementRepositoryAdvance({
+    sessionDir: value.sessionDir, workingDir: value.repo, ticketId: 'r1', requiresCleanCommit: false,
+  });
+  assert.equal(advance.phase, 'started');
+  assert.equal(advance.baseline_repository_identity, dirtyIdentity);
+  assert.equal(advance.baseline_head_sha, git(value.repo, ['rev-parse', 'HEAD']));
+  assert.deepEqual(advance.baseline_untracked_files, ['candidate-new.txt']);
+
+  const deps = depsFor(value);
+  delete deps.sealSession;
+  const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.equal(record.status, 'adopted');
+  assert.deepEqual(record.candidate_archive.paths, ['candidate-new.txt', 'tracked.txt']);
+  assert.deepEqual(record.candidate_archive.staged_paths, ['tracked.txt']);
+  assert.match(record.candidate_archive.ref, /^refs\/pickle\/salvage-history\//);
+  assert.equal(git(value.repo, ['status', '--porcelain']), '');
+  const cleanIdentity = refinementRepositoryIdentity(value.repo, value.sessionDir);
+  assert.notEqual(cleanIdentity, dirtyIdentity);
+  assert.equal(validateRefinementAcceptance(value.sessionDir, {
+    workingDir: value.repo, verifyRepository: true,
+  }).ok, true);
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'refinement-acceptance.json'), 'utf8',
+  )).repository_identity, cleanIdentity);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'refinement-repository-advance.json')), false);
+  assert.equal(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).tickets[0].status, 'Todo');
+  assert.match(fs.readFileSync(path.join(value.sessionDir, 'r1', 'linear_ticket_r1.md'), 'utf8'), /status: "Todo"/);
+
+  const archivePath = path.join(value.sessionDir, 'legacy-candidate-archive.json');
+  const checkpointPath = path.join(value.sessionDir, 'rejected-candidates', 'r1.json');
+  const archiveBeforeReadiness = fs.readFileSync(archivePath, 'utf8');
+  const checkpointBeforeReadiness = fs.readFileSync(checkpointPath, 'utf8');
+  const archive = JSON.parse(archiveBeforeReadiness);
+  const checkpoint = JSON.parse(checkpointBeforeReadiness);
+  const recoverySha = git(value.repo, ['rev-parse', record.candidate_archive.ref]);
+  assert.equal(archive.cleanup_complete, true);
+  assert.equal(archive.ref, record.candidate_archive.ref);
+  assert.equal(checkpoint.recovery_ref, record.candidate_archive.ref);
+  assert.equal(checkpoint.evidence_path, fs.realpathSync(archivePath));
+  assert.deepEqual(checkpoint.changed_paths, ['candidate-new.txt', 'tracked.txt']);
+  const migration = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+  const preserved = new Set(migration.preserved_artifacts.map((entry) => entry.path));
+  assert.ok(preserved.has('legacy-candidate-archive.json'));
+  assert.ok(preserved.has('legacy-refinement-boundary-reconciliation.json'));
+  assert.ok(preserved.has('rejected-candidates/r1.json'));
+  assert.ok(migration.salvage_refs.some((entry) => entry.startsWith(`${record.candidate_archive.ref}:`)));
+  assert.ok(fs.existsSync(path.join(value.sessionDir, 'prd.lock.json')));
+  assert.equal(readLogicalPipeline(value.sessionDir).events.at(-1).kind, 'legacy_session_adopted');
+
+  const readiness = checkReadiness(value.sessionDir, { runtimeRoot: projectRoot });
+  assert.equal(readiness.ready, true, JSON.stringify(readiness.findings));
+  assert.ok(readiness.findings.some((finding) => finding.code === 'adoption-repair-ready'));
+  const ready = await ensureBootstrapSessionReady(value.sessionDir, { resumeReadyOnly: true });
+  assert.equal(ready.summary.runnable[0].id, 'r1');
+  assert.equal(legacyContractRepairPending(value.sessionDir, 'r1'), true);
+  assert.equal(fs.readFileSync(archivePath, 'utf8'), archiveBeforeReadiness);
+  assert.equal(fs.readFileSync(checkpointPath, 'utf8'), checkpointBeforeReadiness);
+  assert.equal(git(value.repo, ['rev-parse', record.candidate_archive.ref]), recoverySha);
+
+  const restored = restoreRejectedCandidateCheckpoint({
+    sessionDir: value.sessionDir,
+    workingDir: value.repo,
+    ticketId: 'r1',
+    expectedBaseHead: git(value.repo, ['rev-parse', 'HEAD']),
+    validateScope: (paths) => assert.deepEqual(paths, ['candidate-new.txt', 'tracked.txt']),
+  });
+  assert.ok(restored);
+  assert.equal(fs.readFileSync(path.join(value.repo, 'tracked.txt'), 'utf8'), [
+    'base', 'staged candidate', 'unstaged candidate', '',
+  ].join('\n'));
+  assert.equal(fs.readFileSync(path.join(value.repo, 'candidate-new.txt'), 'utf8'), 'untracked candidate\n');
+  assert.equal(git(value.repo, ['diff', '--cached', '--name-only']), 'tracked.txt');
+  assert.equal(git(value.repo, ['diff', '--name-only']), 'tracked.txt');
+  assert.match(git(value.repo, ['status', '--porcelain']), /^MM tracked\.txt\n\?\? candidate-new\.txt$/);
 });
 
 test('migrated adoption supersedes stale repository-bound inventory and resumes idempotently', () => {
