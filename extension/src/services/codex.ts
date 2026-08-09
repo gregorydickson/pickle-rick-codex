@@ -34,11 +34,16 @@ export class AddDirOutsideSandboxError extends Error {
 export class CodexCancelCheckError extends Error {
   readonly code = 'CODEX_CANCEL_CHECK_FAILED';
   override readonly cause: unknown;
+  result: CodexSpawnResult | null = null;
 
   constructor(cause: unknown) {
     super(`Codex cancellation check failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = 'CodexCancelCheckError';
     this.cause = cause;
+  }
+
+  attachResult(result: CodexSpawnResult): void {
+    this.result = result;
   }
 }
 
@@ -374,7 +379,16 @@ async function runSpawnedCommand({
           cancelled = cancelCheck();
         } catch (error) {
           const typedError = new CodexCancelCheckError(error);
-          requestTermination('cancel-check-error', typedError);
+          const accepted = requestTermination('cancel-check-error', typedError);
+          if (!accepted && terminationCause === null
+            && (child.exitCode !== null || child.signalCode !== null)) {
+            // The process can exit before stdio closes. A control-state failure
+            // observed in that drain window must not be silently downgraded to
+            // the child's otherwise-successful exit.
+            terminationCause = 'cancel-check-error';
+            cancelCheckError = typedError;
+            cleanup();
+          }
           return;
         }
         if (!cancelled) return;
@@ -419,13 +433,7 @@ async function runSpawnedCommand({
         const message = readLastMessage(outputLastMessagePath);
         const outputFormat = detectOutputFormat(stdout);
         const usage = inspectCodexUsage(stdout);
-        if (cancelCheckError) {
-          settled = true;
-          cleanup();
-          reject(cancelCheckError);
-          return;
-        }
-        finalize({
+        const result: Omit<CodexSpawnResult, 'command' | 'args'> = {
           exitCode: terminationCause === 'cancel'
             ? 130
             : terminationCause === 'timeout'
@@ -445,7 +453,15 @@ async function runSpawnedCommand({
           outputFormat,
           assistantContent: extractAssistantContent(stdout),
           toolCalls: collectCodexToolCalls(stdout),
-        });
+        };
+        if (cancelCheckError) {
+          settled = true;
+          cleanup();
+          cancelCheckError.attachResult({ command, args, ...result });
+          reject(cancelCheckError);
+          return;
+        }
+        finalize(result);
       };
       setTimeout(finalizeAfterFlush, flushQuietMs);
     });
@@ -572,8 +588,9 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
     });
   } catch (error) {
     if (options.telemetry && reservation) {
+      const capturedResult = error instanceof CodexCancelCheckError ? error.result : null;
       finalizeModelCallTelemetry(options.telemetry.sessionDir, reservation, {
-        result: {
+        result: capturedResult ?? {
           command, args, exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error),
           timedOut: false, durationMs: Date.now() - telemetryStartedAt, lastMessage: '',
           usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runCodexExecMonitored } from '../services/codex.js';
+import { CodexCancelCheckError, runCodexExecMonitored } from '../services/codex.js';
 import {
   executionTelemetrySummary,
   recordExecutionControlTelemetry,
@@ -118,6 +118,105 @@ setInterval(() => {}, 1000);
   assert.equal(event.outcome, 'timed_out');
   assert.equal(event.telemetry_status, 'telemetry_unavailable');
   assert.equal(event.telemetry_failure, 'call_ended_without_usage');
+  assert.equal(event.input_tokens, null);
+  assert.equal(event.cached_input_tokens, null);
+  assert.equal(event.cache_creation_input_tokens, null);
+  assert.equal(event.output_tokens, null);
+});
+
+test('cancel-check failure retains parsed usage and duration in failed telemetry', async () => {
+  const sessionDir = makeTempRoot('pickle-cancel-check-telemetry-');
+  const runtimeDir = makeTempRoot('pickle-cancel-check-bin-');
+  const executable = path.join(runtimeDir, 'codex');
+  const marker = path.join(sessionDir, 'usage-written');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeSync(1, JSON.stringify({ usage: {
+  input_tokens: 23,
+  cache_creation_input_tokens: 5,
+  cache_read_input_tokens: 7,
+  output_tokens: 11,
+} }) + '\\n');
+fs.writeFileSync(process.env.FAKE_MARKER, 'ready');
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  const cause = new Error('cancellation state unreadable');
+  let failure;
+  try {
+    await runCodexExecMonitored({
+      command: executable,
+      prompt: 'cancel check failure',
+      timeoutMs: 2_000,
+      env: { FAKE_MARKER: marker },
+      cancelCheck: () => {
+        if (!fs.existsSync(marker)) return false;
+        throw cause;
+      },
+      telemetry: { sessionDir, ticketId: 'T1', phase: 'cancel_check_failure' },
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof CodexCancelCheckError);
+  assert.equal(failure.cause, cause);
+  assert.ok(failure.result);
+  assert.equal(failure.result.usageReported, true);
+  assert.deepEqual(failure.result.usage, {
+    input_tokens: 23,
+    cache_creation_input_tokens: 5,
+    cache_read_input_tokens: 7,
+    output_tokens: 11,
+  });
+  assert.ok(failure.result.durationMs >= 100 && failure.result.durationMs < 2_000);
+
+  const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
+  assert.equal(event.outcome, 'failed');
+  assert.equal(event.telemetry_status, 'reported');
+  assert.equal(event.telemetry_failure, null);
+  assert.equal(event.duration_ms, failure.result.durationMs);
+  assert.equal(event.input_tokens, 23);
+  assert.equal(event.cache_creation_input_tokens, 5);
+  assert.equal(event.cached_input_tokens, 7);
+  assert.equal(event.output_tokens, 11);
+});
+
+test('cancel-check failure without usage remains typed and records unavailable telemetry', async () => {
+  const sessionDir = makeTempRoot('pickle-cancel-check-no-usage-');
+  const runtimeDir = makeTempRoot('pickle-cancel-check-no-usage-bin-');
+  const executable = path.join(runtimeDir, 'codex');
+  const marker = path.join(sessionDir, 'started');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(process.env.FAKE_MARKER, 'ready');
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  const cause = new Error('cancellation state unavailable');
+  let failure;
+  try {
+    await runCodexExecMonitored({
+      command: executable,
+      prompt: 'cancel check failure without usage',
+      timeoutMs: 2_000,
+      env: { FAKE_MARKER: marker },
+      cancelCheck: () => {
+        if (!fs.existsSync(marker)) return false;
+        throw cause;
+      },
+      telemetry: { sessionDir, ticketId: 'T1', phase: 'cancel_check_no_usage' },
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof CodexCancelCheckError);
+  assert.equal(failure.cause, cause);
+  assert.equal(failure.result.usageReported, false);
+  const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
+  assert.equal(event.outcome, 'failed');
+  assert.equal(event.telemetry_status, 'telemetry_unavailable');
+  assert.equal(event.telemetry_failure, 'call_ended_without_usage');
+  assert.equal(event.duration_ms, failure.result.durationMs);
   assert.equal(event.input_tokens, null);
   assert.equal(event.cached_input_tokens, null);
   assert.equal(event.cache_creation_input_tokens, null);
