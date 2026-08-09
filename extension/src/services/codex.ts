@@ -349,6 +349,30 @@ async function runSpawnedCommand({
       armSuccessTermination();
     };
 
+    const checkForCancellation = (): boolean => {
+      if (terminationCause !== null || typeof cancelCheck !== 'function') return terminationCause !== null;
+      let cancelled: boolean;
+      try {
+        cancelled = cancelCheck();
+      } catch (error) {
+        const typedError = new CodexCancelCheckError(error);
+        const accepted = requestTermination('cancel-check-error', typedError);
+        if (!accepted && terminationCause === null
+          && (child.exitCode !== null || child.signalCode !== null)) {
+          // The process can exit before stdio closes. A control-state failure
+          // observed in that drain window must not be silently downgraded to
+          // the child's otherwise-successful exit.
+          terminationCause = 'cancel-check-error';
+          cancelCheckError = typedError;
+          cleanup();
+        }
+        return true;
+      }
+      if (!cancelled) return false;
+      requestTermination('cancel');
+      return true;
+    };
+
     const armExecutionControls = (): void => {
       if (controlsArmed || settled) return;
       controlsArmed = true;
@@ -356,6 +380,10 @@ async function runSpawnedCommand({
       absoluteDeadlineMs = startedAt + timeoutMs;
       timeoutTimer = setTimeout(() => {
         if (terminationCause === null && child.exitCode === null && child.signalCode === null) {
+          // Cancellation and an unreadable cancellation source are ownership
+          // decisions, so sample them at the immutable timeout boundary before
+          // classifying the same delayed event-loop turn as an ordinary timeout.
+          if (checkForCancellation()) return;
           if (!successObserved) checkForSuccess();
           const usage = inspectCodexUsage(currentStdout());
           const terminalUsageObserved = usage.reported || usage.turnCompleted;
@@ -383,26 +411,7 @@ async function runSpawnedCommand({
 
       if (typeof cancelCheck === 'function') {
         cancelTimer = setInterval(() => {
-          if (terminationCause !== null) return;
-          let cancelled: boolean;
-          try {
-            cancelled = cancelCheck();
-          } catch (error) {
-            const typedError = new CodexCancelCheckError(error);
-            const accepted = requestTermination('cancel-check-error', typedError);
-            if (!accepted && terminationCause === null
-              && (child.exitCode !== null || child.signalCode !== null)) {
-              // The process can exit before stdio closes. A control-state failure
-              // observed in that drain window must not be silently downgraded to
-              // the child's otherwise-successful exit.
-              terminationCause = 'cancel-check-error';
-              cancelCheckError = typedError;
-              cleanup();
-            }
-            return;
-          }
-          if (!cancelled) return;
-          requestTermination('cancel');
+          checkForCancellation();
         }, 100);
       }
     };

@@ -18,6 +18,7 @@ import {
   recoverCitadelStartCommit,
   reconcileValidatedCitadelTelemetry,
   persistCitadelReleaseApproval,
+  resolvePickleTrustedTestInventory,
   resolveCitadelCheckCwd,
   validateCitadelReport,
 } from '../services/citadel.js';
@@ -560,6 +561,130 @@ test('Citadel structured deduplication retains distinct cwd, env, argv, and skip
   assert.deepEqual(deduplicateCitadelCheckExecutions(descriptors, cwd), descriptors);
 });
 
+function makeTrustedPickleTopology(delayMs = 75) {
+  const cwd = makeTempRoot('pickle-citadel-trusted-topology-');
+  const sessionDir = makeTempRoot('pickle-citadel-trusted-session-');
+  const fakeBin = path.join(cwd, 'fake-bin');
+  const orderPath = path.join(cwd, 'trusted-order');
+  fs.mkdirSync(path.join(cwd, 'extension'));
+  fs.mkdirSync(fakeBin);
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    name: 'pickle-rick-codex',
+    scripts: { test: 'npm --prefix extension test' },
+  }));
+  fs.writeFileSync(path.join(cwd, 'extension', 'package.json'), JSON.stringify({
+    scripts: {
+      pretest: 'if [ -d src ] && [ -d node_modules ]; then npm run build && npm run audit:test-tiers; fi',
+      test: 'npm run test:fast && npm run test:integration',
+      prebuild: 'bash scripts/copy-shell-assets.sh',
+      build: 'tsc',
+      'audit:test-tiers': 'bash scripts/audit-test-tiers.sh',
+      'test:fast': 'node bin/test-runner.js --tier fast --test-concurrency=8',
+      'test:integration': 'node bin/test-runner.js --tier integration --test-concurrency=4',
+    },
+  }));
+  writeExecutable(path.join(fakeBin, 'npm'), `#!/bin/sh
+item=''
+for arg in "$@"; do item="$arg"; done
+printf '%s\\n' "$item" >> ${JSON.stringify(orderPath)}
+printf 'untrusted-forged-progress:%s\\n' "$item"
+sleep ${delayMs / 1_000}
+`);
+  execFileSync('git', ['init', '-q'], { cwd });
+  return { cwd, sessionDir, fakeBin, orderPath };
+}
+
+test('Citadel trusted npm adapter binds exact immutable topology and fails closed on drift', () => {
+  const fixture = makeTrustedPickleTopology();
+  const inventory = resolvePickleTrustedTestInventory(fixture.cwd, 250, {
+    PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}`,
+    FIXTURE: 'trusted',
+  });
+  assert.ok(inventory);
+  assert.deepEqual(inventory.items.map(({ id, ordinal }) => ({ id, ordinal })), [
+    { id: 'extension-build', ordinal: 1 },
+    { id: 'extension-audit-test-tiers', ordinal: 2 },
+    { id: 'extension-test-fast', ordinal: 3 },
+    { id: 'extension-test-integration', ordinal: 4 },
+  ]);
+  assert.equal(new Set(inventory.items.map((item) => item.execution_identity)).size, 4);
+  assert.match(inventory.inventory_id, /^[a-f0-9]{64}$/);
+  const extensionPackagePath = path.join(fixture.cwd, 'extension', 'package.json');
+  const extensionPackage = JSON.parse(fs.readFileSync(extensionPackagePath, 'utf8'));
+  extensionPackage.scripts.test = 'npm run test:fast';
+  fs.writeFileSync(extensionPackagePath, JSON.stringify(extensionPackage));
+  assert.throws(
+    () => resolvePickleTrustedTestInventory(fixture.cwd, 250),
+    /topology drifted.*test/i,
+  );
+});
+
+test('Citadel controller accepts only ordered successful inventory completions as semantic progress', async () => {
+  const fixture = makeTrustedPickleTopology(550);
+  const startedAt = Date.now();
+  const results = await runCitadelChecksMonitored(fixture.cwd, fixture.sessionDir, [], {
+    timeoutMs: 2_000,
+    environment: { ...process.env, PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}` },
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+  });
+  const testResult = results.find((result) => result.command === 'npm run test');
+  assert.equal(testResult.status, 'passed');
+  assert.equal(testResult.semantic_progress_count, 4);
+  assert.equal(testResult.last_progress_identity, 'extension-test-integration');
+  assert.ok(Date.now() - startedAt > 2_000, 'ordered completions must extend work beyond one item window');
+  assert.deepEqual(fs.readFileSync(fixture.orderPath, 'utf8').trim().split('\n'), [
+    'build', 'audit:test-tiers', 'test:fast', 'test:integration',
+  ]);
+  const journal = JSON.parse(fs.readFileSync(
+    path.join(fixture.sessionDir, 'citadel-deterministic-check-journal.json'), 'utf8',
+  ));
+  assert.equal(journal.status, 'completed');
+  assert.deepEqual(journal.completed_items.map(({ item_id, ordinal }) => ({ item_id, ordinal })), [
+    { item_id: 'extension-build', ordinal: 1 },
+    { item_id: 'extension-audit-test-tiers', ordinal: 2 },
+    { item_id: 'extension-test-fast', ordinal: 3 },
+    { item_id: 'extension-test-integration', ordinal: 4 },
+  ]);
+});
+
+test('Citadel whole-gate absolute cap dominates continuing valid inventory progress', async () => {
+  const fixture = makeTrustedPickleTopology(90);
+  const results = await runCitadelChecksMonitored(fixture.cwd, fixture.sessionDir, [], {
+    timeoutMs: 400,
+    wholeGateTimeoutMs: 450,
+    environment: { ...process.env, PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}` },
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+  });
+  const testResult = results.find((result) => result.command === 'npm run test');
+  assert.equal(testResult.status, 'failed');
+  assert.equal(testResult.timed_out, true);
+  assert.equal(testResult.timeout_kind, 'absolute');
+  assert.ok(testResult.semantic_progress_count > 0);
+  assert.ok(testResult.semantic_progress_count < 4);
+  assert.equal(results.some((result) => result.command === 'git diff --check'), false);
+});
+
+test('Citadel cancellation dominates a successful trusted completion before the next item', async () => {
+  const fixture = makeTrustedPickleTopology(25);
+  let exits = 0;
+  await assert.rejects(() => runCitadelChecksMonitored(fixture.cwd, fixture.sessionDir, [], {
+    timeoutMs: 400,
+    environment: { ...process.env, PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}` },
+    isCancelled: () => exits >= 1,
+    onSpawn: () => {},
+    onExit: () => { exits += 1; },
+  }), /deterministic checks cancelled/i);
+  assert.deepEqual(fs.readFileSync(fixture.orderPath, 'utf8').trim().split('\n'), ['build']);
+  const journal = JSON.parse(fs.readFileSync(
+    path.join(fixture.sessionDir, 'citadel-deterministic-check-journal.json'), 'utf8',
+  ));
+  assert.equal(journal.status, 'interrupted');
+});
+
 test('Citadel snapshots cancellation at close before the cancellation poll can run', async () => {
   const cwd = makeTempRoot('pickle-citadel-close-cancel-race-');
   let cancellationChecks = 0;
@@ -585,6 +710,50 @@ test('Citadel snapshots cancellation at close before the cancellation poll can r
   assert.equal(cancellationChecks, 2, 'cancellation must be checked once before spawn and once at close');
   assert.equal(drainCalls, 1, 'close-observed cancellation must use the awaited drain path');
   assert.deepEqual(exitOutcome, { quiescent: true, cancelled: true, timedOut: false });
+});
+
+test('Citadel deadlines begin at child spawn even when onSpawn persistence is delayed', async () => {
+  const cwd = makeTempRoot('pickle-citadel-delayed-onspawn-');
+  const result = await runMonitoredCitadelCheck({
+    command: 'early exit with delayed fence persistence',
+    executable: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+  }, cwd, {
+    timeoutMs: 25,
+    absoluteTimeoutMs: 25,
+    isCancelled: () => false,
+    onSpawn: async () => await new Promise((resolve) => setTimeout(resolve, 200)),
+    onExit: () => {},
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.timed_out, true);
+  assert.ok(result.elapsed_ms >= 200);
+});
+
+test('Citadel whole-gate cap includes delayed onSpawn and suppresses the next check', async () => {
+  const cwd = makeTempRoot('pickle-citadel-delayed-onspawn-gate-');
+  const sessionDir = makeTempRoot('pickle-citadel-delayed-onspawn-session-');
+  const marker = path.join(cwd, 'later-check-ran');
+  fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
+    scripts: { test: `${JSON.stringify(process.execPath)} -e "process.exit(0)"` },
+  }));
+  execFileSync('git', ['init', '-q'], { cwd });
+  const results = await runCitadelChecksMonitored(cwd, sessionDir, [{
+    kind: 'process',
+    executable: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`],
+  }], {
+    timeoutMs: 1_000,
+    wholeGateTimeoutMs: 75,
+    isCancelled: () => false,
+    onSpawn: async () => await new Promise((resolve) => setTimeout(resolve, 200)),
+    onExit: () => {},
+  });
+  const testResult = results.find((result) => result.command === 'npm run test');
+  assert.equal(testResult.status, 'failed');
+  assert.equal(testResult.timed_out, true);
+  assert.equal(testResult.timeout_kind, 'absolute');
+  assert.equal(fs.existsSync(marker), false);
 });
 
 test('Citadel timeout drains its ready process tree and suppresses every subsequent check', {
@@ -635,6 +804,11 @@ test('Citadel timeout drains its ready process tree and suppresses every subsequ
   assert.deepEqual(results.map(({ status }) => status), ['skipped', 'skipped', 'failed']);
   assert.equal(results.at(-1).command, 'npm run test');
   assert.equal(results.at(-1).timed_out, true);
+  assert.equal(results.at(-1).timeout_kind, 'inactivity');
+  assert.equal(results.at(-1).inactivity_timeout_ms, 100);
+  assert.equal(results.at(-1).absolute_timeout_ms, 100);
+  assert.ok(results.at(-1).output_bytes >= 0);
+  assert.ok(results.at(-1).elapsed_ms >= 100);
   assert.notEqual(results.at(-1).process_tree_quiescent, false);
   assert.match(results.at(-1).output, /timed out/);
   assert.doesNotMatch(results.at(-1).output, /did not quiesce/);
@@ -644,6 +818,62 @@ test('Citadel timeout drains its ready process tree and suppresses every subsequ
     (error) => error?.code === 'ESRCH',
     'the exact captured process group must be dead before the result is returned',
   );
+});
+
+test('Citadel ignores arbitrary output spam for semantic progress and drains at inactivity timeout', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const cwd = makeTempRoot('pickle-citadel-progress-timeout-');
+  let childIdentity = null;
+  const result = await runMonitoredCitadelCheck({
+    command: 'continuous progress fixture',
+    executable: process.execPath,
+    args: ['-e', "setInterval(() => process.stdout.write('extension-test-integration\\nunknown-item\\nextension-test-fast\\nextension-test-fast\\n'), 50)"],
+  }, cwd, {
+    timeoutMs: 250,
+    absoluteTimeoutMs: 700,
+    isCancelled: () => false,
+    onSpawn: (child) => { childIdentity = captureSpawnedProcessIdentity(Number(child.pid)); },
+    onExit: () => {},
+  });
+
+  assert.ok(childIdentity);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.timed_out, true);
+  assert.equal(result.timeout_kind, 'inactivity');
+  assert.equal(result.inactivity_timeout_ms, 250);
+  assert.equal(result.absolute_timeout_ms, 700);
+  assert.ok(result.output_bytes > 0);
+  assert.ok(result.elapsed_ms >= 250);
+  assert.ok(result.elapsed_ms < 700);
+  assert.match(result.output, /trusted semantic progress/);
+  assert.throws(
+    () => process.kill(-childIdentity.pgid, 0),
+    (error) => error?.code === 'ESRCH',
+  );
+});
+
+test('Citadel does not let bounded child output forge trusted semantic progress', async () => {
+  const cwd = makeTempRoot('pickle-citadel-progress-success-');
+  const result = await runMonitoredCitadelCheck({
+    command: 'bounded progress fixture',
+    executable: process.execPath,
+    args: ['-e', [
+      'let count = 0;',
+      "const timer = setInterval(() => { process.stdout.write('tick\\n'); if (++count === 6) { clearInterval(timer); process.exit(0); } }, 100);",
+    ].join(' ')],
+  }, cwd, {
+    timeoutMs: 250,
+    absoluteTimeoutMs: 2_000,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.timed_out, true);
+  assert.equal(result.timeout_kind, 'inactivity');
+  assert.match(result.output, /tick/);
 });
 
 test('Citadel preserves the active child fence and suppresses later checks when drain cannot prove quiescence', async () => {
@@ -677,6 +907,157 @@ test('Citadel preserves the active child fence and suppresses later checks when 
   assert.deepEqual(exitOutcome, { quiescent: false, cancelled: false, timedOut: true });
   assert.equal(activeFence.command, 'npm run test');
   assert.equal(fs.existsSync(marker), false);
+});
+
+test('Citadel bounds lifecycle callback and drain failures without cache-passable success', async () => {
+  const cwd = makeTempRoot('pickle-citadel-lifecycle-callbacks-');
+  let spawnFailureExit = null;
+  const spawnFailure = await runMonitoredCitadelCheck({
+    command: 'onSpawn failure',
+    executable: process.execPath,
+    args: ['-e', 'setInterval(() => {}, 1000)'],
+  }, cwd, {
+    timeoutMs: 5_000,
+    isCancelled: () => false,
+    onSpawn: () => { throw new Error('fence persistence failed'); },
+    onExit: (outcome) => { spawnFailureExit = outcome; },
+  });
+  assert.equal(spawnFailure.status, 'failed');
+  assert.match(spawnFailure.output, /fence persistence failed/);
+  assert.deepEqual(spawnFailureExit, { quiescent: true, cancelled: false, timedOut: false });
+
+  const drainFailure = await runMonitoredCitadelCheck({
+    command: 'drain failure',
+    executable: process.execPath,
+    args: ['-e', 'setInterval(() => {}, 1000)'],
+  }, cwd, {
+    timeoutMs: 75,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+    drainProcessTree: async () => { throw new Error('drain fixture rejected'); },
+  });
+  assert.equal(drainFailure.status, 'failed');
+  assert.equal(drainFailure.process_tree_quiescent, false);
+  assert.match(drainFailure.lifecycle_error, /drain fixture rejected/);
+
+  const exitFailure = await runMonitoredCitadelCheck({
+    command: 'onExit failure',
+    executable: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+  }, cwd, {
+    timeoutMs: 5_000,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => { throw new Error('fence clear failed'); },
+  });
+  assert.equal(exitFailure.status, 'failed');
+  assert.equal(exitFailure.process_tree_quiescent, false);
+  assert.match(exitFailure.lifecycle_error, /fence clear failed/);
+});
+
+test('Citadel watchdog settles callbacks and drains that never resolve', async () => {
+  const cwd = makeTempRoot('pickle-citadel-lifecycle-watchdog-');
+  const startedAt = Date.now();
+  const spawnHang = await runMonitoredCitadelCheck({
+    command: 'onSpawn hangs',
+    executable: process.execPath,
+    args: ['-e', 'setInterval(() => {}, 1000)'],
+  }, cwd, {
+    timeoutMs: 10_000,
+    isCancelled: () => false,
+    onSpawn: async () => await new Promise(() => {}),
+    onExit: () => {},
+  });
+  assert.equal(spawnHang.status, 'failed');
+  assert.match(spawnHang.output, /onSpawn callback did not settle/i);
+
+  const exitHang = await runMonitoredCitadelCheck({
+    command: 'onExit hangs',
+    executable: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+  }, cwd, {
+    timeoutMs: 10_000,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: async () => await new Promise(() => {}),
+  });
+  assert.equal(exitHang.status, 'failed');
+  assert.equal(exitHang.process_tree_quiescent, false);
+  assert.match(exitHang.lifecycle_error, /onExit callback did not settle/i);
+
+  const drainHang = await runMonitoredCitadelCheck({
+    command: 'drain hangs',
+    executable: process.execPath,
+    args: ['-e', 'setInterval(() => {}, 1000)'],
+  }, cwd, {
+    timeoutMs: 75,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+    drainProcessTree: async () => await new Promise(() => {}),
+  });
+  assert.equal(drainHang.status, 'failed');
+  assert.equal(drainHang.process_tree_quiescent, false);
+  assert.match(drainHang.lifecycle_error, /process-tree drain did not settle/i);
+  assert.ok(Date.now() - startedAt < 10_000, 'independent lifecycle watchdogs must bound total settlement');
+});
+
+test('Citadel kills descendants that retain inherited pipes after their leader exits', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const cwd = makeTempRoot('pickle-citadel-retained-pipes-');
+  const releaseMarker = path.join(cwd, 'release-leader');
+  let identity = null;
+  const result = await runMonitoredCitadelCheck({
+    command: 'descendant retains pipes',
+    executable: process.execPath,
+    args: ['-e', [
+      "const fs = require('node:fs');",
+      `while (!fs.existsSync(${JSON.stringify(releaseMarker)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);`,
+      "require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] });",
+      'process.exit(0);',
+    ].join(' ')],
+  }, cwd, {
+    timeoutMs: 100,
+    isCancelled: () => false,
+    onSpawn: (child) => {
+      const deadline = Date.now() + 1_000;
+      while (!identity && Date.now() < deadline) {
+        identity = captureSpawnedProcessIdentity(Number(child.pid));
+      }
+      fs.writeFileSync(releaseMarker, 'go');
+    },
+    onExit: () => {},
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.timed_out, true);
+  assert.ok(identity);
+  assert.throws(() => process.kill(-identity.pgid, 0), (error) => error?.code === 'ESRCH');
+});
+
+test('Citadel timeout remains failed when SIGTERM handler exits zero and records bounded output loss', async () => {
+  const cwd = makeTempRoot('pickle-citadel-timeout-exit-zero-');
+  const result = await runMonitoredCitadelCheck({
+    command: 'timeout then zero',
+    executable: process.execPath,
+    args: ['-e', [
+      "process.stdout.write('x'.repeat(150000));",
+      'process.on(\'SIGTERM\', () => process.exit(0));',
+      'setInterval(() => {}, 1000);',
+    ].join(' ')],
+  }, cwd, {
+    timeoutMs: 100,
+    isCancelled: () => false,
+    onSpawn: () => {},
+    onExit: () => {},
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.timed_out, true);
+  assert.equal(result.exit_code, 0);
+  assert.equal(result.output_bytes, 150_000);
+  assert.equal(result.output_truncated, true);
+  assert.ok(result.output_dropped_bytes >= 50_000);
 });
 
 test('Citadel cooperatively terminates a long deterministic check after lease loss', async () => {
@@ -963,6 +1344,38 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     assert.equal(checks[3].command, 'git diff --check');
     assert.equal(approvedState.active_child_pid, null);
     assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: approved.cwd, encoding: 'utf8' }), '');
+
+    const cacheBound = makeCitadelLifecycleSession('deterministic cache is policy and journal bound');
+    const gateCountPath = path.join(cacheBound.sessionDir, 'deterministic-gate-count');
+    fs.writeFileSync(path.join(cacheBound.cwd, 'package.json'), JSON.stringify({
+      scripts: {
+        test: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+          "const fs = require('node:fs');",
+          `const p = ${JSON.stringify(gateCountPath)};`,
+          "fs.writeFileSync(p, String((fs.existsSync(p) ? Number(fs.readFileSync(p, 'utf8')) : 0) + 1));",
+        ].join(' '))}`,
+      },
+    }));
+    execFileSync('git', ['add', 'package.json'], { cwd: cacheBound.cwd });
+    execFileSync('git', ['commit', '-qm', 'cache-bound deterministic gate'], { cwd: cacheBound.cwd });
+    assert.equal(await runCitadel(cacheBound.sessionDir), 'success');
+    assert.equal(fs.readFileSync(gateCountPath, 'utf8'), '1');
+    assert.equal(await runCitadel(cacheBound.sessionDir), 'success');
+    assert.equal(fs.readFileSync(gateCountPath, 'utf8'), '1', 'completed bound journal should permit reuse');
+    new StateManager().update(path.join(cacheBound.sessionDir, 'state.json'), (current) => {
+      current.worker_timeout_seconds = 901;
+      return current;
+    });
+    assert.equal(await runCitadel(cacheBound.sessionDir), 'success');
+    assert.equal(fs.readFileSync(gateCountPath, 'utf8'), '2', 'timeout policy drift must invalidate reuse');
+    const deterministicJournalPath = path.join(
+      cacheBound.sessionDir, 'citadel-deterministic-check-journal.json',
+    );
+    const interruptedJournal = JSON.parse(fs.readFileSync(deterministicJournalPath, 'utf8'));
+    interruptedJournal.status = 'running';
+    fs.writeFileSync(deterministicJournalPath, JSON.stringify(interruptedJournal));
+    assert.equal(await runCitadel(cacheBound.sessionDir), 'success');
+    assert.equal(fs.readFileSync(gateCountPath, 'utf8'), '3', 'crash journal must never cache-pass');
 
     const invalid = makeCitadelLifecycleSession('invalid evidence');
     fs.writeFileSync(path.join(invalid.sessionDir, 'refinement_manifest.json'), JSON.stringify({

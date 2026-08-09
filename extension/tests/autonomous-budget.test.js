@@ -12,7 +12,7 @@ import {
 } from '../services/autonomous-budget.js';
 import { runLoop } from '../bin/loop-runner.js';
 import { runSupervisedRunner } from '../bin/supervised-runner.js';
-import { beginAutonomousExecution, cancelLogicalPipelineByOperator, createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
+import { beginAutonomousExecution, cancelLogicalPipelineByOperator, createLogicalPipeline } from '../services/durable-supervisor.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 
 test('autonomous iteration budget rollover advances a stable window and consumes its intent once', () => {
@@ -304,9 +304,22 @@ test('supervised standalone loop CLI owns, checkpoints, consumes, and replaces a
     current.cancel_requested_at = new Date().toISOString();
     return current;
   });
-  cancelLogicalPipelineByOperator(sessionDir, 'test completed after two exact replacements');
+  const cancelledLogical = cancelLogicalPipelineByOperator(
+    sessionDir,
+    'test completed after two exact replacements',
+  );
+  assert.equal(cancelledLogical.terminal_state, 'cancelled');
   assert.equal(await supervised, 130);
-  const checkpoints = readLogicalPipeline(sessionDir).events
+  const repeatedCancellation = cancelLogicalPipelineByOperator(
+    sessionDir,
+    'replayed cleanup after the supervised executor observed cancellation',
+  );
+  assert.equal(repeatedCancellation.terminal_state, 'cancelled');
+  assert.equal(
+    repeatedCancellation.events.filter((event) => event.kind === 'pipeline_cancelled').length,
+    1,
+  );
+  const checkpoints = repeatedCancellation.events
     .map((event) => event.details.checkpoint)
     .filter((checkpoint) => checkpoint?.kind?.startsWith('autonomous_budget'));
   assert.deepEqual(checkpoints.map((checkpoint) => checkpoint.kind), [

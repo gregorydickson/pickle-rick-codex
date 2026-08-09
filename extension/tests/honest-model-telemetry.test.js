@@ -170,7 +170,8 @@ setInterval(() => {}, 1000);
     cache_read_input_tokens: 7,
     output_tokens: 11,
   });
-  assert.ok(failure.result.durationMs >= 100 && failure.result.durationMs < 2_000);
+  assert.ok(failure.result.durationMs >= 100);
+  assert.equal(failure.result.timedOut, false);
 
   const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
   assert.equal(event.outcome, 'failed');

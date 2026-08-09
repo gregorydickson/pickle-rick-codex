@@ -876,6 +876,15 @@ export function cancelLogicalPipelineByOperator(
 ): LogicalPipelineState {
   requireNonEmpty(reason, 'operator cancellation reason');
   return mutate(sessionDir, (state) => {
+    // The legacy session cancellation marker is persisted before the durable
+    // journal is sealed. A live executor can observe that marker and win the
+    // race by sealing the same cancelled terminal state under its lease. Treat
+    // that exact terminal result as an idempotent success; every other terminal
+    // state remains immutable and must fail closed.
+    if (state.terminal_state === 'cancelled') return;
+    if (state.terminal_state !== null) {
+      throw new Error(`Logical pipeline is already terminal: ${state.terminal_state}.`);
+    }
     appendEvent(state, 'pipeline_cancelled', {
       terminal_state: 'cancelled',
       operator_initiated: true,

@@ -57,6 +57,17 @@ export interface CitadelCheckResult {
   exit_code: number | null;
   output: string;
   timed_out?: boolean;
+  timeout_kind?: 'inactivity' | 'absolute';
+  inactivity_timeout_ms?: number;
+  absolute_timeout_ms?: number;
+  output_bytes?: number;
+  output_dropped_bytes?: number;
+  output_truncated?: boolean;
+  last_progress_at?: string;
+  semantic_progress_count?: number;
+  last_progress_identity?: string | null;
+  elapsed_ms?: number;
+  lifecycle_error?: string;
   process_tree_quiescent?: false;
 }
 
@@ -107,11 +118,92 @@ export interface CitadelCheckExitOutcome {
 
 export interface CitadelCheckRunOptions {
   timeoutMs: number;
+  absoluteTimeoutMs?: number;
+  wholeGateTimeoutMs?: number;
+  journalBindingHash?: string;
+  environment?: NodeJS.ProcessEnv;
   isCancelled: () => boolean;
-  onSpawn: (child: ChildProcess, command: string) => void;
-  onExit: (outcome: CitadelCheckExitOutcome) => void;
+  onSpawn: (child: ChildProcess, command: string) => void | Promise<void>;
+  onExit: (outcome: CitadelCheckExitOutcome) => void | Promise<void>;
   cancelPollMs?: number;
   drainProcessTree?: (child: ChildProcess) => Promise<boolean>;
+}
+
+export interface CitadelDeterministicTimeoutPolicy {
+  schema_version: 1;
+  policy_id: 'trusted-work-inventory-v1';
+  inactivity_timeout_ms: number;
+  workload_units: number;
+  extension_per_unit_ms: number;
+  max_extension_ms: number;
+  absolute_timeout_ms: number;
+}
+
+const CITADEL_PROGRESS_EXTENSION_PER_TEST_FILE_MS = 5_000;
+
+function countCitadelTestWorkloadUnits(workingDir: string, limit = 10_000): number {
+  const pending = [workingDir];
+  let count = 0;
+  while (pending.length && count < limit) {
+    const current = pending.pop() as string;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!['.git', 'node_modules', 'vendor', 'target', 'dist', 'build'].includes(entry.name)) {
+          pending.push(path.join(current, entry.name));
+        }
+      } else if (entry.isFile() && /(?:^|\.)test\.[cm]?[jt]sx?$/.test(entry.name)) {
+        count += 1;
+        if (count >= limit) break;
+      }
+    }
+  }
+  return Math.max(1, count);
+}
+
+export function deriveCitadelDeterministicTimeoutPolicy(
+  workingDir: string,
+  inactivityTimeoutMs: number,
+): CitadelDeterministicTimeoutPolicy {
+  const workloadUnits = countCitadelTestWorkloadUnits(workingDir);
+  const maxExtensionMs = inactivityTimeoutMs;
+  const extensionMs = Math.min(
+    maxExtensionMs,
+    workloadUnits * CITADEL_PROGRESS_EXTENSION_PER_TEST_FILE_MS,
+  );
+  return {
+    schema_version: 1,
+    policy_id: 'trusted-work-inventory-v1',
+    inactivity_timeout_ms: inactivityTimeoutMs,
+    workload_units: workloadUnits,
+    extension_per_unit_ms: CITADEL_PROGRESS_EXTENSION_PER_TEST_FILE_MS,
+    max_extension_ms: maxExtensionMs,
+    absolute_timeout_ms: inactivityTimeoutMs + extensionMs,
+  };
+}
+
+export interface CitadelTrustedWorkItem {
+  id: string;
+  ordinal: number;
+  command: string;
+  executable: string;
+  args: string[];
+  cwd: string;
+  execution_identity: string;
+  inactivity_timeout_ms: number;
+  absolute_timeout_ms: number;
+}
+
+export interface CitadelTrustedWorkInventory {
+  schema_version: 1;
+  adapter_id: 'pickle-npm-test-topology-v1';
+  inventory_id: string;
+  environment_hash: string;
+  script_hashes: Record<string, string>;
+  timeout_policy: CitadelDeterministicTimeoutPolicy;
+  whole_gate_timeout_ms: number;
+  items: CitadelTrustedWorkItem[];
 }
 
 class CitadelChecksCancelledError extends Error {
@@ -1214,6 +1306,80 @@ function packageScripts(workingDir: string): Record<string, string> {
     .filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
 }
 
+export function resolvePickleTrustedTestInventory(
+  workingDir: string,
+  inactivityTimeoutMs: number,
+  environment: NodeJS.ProcessEnv = process.env,
+): CitadelTrustedWorkInventory | null {
+  const rootPackage = readJsonFile<Record<string, unknown>>(path.join(workingDir, 'package.json'), null);
+  if (rootPackage?.name !== 'pickle-rick-codex') return null;
+  const rootScripts = packageScripts(workingDir);
+  const extensionDir = fs.realpathSync(path.join(workingDir, 'extension'));
+  const extensionScripts = packageScripts(extensionDir);
+  const expected = {
+    root_test: 'npm --prefix extension test',
+    pretest: 'if [ -d src ] && [ -d node_modules ]; then npm run build && npm run audit:test-tiers; fi',
+    test: 'npm run test:fast && npm run test:integration',
+    prebuild: 'bash scripts/copy-shell-assets.sh',
+    build: 'tsc',
+    audit: 'bash scripts/audit-test-tiers.sh',
+    fast: 'node bin/test-runner.js --tier fast --test-concurrency=8',
+    integration: 'node bin/test-runner.js --tier integration --test-concurrency=4',
+  };
+  const observed = {
+    root_test: rootScripts.test,
+    pretest: extensionScripts.pretest,
+    test: extensionScripts.test,
+    prebuild: extensionScripts.prebuild,
+    build: extensionScripts.build,
+    audit: extensionScripts['audit:test-tiers'],
+    fast: extensionScripts['test:fast'],
+    integration: extensionScripts['test:integration'],
+  };
+  for (const [name, body] of Object.entries(expected)) {
+    if (observed[name as keyof typeof observed] !== body) {
+      throw new Error(`Citadel trusted npm test topology drifted at ${name}; refusing unproven progress expansion.`);
+    }
+  }
+  const timeoutPolicy = deriveCitadelDeterministicTimeoutPolicy(workingDir, inactivityTimeoutMs);
+  const environmentHash = reportHash(canonicalCitadelCheckEnv(environment));
+  const definitions = [
+    { id: 'extension-build', script: 'build' },
+    { id: 'extension-audit-test-tiers', script: 'audit:test-tiers' },
+    { id: 'extension-test-fast', script: 'test:fast' },
+    { id: 'extension-test-integration', script: 'test:integration' },
+  ];
+  const items = definitions.map(({ id, script }, index): CitadelTrustedWorkItem => {
+    const executable = 'npm';
+    const args = ['--prefix', 'extension', 'run', script];
+    const command = `${executable} ${args.join(' ')}`;
+    return {
+      id,
+      ordinal: index + 1,
+      command,
+      executable,
+      args,
+      cwd: fs.realpathSync(workingDir),
+      execution_identity: reportHash({
+        cwd: fs.realpathSync(workingDir), executable, args, environment_hash: environmentHash,
+      }),
+      inactivity_timeout_ms: inactivityTimeoutMs,
+      absolute_timeout_ms: inactivityTimeoutMs,
+    };
+  });
+  const scriptHashes = Object.fromEntries(Object.entries(observed).map(([name, body]) => [name, reportHash(body)]));
+  const unsigned = {
+    schema_version: 1 as const,
+    adapter_id: 'pickle-npm-test-topology-v1' as const,
+    environment_hash: environmentHash,
+    script_hashes: scriptHashes,
+    timeout_policy: timeoutPolicy,
+    whole_gate_timeout_ms: timeoutPolicy.absolute_timeout_ms,
+    items,
+  };
+  return { ...unsigned, inventory_id: reportHash(unsigned) };
+}
+
 function packageCheckDescriptor(workingDir: string, script: string): CitadelCheckDescriptor {
   const rootScripts = packageScripts(workingDir);
   if (rootScripts[script]) {
@@ -1290,6 +1456,7 @@ export interface CitadelCheckDescriptor {
   skipped?: boolean;
   verificationStep?: VerificationStep;
   allowedRoots?: string[];
+  trustedWorkInventory?: CitadelTrustedWorkInventory;
 }
 
 function canonicalCitadelCheckCwd(workingDir: string, requestedCwd?: string): string {
@@ -1316,6 +1483,55 @@ export function citadelCheckExecutionIdentity(
     env: canonicalCitadelCheckEnv(descriptor.env || process.env),
     skipped: descriptor.skipped === true,
   });
+}
+
+function citadelLogicalCheckExecutionIdentity(
+  descriptor: Pick<CitadelCheckDescriptor, 'executable' | 'args' | 'cwd' | 'env' | 'skipped'>,
+  workingDir: string,
+): string {
+  const root = canonicalCitadelCheckCwd(workingDir);
+  const actualCwd = canonicalCitadelCheckCwd(workingDir, descriptor.cwd);
+  const relative = path.relative(root, actualCwd);
+  const logicalCwd = relative === '' ? '$CITADEL_WORKTREE'
+    : relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+      ? `$CITADEL_WORKTREE/${relative.split(path.sep).join('/')}`
+      : actualCwd;
+  return reportHash({
+    cwd: logicalCwd,
+    executable: descriptor.executable,
+    args: descriptor.args,
+    environment_hash: reportHash(canonicalCitadelCheckEnv(descriptor.env || process.env)),
+    skipped: descriptor.skipped === true,
+  });
+}
+
+function citadelTrustedInventoryBinding(
+  inventory: CitadelTrustedWorkInventory,
+  workingDir: string,
+): Record<string, unknown> {
+  const binding = {
+    schema_version: inventory.schema_version,
+    adapter_id: inventory.adapter_id,
+    environment_hash: inventory.environment_hash,
+    script_hashes: inventory.script_hashes,
+    timeout_policy: inventory.timeout_policy,
+    whole_gate_timeout_ms: inventory.whole_gate_timeout_ms,
+    items: inventory.items.map((item) => ({
+      id: item.id,
+      ordinal: item.ordinal,
+      command: item.command,
+      executable: item.executable,
+      args: item.args,
+      execution_identity: citadelLogicalCheckExecutionIdentity({
+        executable: item.executable,
+        args: item.args,
+        cwd: item.cwd,
+      }, workingDir),
+      inactivity_timeout_ms: item.inactivity_timeout_ms,
+      absolute_timeout_ms: item.absolute_timeout_ms,
+    })),
+  };
+  return { ...binding, inventory_id: reportHash(binding) };
 }
 
 export function deduplicateCitadelCheckExecutions<T extends CitadelCheckDescriptor>(
@@ -1407,11 +1623,33 @@ function processGroupAlive(child: ChildProcess): boolean {
 
 async function drainProcessTree(child: ChildProcess, timeoutMs = 2_000): Promise<boolean> {
   signalProcessTree(child, 'SIGKILL');
-  const deadline = Date.now() + timeoutMs;
-  while (processGroupAlive(child) && Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (processGroupAlive(child) && performance.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return !processGroupAlive(child);
+}
+
+const CITADEL_CHECK_CALLBACK_TIMEOUT_MS = 2_000;
+const CITADEL_CHECK_TERM_GRACE_MS = 1_000;
+const CITADEL_CHECK_DRAIN_TIMEOUT_MS = 2_500;
+
+async function boundedCitadelLifecycleCall<T>(
+  label: string,
+  callback: () => T | Promise<T>,
+  timeoutMs = CITADEL_CHECK_CALLBACK_TIMEOUT_MS,
+): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(callback),
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not settle within ${timeoutMs}ms.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function runMonitoredCitadelCheck(
@@ -1432,86 +1670,221 @@ export async function runMonitoredCitadelCheck(
   return await new Promise<CitadelCheckResult>((resolve, reject) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let stdoutBufferedBytes = 0;
+    let stderrBufferedBytes = 0;
+    let settling = false;
     let settled = false;
     let timedOut = false;
+    let timeoutKind: 'inactivity' | 'absolute' | null = null;
     let cancelled = false;
-    let killEscalation: NodeJS.Timeout | null = null;
+    const startedAt = performance.now();
+    let outputBytes = 0;
+    let observedExitCode: number | null = null;
+    let spawnCallbackComplete = false;
+    let pendingCloseCode: number | null | undefined;
+    let pendingProcessError: unknown;
+    let spawnCallbackError: unknown;
+    let markSpawnCallbackFinished: (() => void) | null = null;
+    const spawnCallbackFinished = new Promise<void>((done) => { markSpawnCallbackFinished = done; });
+    let markChildClosed: (() => void) | null = null;
+    const childClosed = new Promise<void>((done) => { markChildClosed = done; });
     const child = spawn(descriptor.executable, descriptor.args, {
       cwd: descriptor.cwd || workingDir,
       env: descriptor.env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     });
-    options.onSpawn(child, descriptor.command);
-
-    const terminate = (): void => {
-      signalProcessTree(child, 'SIGTERM');
-      if (killEscalation) return;
-      killEscalation = setTimeout(() => {
-        // The leader may exit while descendants retain its pipes and process group.
-        // Always target the owned group; signalProcessTree safely tolerates ESRCH.
+    const absoluteTimeoutMs = Math.max(1, options.absoluteTimeoutMs ?? options.timeoutMs);
+    let inactivityTimeout: NodeJS.Timeout | null = null;
+    let absoluteTimeout: NodeJS.Timeout | null = null;
+    let cancelPoll: NodeJS.Timeout | null = null;
+    let inactivityDeadline = Number.POSITIVE_INFINITY;
+    let absoluteDeadline = Number.POSITIVE_INFINITY;
+    const cleanupTimers = (): void => {
+      if (inactivityTimeout) clearTimeout(inactivityTimeout);
+      if (absoluteTimeout) clearTimeout(absoluteTimeout);
+      if (cancelPoll) clearInterval(cancelPoll);
+    };
+    const recordProgress = (chunks: Buffer[], chunk: Buffer, bufferedBytes: number): number => {
+      const copy = Buffer.from(chunk);
+      const retained = copy.byteLength > 100_000 ? copy.subarray(copy.byteLength - 100_000) : copy;
+      chunks.push(retained);
+      bufferedBytes += retained.byteLength;
+      while (bufferedBytes > 100_000 && chunks.length > 1) {
+        bufferedBytes -= chunks.shift()?.byteLength || 0;
+      }
+      if (bufferedBytes > 100_000 && chunks[0]) {
+        chunks[0] = chunks[0].subarray(bufferedBytes - 100_000);
+      }
+      outputBytes += copy.byteLength;
+      return Math.min(bufferedBytes, 100_000);
+    };
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBufferedBytes = recordProgress(stdout, chunk, stdoutBufferedBytes);
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrBufferedBytes = recordProgress(stderr, chunk, stderrBufferedBytes);
+    });
+    const capturedOutput = (): { output: string; retainedBytes: number } => {
+      const combined = Buffer.concat([Buffer.concat(stdout), Buffer.from('\n'), Buffer.concat(stderr)]);
+      const retained = combined.byteLength > 100_000
+        ? combined.subarray(combined.byteLength - 100_000) : combined;
+      return { output: retained.toString('utf8').trim(), retainedBytes: Math.min(outputBytes, retained.byteLength) };
+    };
+    const settle = async (input: {
+      code: number | null;
+      error?: unknown;
+      forceTerminate?: boolean;
+    }): Promise<void> => {
+      if (settling || settled) return;
+      settling = true;
+      cleanupTimers();
+      const lifecycleErrors: string[] = [];
+      const settlementNow = performance.now();
+      if (!timedOut && !input.error && !input.forceTerminate) {
+        if (settlementNow >= absoluteDeadline && absoluteDeadline <= inactivityDeadline) {
+          timedOut = true;
+          timeoutKind = 'absolute';
+        } else if (settlementNow >= inactivityDeadline) {
+          timedOut = true;
+          timeoutKind = 'inactivity';
+        } else if (settlementNow >= absoluteDeadline) {
+          timedOut = true;
+          timeoutKind = 'absolute';
+        }
+      }
+      let cancelledAtSettlement = cancelled;
+      try {
+        cancelledAtSettlement = cancelledAtSettlement || options.isCancelled();
+      } catch (error) {
+        cancelledAtSettlement = true;
+        lifecycleErrors.push(`cancellation check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (cancelledAtSettlement) cancelled = true;
+      if (input.forceTerminate || timedOut || cancelledAtSettlement) {
+        signalProcessTree(child, 'SIGTERM');
+        await Promise.race([
+          childClosed,
+          new Promise<void>((done) => { setTimeout(done, CITADEL_CHECK_TERM_GRACE_MS); }),
+        ]);
         signalProcessTree(child, 'SIGKILL');
-      }, 1_000);
-      killEscalation.unref?.();
-    };
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      terminate();
-    }, options.timeoutMs);
-    const cancelPoll = setInterval(() => {
-      if (!options.isCancelled()) return;
-      cancelled = true;
-      terminate();
-    }, options.cancelPollMs ?? 100);
-    const cleanup = (): void => {
-      clearTimeout(timeout);
-      clearInterval(cancelPoll);
-      if (killEscalation) clearTimeout(killEscalation);
-      options.onExit({ quiescent: true, cancelled, timedOut });
-    };
-    const finish = (fn: () => void): void => {
-      if (settled) return;
+      }
+      let drained = !(input.forceTerminate || timedOut || cancelledAtSettlement || processGroupAlive(child));
+      if (!drained) {
+        try {
+          drained = await boundedCitadelLifecycleCall(
+            'Citadel process-tree drain',
+            () => (options.drainProcessTree || drainProcessTree)(child),
+            CITADEL_CHECK_DRAIN_TIMEOUT_MS,
+          );
+        } catch (error) {
+          drained = false;
+          lifecycleErrors.push(`process-tree drain failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      // onExit must never race ahead of the fence-persistence callback. The
+      // callback is independently bounded, while TERM/KILL/drain above remain
+      // free to enforce the process deadline immediately.
+      await spawnCallbackFinished;
+      const effectiveError = input.error ?? spawnCallbackError;
+      try {
+        await boundedCitadelLifecycleCall(
+          'Citadel onExit callback',
+          () => options.onExit({ quiescent: drained, cancelled: cancelledAtSettlement, timedOut }),
+        );
+      } catch (error) {
+        drained = false;
+        lifecycleErrors.push(`onExit callback failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       settled = true;
-      cleanup();
-      fn();
-    };
-    child.stdout?.on('data', (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
-    child.stderr?.on('data', (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
-    child.on('error', (error) => finish(() => reject(error)));
-    child.on('close', async (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      clearInterval(cancelPoll);
-      if (killEscalation) clearTimeout(killEscalation);
-      // Snapshot cancellation before deciding whether the process tree must be
-      // drained. Calling isCancelled after onExit can erase the recovery fence
-      // before an ownership loss is observed.
-      const cancellationRequestedAtClose = options.isCancelled();
-      const cancelledAtClose = cancelled || cancellationRequestedAtClose;
-      const requiresDrain = timedOut || cancelledAtClose || processGroupAlive(child);
-      const drained = requiresDrain
-        ? await (options.drainProcessTree || drainProcessTree)(child)
-        : true;
-      options.onExit({ quiescent: drained, cancelled: cancelledAtClose, timedOut });
-      if (cancelledAtClose) {
+      settling = false;
+      if (cancelledAtSettlement) {
         reject(new CitadelChecksCancelledError());
         return;
       }
-      const output = `${Buffer.concat(stdout).toString('utf8')}\n${Buffer.concat(stderr).toString('utf8')}`
-        .trim()
-        .slice(-100_000);
+      const captured = capturedOutput();
+      const baseError = effectiveError instanceof Error ? effectiveError.message
+        : effectiveError === undefined ? null : String(effectiveError);
+      const output = [captured.output,
+        ...(baseError ? [`Citadel check process failed: ${baseError}`] : []),
+        ...(timedOut ? [timeoutKind === 'absolute'
+          ? `Citadel check reached its immutable absolute timeout after ${absoluteTimeoutMs}ms.`
+          : `Citadel check timed out after ${options.timeoutMs}ms without trusted semantic progress.`] : []),
+        ...lifecycleErrors,
+        ...(drained ? [] : ['Citadel process tree did not quiesce; subsequent checks were suppressed.'])]
+        .filter(Boolean).join('\n');
       resolve({
         command: descriptor.command,
-        status: !timedOut && drained && code === 0 ? 'passed' : 'failed',
-        exit_code: code,
-        output: [output,
-          ...(timedOut ? [`Citadel check timed out after ${options.timeoutMs}ms`] : []),
-          ...(drained ? [] : ['Citadel process tree did not quiesce; subsequent checks were suppressed.'])]
-          .filter(Boolean).join('\n'),
-        ...(timedOut ? { timed_out: true } : {}),
+        status: !timedOut && drained && input.code === 0 && !baseError && lifecycleErrors.length === 0
+          ? 'passed' : 'failed',
+        exit_code: input.code ?? observedExitCode,
+        output,
+        output_bytes: outputBytes,
+        output_dropped_bytes: Math.max(0, outputBytes - captured.retainedBytes),
+        output_truncated: outputBytes > captured.retainedBytes,
+        elapsed_ms: Math.round(performance.now() - startedAt),
+        ...(timedOut ? {
+          timed_out: true,
+          timeout_kind: timeoutKind || 'inactivity',
+          inactivity_timeout_ms: options.timeoutMs,
+          absolute_timeout_ms: absoluteTimeoutMs,
+        } : {}),
+        ...(lifecycleErrors.length ? { lifecycle_error: lifecycleErrors.join('; ') } : {}),
         ...(drained ? {} : { process_tree_quiescent: false as const }),
       });
+    };
+    const triggerTimeout = (kind: 'inactivity' | 'absolute'): void => {
+      if (timedOut || cancelled || settling || settled) return;
+      timedOut = true;
+      timeoutKind = kind;
+      void settle({ code: child.exitCode, forceTerminate: true });
+    };
+    child.once('error', (error) => {
+      pendingProcessError = error;
+      if (spawnCallbackComplete) void settle({ code: child.exitCode, error, forceTerminate: true });
+    });
+    child.once('close', (code) => {
+      observedExitCode = code;
+      pendingCloseCode = code;
+      markChildClosed?.();
+      if (spawnCallbackComplete) void settle({ code, error: pendingProcessError });
+    });
+    const deadlineBase = performance.now();
+    inactivityDeadline = deadlineBase + options.timeoutMs;
+    absoluteDeadline = deadlineBase + absoluteTimeoutMs;
+    inactivityTimeout = setTimeout(() => triggerTimeout('inactivity'), options.timeoutMs);
+    inactivityTimeout.unref?.();
+    absoluteTimeout = setTimeout(() => triggerTimeout('absolute'), absoluteTimeoutMs);
+    absoluteTimeout.unref?.();
+    cancelPoll = setInterval(() => {
+      if (settling || settled) return;
+      let requested: boolean;
+      try { requested = options.isCancelled(); } catch { requested = true; }
+      if (!requested) return;
+      cancelled = true;
+      void settle({ code: child.exitCode, forceTerminate: true });
+    }, options.cancelPollMs ?? 100);
+    cancelPoll.unref?.();
+    void boundedCitadelLifecycleCall(
+      'Citadel onSpawn callback',
+      () => options.onSpawn(child, descriptor.command),
+    ).then(() => {
+      spawnCallbackComplete = true;
+      markSpawnCallbackFinished?.();
+      if (settling || settled) return;
+      if (pendingProcessError !== undefined || pendingCloseCode !== undefined) {
+        void settle({
+          code: pendingCloseCode ?? child.exitCode,
+          error: pendingProcessError,
+          forceTerminate: pendingProcessError !== undefined,
+        });
+        return;
+      }
+    }, (error) => {
+      spawnCallbackComplete = true;
+      spawnCallbackError = error;
+      markSpawnCallbackFinished?.();
+      void settle({ code: child.exitCode, error, forceTerminate: true });
     });
   });
 }
@@ -1523,15 +1896,231 @@ export async function runCitadelChecksMonitored(
   options: CitadelCheckRunOptions,
 ): Promise<CitadelCheckResult[]> {
   const results: CitadelCheckResult[] = [];
-  const descriptors = deduplicateCitadelCheckExecutions(
-    citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps), workingDir,
-  );
-  for (const descriptor of descriptors) {
-    const result = await runMonitoredCitadelCheck(descriptor, workingDir, options);
-    results.push(result);
-    if (result.timed_out || result.process_tree_quiescent === false) break;
+  const discoveredDescriptors = citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps);
+  if (options.environment) {
+    for (const descriptor of discoveredDescriptors) descriptor.env = options.environment;
   }
-  return results;
+  const descriptors = deduplicateCitadelCheckExecutions(discoveredDescriptors, workingDir);
+  for (const descriptor of descriptors) {
+    if (descriptor.executable === 'npm' && JSON.stringify(descriptor.args) === JSON.stringify(['run', 'test'])) {
+      descriptor.trustedWorkInventory = resolvePickleTrustedTestInventory(
+        workingDir, options.timeoutMs, descriptor.env || process.env,
+      ) || undefined;
+    }
+  }
+  const trustedInventories = descriptors.flatMap((descriptor) => descriptor.trustedWorkInventory || []);
+  const derivedWholeGateTimeoutMs = trustedInventories.length > 0
+    ? Math.max(...trustedInventories.map((inventory) => inventory.whole_gate_timeout_ms))
+    : options.timeoutMs * Math.max(1, descriptors.filter((descriptor) => !descriptor.skipped).length);
+  const wholeGateTimeoutMs = options.wholeGateTimeoutMs ?? derivedWholeGateTimeoutMs;
+  const gateStartedAt = performance.now();
+  const journalPath = path.join(sessionDir, 'citadel-deterministic-check-journal.json');
+  const journal: Record<string, unknown> = {
+    schema_version: 1,
+    status: 'running',
+    whole_gate_timeout_ms: wholeGateTimeoutMs,
+    inventories: trustedInventories,
+    binding_hash: options.journalBindingHash ?? null,
+    checks: [],
+    started_at: new Date().toISOString(),
+  };
+  const persistJournal = (): void => atomicWriteJson(journalPath, journal);
+  const assertNotCancelled = (): void => {
+    let cancellationRequested: boolean;
+    try { cancellationRequested = options.isCancelled(); } catch { cancellationRequested = true; }
+    if (cancellationRequested) throw new CitadelChecksCancelledError();
+  };
+  const enforceWholeGateBoundary = (result: CitadelCheckResult): CitadelCheckResult => {
+    const elapsedMs = performance.now() - gateStartedAt;
+    if (result.status !== 'passed' || elapsedMs < wholeGateTimeoutMs) return result;
+    return {
+      ...result,
+      status: 'failed',
+      output: [
+        result.output,
+        `Citadel deterministic gate reached its immutable whole-gate cap after ${wholeGateTimeoutMs}ms.`,
+      ].filter(Boolean).join('\n'),
+      timed_out: true,
+      timeout_kind: 'absolute',
+      inactivity_timeout_ms: result.inactivity_timeout_ms ?? options.timeoutMs,
+      absolute_timeout_ms: wholeGateTimeoutMs,
+      elapsed_ms: Math.round(elapsedMs),
+    };
+  };
+  persistJournal();
+  try {
+    for (const descriptor of descriptors) {
+      assertNotCancelled();
+      const elapsedMs = performance.now() - gateStartedAt;
+      const remainingGateMs = Math.floor(wholeGateTimeoutMs - elapsedMs);
+      if (remainingGateMs <= 0) {
+        const gateCapResult: CitadelCheckResult = {
+          command: descriptor.command,
+          status: 'failed',
+          exit_code: null,
+          output: `Citadel deterministic gate reached its immutable whole-gate cap after ${wholeGateTimeoutMs}ms.`,
+          timed_out: true,
+          timeout_kind: 'absolute',
+          inactivity_timeout_ms: options.timeoutMs,
+          absolute_timeout_ms: wholeGateTimeoutMs,
+          elapsed_ms: Math.round(elapsedMs),
+        };
+        results.push(gateCapResult);
+        journal.checks = results.map((check) => ({
+          command: check.command,
+          status: check.status,
+          exit_code: check.exit_code,
+          timed_out: check.timed_out || false,
+          process_tree_quiescent: check.process_tree_quiescent !== false,
+        }));
+        persistJournal();
+        break;
+      }
+      let result: CitadelCheckResult;
+      const inventory = descriptor.trustedWorkInventory;
+      if (!inventory) {
+        result = await runMonitoredCitadelCheck(descriptor, workingDir, {
+          ...options,
+          timeoutMs: options.timeoutMs,
+          absoluteTimeoutMs: Math.min(options.timeoutMs, remainingGateMs),
+        });
+        assertNotCancelled();
+        result = enforceWholeGateBoundary(result);
+      } else {
+        const itemResults: Array<{ item_id: string; ordinal: number; result: CitadelCheckResult }> = [];
+        let lastProgressAt: string | null = null;
+        let gateCapFailure: CitadelCheckResult | null = null;
+        for (const item of inventory.items) {
+          const itemRemainingGateMs = Math.floor(wholeGateTimeoutMs - (performance.now() - gateStartedAt));
+          if (itemRemainingGateMs <= 0) {
+            gateCapFailure = {
+              command: item.command,
+              status: 'failed',
+              exit_code: null,
+              output: `Citadel deterministic gate reached its immutable whole-gate cap after ${wholeGateTimeoutMs}ms before trusted item ${item.id}.`,
+              timed_out: true,
+              timeout_kind: 'absolute',
+              inactivity_timeout_ms: item.inactivity_timeout_ms,
+              absolute_timeout_ms: wholeGateTimeoutMs,
+              elapsed_ms: Math.round(performance.now() - gateStartedAt),
+            };
+            break;
+          }
+          journal.active_check = descriptor.command;
+          journal.active_inventory_id = inventory.inventory_id;
+          journal.active_item = {
+            id: item.id,
+            ordinal: item.ordinal,
+            execution_identity: item.execution_identity,
+            started_at: new Date().toISOString(),
+          };
+          persistJournal();
+          const itemAbsoluteTimeoutMs = Math.min(item.absolute_timeout_ms, itemRemainingGateMs);
+          let itemResult = await runMonitoredCitadelCheck({
+            command: item.command,
+            executable: item.executable,
+            args: item.args,
+            cwd: item.cwd,
+            env: descriptor.env,
+          }, workingDir, {
+            ...options,
+            timeoutMs: item.inactivity_timeout_ms,
+            absoluteTimeoutMs: itemAbsoluteTimeoutMs,
+          });
+          assertNotCancelled();
+          itemResult = enforceWholeGateBoundary(itemResult);
+          itemResults.push({ item_id: item.id, ordinal: item.ordinal, result: itemResult });
+          if (itemResult.status === 'passed') lastProgressAt = new Date().toISOString();
+          journal.active_item = null;
+          journal.completed_items = itemResults.map(({ item_id, ordinal, result: completed }) => ({
+            item_id,
+            ordinal,
+            status: completed.status,
+            exit_code: completed.exit_code,
+            timed_out: completed.timed_out || false,
+            timeout_kind: completed.timeout_kind || null,
+            elapsed_ms: completed.elapsed_ms ?? null,
+            process_tree_quiescent: completed.process_tree_quiescent !== false,
+            output_bytes: completed.output_bytes || 0,
+            output_dropped_bytes: completed.output_dropped_bytes || 0,
+            output_truncated: completed.output_truncated || false,
+            lifecycle_error: completed.lifecycle_error || null,
+            output_tail: completed.output.slice(-10_000),
+          }));
+          persistJournal();
+          if (itemResult.status !== 'passed' || itemResult.process_tree_quiescent === false) break;
+        }
+        const failedItem = itemResults.find(({ result: itemResult }) => itemResult.status !== 'passed')?.result
+          || gateCapFailure;
+        const completedAll = itemResults.length === inventory.items.length
+          && itemResults.every(({ result: itemResult }) => itemResult.status === 'passed');
+        const aggregateOutputBytes = itemResults.reduce(
+          (sum, entry) => sum + (entry.result.output_bytes || 0), 0,
+        );
+        const assembledOutput = Buffer.from([
+          ...itemResults.map(({ item_id, result: itemResult }) => (
+            `[trusted-item ${item_id}]\n${itemResult.output}`
+          )),
+          ...(gateCapFailure ? [gateCapFailure.output] : []),
+        ].join('\n'));
+        const retainedAggregateOutput = assembledOutput.byteLength > 100_000
+          ? assembledOutput.subarray(assembledOutput.byteLength - 100_000) : assembledOutput;
+        result = {
+          command: descriptor.command,
+          status: completedAll ? 'passed' : 'failed',
+          exit_code: completedAll ? 0 : (failedItem?.exit_code ?? null),
+          output: retainedAggregateOutput.toString('utf8'),
+          semantic_progress_count: itemResults.filter(({ result: itemResult }) => itemResult.status === 'passed').length,
+          last_progress_identity: [...itemResults].reverse()
+            .find(({ result: itemResult }) => itemResult.status === 'passed')?.item_id || null,
+          ...(lastProgressAt ? { last_progress_at: lastProgressAt } : {}),
+          output_bytes: aggregateOutputBytes,
+          output_dropped_bytes: Math.max(0, aggregateOutputBytes - retainedAggregateOutput.byteLength),
+          output_truncated: aggregateOutputBytes > retainedAggregateOutput.byteLength,
+          ...(failedItem?.timed_out ? {
+            timed_out: true,
+            timeout_kind: failedItem.timeout_kind,
+            inactivity_timeout_ms: failedItem.inactivity_timeout_ms,
+            absolute_timeout_ms: failedItem.absolute_timeout_ms,
+            elapsed_ms: failedItem.elapsed_ms,
+          } : {}),
+          ...(failedItem?.process_tree_quiescent === false ? { process_tree_quiescent: false as const } : {}),
+        };
+      }
+      assertNotCancelled();
+      results.push(result);
+      journal.checks = results.map((check) => ({
+        command: check.command,
+        status: check.status,
+        exit_code: check.exit_code,
+        timed_out: check.timed_out || false,
+        timeout_kind: check.timeout_kind || null,
+        elapsed_ms: check.elapsed_ms ?? null,
+        output_bytes: check.output_bytes || 0,
+        output_dropped_bytes: check.output_dropped_bytes || 0,
+        output_truncated: check.output_truncated || false,
+        lifecycle_error: check.lifecycle_error || null,
+        process_tree_quiescent: check.process_tree_quiescent !== false,
+      }));
+      persistJournal();
+      if (result.timed_out || result.process_tree_quiescent === false) break;
+    }
+    assertNotCancelled();
+    journal.status = 'completed';
+    journal.active_check = null;
+    journal.active_inventory_id = null;
+    journal.active_item = null;
+    journal.checks_hash = reportHash(results);
+    journal.completed_at = new Date().toISOString();
+    persistJournal();
+    return results;
+  } catch (error) {
+    journal.status = 'interrupted';
+    journal.error = error instanceof Error ? error.message : String(error);
+    journal.interrupted_at = new Date().toISOString();
+    persistJournal();
+    throw error;
+  }
 }
 
 function buildCitadelPrompt(
@@ -1891,19 +2480,61 @@ export async function runCitadel(
     return 'citadel-system-blocked';
   }
   const verificationSteps = verificationGate.steps;
+  const deterministicCheckTimeoutMs = Number(state.worker_timeout_seconds || 900) * 1000;
+  const trustedTestInventory = resolvePickleTrustedTestInventory(
+    citadelWorkingDir,
+    deterministicCheckTimeoutMs,
+  );
+  const deterministicCheckDescriptors = deduplicateCitadelCheckExecutions(
+    citadelCheckDescriptors(citadelWorkingDir, sessionDir, verificationSteps),
+    citadelWorkingDir,
+  );
+  const deterministicTimeoutBinding = {
+    schema_version: 1,
+    generic_command_policy: 'fixed-monotonic-deadline-v1',
+    inactivity_timeout_ms: deterministicCheckTimeoutMs,
+    absolute_timeout_ms: deterministicCheckTimeoutMs,
+    whole_gate_timeout_ms: trustedTestInventory?.whole_gate_timeout_ms
+      ?? deterministicCheckTimeoutMs * Math.max(
+        1,
+        deterministicCheckDescriptors.filter((descriptor) => !descriptor.skipped).length,
+      ),
+    executions: deterministicCheckDescriptors.map((descriptor) => ({
+      command: descriptor.command,
+      execution_identity: citadelLogicalCheckExecutionIdentity(descriptor, citadelWorkingDir),
+      verification_identity: descriptor.verificationStep
+        ? verificationStepIdentity([descriptor.verificationStep]) : null,
+    })),
+    progress_protocol: trustedTestInventory ? {
+      transport: 'controller-owned-child-exit',
+      adapter_id: trustedTestInventory.adapter_id,
+      schema_version: trustedTestInventory.schema_version,
+      inventory: citadelTrustedInventoryBinding(trustedTestInventory, citadelWorkingDir),
+    } : null,
+  };
   const checksBinding = {
     checkpoint_head: checkpointHead,
     release_fingerprint: releaseCheckpointFingerprint,
     reviewed_range: reviewedRange,
     verification_hash: reportHash(verificationSteps),
     acceptance_criteria_hash: reportHash(expectedAcceptanceCriteria),
+    deterministic_timeout_policy: deterministicTimeoutBinding,
   };
+  const checksBindingHash = reportHash(checksBinding);
   const cachedChecks = readJsonFile<Record<string, unknown>>(checksPath, null);
+  const cachedJournal = readJsonFile<Record<string, unknown>>(
+    path.join(sessionDir, 'citadel-deterministic-check-journal.json'), null,
+  );
+  const cachedJournalHash = cachedJournal ? reportHash(cachedJournal) : null;
   const cachedResults = Array.isArray(cachedChecks?.checks)
     ? cachedChecks.checks as CitadelCheckResult[] : null;
   const cachedChecksHash = cachedResults ? reportHash(cachedResults) : null;
   const canReuseChecks = JSON.stringify(cachedChecks?.binding) === JSON.stringify(checksBinding)
     && cachedChecks?.checks_hash === cachedChecksHash
+    && cachedJournal?.status === 'completed'
+    && cachedJournal?.binding_hash === checksBindingHash
+    && cachedJournal?.checks_hash === cachedChecksHash
+    && cachedChecks?.journal_hash === cachedJournalHash
     && cachedResults?.some((check) => check.status === 'passed')
     && !cachedResults.some((check) => check.status === 'failed');
   let checks: CitadelCheckResult[];
@@ -1917,7 +2548,9 @@ export async function runCitadel(
       sessionDir,
       verificationSteps,
       {
-        timeoutMs: Number(state.worker_timeout_seconds || 900) * 1000,
+        timeoutMs: deterministicCheckTimeoutMs,
+        wholeGateTimeoutMs: deterministicTimeoutBinding.whole_gate_timeout_ms,
+        journalBindingHash: checksBindingHash,
         isCancelled: shouldCancel,
         onSpawn: (child, command) => {
           manager.update(path.join(sessionDir, 'state.json'), (current) => {
@@ -1960,11 +2593,20 @@ export async function runCitadel(
   }
   }
   assertOwnership();
+  const completedChecksJournal = readJsonFile<Record<string, unknown>>(
+    path.join(sessionDir, 'citadel-deterministic-check-journal.json'), null,
+  );
+  if (!completedChecksJournal || completedChecksJournal.status !== 'completed'
+    || completedChecksJournal.binding_hash !== checksBindingHash
+    || completedChecksJournal.checks_hash !== reportHash(checks)) {
+    throw new Error('Citadel deterministic-check journal is incomplete or does not match the final check summary.');
+  }
   atomicWriteJson(checksPath, {
     schema_version: 1,
     reviewed_range: reviewedRange,
     binding: checksBinding,
     checks_hash: reportHash(checks),
+    journal_hash: reportHash(completedChecksJournal),
     checks,
   });
   if (restoreIsolatedCheckpoint('deterministic-check')) {
