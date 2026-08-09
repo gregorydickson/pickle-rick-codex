@@ -12,6 +12,21 @@ import {
 import type { LegacyAdoptionRecord } from '../services/legacy-session-adoption.js';
 import type { InstalledRuntimeDescriptor } from '../services/durable-supervisor.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
+import {
+  adoptionWatchEvidenceHash,
+  adoptionWatchStrategyStateLaunched,
+  beginAdoptionWatchStrategy,
+  createAdoptionWatchTerminalRecoveryState,
+  createAdoptionWatchStrategyState,
+  finishAdoptionWatchStrategy,
+  validateAdoptionWatchStrategyState,
+} from '../services/adoption-watch-strategies.js';
+import type { AdoptionWatchStrategyId, AdoptionWatchStrategyState } from '../services/adoption-watch-strategies.js';
+import {
+  archiveAdoptionWatchTerminalState,
+  validateAdoptionWatchTerminalRecoveryRefs,
+} from '../services/adoption-watch-terminal-recovery.js';
+import type { AdoptionWatchTerminalRecoveryRef } from '../services/adoption-watch-terminal-recovery.js';
 
 interface Args {
   command: 'prepare' | 'launch' | 'watch';
@@ -26,7 +41,8 @@ export const LEGACY_ADOPTION_WATCH_STATUS_FILE = 'legacy-session-adoption-watch.
 
 export interface LegacyAdoptionWatchFailure {
   kind: 'migration-continuity-failed' | 'runtime-mismatch' | 'ownership-conflict'
-    | 'lock-unavailable' | 'launch-failed' | 'watch-status-invalid' | 'adoption-failed';
+    | 'lock-unavailable' | 'launch-failed' | 'watch-status-invalid'
+    | 'terminal-inconsistency' | 'adoption-failed';
   name: string;
   message: string;
   recoverable: true;
@@ -49,6 +65,8 @@ export interface LegacyAdoptionWatchStatus {
   retry_delay_ms: number | null;
   last_failure: LegacyAdoptionWatchFailure | null;
   launched_runtime_root: string | null;
+  strategy_state?: AdoptionWatchStrategyState;
+  terminal_recovery_refs?: AdoptionWatchTerminalRecoveryRef[];
 }
 
 interface LegacyAdoptionWatchDependencies {
@@ -62,6 +80,9 @@ interface LegacyAdoptionWatchDependencies {
   adopt?: typeof adoptActiveLegacyMuxSession;
   launch?: typeof launchAdoptedLegacySession;
   chooseRuntime?: typeof chooseLegacyLaunchRuntime;
+  runtimeMatches?: typeof runtimeRootMatchesDescriptor;
+  executeStrategy?: (strategyId: AdoptionWatchStrategyId) => LegacyAdoptionRecord;
+  checkpoint?: (point: 'strategy_persisted') => void;
 }
 
 function finiteNonNegative(value: number, fallback: number): number {
@@ -96,11 +117,12 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 const watchFailureKinds = new Set<LegacyAdoptionWatchFailure['kind']>([
   'migration-continuity-failed', 'runtime-mismatch', 'ownership-conflict', 'lock-unavailable',
-  'launch-failed', 'watch-status-invalid', 'adoption-failed',
+  'launch-failed', 'watch-status-invalid', 'terminal-inconsistency', 'adoption-failed',
 ]);
 
 function invalidWatchStatusReason(
   value: unknown,
+  sessionDir: string,
   expectedSessionId: string,
   nowMs: number,
   maxDelayMs: number,
@@ -156,6 +178,18 @@ function invalidWatchStatusReason(
     return 'non-retrying status has a retry scheduling timestamp';
   }
   if (value.status === 'launched' && Number(value.consecutive_failures) !== 0) return 'launched status has consecutive failures';
+  if (value.strategy_state !== undefined) {
+    const strategyError = validateAdoptionWatchStrategyState(value.strategy_state);
+    if (strategyError) return strategyError;
+    const strategy = value.strategy_state as AdoptionWatchStrategyState;
+    const strategyLaunched = strategy.history.at(-1)?.outcome === 'launched'
+      || (strategy.history.length === 0 && strategy.history_base_checkpoint.launched);
+    if (strategyLaunched && value.status !== 'launched') return 'non-launched watch status follows a launched strategy';
+  }
+  if (value.terminal_recovery_refs !== undefined) {
+    const recoveryError = validateAdoptionWatchTerminalRecoveryRefs(sessionDir, value.terminal_recovery_refs);
+    if (recoveryError) return recoveryError;
+  }
   return null;
 }
 
@@ -188,6 +222,53 @@ function launchedRecord(sessionDir: string): LegacyAdoptionRecord | null {
   return record?.schema_version === 1 && record.status === 'launched' ? record : null;
 }
 
+function executeAdoptionWatchStrategy(
+  strategyId: AdoptionWatchStrategyId,
+  args: Pick<Args, 'sessionDir' | 'sourceRuntimeRoot' | 'targetRuntimeRoot' | 'validationSessionDir'>,
+  deps: LegacyAdoptionWatchDependencies,
+): LegacyAdoptionRecord {
+  if (deps.executeStrategy) return deps.executeStrategy(strategyId);
+  const adopt = deps.adopt || adoptActiveLegacyMuxSession;
+  const launch = deps.launch || launchAdoptedLegacySession;
+  const chooseRuntime = deps.chooseRuntime || chooseLegacyLaunchRuntime;
+
+  if (strategyId === 'sealed-launch-transaction-reconstruction') {
+    const record = readJsonFile<LegacyAdoptionRecord>(path.join(args.sessionDir, LEGACY_ADOPTION_FILE), null);
+    if (!record || record.schema_version !== 1) {
+      throw new Error('Sealed launch-transaction reconstruction requires a durable adoption record.');
+    }
+    const selected = chooseRuntime(args.sourceRuntimeRoot, args.targetRuntimeRoot, record.target_runtime);
+    return launch(args.sessionDir, selected.runtimeRoot);
+  }
+
+  if (strategyId === 'authenticated-runtime-revalidation') {
+    const record = readJsonFile<LegacyAdoptionRecord>(path.join(args.sessionDir, LEGACY_ADOPTION_FILE), null);
+    const transaction = readJsonFile<Record<string, unknown>>(
+      path.join(args.sessionDir, 'legacy-session-adoption-transaction.json'), null,
+    );
+    const sourceRuntime = transaction?.source_runtime as InstalledRuntimeDescriptor | undefined;
+    const targetRuntime = record?.target_runtime
+      || transaction?.target_runtime as InstalledRuntimeDescriptor | undefined;
+    const matches = deps.runtimeMatches || runtimeRootMatchesDescriptor;
+    if (!(sourceRuntime && matches(args.sourceRuntimeRoot, sourceRuntime))
+      && !(targetRuntime && matches(args.targetRuntimeRoot, targetRuntime))) {
+      throw new Error('Authenticated runtime revalidation found no persisted runtime identity to authorize repin.');
+    }
+  }
+
+  const adopted = adopt(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, {
+    startWatchdog: () => undefined, validationSessionDir: args.validationSessionDir || undefined,
+  });
+  const selected = chooseRuntime(args.sourceRuntimeRoot, args.targetRuntimeRoot, adopted.target_runtime);
+  if (strategyId === 'authenticated-runtime-revalidation') {
+    const matches = deps.runtimeMatches || runtimeRootMatchesDescriptor;
+    if (!matches(selected.runtimeRoot, adopted.target_runtime)) {
+      throw new Error('Authenticated runtime revalidation rejected the selected adoption runtime.');
+    }
+  }
+  return launch(args.sessionDir, selected.runtimeRoot);
+}
+
 export function runLegacyAdoptionWatch(
   args: Pick<Args, 'sessionDir' | 'sourceRuntimeRoot' | 'targetRuntimeRoot' | 'validationSessionDir'>,
   deps: LegacyAdoptionWatchDependencies = {},
@@ -199,13 +280,20 @@ export function runLegacyAdoptionWatch(
   const readAt = now();
   const delayBounds = legacyAdoptionWatchDelayBounds(deps);
   const invalidPrior = fs.existsSync(statusPath)
-    ? invalidWatchStatusReason(rawPrior, path.basename(args.sessionDir), readAt, delayBounds.maxDelayMs) : null;
+    ? invalidWatchStatusReason(rawPrior, args.sessionDir, path.basename(args.sessionDir),
+      readAt, delayBounds.maxDelayMs) : null;
   let prior = invalidPrior ? null : rawPrior as LegacyAdoptionWatchStatus | null;
   const startedAt = prior?.started_at || new Date(readAt).toISOString();
   let attemptCount = prior?.attempt_count || 0;
   let consecutiveFailures = prior?.status === 'retrying' ? prior.consecutive_failures : 0;
   let lastFailure = prior?.last_failure || null;
   let initialDelay = 0;
+  const currentEvidenceHash = () => adoptionWatchEvidenceHash(
+    args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot,
+  );
+  let strategyState = prior?.strategy_state
+    || createAdoptionWatchStrategyState(path.basename(args.sessionDir), currentEvidenceHash());
+  let terminalRecoveryRefs = prior?.terminal_recovery_refs || [];
 
   if (invalidPrior) {
     const observedAt = new Date(now()).toISOString();
@@ -223,10 +311,37 @@ export function runLegacyAdoptionWatch(
       watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
       attempt_count: 0, consecutive_failures: 1, last_attempt_at: null,
       retry_scheduled_at: observedAt, next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
-      last_failure: lastFailure, launched_runtime_root: null,
+      last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
+      terminal_recovery_refs: terminalRecoveryRefs,
     };
     atomicWriteJson(statusPath, prior);
     consecutiveFailures = 1;
+    initialDelay = delay;
+  }
+
+  if (!invalidPrior && strategyState.active) {
+    const observedAt = new Date(now()).toISOString();
+    strategyState = finishAdoptionWatchStrategy(
+      strategyState, 'interrupted', 'watcher-restarted-with-active-strategy', observedAt,
+    );
+    consecutiveFailures += 1;
+    const delay = legacyAdoptionWatchDelayMs(consecutiveFailures, {
+      baseDelayMs: deps.baseDelayMs, maxDelayMs: deps.maxDelayMs,
+      jitterRatio: deps.jitterRatio, random: deps.random,
+    });
+    lastFailure = {
+      kind: 'adoption-failed', name: 'LegacyAdoptionWatchInterrupted',
+      message: 'Watcher restarted with an unfinished recovery strategy.', recoverable: true,
+      first_observed_at: observedAt, last_observed_at: observedAt,
+    };
+    prior = {
+      ...prior!, status: 'retrying', watcher_pid: deps.watcherPid ?? process.pid, updated_at: observedAt,
+      consecutive_failures: consecutiveFailures, retry_scheduled_at: observedAt,
+      next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
+      last_failure: lastFailure, strategy_state: strategyState,
+      terminal_recovery_refs: terminalRecoveryRefs,
+    };
+    atomicWriteJson(statusPath, prior);
     initialDelay = delay;
   }
 
@@ -244,9 +359,42 @@ export function runLegacyAdoptionWatch(
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: timestamp,
         attempt_count: attemptCount, consecutive_failures: 0, last_attempt_at: prior?.last_attempt_at || null,
         retry_scheduled_at: null, next_retry_at: null, retry_delay_ms: null, last_failure: lastFailure,
-        launched_runtime_root: converged.launched_runtime_root || null,
+        launched_runtime_root: converged.launched_runtime_root || null, strategy_state: strategyState,
+        terminal_recovery_refs: terminalRecoveryRefs,
       } satisfies LegacyAdoptionWatchStatus);
       return converged;
+    }
+    if (adoptionWatchStrategyStateLaunched(strategyState)) {
+      const observedAt = new Date(now()).toISOString();
+      const evidenceHash = currentEvidenceHash();
+      const archive = archiveAdoptionWatchTerminalState(
+        args.sessionDir, strategyState, evidenceHash, prior?.updated_at || observedAt,
+      );
+      terminalRecoveryRefs = [...terminalRecoveryRefs, archive].slice(-16);
+      strategyState = createAdoptionWatchTerminalRecoveryState(
+        path.basename(args.sessionDir), evidenceHash, strategyState,
+      );
+      consecutiveFailures += 1;
+      const delay = legacyAdoptionWatchDelayMs(consecutiveFailures, {
+        baseDelayMs: deps.baseDelayMs, maxDelayMs: deps.maxDelayMs,
+        jitterRatio: deps.jitterRatio, random: deps.random,
+      });
+      lastFailure = {
+        kind: 'terminal-inconsistency', name: 'LegacyAdoptionWatchTerminalInconsistency',
+        message: 'Persisted launched strategy lacks its authoritative launched adoption record.', recoverable: true,
+        first_observed_at: observedAt, last_observed_at: observedAt,
+      };
+      atomicWriteJson(statusPath, {
+        schema_version: 1, status: 'retrying', session_id: path.basename(args.sessionDir),
+        watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
+        attempt_count: attemptCount, consecutive_failures: consecutiveFailures,
+        last_attempt_at: prior?.last_attempt_at || null, retry_scheduled_at: observedAt,
+        next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
+        last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
+        terminal_recovery_refs: terminalRecoveryRefs,
+      } satisfies LegacyAdoptionWatchStatus);
+      initialDelay = delay;
+      continue;
     }
     if (initialDelay > 0) {
       const delay = initialDelay;
@@ -257,22 +405,29 @@ export function runLegacyAdoptionWatch(
 
     const attemptAt = new Date(now()).toISOString();
     attemptCount += 1;
+    const begun = beginAdoptionWatchStrategy(strategyState, currentEvidenceHash(), attemptAt);
+    strategyState = begun.state;
+    atomicWriteJson(statusPath, {
+      schema_version: 1, status: 'watching', session_id: path.basename(args.sessionDir),
+      watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: attemptAt,
+      attempt_count: attemptCount, consecutive_failures: consecutiveFailures, last_attempt_at: attemptAt,
+      retry_scheduled_at: null, next_retry_at: null, retry_delay_ms: null, last_failure: lastFailure,
+      launched_runtime_root: null, strategy_state: strategyState,
+      terminal_recovery_refs: terminalRecoveryRefs,
+    } satisfies LegacyAdoptionWatchStatus);
+    deps.checkpoint?.('strategy_persisted');
     try {
-      const adopted = (deps.adopt || adoptActiveLegacyMuxSession)(
-        args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot,
-        { startWatchdog: () => undefined, validationSessionDir: args.validationSessionDir || undefined },
-      );
-      const selected = (deps.chooseRuntime || chooseLegacyLaunchRuntime)(
-        args.sourceRuntimeRoot, args.targetRuntimeRoot, adopted.target_runtime,
-      );
-      const result = (deps.launch || launchAdoptedLegacySession)(args.sessionDir, selected.runtimeRoot);
+      const result = executeAdoptionWatchStrategy(begun.attempt.strategy_id, args, deps);
       const timestamp = new Date(now()).toISOString();
+      strategyState = finishAdoptionWatchStrategy(strategyState, 'launched', null, timestamp);
       atomicWriteJson(statusPath, {
         schema_version: 1, status: 'launched', session_id: path.basename(args.sessionDir),
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: timestamp,
         attempt_count: attemptCount, consecutive_failures: 0, last_attempt_at: attemptAt,
         retry_scheduled_at: null, next_retry_at: null, retry_delay_ms: null, last_failure: lastFailure,
-        launched_runtime_root: result.launched_runtime_root || selected.runtimeRoot,
+        launched_runtime_root: result.launched_runtime_root || args.targetRuntimeRoot,
+        strategy_state: strategyState,
+        terminal_recovery_refs: terminalRecoveryRefs,
       } satisfies LegacyAdoptionWatchStatus);
       return result;
     } catch (error) {
@@ -283,8 +438,12 @@ export function runLegacyAdoptionWatch(
         jitterRatio: deps.jitterRatio, random: deps.random,
       });
       const message = error instanceof Error ? error.message : String(error);
+      const failureKind = classifyLegacyAdoptionWatchFailure(error);
+      strategyState = finishAdoptionWatchStrategy(
+        strategyState, 'failed', `${failureKind}:${message}`.slice(0, 2_000), observedAt,
+      );
       lastFailure = {
-        kind: classifyLegacyAdoptionWatchFailure(error),
+        kind: failureKind,
         name: error instanceof Error ? error.name : 'Error',
         message,
         recoverable: true,
@@ -296,7 +455,8 @@ export function runLegacyAdoptionWatch(
         watcher_pid: deps.watcherPid ?? process.pid, started_at: startedAt, updated_at: observedAt,
         attempt_count: attemptCount, consecutive_failures: consecutiveFailures, last_attempt_at: attemptAt,
         retry_scheduled_at: observedAt, next_retry_at: new Date(Date.parse(observedAt) + delay).toISOString(), retry_delay_ms: delay,
-        last_failure: lastFailure, launched_runtime_root: null,
+        last_failure: lastFailure, launched_runtime_root: null, strategy_state: strategyState,
+        terminal_recovery_refs: terminalRecoveryRefs,
       } satisfies LegacyAdoptionWatchStatus);
       wait(delay);
     }
@@ -358,7 +518,8 @@ export function runLegacyAdoptionCli(argv: string[]): void {
   const result = args.command === 'prepare'
     ? adoptActiveLegacyMuxSession(args.sessionDir, args.sourceRuntimeRoot, args.targetRuntimeRoot, {
       startWatchdog: (sessionDir, sourceRoot, targetRoot) => {
-        const childArgs = [fileURLToPath(import.meta.url), 'watch', '--session-dir', sessionDir,
+        const supervisorBin = fileURLToPath(new URL('./legacy-adoption-executor-supervisor.js', import.meta.url));
+        const childArgs = [supervisorBin, '--session-dir', sessionDir,
           '--source-runtime-root', sourceRoot, '--target-runtime-root', targetRoot];
         if (args.validationSessionDir) childArgs.push('--validation-session', args.validationSessionDir);
         const child = spawn(process.execPath, childArgs, {

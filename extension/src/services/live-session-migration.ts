@@ -61,6 +61,7 @@ function sessionFiles(root: string, current = root): string[] {
       || relative === 'legacy-session-adoption-transaction.json'
       || relative === 'legacy-session-adoption.json'
       || relative === 'legacy-session-adoption-watch.json'
+      || relative === 'legacy-session-adoption-executor.json'
       || relative.endsWith('.lock')) return [];
     return [relative];
   });
