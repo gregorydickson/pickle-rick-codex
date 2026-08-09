@@ -64,6 +64,7 @@ import {
   inspectTicketDependencyGraph,
   reconcileDependencyRepairTransaction,
   repairTicketDependencyContract,
+  DependencyRepairIsolationError,
   type DependencyGraphInspection,
 } from '../services/dependency-contract-repair.js';
 import { reconcileVerificationRepairTransaction } from '../services/verification-seal-contract.js';
@@ -733,12 +734,20 @@ async function runSequentialWithLease(
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} drained for runtime handoff`);
           break;
         }
-        const cancelled = manager.read(statePath).active === false;
+        let catchState;
+        try {
+          catchState = manager.read(statePath);
+        } catch (stateError) {
+          if (error instanceof DependencyRepairIsolationError) throw error;
+          throw stateError;
+        }
+        const cancelled = catchState.active === false;
         if (cancelled) {
-          exitReason = (manager.read(statePath).last_exit_reason as string | null) || 'cancelled';
+          exitReason = (catchState.last_exit_reason as string | null) || 'cancelled';
           appendRunnerLog(sessionDir, runnerMode, `ticket ${ticket.id} stopped: ${exitReason}`);
           break;
         }
+        if (error instanceof DependencyRepairIsolationError) throw error;
         if (scheduledDiagnosticTicketId === normalizeTicketId(ticket.id, ticket.id)
           && scheduledDiagnosticTask === 'repair-dependency-or-contract-blockage') {
           const failureMessage = error instanceof Error ? error.message : String(error);

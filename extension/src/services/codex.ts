@@ -31,6 +31,17 @@ export class AddDirOutsideSandboxError extends Error {
   }
 }
 
+export class CodexCancelCheckError extends Error {
+  readonly code = 'CODEX_CANCEL_CHECK_FAILED';
+  override readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(`Codex cancellation check failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'CodexCancelCheckError';
+    this.cause = cause;
+  }
+}
+
 function canonicalPath(candidate: string): string {
   const resolved = path.resolve(candidate);
   let existing = resolved;
@@ -156,9 +167,8 @@ async function runSpawnedCommand({
     let timeoutTimer: NodeJS.Timeout | null = null;
     let pollTimer: NodeJS.Timeout | null = null;
     let cancelTimer: NodeJS.Timeout | null = null;
-    let forcedAfterSuccess = false;
-    let forcedByCancel = false;
-    let forcedByTimeout = false;
+    let terminationCause: 'success' | 'cancel' | 'timeout' | 'cancel-check-error' | null = null;
+    let cancelCheckError: CodexCancelCheckError | null = null;
     let successTerminationSent = false;
     let jsonStreamObserved = false;
     let progressSignature = '';
@@ -218,6 +228,21 @@ async function runSpawnedCommand({
       }, delayMs).unref?.();
     };
 
+    const requestTermination = (
+      cause: NonNullable<typeof terminationCause>,
+      error: CodexCancelCheckError | null = null,
+    ): boolean => {
+      if (terminationCause !== null || child.exitCode !== null || child.signalCode !== null) return false;
+      terminationCause = cause;
+      cancelCheckError = error;
+      if (successGraceTimer) clearTimeout(successGraceTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      if (cancelTimer) clearInterval(cancelTimer);
+      scheduleTermination('SIGTERM', 'SIGKILL');
+      return true;
+    };
+
     const armSuccessTermination = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       const usage = inspectCodexUsage(currentStdout());
@@ -229,10 +254,8 @@ async function runSpawnedCommand({
         ? Math.min(usageCompletionGraceMs, Math.max(0, absoluteDeadlineMs - Date.now() - drainReserveMs))
         : successSignalGraceMs;
       successGraceTimer = setTimeout(() => {
-        if (!successTerminationSent && child.exitCode === null && child.signalCode === null) {
+        if (!successTerminationSent && requestTermination('success')) {
           successTerminationSent = true;
-          forcedAfterSuccess = true;
-          scheduleTermination('SIGTERM', 'SIGKILL');
         }
       }, graceMs);
     };
@@ -269,20 +292,17 @@ async function runSpawnedCommand({
     };
 
     timeoutTimer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) {
+      if (terminationCause === null && child.exitCode === null && child.signalCode === null) {
         const successWasObserved = successObserved;
         if (!successWasObserved) checkForSuccess();
         if (!successWasObserved && successObserved) {
           if (successGraceTimer) clearTimeout(successGraceTimer);
-          if (!successTerminationSent) {
+          if (!successTerminationSent && requestTermination('success')) {
             successTerminationSent = true;
-            forcedAfterSuccess = true;
-            scheduleTermination('SIGTERM', 'SIGKILL');
           }
           return;
         }
-        forcedByTimeout = true;
-        scheduleTermination('SIGTERM', 'SIGKILL');
+        requestTermination('timeout');
       }
     }, timeoutMs);
 
@@ -293,11 +313,17 @@ async function runSpawnedCommand({
 
     if (typeof cancelCheck === 'function') {
       cancelTimer = setInterval(() => {
-        if (!cancelCheck()) return;
-        if (child.exitCode === null && child.signalCode === null) {
-          forcedByCancel = true;
-          scheduleTermination('SIGTERM', 'SIGKILL');
+        if (terminationCause !== null) return;
+        let cancelled: boolean;
+        try {
+          cancelled = cancelCheck();
+        } catch (error) {
+          const typedError = new CodexCancelCheckError(error);
+          requestTermination('cancel-check-error', typedError);
+          return;
         }
+        if (!cancelled) return;
+        requestTermination('cancel');
       }, 100);
     }
 
@@ -336,23 +362,29 @@ async function runSpawnedCommand({
         const message = readLastMessage(outputLastMessagePath);
         const outputFormat = detectOutputFormat(stdout);
         const usage = inspectCodexUsage(stdout);
+        if (cancelCheckError) {
+          settled = true;
+          cleanup();
+          reject(cancelCheckError);
+          return;
+        }
         finalize({
-          exitCode: forcedByCancel
+          exitCode: terminationCause === 'cancel'
             ? 130
-            : forcedByTimeout
+            : terminationCause === 'timeout'
               ? 124
               : successObserved
                 ? 0
                 : (code ?? (signal ? 1 : 0)),
           stdout,
           stderr,
-          timedOut: forcedByTimeout,
+          timedOut: terminationCause === 'timeout',
           durationMs: Date.now() - startedAt,
           lastMessage: message,
           usage: usage.usage as CodexUsage,
           usageReported: usage.reported,
-          terminatedAfterSuccess: forcedAfterSuccess,
-          cancelled: forcedByCancel,
+          terminatedAfterSuccess: terminationCause === 'success',
+          cancelled: terminationCause === 'cancel',
           outputFormat,
           assistantContent: extractAssistantContent(stdout),
           toolCalls: collectCodexToolCalls(stdout),

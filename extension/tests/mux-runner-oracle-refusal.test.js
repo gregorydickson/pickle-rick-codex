@@ -22,6 +22,7 @@ import {
   buildTicketRecoveryFailureIdentity,
   recordTicketRecoveryFailure,
 } from '../services/recovery-controller.js';
+import { DependencyRepairIsolationError } from '../services/dependency-contract-repair.js';
 
 function createSessionWithTodoTicket(taskLabel) {
   const dataRoot = makeTempRoot();
@@ -955,29 +956,38 @@ import fs from 'node:fs';
 import path from 'node:path';
 const prompt = fs.readFileSync(0, 'utf8');
 const value = (prefix) => prompt.split('\\n').find((line) => line.startsWith(prefix))?.slice(prefix.length).trim() || '';
+// Let the parent persist child ownership and complete one healthy cancellation
+// poll before corrupting the authoritative state.
+await new Promise((resolve) => setTimeout(resolve, 150));
 fs.writeFileSync(process.env.HOSTILE_MANIFEST, '{"poisoned":true}');
 fs.writeFileSync(process.env.HOSTILE_STATE, '{');
 const artifact = value('Dependency repair artifact path: ');
 if (process.env.HOSTILE_MODE === 'symlink') fs.symlinkSync(path.dirname(artifact), artifact);
 else { const fd = fs.openSync(artifact, 'w'); fs.ftruncateSync(fd, 2 * 1024 * 1024); fs.closeSync(fd); }
-console.log('<promise>DEPENDENCY_REPAIR_COMPLETE</promise>');
+// Stay alive until the cancellation poll observes the corrupt authoritative
+// state. This makes the timer/error race deterministic.
+setInterval(() => {}, 1000);
 `);
-    await assert.rejects(
-      () => withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
+    await assert.rejects(() => withDataRoot(dataRoot, () => runSequential(sessionDir, { onFailure: 'retry', runnerMode: 'pickle' }, {
         runTicket: async () => { throw new Error('implementation must not run'); },
       }), {
         ...prependPath(binDir), HOSTILE_MODE: artifactMode,
         HOSTILE_MANIFEST: path.join(sessionDir, 'refinement_manifest.json'),
         HOSTILE_STATE: path.join(sessionDir, 'state.json'),
-      }),
-      /State file must contain a JSON object/,
-      artifactMode,
-    );
+      }), (error) => error instanceof DependencyRepairIsolationError
+        && error.code === 'DEPENDENCY_REPAIR_ISOLATED'
+        && error.drift.includes('state.json'), artifactMode);
     assert.equal(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'), '{', artifactMode);
     assert.match(fs.readFileSync(path.join(sessionDir, 'refinement_manifest.json'), 'utf8'), /poisoned/, artifactMode);
     const quarantine = JSON.parse(fs.readFileSync(path.join(sessionDir, 'dependency-repair-quarantine.json'), 'utf8'));
+    assert.equal(quarantine.reason, 'dependency-repair-unattributed-authoritative-drift', artifactMode);
+    assert.ok(quarantine.drift.includes('state.json'), artifactMode);
     assert.equal(quarantine.candidate_artifact.kind, artifactMode === 'symlink' ? 'unsafe-file' : 'oversize');
+    assert.deepEqual(quarantine.authoritative_drift['state.json'], {
+      kind: 'content', size: 1, content_base64: Buffer.from('{').toString('base64'),
+    }, artifactMode);
     assert.match(quarantine.cleanup_failure, /State file must contain a JSON object/);
+    assert.match(quarantine.monitor_error, /Codex cancellation check failed.*State file must contain a JSON object/, `${artifactMode}: ${quarantine.worker_error}`);
   }
 });
 

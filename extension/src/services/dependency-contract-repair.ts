@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
+import { CodexCancelCheckError, assertCodexSucceeded, hasPromiseToken, runCodexExecMonitored } from './codex.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
@@ -69,6 +69,19 @@ interface DependencyRepairTransaction {
 }
 
 const DEPENDENCY_TRANSACTION_FILE = 'dependency-repair-transaction.json';
+
+export class DependencyRepairIsolationError extends Error {
+  readonly code = 'DEPENDENCY_REPAIR_ISOLATED';
+  readonly drift: string[];
+  override readonly cause: unknown;
+
+  constructor(message: string, drift: string[], cause: unknown = null) {
+    super(message);
+    this.name = 'DependencyRepairIsolationError';
+    this.drift = [...drift];
+    this.cause = cause;
+  }
+}
 
 function canonicalId(ticket: Ticket): string {
   return normalizeTicketId(ticket.id, ticket.id);
@@ -715,6 +728,8 @@ export async function repairTicketDependencyContract(
           reason: 'dependency-repair-unattributed-authoritative-drift',
           drift,
           cleanup_failure: cleanupFailure,
+          monitor_error: workerError instanceof CodexCancelCheckError ? workerError.message : null,
+          worker_error: workerError instanceof Error ? workerError.message : workerError === null ? null : String(workerError),
           candidate_artifact: candidateArtifact,
           authoritative_drift: authoritativeDriftEvidence(sessionDir, drift),
           repository: repositoryDrift ? repositoryFenceEvidence(workingDir, fence) : null,
@@ -725,7 +740,10 @@ export async function repairTicketDependencyContract(
         cleanupFailure ||= `quarantine failed: ${error instanceof Error ? error.message : String(error)}`;
       }
       fs.rmSync(candidateDir, { recursive: true, force: true });
-      isolationError = new Error(`dependency-repair-unattributed-authoritative-drift: ${drift.join(', ')}${cleanupFailure ? `; ${cleanupFailure}` : ''}`);
+      const driftMessage = `dependency-repair-unattributed-authoritative-drift: ${drift.join(', ')}${cleanupFailure ? `; ${cleanupFailure}` : ''}`;
+      isolationError = drift.includes('state.json') || workerError instanceof CodexCancelCheckError
+        ? new DependencyRepairIsolationError(driftMessage, drift, workerError)
+        : new Error(driftMessage);
     } else {
       try {
         cleanupWorkerState(manager, statePath, result?.cancelled === true, workerChildPid);
