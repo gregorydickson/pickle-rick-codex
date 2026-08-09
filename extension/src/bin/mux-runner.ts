@@ -195,12 +195,19 @@ async function runSequentialWithLease(
 
   let dependencyInspection = inspectTicketDependencyGraph(sessionDir);
   const completeAdoptedVerificationRepair = (ticketId: string): void => {
+    const adoptionPending = legacyContractRepairPending(sessionDir, ticketId);
     const repairedSummary = summarizeTickets(sessionDir);
-    capturePipelineVerificationBaselines(sessionDir, {
+    const baselines = capturePipelineVerificationBaselines(sessionDir, {
       state: manager.read(statePath),
       summary: repairedSummary,
       config,
     });
+    const repairedTicketBaseline = baselines && Object.entries(baselines.by_ticket).find(([candidateId]) => (
+      normalizeTicketId(candidateId, candidateId) === normalizeTicketId(ticketId, ticketId)
+    ))?.[1];
+    if (adoptionPending && (!repairedTicketBaseline || Object.keys(repairedTicketBaseline).length === 0)) {
+      throw new Error(`adopted-verification-repair-baseline-missing: ${ticketId}`);
+    }
     markLegacyContractRepairComplete(sessionDir);
     appendRunnerLog(sessionDir, runnerMode, `captured repaired verification baseline and completed legacy repair for ${ticketId}`);
   };
