@@ -55,7 +55,7 @@ import type {
 } from '../types/index.js';
 import { assertSessionOrphanRecovered } from './orphan-reaper.js';
 import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from './session-prd-seal.js';
-import { LEGACY_ADOPTION_FILE, type LegacyAdoptionRecord } from './legacy-session-adoption.js';
+import { LEGACY_ADOPTION_FILE, LEGACY_ADOPTION_TRANSACTION_FILE, type LegacyAdoptionRecord } from './legacy-session-adoption.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { readLogicalPipeline } from './durable-supervisor.js';
 
@@ -153,9 +153,15 @@ export function pendingAdoptedVerificationRepairTicket(
   const seal = readPrdSeal(sessionDir);
   assertPrdSealMatchesPrd(seal, prd);
   const logical = readLogicalPipeline(sessionDir);
-  const adoptionEvent = logical.events.find((event) => event.kind === 'legacy_session_adopted'
-    && event.details.migration_content_hash === record.migration_content_hash);
+  const adoptionEvent = [...logical.events].reverse().find((event) => event.kind === 'legacy_session_adopted');
+  const adoptionTransaction = readJsonFile<{ post_adoption_repin?: { status?: string } }>(
+    path.join(sessionDir, LEGACY_ADOPTION_TRANSACTION_FILE), null,
+  );
   if (!adoptionEvent || logical.control_state !== 'autonomous_execution'
+    || adoptionEvent.details.migration_content_hash !== record.migration_content_hash
+    || (adoptionEvent.details.prior_adoption_record_sha256 && !adoptionTransaction?.post_adoption_repin)
+    || (adoptionTransaction?.post_adoption_repin
+      && adoptionTransaction.post_adoption_repin.status !== 'completed')
     || logical.prd_seal_hash !== seal.semantic_hash || logical.lease !== null) {
     throw new Error('Adopted verification repair lacks its exact sealed migration checkpoint.');
   }

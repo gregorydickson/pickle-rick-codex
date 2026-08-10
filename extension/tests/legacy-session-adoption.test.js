@@ -24,7 +24,7 @@ import {
   validateRefinementAcceptance,
   writeRefinementAcceptance,
 } from '../services/refinement-artifacts.js';
-import { ensureBootstrapSessionReady } from '../services/pipeline-bootstrap.js';
+import { ensureBootstrapSessionReady, pendingAdoptedVerificationRepairTicket } from '../services/pipeline-bootstrap.js';
 import { checkReadiness } from '../services/readiness.js';
 import { readVerificationBaselines } from '../services/pipeline-state.js';
 import { assertTicketVerificationBoundToSeal } from '../services/verification-seal-contract.js';
@@ -1270,7 +1270,7 @@ test('quiesced target repin requires a Citadel validation session for the exact 
   assert.equal(transaction.target_runtime_repin, undefined);
 });
 
-test('migrated adoption verifies old evidence before target repin and resumes after supersession crash', () => {
+test('migrated adoption upgrades legacy prepared validation evidence and resumes after supersession crash', () => {
   const value = fixture();
   const deps = depsFor(value);
   deps.checkpoint = (checkpoint) => {
@@ -1299,6 +1299,9 @@ test('migrated adoption verifies old evidence before target repin and resumes af
   assert.equal(prepared.target_runtime_repin.prior_migration_content_hash, oldMigration.content_hash);
   assert.deepEqual(prepared.target_runtime, oldMigration.target_runtime);
   assert.equal(fs.existsSync(path.join(value.sessionDir, 'installed-runtime-migration.json')), true);
+  delete prepared.target_runtime_repin.validation_approval_file_sha256;
+  delete prepared.target_runtime_repin.validation_report_file_sha256;
+  writeJson(path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), prepared);
 
   deps.checkpoint = undefined;
   const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
@@ -1311,6 +1314,8 @@ test('migrated adoption verifies old evidence before target repin and resumes af
     path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
   ));
   assert.equal(completed.target_runtime_repin.status, 'completed');
+  assert.match(completed.target_runtime_repin.validation_approval_file_sha256, /^[a-f0-9]{64}$/);
+  assert.match(completed.target_runtime_repin.validation_report_file_sha256, /^[a-f0-9]{64}$/);
   assert.equal(completed.target_runtime_supersessions.length, 1);
 });
 
@@ -1463,6 +1468,306 @@ test('legacy adoption resumes idempotently from every durable post-fence checkpo
     assert.equal(record.status, 'adopted', stage);
     assert.equal(readLogicalPipeline(value.sessionDir).events.filter((event) => event.kind === 'legacy_session_adopted').length, 1, stage);
   }
+});
+
+function strandAdoptionRecordBeforeLaunch(value, record) {
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  writeJson(transactionPath, { ...transaction, stage: 'launching', launch_attempt: undefined,
+    launched_runtime_root: undefined, updated_at: '2026-08-08T20:01:00.000Z' });
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  writeJson(statePath, { ...state, active: false });
+  return record;
+}
+
+function strandAdoptedSessionBeforeLaunch(value, deps) {
+  return strandAdoptionRecordBeforeLaunch(value,
+    adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps));
+}
+
+function preparePostAdoptionReplacement(value, deps, existingSupersession = false) {
+  let prior;
+  if (existingSupersession) {
+    deps.checkpoint = (current) => {
+      if (current === 'migrated') throw new Error('pause-initial-migration');
+    };
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /pause-initial-migration/);
+    fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// first approved replacement\n');
+    deps.validationSessionDir = approveTargetRuntime(value.targetRoot);
+    deps.checkpoint = undefined;
+    prior = strandAdoptionRecordBeforeLaunch(value,
+      adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps));
+  } else {
+    prior = strandAdoptedSessionBeforeLaunch(value, deps);
+  }
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// post-adoption replacement\n');
+  deps.validationSessionDir = approveTargetRuntime(value.targetRoot);
+  return prior;
+}
+
+test('stranded adopted launch is rolled back, superseded, and launched from the exact replacement epoch once', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const prior = preparePostAdoptionReplacement(value, deps, true);
+  const replacement = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.notEqual(replacement.migration_content_hash, prior.migration_content_hash);
+  assert.notEqual(replacement.target_runtime.build_hash, prior.target_runtime.build_hash);
+  assert.equal(prior.target_runtime_supersessions.length, 1);
+  assert.equal(replacement.target_runtime_supersessions.length, 2);
+  assert.deepEqual(replacement.target_runtime_supersessions[0], prior.target_runtime_supersessions[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'state.json'), 'utf8'));
+  assert.equal(state.active, true);
+  const transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(transaction.stage, 'adopted');
+  assert.equal(transaction.post_adoption_repin.status, 'completed');
+  assert.equal(transaction.target_runtime_repin.status, 'completed');
+  assert.equal(transaction.target_runtime_supersessions.length, 2);
+  assert.equal(transaction.superseded_migration_content_hash, prior.migration_content_hash);
+  assert.equal(transaction.launch_attempt, undefined);
+  const events = readLogicalPipeline(value.sessionDir).events.filter((event) => event.kind === 'legacy_session_adopted');
+  assert.equal(events.length, 2);
+  assert.equal(events.at(-1).details.migration_content_hash, replacement.migration_content_hash);
+  assert.deepEqual(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps), replacement);
+  let launches = 0;
+  const launched = launchAdoptedLegacySession(value.sessionDir, value.targetRoot,
+    exactLaunchDeps(value, () => { launches += 1; }));
+  assert.equal(launched.status, 'launched');
+  assert.equal(launches, 1);
+});
+
+test('post-adoption supersession replays every exact write prefix without duplicating its epoch', () => {
+  for (const checkpoint of [
+    'post_adoption_repin_prepared', 'post_adoption_repin_journal_applied',
+    'post_adoption_repin_journaled', 'post_adoption_repin_migration_applied',
+    'post_adoption_repin_migration_written', 'post_adoption_repin_record_applied',
+    'post_adoption_repin_record_written', 'post_adoption_repin_completed',
+  ]) {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    let injected = false;
+    deps.checkpoint = (current) => {
+      if (!injected && current === checkpoint) {
+        injected = true;
+        throw new Error(`crash-${checkpoint}`);
+      }
+    };
+    assert.throws(
+      () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      new RegExp(`crash-${checkpoint}`), checkpoint,
+    );
+    deps.checkpoint = undefined;
+    const replacement = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+    assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).migration_content_hash,
+      replacement.migration_content_hash, checkpoint);
+    assert.equal(readLogicalPipeline(value.sessionDir).events
+      .filter((event) => event.kind === 'legacy_session_adopted').length, 2, checkpoint);
+    const transaction = JSON.parse(fs.readFileSync(
+      path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+    ));
+    const migration = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'installed-runtime-migration.json'), 'utf8'));
+    const latest = readLogicalPipeline(value.sessionDir).events.filter((event) => event.kind === 'legacy_session_adopted').at(-1);
+    assert.equal(transaction.post_adoption_repin.status, 'completed', checkpoint);
+    assert.equal(transaction.migration_content_hash, replacement.migration_content_hash, checkpoint);
+    assert.equal(migration.content_hash, replacement.migration_content_hash, checkpoint);
+    assert.equal(latest.details.migration_content_hash, replacement.migration_content_hash, checkpoint);
+    let launches = 0;
+    const launchDeps = exactLaunchDeps(value, () => { launches += 1; });
+    assert.equal(launchAdoptedLegacySession(value.sessionDir, value.targetRoot, launchDeps).status, 'launched', checkpoint);
+    assert.equal(launchAdoptedLegacySession(value.sessionDir, value.targetRoot, launchDeps).status, 'launched', checkpoint);
+    assert.equal(launches, 1, checkpoint);
+  }
+});
+
+test('post-adoption supersession rejects forged predecessor evidence and live ownership', () => {
+  {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    deps.checkpoint = (current) => {
+      if (current === 'post_adoption_repin_prepared') throw new Error('pause-prepared');
+    };
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps), /pause-prepared/);
+    const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+    const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+    transaction.post_adoption_repin.prior_adoption_record_sha256 = 'a'.repeat(64);
+    writeJson(transactionPath, transaction);
+    deps.checkpoint = undefined;
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /artifacts do not match an exact recoverable write prefix/);
+  }
+  {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    const logical = readLogicalPipeline(value.sessionDir);
+    acquireSupervisorLease(value.sessionDir, { ownerId: 'intruder', ttlMs: 60_000 });
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /leased logical pipeline|live logical lease/);
+    assert.equal(logical.events.filter((event) => event.kind === 'legacy_session_adopted').length, 1);
+  }
+});
+
+function pausePreparedPostAdoptionRepin(value, deps) {
+  preparePostAdoptionReplacement(value, deps);
+  deps.checkpoint = (current) => {
+    if (current === 'post_adoption_repin_prepared') throw new Error('pause-prepared-evidence');
+  };
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pause-prepared-evidence/);
+  deps.checkpoint = undefined;
+  return path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+}
+
+test('prepared post-adoption repin reauthenticates external approval, clean head, and every descriptor', () => {
+  for (const mutation of ['head', 'dirty', 'approval', 'report', 'embedded', 'descriptor']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    const transactionPath = pausePreparedPostAdoptionRepin(value, deps);
+    const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+    if (mutation === 'head') {
+      fs.appendFileSync(path.join(value.targetRoot, 'install.sh'), '# clean new head\n');
+      approveTargetRuntime(value.targetRoot);
+    }
+    if (mutation === 'dirty') fs.appendFileSync(path.join(value.targetRoot, 'install.sh'), '# dirty\n');
+    if (mutation === 'approval') fs.appendFileSync(
+      path.join(deps.validationSessionDir, 'citadel-release-approval.json'), ' ',
+    );
+    if (mutation === 'report') fs.appendFileSync(path.join(deps.validationSessionDir, 'citadel-report.json'), ' ');
+    if (mutation === 'embedded') {
+      transaction.post_adoption_repin.validation_report.generated_at = 'tampered';
+      transaction.post_adoption_repin.validation_report_sha256 = sha256(
+        JSON.stringify(transaction.post_adoption_repin.validation_report),
+      );
+      writeJson(transactionPath, transaction);
+    }
+    if (mutation === 'descriptor') {
+      transaction.post_adoption_repin.replacement_record.target_runtime.version = 'same-build-forgery';
+      writeJson(transactionPath, transaction);
+    }
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /validation|approval|report|replacement runtime|descriptor|clean replacement checkout/i, mutation);
+  }
+});
+
+test('post-adoption repin never downgrades missing top-level or nested raw validation hashes', () => {
+  {
+    const value = fixture();
+    const deps = depsFor(value);
+    const transactionPath = pausePreparedPostAdoptionRepin(value, deps);
+    const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+    delete transaction.post_adoption_repin.validation_approval_file_sha256;
+    delete transaction.post_adoption_repin.validation_report_file_sha256;
+    writeJson(transactionPath, transaction);
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /validation evidence is incomplete/);
+  }
+  for (const layer of ['top-level', 'nested']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+    const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+    const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+    const evidence = layer === 'top-level'
+      ? transaction.post_adoption_repin : transaction.post_adoption_repin.supersession;
+    delete evidence.validation_approval_file_sha256;
+    delete evidence.validation_report_file_sha256;
+    writeJson(transactionPath, transaction);
+    assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, exactLaunchDeps(value)),
+      /validation evidence is incomplete/, layer);
+  }
+});
+
+test('journal-applied supersession is not exposed as resume-ready and tampered epochs never advance', () => {
+  for (const checkpoint of ['post_adoption_repin_journal_applied', 'post_adoption_repin_migration_written']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    deps.checkpoint = (current) => {
+      if (current === checkpoint) throw new Error(`pause-${checkpoint}`);
+    };
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      new RegExp(`pause-${checkpoint}`));
+    deps.checkpoint = undefined;
+    const state = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'state.json'), 'utf8'));
+    if (checkpoint === 'post_adoption_repin_journal_applied') {
+      assert.throws(() => pendingAdoptedVerificationRepairTicket(value.sessionDir, state, true),
+        /exact sealed migration checkpoint/);
+    }
+    const logicalPath = path.join(value.sessionDir, 'logical-pipeline.json');
+    const logical = JSON.parse(fs.readFileSync(logicalPath, 'utf8'));
+    const latest = logical.events.at(-1);
+    latest.details.legacy_owner = { ...latest.details.legacy_owner, operation_lock_pid: 999999 };
+    const { event_hash: ignored, ...withoutHash } = latest;
+    latest.event_hash = sha256(JSON.stringify(stableValue(withoutHash)));
+    writeJson(logicalPath, logical);
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /journal|prefix|adoption/i, checkpoint);
+  }
+});
+
+test('unsafe post-adoption owners and recovery ledgers reject without changing durable artifacts', () => {
+  for (const unsafe of ['persisted-owner', 'tmux', 'refinement-ledger', 'launch-owner']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    preparePostAdoptionReplacement(value, deps);
+    const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+    const statePath = path.join(value.sessionDir, 'state.json');
+    if (unsafe === 'persisted-owner') deps.inspectProcess = () => 'matched';
+    if (unsafe === 'tmux') {
+      deps.tmuxExists = () => true;
+      deps.tmuxBinding = () => ({ session_name: value.tmuxName, session_id: '$7', session_created: '1723147200',
+        pane_id: '%11', pane_pid: value.pane.pid, pane_start_command: 'bash' });
+    }
+    if (unsafe === 'refinement-ledger') {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      writeJson(statePath, { ...state, refinement_child_identities: [identity(7777)], recovery_required: true });
+    }
+    if (unsafe === 'launch-owner') {
+      const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+      transaction.launch_attempt = { owner_pid: 8888, runtime_root: value.targetRoot };
+      writeJson(transactionPath, transaction);
+      deps.observeProcess = (pid) => pid === 8888
+        ? { identity: identity(pid), parent_pid: 1, command: 'live launch reservation owner' } : null;
+    }
+    const paths = [statePath, transactionPath, path.join(value.sessionDir, 'installed-runtime-migration.json'),
+      path.join(value.sessionDir, 'logical-pipeline.json'), path.join(value.sessionDir, LEGACY_ADOPTION_FILE)];
+    const before = paths.map((file) => fs.readFileSync(file, 'utf8'));
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /live|recovery|historical state|owner|tmux/i, unsafe);
+    assert.deepEqual(paths.map((file) => fs.readFileSync(file, 'utf8')), before, unsafe);
+  }
+});
+
+test('completed supersession cannot bypass its transaction and launched target drift fails before deployment', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  preparePostAdoptionReplacement(value, deps);
+  adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  const transaction = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  const stripped = { ...transaction };
+  delete stripped.post_adoption_repin;
+  writeJson(transactionPath, stripped);
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /mandatory completed repin transaction/);
+  const state = JSON.parse(fs.readFileSync(path.join(value.sessionDir, 'state.json'), 'utf8'));
+  assert.throws(() => pendingAdoptedVerificationRepairTicket(value.sessionDir, state, true),
+    /exact sealed migration checkpoint/);
+  assert.throws(() => launchAdoptedLegacySession(value.sessionDir, value.targetRoot, exactLaunchDeps(value)),
+    /exact completed launch epoch|journal checkpoint/);
+
+  writeJson(transactionPath, transaction);
+  assert.equal(launchAdoptedLegacySession(value.sessionDir, value.targetRoot, exactLaunchDeps(value)).status, 'launched');
+  fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// drift after launch\n');
+  approveTargetRuntime(value.targetRoot);
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /authenticated live runtime handoff before deployment/);
 });
 
 test('installer stages legacy adoption before replacement and launches only after deployment', () => {

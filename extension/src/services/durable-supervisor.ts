@@ -432,6 +432,40 @@ export function recordLegacySessionAdoption(
   });
 }
 
+export function recordLegacySessionAdoptionSupersession(
+  sessionDir: string,
+  details: {
+    prior_adoption_record_sha256: string;
+    prior_migration_content_hash: string;
+    migration_content_hash: string;
+    source_runtime: InstalledRuntimeDescriptor;
+    target_runtime: InstalledRuntimeDescriptor;
+    target_runtime_supersessions: Array<Record<string, unknown>>;
+    resume_checkpoint: Record<string, unknown>;
+    legacy_owner: Record<string, unknown>;
+    validation_session_dir: string;
+    validation_approval_sha256: string;
+    validation_report_sha256: string;
+  },
+  options: ClockOptions = {},
+): LogicalPipelineState {
+  requireNonEmpty(details.prior_adoption_record_sha256, 'prior adoption record hash');
+  requireNonEmpty(details.prior_migration_content_hash, 'prior migration hash');
+  requireNonEmpty(details.migration_content_hash, 'replacement migration hash');
+  validateRuntime(details.source_runtime);
+  validateRuntime(details.target_runtime);
+  return mutate(sessionDir, (state) => {
+    if (state.control_state !== 'autonomous_execution' || state.terminal_state !== null || state.lease !== null) {
+      throw new Error('Legacy adoption supersession requires nonterminal unleased autonomous execution.');
+    }
+    const prior = [...state.events].reverse().find((event) => event.kind === 'legacy_session_adopted');
+    if (!prior || prior.details.migration_content_hash !== details.prior_migration_content_hash) {
+      throw new Error('Legacy adoption supersession does not extend the latest authenticated adoption epoch.');
+    }
+    appendEvent(state, 'legacy_session_adopted', { ...details }, options.nowMs ?? Date.now());
+  });
+}
+
 export function approvePrdRevision(
   sessionDir: string,
   input: CreatePrdSealInput,

@@ -233,6 +233,34 @@ export function prepareLiveSessionMigration(
   return migration;
 }
 
+/** Rebind an already sealed migration to a compatible replacement runtime
+ * without recapturing session artifacts, salvage refs, or resume state. */
+export function deriveRepinnedLiveSessionMigration(
+  prior: InstalledRuntimeMigration,
+  targetRuntime: InstalledRuntimeDescriptor,
+  now = new Date(),
+): InstalledRuntimeMigration {
+  const { content_hash: priorContentHash, ...priorPayload } = prior;
+  if (priorContentHash !== sha256(canonicalize(priorPayload)) || prior.session_was_active !== true) {
+    throw new Error('Cannot repin an invalid or inactive sealed migration manifest.');
+  }
+  validateRuntime(prior.source_runtime, prior.session_schema);
+  validateRuntime(targetRuntime, prior.session_schema);
+  const payload = {
+    schema_version: LIVE_SESSION_MIGRATION_SCHEMA_VERSION as 1,
+    migration_id: crypto.randomUUID(),
+    source_runtime: prior.source_runtime,
+    target_runtime: targetRuntime,
+    session_schema: prior.session_schema,
+    session_was_active: true as const,
+    resume_checkpoint: prior.resume_checkpoint,
+    preserved_artifacts: prior.preserved_artifacts,
+    salvage_refs: prior.salvage_refs,
+    created_at: now.toISOString(),
+  };
+  return { ...payload, content_hash: sha256(canonicalize(payload)) };
+}
+
 export function verifyLiveSessionMigration(sessionDir: string, migration: InstalledRuntimeMigration): void {
   const { content_hash: contentHash, ...payload } = migration;
   if (contentHash !== sha256(canonicalize(payload))) throw new Error('Live session migration manifest hash mismatch.');
@@ -290,7 +318,7 @@ export function verifyLiveSessionMigrationDomainBoundary(
   }
   if (postSealJournal) {
     const logical = readLogicalPipeline(sessionDir);
-    const adoption = logical.events.find((event) => event.kind === 'legacy_session_adopted');
+    const adoption = [...logical.events].reverse().find((event) => event.kind === 'legacy_session_adopted');
     if (!adoption
       || adoption.details.migration_content_hash !== migration.content_hash
       || canonicalize(adoption.details.source_runtime) !== canonicalize(sourceRuntime)
