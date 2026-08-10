@@ -27,6 +27,11 @@ import type {
   RunSpawnedCommandOptions,
   SuccessCheckContext,
 } from '../types/index.js';
+import {
+  CONTROLLER_BROKER_FORCE_KILL_TIMEOUT_MS,
+  MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS,
+  POST_CLOSE_ATTESTATION_WINDOW_MS,
+} from './monitored-process-protocol.js';
 
 export class AddDirOutsideSandboxError extends Error {
   readonly addDir: string;
@@ -153,12 +158,6 @@ function processGroupAlive(pgid: number): boolean {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
-
-const BROKER_KILL_FALLBACK_MS = 3_000;
-const PROCESS_IDENTITY_PS_TIMEOUT_MS = 5_000;
-const POST_CLOSE_ATTESTATION_WINDOW_MS = BROKER_KILL_FALLBACK_MS
-  + (2 * PROCESS_IDENTITY_PS_TIMEOUT_MS);
-const MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS = 2;
 
 async function runSpawnedCommand({
   command,
@@ -357,11 +356,15 @@ async function runSpawnedCommand({
         },
       );
       if (fallbackTimer) clearTimeout(fallbackTimer);
+      // Do not let an expired controller timer run before a queued IPC ack and
+      // destroy the broker's authenticated ledger. The broker gets its full
+      // release/fallback budget first; this is only the final wedged-broker
+      // safeguard after that autonomous path should already have drained.
       fallbackTimer = setTimeout(() => {
         if (!shutdownAckObserved || processGroupAlive(brokerIdentity?.pgid || 0)) {
           signalAttestedGroup('SIGKILL');
         }
-      }, BROKER_KILL_FALLBACK_MS);
+      }, CONTROLLER_BROKER_FORCE_KILL_TIMEOUT_MS);
       fallbackTimer.unref?.();
     };
 
@@ -714,7 +717,8 @@ async function runSpawnedCommand({
         }
         const attestedGroups = new Set([brokerIdentity?.pgid,
           ...descendantIdentities.map((identity) => identity.pgid)].filter((pgid): pgid is number => Boolean(pgid)));
-        const groupsAbsent = [...attestedGroups].every((pgid) => !processGroupAlive(pgid));
+        const groupLiveness = [...attestedGroups].map((pgid) => ({ pgid, alive: processGroupAlive(pgid) }));
+        const groupsAbsent = groupLiveness.every(({ alive }) => !alive);
         const identitiesAbsent = brokerLiveness === 'not-running' && targetLiveness === 'not-running'
           && descendantLiveness.every((liveness) => liveness === 'not-running');
         if (shutdownAckObserved && identitiesAbsent && groupsAbsent && !protocolFailure
@@ -746,6 +750,24 @@ async function runSpawnedCommand({
         const outputFormat = detectOutputFormat(stdout);
         const usage = inspectCodexUsage(stdout);
         const unattestedBrokerClose = controlsArmed && !brokerDrainAttested;
+        const drainFailureDiagnostic = unattestedBrokerClose ? JSON.stringify({
+          shutdown_ack_observed: shutdownAckObserved,
+          launch_attested: launchAttested,
+          release_attested: releaseAttested,
+          broker_identity_persisted: Boolean(brokerIdentity),
+          target_identity_persisted: Boolean(targetIdentity),
+          broker_liveness: brokerLiveness,
+          target_liveness: targetLiveness,
+          descendant_liveness: descendantLiveness,
+          group_liveness: groupLiveness,
+          protocol_failure: protocolFailure || null,
+          shutdown_delivery_failure: shutdownDeliveryFailure || null,
+          shutdown_release_delivery_failure: shutdownReleaseDeliveryFailure || null,
+          target_outcome: targetOutcome,
+          broker_close: { code, signal },
+          termination_cause: terminationCause,
+          attestation_observations: attestationObservations,
+        }) : '';
         const naturalExitCode = targetOutcome?.code ?? (targetOutcome?.signal ? 1 : (code ?? (signal ? 1 : 0)));
         const result: Omit<CodexSpawnResult, 'command' | 'args'> = {
           exitCode: terminationCause === 'cancel'
@@ -760,6 +782,7 @@ async function runSpawnedCommand({
           stdout,
           stderr: [stderr, protocolFailure,
             unattestedBrokerClose ? 'Monitored process broker closed without an exact quiescent target attestation.' : '',
+            drainFailureDiagnostic ? `Monitored process drain diagnostic: ${drainFailureDiagnostic}` : '',
             !brokerDrainAttested ? shutdownReleaseDeliveryFailure : '',
             targetPublicationError?.message || '',
           ].filter(Boolean).join('\n'),

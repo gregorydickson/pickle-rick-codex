@@ -8,6 +8,7 @@ import {
   inspectProcessLivenessIdentity,
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
+import { BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS } from '../services/monitored-process-protocol.js';
 
 interface LaunchRequest {
   type: 'launch';
@@ -38,6 +39,8 @@ const descendantCandidates = new Map<number, { identity: PersistedProcessIdentit
 let descendantTracker: NodeJS.Timeout | null = null;
 let shutdownGraceMs = 500;
 let shutdownExecuting = false;
+let terminationSignaled = false;
+let shutdownReleaseTimer: NodeJS.Timeout | null = null;
 
 const registrationDeadline = setTimeout(() => fail('Monitored process broker registration timed out.'), 30_000);
 
@@ -165,12 +168,20 @@ function signalOwnedGroups(signal: NodeJS.Signals): void {
   }
 }
 
-function executeShutdown(): void {
-  if (shutdownExecuting) return;
-  shutdownExecuting = true;
+function signalTermination(): void {
+  if (terminationSignaled) return;
+  terminationSignaled = true;
   if (descendantTracker) clearInterval(descendantTracker);
   discoverDescendants();
   signalOwnedGroups('SIGTERM');
+}
+
+function executeShutdown(): void {
+  if (shutdownExecuting) return;
+  shutdownExecuting = true;
+  if (shutdownReleaseTimer) clearTimeout(shutdownReleaseTimer);
+  shutdownReleaseTimer = null;
+  signalTermination();
   const killTimer = setTimeout(() => signalOwnedGroups('SIGKILL'), shutdownGraceMs);
   killTimer.ref?.();
 }
@@ -193,13 +204,27 @@ function beginShutdown(cause: string, graceMs: number): void {
     target_signal: targetSignal,
     descendant_identities: [...descendantIdentities.values()],
   };
-  // Flush the authenticated ledger into the IPC channel before killing this
-  // broker's process group. A wall-clock fallback can fire while a healthy but
-  // load-starved controller has not consumed the acknowledgement, turning a
-  // successful fast target into an unattested close. The send completion is
-  // the semantic boundary: accepted bytes survive broker exit; disconnect
-  // below still drains the tree if the controller is actually gone.
-  send(acknowledgement, () => executeShutdown());
+  // Accepted IPC bytes do not prove that the controller consumed and durably
+  // persisted this ledger. Stay alive until its identity-bound
+  // `shutdown_release` proves receipt. The target tree receives TERM once the
+  // ack is flushed so it cannot keep working while a healthy controller is
+  // scheduler-starved, but the broker remains alive as the durable ledger.
+  // Disconnect drains immediately; a connected-but-wedged controller gets the
+  // bounded autonomous fallback below.
+  send(acknowledgement, (error) => {
+    if (error) {
+      executeShutdown();
+      return;
+    }
+    if (shutdownExecuting) return;
+    signalTermination();
+    shutdownReleaseTimer = setTimeout(() => {
+      shutdownCause = `${shutdownCause}-controller-release-timeout`;
+      process.stderr.write(`Monitored process broker autonomous fallback: ${shutdownCause}\n`);
+      executeShutdown();
+    }, BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS);
+    shutdownReleaseTimer.ref?.();
+  });
 }
 
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as NodeJS.Signals[]) {

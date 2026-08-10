@@ -10,6 +10,7 @@ import {
   inspectProcessLivenessIdentity,
 } from '../services/orphan-reaper.js';
 import { recoverMonitoredProcessOwnership } from '../services/monitored-process-ownership.js';
+import { BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS } from '../services/monitored-process-protocol.js';
 import { StateManager } from '../services/state-manager.js';
 import { makeTempRoot, repoRoot, waitFor, writeExecutable } from './helpers.js';
 
@@ -267,10 +268,43 @@ test('direct target exit still reaps a stubborn descendant and reports the targe
   assert.equal(acknowledgement.cause, 'target-exit');
   assert.equal(acknowledgement.target_exit_code, 23);
   assert.equal(acknowledgement.target_signal, null);
+  // Pipe-write acceptance is not controller receipt. The broker must retain
+  // its authenticated ledger until the controller sends shutdown_release;
+  // otherwise a load-starved controller can observe close before the ack.
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.equal(inspectProcessLivenessIdentity(launched.broker_identity), 'matched');
+  assert.ok(appendJsonLines(fixture.env.SIGNAL_LOG).some(({ role, signal }) => (
+    role === 'descendant' && signal === 'SIGTERM'
+  )), 'the target tree begins termination while the broker retains its durable ledger');
   await send(run.child, {
     type: 'shutdown_release', launch_id: fixture.launchId, command_digest: fixture.digest,
   });
   await run.closed;
+  await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+    tree.target.identity, tree.descendant.identity);
+});
+
+test('connected controller that never releases shutdown falls back after the full attestation budget', {
+  timeout: BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS + 15_000,
+}, async (t) => {
+  const root = makeTempRoot('pickle-broker-wedged-controller-');
+  const run = startBroker(t);
+  const fixture = launchFixture(run, root, { MODE: 'direct-exit', CLOSE_STDIO: '0' });
+  await send(run.child, fixture.request);
+  const launched = await waitForMessage(run, 'launched');
+  await send(run.child, {
+    type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  await waitForMessage(run, 'released');
+  const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+  await waitFor(() => fs.existsSync(fixture.env.SUCCESS_ARTIFACT), { timeoutMs: 10_000 });
+  fs.writeFileSync(fixture.env.RELEASE_GATE, 'exit\n');
+
+  const acknowledgement = await waitForMessage(run, 'shutdown_ack');
+  assert.equal(acknowledgement.cause, 'target-exit');
+  assert.equal(inspectProcessLivenessIdentity(launched.broker_identity), 'matched');
+  await run.closed;
+  assert.match(run.stderr(), /controller-release-timeout/);
   await assertTreeAbsent(launched.broker_identity, launched.target_identity,
     tree.target.identity, tree.descendant.identity);
 });
