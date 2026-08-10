@@ -88,8 +88,10 @@ function quarantine(
 
 /**
  * Remove only the immutable tmux session/pane binding persisted by its launcher.
- * The recorded pane is inspected twice while the state lock is held. A name is
- * diagnostic metadata only; it is never used as a destructive target.
+ * The recorded pane is inspected twice while the state lock is held. The lock
+ * is released before signaling because this cleanup process may itself belong
+ * to the killed tmux session. A name is diagnostic metadata only; it is never
+ * used as a destructive target.
  */
 export function cleanupTerminalTmuxSession(
   sessionDir: string,
@@ -99,6 +101,7 @@ export function cleanupTerminalTmuxSession(
   const statePath = path.join(resolvedSessionDir, 'state.json');
   const stateManager = options.stateManager || new StateManager();
   stateManager.acquireLock(statePath);
+  let lockHeld = true;
   try {
     const state = stateManager.read(statePath);
     const sessionName = typeof state.tmux_session_name === 'string' && state.tmux_session_name
@@ -161,9 +164,11 @@ export function cleanupTerminalTmuxSession(
     }
 
     recordCleanup(state, statePath, 'cleaned', 'terminal immutable tmux session cleanup requested', at);
+    stateManager.releaseLock(statePath);
+    lockHeld = false;
     (options.killSessionId || killTmuxSessionById)(binding.session_id);
     return { status: 'cleaned', sessionName, reason: 'terminal immutable tmux session removed' };
   } finally {
-    stateManager.releaseLock(statePath);
+    if (lockHeld) stateManager.releaseLock(statePath);
   }
 }

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +59,22 @@ export interface AutonomousOwnerSpec {
   runner_sha256?: string;
   node_path?: string;
   node_sha256?: string;
+}
+
+export interface AutonomousSupervisorReadyReceipt {
+  schema_version: 1;
+  receipt_id: string;
+  owner_spec_id: string;
+  supervisor_identity: PersistedProcessIdentity;
+  node_path: string;
+  supervisor_path: string;
+  working_dir: string;
+  session_dir: string;
+  runner_bin: string;
+  runner_args: string[];
+  recovery_daemon_identity: PersistedProcessIdentity | null;
+  adoption_challenge: string | null;
+  ready_at: string;
 }
 
 interface CancellationRecoveryRuntimeBinding {
@@ -453,6 +469,7 @@ export function registerAutonomousOwnerSpec(
       if (!current.cancel_requested_at && current.last_exit_reason !== 'cancelled') {
         current.autonomous_supervisor_pid = process.pid;
         current.autonomous_supervisor_identity = currentSupervisorIdentity;
+        current.autonomous_supervisor_ready_receipt = null;
         const restoration = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
         if (restoration?.status === 'restoring'
           && restoration.owner_spec_id === processSpec.spec_id
@@ -511,6 +528,7 @@ export function registerAutonomousOwnerSpec(
       if (!current.cancel_requested_at && current.last_exit_reason !== 'cancelled') {
         current.autonomous_supervisor_pid = process.pid;
         current.autonomous_supervisor_identity = currentSupervisorIdentity;
+        current.autonomous_supervisor_ready_receipt = null;
       }
       return current;
     });
@@ -547,6 +565,7 @@ export function registerAutonomousOwnerSpec(
     if (!current.cancel_requested_at && current.last_exit_reason !== 'cancelled') {
       current.autonomous_supervisor_pid = process.pid;
       current.autonomous_supervisor_identity = currentSupervisorIdentity;
+      current.autonomous_supervisor_ready_receipt = null;
     }
     return current;
   });
@@ -597,6 +616,178 @@ export function authenticateProcessOwnerRuntime(spec: AutonomousOwnerSpec): {
       { cause: error },
     );
   }
+}
+
+function supervisorReadyReceiptId(
+  receipt: Omit<AutonomousSupervisorReadyReceipt, 'receipt_id'>,
+): string {
+  return crypto.createHash('sha256').update(JSON.stringify(receipt)).digest('hex');
+}
+
+function liveParentPid(pid: number): number | null {
+  try {
+    const match = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').match(/^\d+ \(.*\) \S (\d+) /);
+    const parent = Number(match?.[1]);
+    if (Number.isInteger(parent) && parent > 0) return parent;
+  } catch { /* macOS uses numeric ps metadata below */ }
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'ppid='], {
+    encoding: 'utf8', timeout: 5_000,
+  });
+  const parent = Number(result.stdout.trim());
+  return result.status === 0 && Number.isInteger(parent) && parent > 0 ? parent : null;
+}
+
+export interface ProcessLivenessTopologyObservation {
+  supervisor: 'not-running' | 'matched' | 'reused';
+  recoveryDaemon: 'not-running' | 'matched' | 'reused';
+  supervisorParentPid: number | null;
+}
+
+export interface ProcessLivenessTopologyDependencies {
+  inspect?: typeof inspectProcessLivenessIdentity;
+  parentPid?: (pid: number) => number | null;
+}
+
+/**
+ * Observe the adoption recovery topology with one probe per fact. Parentage is
+ * sampled first, then both immutable identities are validated against that
+ * sample. A PID reuse after the parent sample is therefore rejected by the
+ * final identity probes without repeating the expensive process inspections.
+ */
+export function observeProcessLivenessTopology(
+  supervisor: PersistedProcessIdentity,
+  recoveryDaemon: PersistedProcessIdentity,
+  dependencies: ProcessLivenessTopologyDependencies = {},
+): ProcessLivenessTopologyObservation {
+  const inspect = dependencies.inspect || inspectProcessLivenessIdentity;
+  const supervisorParentPid = (dependencies.parentPid || liveParentPid)(supervisor.pid);
+  const daemonState = inspect(recoveryDaemon);
+  const supervisorState = inspect(supervisor);
+  return {
+    supervisor: supervisorState,
+    recoveryDaemon: daemonState,
+    supervisorParentPid,
+  };
+}
+
+function sealAutonomousSupervisorReadyReceipt(
+  receipt: Omit<AutonomousSupervisorReadyReceipt, 'receipt_id'>,
+): AutonomousSupervisorReadyReceipt {
+  return { ...receipt, receipt_id: supervisorReadyReceiptId(receipt) };
+}
+
+function validSupervisorReadyReceipt(value: unknown): AutonomousSupervisorReadyReceipt | null {
+  const receipt = value as AutonomousSupervisorReadyReceipt | null;
+  if (!receipt || receipt.schema_version !== 1 || !/^[a-f0-9]{64}$/.test(String(receipt.receipt_id || ''))
+    || typeof receipt.owner_spec_id !== 'string' || !isPersistedProcessIdentityValid(receipt.supervisor_identity)
+    || typeof receipt.node_path !== 'string' || typeof receipt.supervisor_path !== 'string'
+    || typeof receipt.working_dir !== 'string' || typeof receipt.session_dir !== 'string'
+    || typeof receipt.runner_bin !== 'string' || !Array.isArray(receipt.runner_args)
+    || !receipt.runner_args.every((argument) => typeof argument === 'string')
+    || (receipt.recovery_daemon_identity !== null
+      && !isPersistedProcessIdentityValid(receipt.recovery_daemon_identity))
+    || (receipt.adoption_challenge !== null && typeof receipt.adoption_challenge !== 'string')
+    || !Number.isFinite(Date.parse(receipt.ready_at))) return null;
+  const unsigned = { ...receipt } as Omit<AutonomousSupervisorReadyReceipt, 'receipt_id'> & { receipt_id?: string };
+  delete unsigned.receipt_id;
+  return supervisorReadyReceiptId(unsigned) === receipt.receipt_id ? receipt : null;
+}
+
+export function publishAutonomousSupervisorReadyReceipt(
+  sessionDir: string,
+  spec: AutonomousOwnerSpec,
+  runnerBin: string,
+  runnerArgs: string[],
+  supervisorPath: string,
+  stateManager: StateManager = new StateManager(),
+): AutonomousSupervisorReadyReceipt {
+  const runtime = authenticateProcessOwnerRuntime(spec);
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const identity = captureProcessLivenessIdentity(process.pid);
+  const before = stateManager.read(getStatePath(resolvedSessionDir));
+  const challenge = typeof before.legacy_adoption_supervisor_challenge === 'string'
+    ? before.legacy_adoption_supervisor_challenge : null;
+  const recoveryDaemon = challenge !== null
+    && isPersistedProcessIdentityValid(before.autonomous_owner_recovery_daemon_identity)
+    ? before.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity : null;
+  const expectedArgv = [resolvedSessionDir, `--runner-bin=${runnerBin}`, ...runnerArgs];
+  if (!identity || resolvedSessionDir !== spec.session_dir
+    || fs.realpathSync(process.execPath) !== runtime.nodePath
+    || !process.argv[1] || fs.realpathSync(process.argv[1]) !== runtime.supervisorPath
+    || JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expectedArgv)
+    || fs.realpathSync(supervisorPath) !== runtime.supervisorPath
+    || fs.realpathSync(process.cwd()) !== runtime.workingDir
+    || runnerBin !== spec.runner_bin || JSON.stringify(runnerArgs) !== JSON.stringify(spec.runner_args)
+    || (challenge !== null && (!recoveryDaemon || process.ppid !== recoveryDaemon.pid
+      || identity.pgid !== identity.pid || inspectProcessLivenessIdentity(recoveryDaemon) !== 'matched'))) {
+    throw new Error('Refusing to publish autonomous supervisor readiness from a mismatched live process contract.');
+  }
+  const receipt = sealAutonomousSupervisorReadyReceipt({
+    schema_version: 1, owner_spec_id: spec.spec_id, supervisor_identity: identity,
+    node_path: runtime.nodePath, supervisor_path: runtime.supervisorPath, working_dir: runtime.workingDir,
+    session_dir: resolvedSessionDir, runner_bin: runnerBin, runner_args: [...runnerArgs],
+    recovery_daemon_identity: recoveryDaemon, adoption_challenge: challenge,
+    ready_at: new Date().toISOString(),
+  });
+  stateManager.update(getStatePath(resolvedSessionDir), (current) => {
+    const exactSpec = ownerSpec(current.autonomous_owner_spec);
+    const currentChallenge = typeof current.legacy_adoption_supervisor_challenge === 'string'
+      ? current.legacy_adoption_supervisor_challenge : null;
+    const currentDaemon = challenge !== null
+      && isPersistedProcessIdentityValid(current.autonomous_owner_recovery_daemon_identity)
+      ? current.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity : null;
+    if (!exactSpec || exactSpec.spec_id !== spec.spec_id
+      || Number(current.autonomous_supervisor_pid) !== identity.pid
+      || JSON.stringify(current.autonomous_supervisor_identity) !== JSON.stringify(identity)
+      || currentChallenge !== challenge
+      || JSON.stringify(currentDaemon) !== JSON.stringify(recoveryDaemon)) {
+      throw new Error('Refusing to publish autonomous supervisor readiness after its owner fence changed.');
+    }
+    current.autonomous_supervisor_ready_receipt = receipt;
+    return current;
+  });
+  return receipt;
+}
+
+export function authenticatedReadyProcessOwner(
+  sessionDir: string,
+  state: Record<string, unknown>,
+  expectedRecoveryDaemon: PersistedProcessIdentity | null = null,
+  expectedAdoptionChallenge: string | null = null,
+  requireCurrentAdoptionChallenge = true,
+  observeTopology: typeof observeProcessLivenessTopology = observeProcessLivenessTopology,
+): PersistedProcessIdentity | null {
+  const spec = ownerSpec(state.autonomous_owner_spec);
+  const receipt = validSupervisorReadyReceipt(state.autonomous_supervisor_ready_receipt);
+  const identity = state.autonomous_supervisor_identity as PersistedProcessIdentity | null;
+  if (!spec || spec.owner_mode !== 'process' || !receipt || !isPersistedProcessIdentityValid(identity)
+    || Number(state.autonomous_supervisor_pid) !== identity.pid
+    || JSON.stringify(receipt.supervisor_identity) !== JSON.stringify(identity)
+    || receipt.owner_spec_id !== spec.spec_id || receipt.node_path !== spec.node_path
+    || receipt.supervisor_path !== spec.supervisor_path || receipt.working_dir !== spec.working_dir
+    || receipt.session_dir !== spec.session_dir || receipt.runner_bin !== spec.runner_bin
+    || JSON.stringify(receipt.runner_args) !== JSON.stringify(spec.runner_args)
+    || JSON.stringify(receipt.recovery_daemon_identity) !== JSON.stringify(expectedRecoveryDaemon)
+    || receipt.adoption_challenge !== expectedAdoptionChallenge
+    || (expectedRecoveryDaemon
+      && JSON.stringify(state.autonomous_owner_recovery_daemon_identity) !== JSON.stringify(expectedRecoveryDaemon))
+    || (expectedRecoveryDaemon && Number(state.autonomous_owner_recovery_daemon_pid) !== expectedRecoveryDaemon.pid)
+    || (requireCurrentAdoptionChallenge
+      && (typeof state.legacy_adoption_supervisor_challenge === 'string'
+        ? state.legacy_adoption_supervisor_challenge : null) !== expectedAdoptionChallenge)) return null;
+  try {
+    if (fs.realpathSync(sessionDir) !== spec.session_dir) return null;
+    authenticateProcessOwnerRuntime(spec);
+  } catch { return null; }
+  if (!expectedRecoveryDaemon) {
+    if (inspectProcessLivenessIdentity(identity) !== 'matched') return null;
+    return identity;
+  }
+  const topology = observeTopology(identity, expectedRecoveryDaemon);
+  if (topology.supervisor !== 'matched' || topology.recoveryDaemon !== 'matched'
+    || identity.pgid !== identity.pid
+    || topology.supervisorParentPid !== expectedRecoveryDaemon.pid) return null;
+  return identity;
 }
 
 export function restoreAutonomousBudgetOwner(
@@ -709,6 +900,7 @@ export function restoreAutonomousBudgetOwner(
         if (cancelled || intent?.intent_id !== intentId || intent.restorer_pid !== process.pid) return current;
         current.autonomous_supervisor_pid = launchedProcessIdentity?.pid ?? null;
         current.autonomous_supervisor_identity = launchedProcessIdentity;
+        current.autonomous_supervisor_ready_receipt = null;
         current.autonomous_owner_restoration = {
           ...intent,
           status: 'restored',
@@ -1005,6 +1197,7 @@ export function transferAutonomousOwnerRecoveryForAcceptedHandoff(
     current.autonomous_owner_restoration = null;
     current.autonomous_supervisor_pid = supervisorIdentity.pid;
     current.autonomous_supervisor_identity = supervisorIdentity;
+    current.autonomous_supervisor_ready_receipt = null;
     current.autonomous_owner_recovery_suspended = false;
     current.autonomous_owner_recovery_suspended_for_handoff = null;
     if (transaction?.status === 'fenced') {
@@ -1262,6 +1455,7 @@ export function reconcileAutonomousOwnerHandoffTransaction(
       current.autonomous_owner_spec = exact.target_owner_spec;
       current.autonomous_supervisor_pid = exact.target_supervisor_pid;
       current.autonomous_supervisor_identity = exact.target_supervisor_identity;
+      current.autonomous_supervisor_ready_receipt = null;
       current.autonomous_owner_restoration = null;
       current.autonomous_owner_recovery_suspended = false;
       current.autonomous_owner_recovery_suspended_for_handoff = null;
@@ -1287,6 +1481,7 @@ export function reconcileAutonomousOwnerHandoffTransaction(
       current.autonomous_owner_spec = exact.source_owner_spec;
       current.autonomous_supervisor_pid = exact.source_supervisor_pid;
       current.autonomous_supervisor_identity = exact.source_supervisor_identity;
+      current.autonomous_supervisor_ready_receipt = null;
       current.autonomous_owner_restoration = null;
       current.autonomous_owner_recovery_suspended = false;
       current.autonomous_owner_recovery_suspended_for_handoff = null;

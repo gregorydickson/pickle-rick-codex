@@ -64,6 +64,7 @@ import {
   validateCitadelRecoveryEvidence,
   type CitadelRecoveryAuthority,
 } from './citadel.js';
+import { modernOwnershipEvidence } from './modern-ownership-evidence.js';
 
 export interface SessionResult {
   sessionDir: string;
@@ -691,9 +692,11 @@ function legacyMaxTimeMigrationEvidence(
   state: PersistedState,
   resolvedSessionDir: string,
 ): LegacyMaxTimeMigrationEvidence | null {
+  const legacyPidIsEmpty = (value: unknown): boolean => value === null || value === undefined || value === 0;
   if (state.active !== false || state.step !== 'paused' || state.last_exit_reason !== 'max_time'
-    || state.cancel_requested_at || state.cancelled === true || state.recovery_required === true
-    || Number(state.orphan_child_pid || 0) > 0 || Number(state.active_child_pid || 0) > 0
+    || modernOwnershipEvidence(state).length > 0
+    || !legacyPidIsEmpty(state.active_child_pid) || !legacyPidIsEmpty(state.worker_pid)
+    || !legacyPidIsEmpty(state.tmux_runner_pid)
     || state.autonomous_budget_rollover_intent_id || state.autonomous_budget_rollover_checkpoint_pending
     || state.autonomous_owner_restoration || state.legacy_max_time_migration
     || state.completed_at) return null;
@@ -820,13 +823,18 @@ function reconcileSessionLivenessInternal(
 ): { state: PersistedState; stale: boolean } {
   const resolvedSessionDir = fs.realpathSync(sessionDir);
   const statePath = getStatePath(resolvedSessionDir);
+  let state = stateManager.read(statePath);
+  const legacyMaxTimeCandidate = state.active === false && state.step === 'paused'
+    && state.last_exit_reason === 'max_time' && !state.legacy_max_time_migration;
+  if (options.allowLegacyMaxTimeMigration && legacyMaxTimeCandidate
+    && modernOwnershipEvidence(state).length > 0) return { state, stale: false };
   if (options.allowLegacyMaxTimeMigration) {
     // A process may have died after writing one half of the state/logical bootstrap.
     // Recover the durable reverse journal before interpreting either file. The
     // transaction primitive preserves cancellation requests that raced prepare.
     recoverInterruptedTicketTransaction(resolvedSessionDir);
+    state = stateManager.read(statePath);
   }
-  let state = stateManager.read(statePath);
   const rolloverIntentId = typeof state.autonomous_budget_rollover_intent_id === 'string'
     ? state.autonomous_budget_rollover_intent_id : '';
   const hasPersistedRolloverEpoch = state.autonomous_budget_epoch !== undefined
@@ -1242,8 +1250,9 @@ export function reconcileSessionLiveness(
   sessionDir: string,
   stateManager: StateManager = new StateManager(),
   nowMs: number = Date.now(),
+  options: ReconcileSessionLivenessOptions = {},
 ): { state: PersistedState; stale: boolean } {
-  return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs);
+  return reconcileSessionLivenessInternal(sessionDir, stateManager, nowMs, options);
 }
 
 export function reconcileAllSessionLiveness(): Array<{ sessionDir: string; reason: string; state: PersistedState }> {

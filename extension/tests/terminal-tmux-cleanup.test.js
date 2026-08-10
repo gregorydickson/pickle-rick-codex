@@ -139,11 +139,11 @@ test('terminal cleanup excludes successful and explicitly cancelled non-durable 
   }
 });
 
-test('terminal cleanup holds the state lock through recheck and immutable kill', () => {
+test('terminal cleanup releases the state lock before a self-terminating immutable kill', () => {
   const sessionDir = makeTempRoot('pickle-tmux-atomic-');
   const binding = terminalSession(sessionDir);
   const manager = new StateManager();
-  let lockHeldDuringKill = false;
+  let lockHeldDuringKill = true;
   const originalAcquire = manager.acquireLock.bind(manager);
   const originalRelease = manager.releaseLock.bind(manager);
   let held = false;
@@ -155,5 +155,17 @@ test('terminal cleanup holds the state lock through recheck and immutable kill',
     killSessionId: () => { lockHeldDuringKill = held; },
   });
   assert.equal(result.status, 'cleaned');
-  assert.equal(lockHeldDuringKill, true);
+  assert.equal(lockHeldDuringKill, false);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'state.json.lock')), false);
+});
+
+test('terminal cleanup cannot strand the state lock when immutable kill terminates abruptly', () => {
+  const sessionDir = makeTempRoot('pickle-tmux-kill-crash-');
+  const binding = terminalSession(sessionDir);
+  assert.throws(() => cleanupTerminalTmuxSession(sessionDir, {
+    readBinding: () => binding,
+    killSessionId: () => { throw new Error('simulated self-termination'); },
+  }), /simulated self-termination/);
+  assert.equal(fs.existsSync(path.join(sessionDir, 'state.json.lock')), false);
+  new StateManager({ acquireTimeoutMs: 50 }).update(path.join(sessionDir, 'state.json'), (state) => state);
 });

@@ -32,12 +32,21 @@ import { readManifest, updateTicketStatus } from '../services/tickets.js';
 import { restoreRejectedCandidateCheckpoint } from '../services/candidate-recovery.js';
 import { chooseLegacyLaunchRuntime } from '../bin/adopt-legacy-session.js';
 import { runSequential } from '../bin/mux-runner.js';
+import { adoptionSupervisorProvenanceReady } from '../bin/supervised-runner.js';
 import { describeInstalledRuntime, runtimeBuildHash } from '../services/runtime-descriptor.js';
 import { getWorkingTreeContentFingerprint, listUntrackedFiles } from '../services/git-utils.js';
 import { prepareLiveSessionMigration } from '../services/live-session-migration.js';
 import { persistCitadelReleaseApproval } from '../services/citadel.js';
 import { acquireLaunchLock } from '../services/detached-launch.js';
 import { readAdoptionWatchDomainEvidence } from '../services/adoption-watch-strategies.js';
+import { captureProcessLivenessIdentity } from '../services/orphan-reaper.js';
+import { legacyAdoptionOutcome } from '../services/legacy-adoption-executor-supervisor.js';
+import { validCommittedLegacyAdoptionTransfer } from '../services/legacy-adoption-transfer-proof.js';
+import { StateManager } from '../services/state-manager.js';
+import {
+  authenticatedReadyProcessOwner,
+  deriveAutonomousProcessOwnerSpec,
+} from '../services/autonomous-owner-recovery.js';
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -71,6 +80,8 @@ function runtime(label) {
     fs.writeFileSync(path.join(root, relative, 'runtime.js'), `// ${label}:${relative}\n`);
   }
   fs.writeFileSync(path.join(root, 'extension', 'bin', 'mux-runner.js'), `// ${label}:mux\n`);
+  fs.writeFileSync(path.join(root, 'extension', 'bin', 'supervised-runner.js'),
+    `// ${label}:supervisor\nsetInterval(() => {}, 1000);\n`);
   fs.writeFileSync(path.join(root, 'install.sh'), `#!/bin/sh\n# ${label}\n`);
   writeJson(path.join(root, 'package.json'), { name: 'pickle-rick-codex', version: '0.2.17-beta.3' });
   writeJson(path.join(root, 'extension', 'package.json'), { name: 'pickle-rick-codex-extension', version: '0.2.17-beta.3' });
@@ -80,6 +91,62 @@ function runtime(label) {
 
 function identity(pid) {
   return { pid, pgid: pid, start_time: `start-${pid}`, fingerprint: `fingerprint-${pid}` };
+}
+
+function modernOwnershipEvidenceCases() {
+  return [
+    ['controller-pid', { active_child_controller_pid: 7001 }],
+    ['controller-identity', { active_child_controller_identity: identity(7001) }],
+    ['active-ledger', { active_child_identities: [identity(7002)] }],
+    ['malformed-active-ledger', { active_child_identities: {} }],
+    ['refinement-ledger', { refinement_child_identities: [identity(7003)] }],
+    ['malformed-refinement-ledger', { refinement_child_identities: 'corrupt' }],
+    ['supervisor-pid', { autonomous_supervisor_pid: 7004 }],
+    ['malformed-supervisor-pid', { autonomous_supervisor_pid: '0' }],
+    ['supervisor-identity', { autonomous_supervisor_identity: identity(7004) }],
+    ['supervisor-ready-receipt', { autonomous_supervisor_ready_receipt: { receipt_id: 'modern-ready' } }],
+    ['owner-spec', { autonomous_owner_spec: { spec_id: 'modern-owner' } }],
+    ['owner-restoration', { autonomous_owner_restoration: { status: 'pending' } }],
+    ['owner-handoff', { autonomous_owner_handoff_transaction: { status: 'prepared' } }],
+    ['recovery-daemon-pid', { autonomous_owner_recovery_daemon_pid: 7005 }],
+    ['recovery-daemon-identity', { autonomous_owner_recovery_daemon_identity: identity(7005) }],
+    ['watchdog-pid', { cancellation_recovery_watchdog_pid: 7006 }],
+    ['watchdog-identity', { cancellation_recovery_watchdog_identity: identity(7006) }],
+    ['watchdog-arm-id', { cancellation_recovery_watchdog_arm_id: 'arm-1' }],
+    ['watchdog-arm', { cancellation_recovery_watchdog_arm: { arm_id: 'arm-1' } }],
+    ['recovery-runtime-binding', { cancellation_recovery_runtime_binding: { runtime_root: '/runtime' } }],
+    ['cancellation-recovery', { cancellation_recovery: { status: 'pending' } }],
+    ['recovery-required', { recovery_required: true }],
+    ['malformed-recovery-required', { recovery_required: 'false' }],
+    ['recovery-kind', { recovery_kind: 'cancellation_ownership' }],
+    ['recovery-reason', { recovery_reason: 'pending ownership recovery' }],
+    ['orphan-recovery', { orphan_recovery: { status: 'ambiguous' } }],
+    ['orphan-child', { orphan_child_pid: 7007 }],
+    ['malformed-zero-orphan-child', { orphan_child_pid: '0' }],
+    ['recovery-suspended', { autonomous_owner_recovery_suspended: true }],
+    ['malformed-recovery-suspended', { autonomous_owner_recovery_suspended: 'false' }],
+    ['handoff-suspended', { autonomous_owner_recovery_suspended_for_handoff: 'handoff-1' }],
+    ['cancel-requested', { cancel_requested_at: '2026-08-10T00:00:00.000Z' }],
+    ['cancelled-flag', { cancelled: true }],
+    ['cancelled-exit', { last_exit_reason: 'cancelled' }],
+    ['manager-relaunch-epoch', { manager_relaunch_recovery_epoch: 2 }],
+    ['malformed-manager-relaunch-epoch', { manager_relaunch_recovery_epoch: '0' }],
+    ['manager-relaunch-route', { manager_relaunch_recovery_route: 'fenced_executor_takeover' }],
+    ['manager-relaunch-status', { manager_relaunch_recovery_status: 'active' }],
+    ['manager-relaunch-activated', { manager_relaunch_recovery_activated_at: '2026-08-10T00:00:00.000Z' }],
+    ['manager-relaunch-consumed', { manager_relaunch_recovery_consumed_at: '2026-08-10T00:00:00.000Z' }],
+    ['artifact-contract-recovery', { artifact_contract_recovery: { status: 'pending' } }],
+    ['budget-rollover-intent', { autonomous_budget_rollover_intent_id: 'rollover-1' }],
+    ['budget-rollover-checkpoint', { autonomous_budget_rollover_checkpoint_pending: { intent_id: 'rollover-1' } }],
+    ['budget-consumed-intent', { autonomous_budget_consumed_intent_id: 'rollover-1' }],
+    ['budget-consumed-checkpoint', { autonomous_budget_consumed_checkpoint_pending: { intent_id: 'rollover-1' } }],
+    ['budget-checkpoint-error', { autonomous_budget_checkpoint_error: 'checkpoint transport failed' }],
+    ['legacy-adoption-challenge', { legacy_adoption_supervisor_challenge: 'challenge-1' }],
+  ];
+}
+
+function byteSnapshot(paths) {
+  return paths.map((file) => fs.existsSync(file) ? fs.readFileSync(file) : null);
 }
 
 function fixture(options = {}) {
@@ -214,6 +281,67 @@ function depsFor(value, actions = []) {
   };
 }
 
+function writeRestoredRecoverySupervisor(statePath, owner, ready = true) {
+  new StateManager().update(statePath, (state) => {
+    const spec = state.autonomous_owner_spec;
+    state.autonomous_supervisor_pid = owner.pid;
+    state.autonomous_supervisor_identity = owner;
+    state.autonomous_owner_restoration = {
+      schema_version: 1, intent_id: 'accepted-test-restoration',
+      rollover_intent_id: state.autonomous_budget_rollover_intent_id,
+      rollover_epoch: Math.max(1, Number(state.autonomous_budget_epoch || 1)),
+      owner_spec_id: spec.spec_id, status: 'restored', attempt: 1,
+      not_before: '2026-08-08T20:00:00.000Z', restorer_pid: null, restorer_identity: null,
+    };
+    if (ready) {
+      const unsignedReceipt = {
+        schema_version: 1, owner_spec_id: spec.spec_id, supervisor_identity: owner,
+        node_path: spec.node_path, supervisor_path: spec.supervisor_path, working_dir: spec.working_dir,
+        session_dir: spec.session_dir, runner_bin: spec.runner_bin, runner_args: [...spec.runner_args],
+        recovery_daemon_identity: state.legacy_adoption_supervisor_challenge
+          ? state.autonomous_owner_recovery_daemon_identity || null : null,
+        adoption_challenge: state.legacy_adoption_supervisor_challenge || null,
+        ready_at: '2026-08-08T20:00:00.000Z',
+      };
+      state.autonomous_supervisor_ready_receipt = {
+        ...unsignedReceipt, receipt_id: sha256(JSON.stringify(unsignedReceipt)),
+      };
+    }
+    return state;
+  });
+  return owner;
+}
+
+function publishTestRecoveryDaemon(statePath) {
+  const daemon = captureProcessLivenessIdentity(process.pid);
+  assert.ok(daemon);
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_owner_recovery_daemon_pid = daemon.pid;
+    state.autonomous_owner_recovery_daemon_identity = daemon;
+    return state;
+  });
+  return daemon;
+}
+
+function publishAcceptedRecoverySupervisor(statePath, t) {
+  const daemon = publishTestRecoveryDaemon(statePath);
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const spec = state.autonomous_owner_spec;
+  const child = spawn(spec.node_path, [
+    spec.supervisor_path, spec.session_dir, `--runner-bin=${spec.runner_bin}`, ...spec.runner_args,
+  ], { cwd: spec.working_dir, detached: true, stdio: 'ignore' });
+  child.unref();
+  const owner = child.pid ? captureProcessLivenessIdentity(child.pid) : null;
+  assert.ok(owner);
+  t.after(() => {
+    try { process.kill(-owner.pid, 'SIGKILL'); } catch {
+      try { process.kill(owner.pid, 'SIGKILL'); } catch {}
+    }
+  });
+  writeRestoredRecoverySupervisor(statePath, owner);
+  return daemon;
+}
+
 function exactLaunchDeps(value, onLaunch = () => undefined, base = {}) {
   const runner = identity(62001);
   let launchedRoot = value.targetRoot;
@@ -249,7 +377,7 @@ test('legacy mux adoption preserves durable evidence, journals explicit adoption
   const recovery = fs.readFileSync(path.join(value.sessionDir, 'ticket-recovery-history.json'), 'utf8');
   const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, depsFor(value, actions));
 
-  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7']);
   assert.equal(record.status, 'adopted');
   assert.equal(record.resume_checkpoint.phase, 'verification_contract_repair');
   assert.deepEqual(record.resume_checkpoint.reuse_phases, ['research', 'research_review', 'plan', 'plan_review']);
@@ -306,7 +434,7 @@ test('legacy adoption never retires a replaced operation lock with the recorded 
         }
       },
     },
-  ), /Could not fence the quiesced legacy session/);
+  ), /refuses ownership transfer across a replaced session-operation lock/);
 
   assert.equal(JSON.parse(fs.readFileSync(
     path.join(value.sessionDir, '.session-operation.lock'), 'utf8',
@@ -870,7 +998,7 @@ test('legacy adoption accepts a mux runner owned directly by the immutable tmux 
   assert.equal(record.legacy_owner.supervisor, null);
   assert.deepEqual(record.legacy_owner.runner, value.runner);
   assert.deepEqual(record.legacy_owner.pane, value.pane);
-  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7']);
 });
 
 test('legacy adoption rejects an arbitrary wrapper inserted into the pane ancestry', () => {
@@ -909,7 +1037,7 @@ test('legacy adoption rejects direct tmux pane identity drift after fencing', ()
     () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
     /controller ancestry changed/,
   );
-  assert.deepEqual(actions, ['watchdog', 'fence']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'resume']);
 });
 
 test('legacy adoption fails closed when the supervisor identity drifts after fencing', () => {
@@ -929,7 +1057,7 @@ test('legacy adoption fails closed when the supervisor identity drifts after fen
     () => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
     /controller ancestry changed/,
   );
-  assert.deepEqual(actions, ['watchdog', 'fence']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'resume']);
 });
 
 test('legacy adoption rejects schema, artifact, ref, and installed runtime hash drift before launch', () => {
@@ -1416,7 +1544,7 @@ test('legacy adoption freezes the controller then rereads a respawned child befo
     return { status: 'reaped', pid: child.pid, pgid: child.pgid, reason: 'test', signals: ['SIGTERM'] };
   };
   adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
-  assert.deepEqual(actions, ['watchdog', 'fence', `child:${replacement.pid}`, 'tmux:$7', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', `child:${replacement.pid}`, 'tmux:$7']);
 });
 
 test('candidate snapshot is taken after child quiescence and captures the final attributable mutation', () => {
@@ -1429,11 +1557,759 @@ test('candidate snapshot is taken after child quiescence and captures the final 
   };
   const record = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
   assert.deepEqual(record.candidate_archive.paths, ['tracked.txt']);
-  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'final-mutation', 'tmux:$7', 'resume']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'final-mutation', 'tmux:$7']);
   assert.equal(git(value.repo, ['status', '--porcelain']), '');
   restoreRejectedCandidateCheckpoint({ sessionDir: value.sessionDir, workingDir: value.repo, ticketId: 'r1',
     expectedBaseHead: git(value.repo, ['rev-parse', 'HEAD']), validateScope: () => undefined });
   assert.equal(fs.readFileSync(path.join(value.repo, 'tracked.txt'), 'utf8'), 'base\nlast-worker-write\n');
+});
+
+test('candidate restore WAL replays every crash prefix without double apply or byte loss', () => {
+  for (const crashPoint of ['prepared', 'patch_applied', 'applied', 'archive_invalidated']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.tickets[0].allowed_paths.push('scratch.txt');
+    writeJson(manifestPath, manifest);
+    fs.writeFileSync(path.join(value.repo, 'tracked.txt'), 'staged WAL candidate\n');
+    git(value.repo, ['add', 'tracked.txt']);
+    fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'unstaged WAL candidate\n');
+    fs.writeFileSync(path.join(value.repo, 'scratch.txt'), 'untracked WAL candidate\n');
+    const expected = {
+      status: git(value.repo, ['status', '--porcelain=v1']),
+      tracked: fs.readFileSync(path.join(value.repo, 'tracked.txt')),
+      staged: execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }),
+      scratch: fs.readFileSync(path.join(value.repo, 'scratch.txt')),
+    };
+    const statePath = path.join(value.sessionDir, 'state.json');
+    let published = false;
+    deps.checkpoint = (checkpoint) => {
+      if (checkpoint !== 'candidate_archived' || published) return;
+      published = true;
+      new StateManager().update(statePath, (state) => {
+        state.autonomous_budget_rollover_intent_id = `wal-${crashPoint}`;
+        return state;
+      });
+    };
+    let crashed = false;
+    let simulatedCrash = null;
+    deps.simulateProcessDeath = (error) => error === simulatedCrash;
+    deps.candidateRestoreCheckpoint = (checkpoint) => {
+      if (checkpoint !== crashPoint || crashed) return;
+      crashed = true;
+      simulatedCrash = new Error(`crash-${crashPoint}`);
+      throw simulatedCrash;
+    };
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      new RegExp(`crash-${crashPoint}`), crashPoint);
+    deps.candidateRestoreCheckpoint = undefined;
+    deps.checkpoint = undefined;
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /refuses modern authority/, crashPoint);
+    assert.equal(git(value.repo, ['status', '--porcelain=v1']), expected.status, crashPoint);
+    assert.deepEqual(fs.readFileSync(path.join(value.repo, 'tracked.txt')), expected.tracked, crashPoint);
+    assert.deepEqual(execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }), expected.staged, crashPoint);
+    assert.deepEqual(fs.readFileSync(path.join(value.repo, 'scratch.txt')), expected.scratch, crashPoint);
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    delete state.autonomous_budget_rollover_intent_id;
+    writeJson(statePath, state);
+    assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).status,
+      'adopted', crashPoint);
+  }
+});
+
+test('prepared restore crash replays mode-only and symlink Git semantics', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const scriptPath = path.join(value.repo, 'mode-only.sh');
+  const linkPath = path.join(value.repo, 'candidate-link');
+  fs.writeFileSync(scriptPath, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+  git(value.repo, ['add', 'mode-only.sh']);
+  git(value.repo, ['commit', '-m', 'tracked non-executable script']);
+  const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].allowed_paths.push('mode-only.sh', 'candidate-link');
+  writeJson(manifestPath, manifest);
+  fs.chmodSync(scriptPath, 0o755);
+  fs.symlinkSync('tracked.txt', linkPath);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  let published = false;
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'candidate_archived' || published) return;
+    published = true;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'mode-symlink-restore';
+      return state;
+    });
+  };
+  let simulatedCrash = null;
+  deps.simulateProcessDeath = (error) => error === simulatedCrash;
+  deps.candidateRestoreCheckpoint = (checkpoint) => {
+    if (checkpoint !== 'prepared' || simulatedCrash) return;
+    simulatedCrash = new Error('prepared-mode-symlink-crash');
+    throw simulatedCrash;
+  };
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /prepared-mode-symlink-crash/);
+  deps.candidateRestoreCheckpoint = undefined;
+  deps.checkpoint = undefined;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /refuses modern authority/);
+  assert.equal(fs.lstatSync(scriptPath).mode & 0o111, 0o111);
+  assert.equal(fs.lstatSync(linkPath).isSymbolicLink(), true);
+  assert.equal(fs.readlinkSync(linkPath), 'tracked.txt');
+});
+
+test('candidate archive cleanup crash is discovered and exactly replayed before retry continues', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.tickets[0].allowed_paths.push('scratch.txt');
+  writeJson(manifestPath, manifest);
+  fs.writeFileSync(path.join(value.repo, 'tracked.txt'), 'staged cleanup candidate\n');
+  git(value.repo, ['add', 'tracked.txt']);
+  fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'unstaged cleanup candidate\n');
+  fs.writeFileSync(path.join(value.repo, 'scratch.txt'), 'untracked cleanup candidate\n');
+  const expected = {
+    status: git(value.repo, ['status', '--porcelain=v1']),
+    tracked: fs.readFileSync(path.join(value.repo, 'tracked.txt')),
+    staged: execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }),
+    scratch: fs.readFileSync(path.join(value.repo, 'scratch.txt')),
+  };
+  let crashed = false;
+  let simulatedCrash = null;
+  deps.simulateProcessDeath = (error) => error === simulatedCrash;
+  deps.afterCandidateArchiveCleanup = () => {
+    if (crashed) return;
+    crashed = true;
+    simulatedCrash = new Error('crash-after-candidate-cleanup');
+    throw simulatedCrash;
+  };
+
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /crash-after-candidate-cleanup/);
+  const stranded = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(stranded.candidate_archive.ref, null);
+  assert.equal(git(value.repo, ['status', '--porcelain=v1']), '');
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-candidate-archive.json'), 'utf8',
+  )).cleanup_complete, true);
+
+  let checkedRestoredCandidate = false;
+  deps.afterCandidateArchiveCleanup = undefined;
+  deps.stopController = () => {
+    checkedRestoredCandidate = true;
+    assert.equal(git(value.repo, ['status', '--porcelain=v1']), expected.status);
+    assert.deepEqual(fs.readFileSync(path.join(value.repo, 'tracked.txt')), expected.tracked);
+    assert.deepEqual(execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }), expected.staged);
+    assert.deepEqual(fs.readFileSync(path.join(value.repo, 'scratch.txt')), expected.scratch);
+  };
+  assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).status, 'adopted');
+  assert.equal(checkedRestoredCandidate, true);
+});
+
+test('late modern evidence resumes the fenced legacy owner and remains retryable before tmux shutdown', () => {
+  for (const phase of ['after-child-quiescence', 'immediately-before-kill']) {
+    const value = fixture();
+    const actions = [];
+    const deps = depsFor(value, actions);
+    const statePath = path.join(value.sessionDir, 'state.json');
+    const evidence = { intent_id: `rollover-${phase}` };
+    let candidateSnapshot = null;
+    if (phase === 'immediately-before-kill') {
+      const manifestPath = path.join(value.sessionDir, 'refinement_manifest.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.tickets[0].allowed_paths.push('scratch.txt', 'late.txt');
+      writeJson(manifestPath, manifest);
+      fs.writeFileSync(path.join(value.repo, 'tracked.txt'), 'staged candidate\n');
+      git(value.repo, ['add', 'tracked.txt']);
+      fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'unstaged candidate\n');
+      fs.writeFileSync(path.join(value.repo, 'scratch.txt'), 'untracked candidate\n');
+      candidateSnapshot = {
+        status: git(value.repo, ['status', '--porcelain=v1']),
+        tracked: fs.readFileSync(path.join(value.repo, 'tracked.txt')),
+        staged: execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }),
+        untracked: fs.readFileSync(path.join(value.repo, 'scratch.txt')),
+      };
+    }
+    const publishEvidence = () => {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      state.autonomous_budget_rollover_checkpoint_pending = evidence;
+      writeJson(statePath, state);
+    };
+    if (phase === 'after-child-quiescence') deps.afterChildQuiesced = publishEvidence;
+    else deps.checkpoint = (checkpoint) => {
+      if (checkpoint === 'candidate_archived') publishEvidence();
+    };
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /refuses modern evidence published/, phase);
+    assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'resume'], phase);
+    const rejected = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.deepEqual(rejected.autonomous_budget_rollover_checkpoint_pending, evidence, phase);
+    assert.equal(rejected.tmux_runner_pid, value.runner.pid, phase);
+    assert.equal(rejected.tmux_session_name, value.tmuxName, phase);
+    if (candidateSnapshot) {
+      assert.equal(git(value.repo, ['status', '--porcelain=v1']), candidateSnapshot.status, phase);
+      assert.deepEqual(fs.readFileSync(path.join(value.repo, 'tracked.txt')), candidateSnapshot.tracked, phase);
+      assert.deepEqual(execFileSync('git', ['show', ':tracked.txt'], { cwd: value.repo }), candidateSnapshot.staged, phase);
+      assert.deepEqual(fs.readFileSync(path.join(value.repo, 'scratch.txt')), candidateSnapshot.untracked, phase);
+    }
+    const transaction = JSON.parse(fs.readFileSync(
+      path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+    ));
+    assert.equal(transaction.stage, 'fenced', phase);
+
+    delete rejected.autonomous_budget_rollover_checkpoint_pending;
+    if (phase === 'immediately-before-kill') {
+      fs.appendFileSync(path.join(value.repo, 'tracked.txt'), 'mutation after abort\n');
+      fs.writeFileSync(path.join(value.repo, 'late.txt'), 'new untracked path after abort\n');
+    }
+    writeJson(statePath, rejected);
+    deps.afterChildQuiesced = undefined;
+    deps.checkpoint = undefined;
+    actions.length = 0;
+    const resumed = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+    assert.equal(resumed.status, 'adopted', phase);
+    assert.deepEqual(actions, ['fence', 'child', 'tmux:$7'], phase);
+    if (phase === 'immediately-before-kill') {
+      assert.deepEqual(resumed.candidate_archive.paths, ['late.txt', 'scratch.txt', 'tracked.txt']);
+      const completed = JSON.parse(fs.readFileSync(
+        path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+      ));
+      assert.equal(Object.hasOwn(completed, 'candidate_archive_epochs'), false);
+      assert.match(git(value.repo, ['rev-parse', '--verify', completed.candidate_archive.ref]), /^[a-f0-9]{40}$/);
+    }
+  }
+});
+
+test('failed controller resume remains durably fenced until watchdog retry succeeds', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  deps.afterChildQuiesced = () => {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    state.autonomous_budget_rollover_intent_id = 'late-rollover';
+    writeJson(statePath, state);
+  };
+  let resumeAttempts = 0;
+  deps.resumeController = () => {
+    resumeAttempts += 1;
+    if (resumeAttempts === 1) throw new Error('injected SIGCONT failure');
+  };
+
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /durably fenced for watchdog retry/);
+  let transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(transaction.stage, 'fenced');
+  assert.equal(transaction.controller_fenced, true);
+
+  deps.afterChildQuiesced = undefined;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /refuses modern authority/);
+  transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(resumeAttempts, 2);
+  assert.equal(transaction.controller_fenced, false);
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  delete state.autonomous_budget_rollover_intent_id;
+  writeJson(statePath, state);
+  assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).status, 'adopted');
+});
+
+test('state-lock publication waits for atomic owner death and clear then remains watchdog-recoverable', (t) => {
+  const value = fixture();
+  const actions = [];
+  const deps = depsFor(value, actions);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const published = path.join(value.sessionDir, 'lock-respecting-publication.done');
+  let writer;
+  deps.afterFinalEvidenceCheck = () => {
+    const source = [
+      "import fs from 'node:fs';",
+      "import { StateManager } from './services/state-manager.js';",
+      "new StateManager().update(process.argv[1], (state) => { state.autonomous_budget_rollover_intent_id = 'concurrent-rollover'; return state; });",
+      "fs.writeFileSync(process.argv[2], 'published');",
+    ].join('\n');
+    writer = spawn(process.execPath, ['--input-type=module', '-e', source, statePath, published], {
+      cwd: path.resolve(new URL('..', import.meta.url).pathname), stdio: 'ignore',
+    });
+  };
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(published) && Date.now() < deadline) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    assert.equal(fs.existsSync(published), true, 'lock-respecting publisher never completed after handoff');
+  };
+  deps.ensurePostHandoffOwner = () => {
+    return publishAcceptedRecoverySupervisor(statePath, t).pid;
+  };
+  t.after(() => {
+    if (writer?.pid) try { process.kill(writer.pid, 'SIGKILL'); } catch {}
+  });
+
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'child', 'tmux:$7']);
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.equal(state.autonomous_budget_rollover_intent_id, 'concurrent-rollover');
+  assert.equal(state.tmux_runner_pid, null);
+  const transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(transaction.stage, 'quiesced');
+  assert.equal(transaction.controller_shutdown.status, 'committed');
+  assert.equal(transaction.post_handoff_recovery.status, 'ownership_transferred');
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('committed transfer proof rejects malformed and mismatched transaction bindings', (t) => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const transactionPath = path.join(value.sessionDir, 'legacy-session-adoption-transaction.json');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'strict-transfer-proof';
+      return state;
+    });
+  };
+  deps.ensurePostHandoffOwner = () => publishAcceptedRecoverySupervisor(statePath, t).pid;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+
+  const committed = JSON.parse(fs.readFileSync(transactionPath, 'utf8'));
+  const consumed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.equal(validCommittedLegacyAdoptionTransfer(value.sessionDir, committed, consumed), true);
+
+  const receiptArgMismatch = structuredClone(committed);
+  receiptArgMismatch.post_handoff_recovery.ready_receipt.runner_args = ['--different'];
+  const { receipt_id: ignored, ...unsignedReceipt } = receiptArgMismatch.post_handoff_recovery.ready_receipt;
+  void ignored;
+  receiptArgMismatch.post_handoff_recovery.ready_receipt.receipt_id = sha256(JSON.stringify(unsignedReceipt));
+  receiptArgMismatch.post_handoff_recovery.ready_receipt_id
+    = receiptArgMismatch.post_handoff_recovery.ready_receipt.receipt_id;
+
+  const cases = [
+    ['schema', (candidate) => { candidate.schema_version = 2; }],
+    ['session', (candidate) => { candidate.session_id = 'different-session'; }],
+    ['stage', (candidate) => { candidate.stage = 'fenced'; }],
+    ['malformed-owner', (candidate) => { candidate.post_handoff_recovery.owner_identity.fingerprint = 'bad'; }],
+    ['swapped-identities', (candidate) => {
+      candidate.post_handoff_recovery.owner_identity
+        = structuredClone(candidate.post_handoff_recovery.recovery_daemon_identity);
+    }],
+    ['spec-id', (candidate) => { candidate.post_handoff_recovery.owner_spec_id = '0'.repeat(64); }],
+    ['receipt-id', (candidate) => { candidate.post_handoff_recovery.ready_receipt_id = '0'.repeat(64); }],
+    ['receipt-spec', (candidate) => { candidate.post_handoff_recovery.ready_receipt.owner_spec_id = '0'.repeat(64); }],
+  ];
+  for (const [label, mutate] of cases) {
+    const candidate = structuredClone(committed);
+    mutate(candidate);
+    assert.equal(validCommittedLegacyAdoptionTransfer(value.sessionDir, candidate, consumed), false, label);
+    writeJson(transactionPath, candidate);
+    assert.equal(legacyAdoptionOutcome(value.sessionDir), 'running', label);
+  }
+  assert.equal(validCommittedLegacyAdoptionTransfer(value.sessionDir, receiptArgMismatch, consumed), false,
+    'self-consistent receipt still must bind the owner spec');
+  assert.equal(validCommittedLegacyAdoptionTransfer(value.sessionDir, committed, {
+    ...consumed, legacy_adoption_supervisor_challenge: committed.post_handoff_recovery.challenge,
+  }), false, 'unconsumed challenge');
+
+  writeJson(transactionPath, committed);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('shutdown commits only when the runner exited and tmux is absent', () => {
+  for (const failure of ['runner-live', 'tmux-live']) {
+    const value = fixture();
+    const actions = [];
+    const deps = depsFor(value, actions);
+    if (failure === 'runner-live') {
+      let runnerLive = true;
+      const baseInspect = deps.inspectProcess;
+      deps.waitForRunnerExit = () => false;
+      deps.inspectProcess = (exact) => exact.pid === value.runner.pid && runnerLive ? 'matched' : baseInspect(exact);
+      deps.reapRunner = (exact) => {
+        actions.push(`reap-runner:${exact.pid}`);
+        runnerLive = false;
+        return { status: 'reaped', pid: exact.pid, pgid: exact.pgid, reason: 'test', signals: ['SIGTERM'] };
+      };
+    }
+    else {
+      const exactKill = deps.killTmux;
+      let killAttempts = 0;
+      deps.killTmux = (sessionId) => {
+        killAttempts += 1;
+        if (killAttempts === 1) actions.push('kill-without-removing-tmux');
+        else exactKill(sessionId);
+      };
+    }
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /owner did not stop/, failure);
+    const transaction = JSON.parse(fs.readFileSync(
+      path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+    ));
+    assert.equal(transaction.stage, 'fenced', failure);
+    assert.notEqual(transaction.controller_shutdown.status, 'committed', failure);
+    assert.equal(transaction.controller_fence.status, 'released', failure);
+    assert.equal(adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps).status,
+      'adopted', failure);
+    if (failure === 'runner-live') assert.equal(actions.includes(`reap-runner:${value.runner.pid}`), true);
+  }
+});
+
+test('quiesced post-handoff evidence derives a durable generic owner and converges on acceptance', (t) => {
+  for (const mode of ['budget-intent', 'async-owner']) {
+    const value = fixture();
+    const deps = depsFor(value);
+    const statePath = path.join(value.sessionDir, 'state.json');
+    let published = false;
+    deps.checkpoint = (checkpoint) => {
+      if (checkpoint !== 'quiesced' || published) return;
+      published = true;
+      new StateManager().update(statePath, (state) => {
+        state.autonomous_budget_rollover_intent_id = `${mode}-rollover`;
+        return state;
+      });
+    };
+    let ensureAttempts = 0;
+    deps.ensurePostHandoffOwner = () => {
+      ensureAttempts += 1;
+      if (ensureAttempts === 2) {
+        return publishAcceptedRecoverySupervisor(statePath, t).pid;
+      }
+      return null;
+    };
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /pending an authenticated target supervisor/, mode);
+    assert.equal(fs.existsSync(path.join(value.sessionDir, 'installed-runtime-migration.json')), false, mode);
+    const pendingState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(pendingState.autonomous_owner_spec.owner_mode, 'process', mode);
+    assert.equal(pendingState.autonomous_owner_spec.runner_bin, 'mux-runner.js', mode);
+    assert.deepEqual(pendingState.autonomous_owner_spec.runner_args, ['--on-failure=retry'], mode);
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /ownership transferred to the authenticated modern recovery owner/, mode);
+    assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal', mode);
+  }
+});
+
+test('recovery daemon death before target acceptance remains supervised and converges', (t) => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'daemon-death-rollover';
+      return state;
+    });
+  };
+  let ensureAttempts = 0;
+  deps.ensurePostHandoffOwner = () => {
+    ensureAttempts += 1;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_owner_recovery_daemon_pid = 90000 + ensureAttempts;
+      state.autonomous_owner_recovery_daemon_identity = identity(90000 + ensureAttempts);
+      return state;
+    });
+    if (ensureAttempts === 3) return publishAcceptedRecoverySupervisor(statePath, t).pid;
+    return 90000 + ensureAttempts;
+  };
+
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pending an authenticated target supervisor/);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'running');
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_owner_recovery_daemon_pid = null;
+    state.autonomous_owner_recovery_daemon_identity = null;
+    return state;
+  });
+  deps.checkpoint = undefined;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pending an authenticated target supervisor/);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'running');
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('arbitrary live Node process cannot satisfy target supervisor readiness', (t) => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'arbitrary-process-rollover';
+      return state;
+    });
+  };
+  let ensureAttempts = 0;
+  deps.ensurePostHandoffOwner = () => {
+    ensureAttempts += 1;
+    if (ensureAttempts === 1) {
+      const arbitrary = captureProcessLivenessIdentity(process.pid);
+      assert.ok(arbitrary);
+      const daemon = publishTestRecoveryDaemon(statePath);
+      writeRestoredRecoverySupervisor(statePath, arbitrary, true);
+      assert.ok(JSON.parse(fs.readFileSync(statePath, 'utf8')).autonomous_supervisor_ready_receipt,
+        'forged receipt must be present for the provenance rejection');
+      return daemon.pid;
+    }
+    return publishAcceptedRecoverySupervisor(statePath, t).pid;
+  };
+
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /pending an authenticated target supervisor/);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'running');
+  deps.checkpoint = undefined;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('supervisor ready receipt preserves spaces, quotes, and empty argv entries exactly', (t) => {
+  const value = fixture();
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const runnerArgs = ['--label=space value', '--quote="exact value"', ''];
+  const supervisorPath = path.join(value.targetRoot, 'extension', 'bin', 'supervised-runner.js');
+  const publishErrorPath = path.join(value.sessionDir, 'ready-publish-error.txt');
+  const recoveryModule = new URL('../services/autonomous-owner-recovery.js', import.meta.url).href;
+  fs.writeFileSync(supervisorPath, [
+    "import { fileURLToPath } from 'node:url';",
+    "import fs from 'node:fs';",
+    `process.on('uncaughtException', (error) => { fs.writeFileSync(${JSON.stringify(publishErrorPath)}, error.stack || error.message); process.exit(1); });`,
+    `import { publishAutonomousSupervisorReadyReceipt, registerAutonomousOwnerSpec } from ${JSON.stringify(recoveryModule)};`,
+    "const sessionDir = process.argv[2];",
+    "const runnerFlag = process.argv[3];",
+    "const runnerBin = runnerFlag.slice('--runner-bin='.length);",
+    "const runnerArgs = process.argv.slice(4);",
+    "const self = fileURLToPath(import.meta.url);",
+    "const spec = registerAutonomousOwnerSpec(sessionDir, runnerBin, runnerArgs, undefined, self);",
+    "publishAutonomousSupervisorReadyReceipt(sessionDir, spec, runnerBin, runnerArgs, self);",
+    "setInterval(() => {}, 1000);",
+  ].join('\n'));
+  const spec = deriveAutonomousProcessOwnerSpec(
+    value.sessionDir, value.repo, 'mux-runner.js', runnerArgs, path.join(value.targetRoot, 'extension', 'bin'),
+  );
+  const recoveryDaemon = captureProcessLivenessIdentity(process.pid);
+  assert.ok(recoveryDaemon);
+  const adoptionChallenge = 'structured-argv-challenge';
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_owner_spec = spec;
+    state.autonomous_budget_rollover_intent_id = 'structured-argv-rollover';
+    state.autonomous_budget_epoch = 1;
+    state.autonomous_owner_recovery_daemon_pid = recoveryDaemon.pid;
+    state.autonomous_owner_recovery_daemon_identity = recoveryDaemon;
+    state.legacy_adoption_supervisor_challenge = adoptionChallenge;
+    state.autonomous_owner_restoration = {
+      schema_version: 1, intent_id: 'structured-argv-restoration',
+      rollover_intent_id: 'structured-argv-rollover', rollover_epoch: 1,
+      owner_spec_id: spec.spec_id, status: 'restoring', attempt: 1,
+      not_before: '2026-08-08T20:00:00.000Z', restorer_pid: process.pid,
+      restorer_identity: captureProcessLivenessIdentity(process.pid),
+    };
+    return state;
+  });
+  const child = spawn(spec.node_path, [
+    spec.supervisor_path, spec.session_dir, `--runner-bin=${spec.runner_bin}`, ...runnerArgs,
+  ], { cwd: spec.working_dir, detached: true, stdio: 'ignore' });
+  child.unref();
+  const owner = child.pid ? captureProcessLivenessIdentity(child.pid) : null;
+  assert.ok(owner);
+  t.after(() => {
+    try { process.kill(-owner.pid, 'SIGKILL'); } catch {
+      try { process.kill(owner.pid, 'SIGKILL'); } catch {}
+    }
+  });
+  const deadline = Date.now() + 5_000;
+  while (!JSON.parse(fs.readFileSync(statePath, 'utf8')).autonomous_supervisor_ready_receipt
+    && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  const exact = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.ok(exact.autonomous_supervisor_ready_receipt,
+    `supervisor did not publish its ready receipt: ${fs.existsSync(publishErrorPath) ? fs.readFileSync(publishErrorPath, 'utf8') : 'no error captured'}`);
+  assert.deepEqual(authenticatedReadyProcessOwner(
+    value.sessionDir, exact, recoveryDaemon, adoptionChallenge,
+  ), owner);
+
+  for (const runner_args of [
+    ['--label=space', 'value', '--quote="exact value"', ''],
+    ['--label=space value', '--quote=exact value', ''],
+    ['--label=space value', '--quote="exact value"'],
+  ]) {
+    const changed = structuredClone(exact);
+    const { receipt_id: ignored, ...unsigned } = changed.autonomous_supervisor_ready_receipt;
+    void ignored;
+    changed.autonomous_supervisor_ready_receipt = {
+      ...unsigned, runner_args,
+      receipt_id: sha256(JSON.stringify({ ...unsigned, runner_args })),
+    };
+    assert.equal(authenticatedReadyProcessOwner(
+      value.sessionDir, changed, recoveryDaemon, adoptionChallenge,
+    ), null);
+  }
+});
+
+test('post-handoff recovery retires an authenticated legacy lock despite runner PID reuse', (t) => {
+  const value = fixture({ runnerPid: process.pid });
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const lockPath = path.join(value.sessionDir, '.session-operation.lock');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'pid-reuse-rollover';
+      return state;
+    });
+  };
+  deps.ensurePostHandoffOwner = () => {
+    assert.equal(fs.existsSync(lockPath), false, 'legacy lock must be retired before target owner acceptance');
+    return publishAcceptedRecoverySupervisor(statePath, t).pid;
+  };
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('consumed adoption challenge permits daemon replacement and a future runtime supervisor', (t) => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'consumed-handoff-rollover';
+      return state;
+    });
+  };
+  deps.ensurePostHandoffOwner = () => publishAcceptedRecoverySupervisor(statePath, t).pid;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+
+  let transferred = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const oldSupervisor = transferred.autonomous_supervisor_identity;
+  t.after(() => { try { process.kill(-oldSupervisor.pid, 'SIGKILL'); } catch {} });
+  assert.equal(transferred.legacy_adoption_supervisor_challenge, null);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/,
+    'post-consumption retry must use the committed proof without rearming the challenge');
+  assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).legacy_adoption_supervisor_challenge, null);
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_budget_consumed_intent_id = state.autonomous_budget_rollover_intent_id;
+    state.autonomous_budget_rollover_intent_id = null;
+    state.autonomous_owner_restoration = null;
+    state.autonomous_owner_recovery_daemon_pid = null;
+    state.autonomous_owner_recovery_daemon_identity = null;
+    return state;
+  });
+  assert.equal(adoptionSupervisorProvenanceReady(value.sessionDir), true,
+    'consumed adoption epoch must not self-fence the productive supervisor after daemon death');
+
+  const replacementDaemon = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true, stdio: 'ignore', cwd: value.repo,
+  });
+  replacementDaemon.unref();
+  const replacementDaemonIdentity = replacementDaemon.pid
+    ? captureProcessLivenessIdentity(replacementDaemon.pid) : null;
+  assert.ok(replacementDaemonIdentity);
+  t.after(() => { try { process.kill(-replacementDaemonIdentity.pid, 'SIGKILL'); } catch {} });
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_owner_recovery_daemon_pid = replacementDaemonIdentity.pid;
+    state.autonomous_owner_recovery_daemon_identity = replacementDaemonIdentity;
+    return state;
+  });
+  assert.equal(adoptionSupervisorProvenanceReady(value.sessionDir), true,
+    'replacement daemon inverse parentage must use the normal post-consumption contract');
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+
+  try { process.kill(-oldSupervisor.pid, 'SIGKILL'); } catch {}
+  const futureRoot = runtime('future-handoff');
+  const futureSpec = deriveAutonomousProcessOwnerSpec(
+    value.sessionDir, value.repo, 'mux-runner.js', ['--on-failure=retry'],
+    path.join(futureRoot, 'extension', 'bin'),
+  );
+  const future = spawn(futureSpec.node_path, [
+    futureSpec.supervisor_path, futureSpec.session_dir, `--runner-bin=${futureSpec.runner_bin}`,
+    ...futureSpec.runner_args,
+  ], { cwd: futureSpec.working_dir, detached: true, stdio: 'ignore' });
+  future.unref();
+  const futureIdentity = future.pid ? captureProcessLivenessIdentity(future.pid) : null;
+  assert.ok(futureIdentity);
+  t.after(() => { try { process.kill(-futureIdentity.pid, 'SIGKILL'); } catch {} });
+  new StateManager().update(statePath, (state) => {
+    state.autonomous_owner_spec = futureSpec;
+    return state;
+  });
+  writeRestoredRecoverySupervisor(statePath, futureIdentity);
+  transferred = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.deepEqual(authenticatedReadyProcessOwner(value.sessionDir, transferred), futureIdentity);
+  assert.equal(adoptionSupervisorProvenanceReady(value.sessionDir), true);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('crash after transfer proof but before challenge consumption remains supervised and resumes consumption', (t) => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(statePath, (state) => {
+      state.autonomous_budget_rollover_intent_id = 'challenge-consumption-crash';
+      return state;
+    });
+  };
+  let daemon = null;
+  deps.ensurePostHandoffOwner = () => {
+    daemon ||= publishAcceptedRecoverySupervisor(statePath, t);
+    return daemon.pid;
+  };
+  deps.afterOwnershipTransferRecorded = () => { throw new Error('crash-before-challenge-consumption'); };
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /crash-before-challenge-consumption/);
+  assert.equal(typeof JSON.parse(fs.readFileSync(statePath, 'utf8')).legacy_adoption_supervisor_challenge, 'string');
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'running');
+
+  deps.afterOwnershipTransferRecorded = undefined;
+  deps.checkpoint = undefined;
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /ownership transferred to the authenticated modern recovery owner/);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).legacy_adoption_supervisor_challenge, null);
+  assert.equal(legacyAdoptionOutcome(value.sessionDir), 'terminal');
+});
+
+test('post-handoff recovery refuses target runtime drift before spawning an owner', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  let ensureAttempts = 0;
+  deps.checkpoint = (checkpoint) => {
+    if (checkpoint !== 'quiesced') return;
+    new StateManager().update(path.join(value.sessionDir, 'state.json'), (state) => {
+      state.autonomous_budget_rollover_intent_id = 'drifted-rollover';
+      return state;
+    });
+    fs.appendFileSync(path.join(value.targetRoot, 'extension', 'bin', 'runtime.js'), '// drift before owner\n');
+  };
+  deps.ensurePostHandoffOwner = () => { ensureAttempts += 1; return null; };
+  assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+    /refuses drifted target runtime ownership/);
+  assert.equal(ensureAttempts, 0);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'installed-runtime-migration.json')), false);
 });
 
 test('legacy adoption rejects immutable tmux reuse after controller fencing without killing a child', () => {
@@ -1448,7 +2324,7 @@ test('legacy adoption rejects immutable tmux reuse after controller fencing with
     return binding && reused ? { ...binding, session_id: '$99' } : binding;
   };
   assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps), /binding changed after controller fencing/);
-  assert.deepEqual(actions, ['watchdog', 'fence']);
+  assert.deepEqual(actions, ['watchdog', 'fence', 'resume']);
 });
 
 test('legacy adoption resumes idempotently from every durable post-fence checkpoint', () => {
@@ -1537,6 +2413,117 @@ test('stranded adopted launch is rolled back, superseded, and launched from the 
     exactLaunchDeps(value, () => { launches += 1; }));
   assert.equal(launched.status, 'launched');
   assert.equal(launches, 1);
+});
+
+test('post-adoption supersession accepts an ownerless legacy boundary with absent nullable ownership fields', () => {
+  const value = fixture();
+  const deps = depsFor(value);
+  const initialStatePath = path.join(value.sessionDir, 'state.json');
+  const initialState = JSON.parse(fs.readFileSync(initialStatePath, 'utf8'));
+  Object.assign(initialState, {
+    active_child_controller_pid: null,
+    active_child_controller_identity: null,
+    active_child_identities: [],
+    refinement_child_identities: [],
+    autonomous_supervisor_pid: null,
+    autonomous_supervisor_identity: null,
+    autonomous_owner_spec: null,
+    autonomous_owner_restoration: null,
+    autonomous_owner_handoff_transaction: null,
+    autonomous_owner_recovery_daemon_pid: null,
+    autonomous_owner_recovery_daemon_identity: null,
+    cancellation_recovery_watchdog_pid: null,
+    cancellation_recovery_watchdog_identity: null,
+    cancellation_recovery_watchdog_arm_id: null,
+    cancellation_recovery_watchdog_arm: null,
+    cancellation_recovery_runtime_binding: null,
+    cancellation_recovery: null,
+    recovery_required: false,
+    recovery_kind: null,
+    recovery_reason: null,
+    orphan_child_pid: 0,
+    orphan_recovery: null,
+    autonomous_owner_recovery_suspended: false,
+    autonomous_owner_recovery_suspended_for_handoff: null,
+    cancel_requested_at: null,
+    cancelled: false,
+    manager_relaunch_recovery_epoch: 0,
+    manager_relaunch_recovery_route: '',
+    manager_relaunch_recovery_status: '',
+    manager_relaunch_recovery_activated_at: '',
+    manager_relaunch_recovery_consumed_at: '',
+    artifact_contract_recovery: null,
+    autonomous_budget_rollover_intent_id: '',
+    autonomous_budget_rollover_checkpoint_pending: null,
+    autonomous_budget_consumed_intent_id: '',
+    autonomous_budget_consumed_checkpoint_pending: null,
+    autonomous_budget_checkpoint_error: '',
+  });
+  writeJson(initialStatePath, initialState);
+  const prior = preparePostAdoptionReplacement(value, deps);
+  const statePath = path.join(value.sessionDir, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.equal(state.active_child_controller_pid, null);
+  assert.equal(state.active_child_controller_identity, null);
+
+  const replacement = adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps);
+  assert.notEqual(replacement.migration_content_hash, prior.migration_content_hash);
+  const transaction = JSON.parse(fs.readFileSync(
+    path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'), 'utf8',
+  ));
+  assert.equal(transaction.stage, 'adopted');
+  assert.equal(transaction.post_adoption_repin.status, 'completed');
+});
+
+test('initial adoption rejects every modern ownership side ledger before side effects with byte identity', () => {
+  for (const [label, evidence] of modernOwnershipEvidenceCases()) {
+    const value = fixture();
+    const actions = [];
+    const deps = depsFor(value, actions);
+    const statePath = path.join(value.sessionDir, 'state.json');
+    writeJson(statePath, { ...JSON.parse(fs.readFileSync(statePath, 'utf8')), ...evidence });
+    const paths = [
+      statePath,
+      path.join(value.sessionDir, '.session-operation.lock'),
+      path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'),
+      path.join(value.sessionDir, 'installed-runtime-migration.json'),
+      path.join(value.sessionDir, 'logical-pipeline.json'),
+      path.join(value.sessionDir, LEGACY_ADOPTION_FILE),
+    ];
+    const before = byteSnapshot(paths);
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /refuses modern authority, recovery, or cancellation evidence/, label);
+    assert.deepEqual(byteSnapshot(paths), before, label);
+    assert.deepEqual(actions, [], label);
+  }
+});
+
+test('post-adoption supersession rejects modern ownership evidence with byte identity', () => {
+  const cases = [
+    ...modernOwnershipEvidenceCases(),
+    ['active-child-identity', { active_child_identity: identity(7010) }],
+    ['malformed-controller-identity', { active_child_controller_identity: { pid: 42 } }],
+  ];
+  for (const [label, evidence] of cases) {
+    const value = fixture();
+    const deps = depsFor(value);
+    pausePreparedPostAdoptionRepin(value, deps);
+    const statePath = path.join(value.sessionDir, 'state.json');
+    writeJson(statePath, { ...JSON.parse(fs.readFileSync(statePath, 'utf8')), ...evidence });
+    const paths = [
+      statePath,
+      path.join(value.sessionDir, 'legacy-session-adoption-transaction.json'),
+      path.join(value.sessionDir, 'installed-runtime-migration.json'),
+      path.join(value.sessionDir, 'logical-pipeline.json'),
+      path.join(value.sessionDir, LEGACY_ADOPTION_FILE),
+    ];
+    const before = byteSnapshot(paths);
+
+    assert.throws(() => adoptActiveLegacyMuxSession(value.sessionDir, value.sourceRoot, value.targetRoot, deps),
+      /exact ownerless verification-repair boundary/, label);
+    assert.deepEqual(byteSnapshot(paths), before, label);
+  }
 });
 
 test('post-adoption supersession replays every exact write prefix without duplicating its epoch', () => {

@@ -31,10 +31,24 @@ import { acquireSessionOperation } from './session-operation.js';
 import { getHeadSha, getWorkingTreeStatus, listWorkingTreeDirtyPaths } from './git-utils.js';
 import { pathIsInPipelineScope } from './pipeline-scope.js';
 import { stashUnattributableRemainder } from './dirty-tree-salvage.js';
-import { persistRejectedCandidateCheckpoint } from './candidate-recovery.js';
+import {
+  persistRejectedCandidateCheckpoint,
+  readRejectedCandidateCheckpoint,
+  restoreRejectedCandidateCheckpoint,
+} from './candidate-recovery.js';
 import { reconcileArchivedCandidateRefinementBoundary, refinementRepositoryAdvancePath } from './refinement-artifacts.js';
 import { assertCitadelReleaseApproval, citadelReportPath } from './citadel.js';
 import { reclaimLaunchReservations, withLaunchReservations } from './detached-launch.js';
+import { assertNoModernOwnershipEvidence, modernOwnershipEvidence } from './modern-ownership-evidence.js';
+import {
+  authenticatedReadyProcessOwner,
+  deriveAutonomousProcessOwnerSpec,
+  ensureAutonomousOwnerRecoveryDaemon,
+  validateAutonomousOwnerSpec,
+  type AutonomousOwnerSpec,
+  type AutonomousSupervisorReadyReceipt,
+} from './autonomous-owner-recovery.js';
+import { validCommittedLegacyAdoptionTransfer } from './legacy-adoption-transfer-proof.js';
 
 export const LEGACY_ADOPTION_FILE = 'legacy-session-adoption.json';
 export const LEGACY_ADOPTION_SCHEMA_VERSION = 1;
@@ -94,6 +108,31 @@ interface LegacyAdoptionTransaction {
   operation_lock_sha256: string;
   active_child: PersistedProcessIdentity | null;
   candidate_archive: { paths: string[]; staged_paths: string[]; ref: string | null };
+  controller_fenced?: boolean;
+  controller_fence?: {
+    status: 'preparing' | 'fenced' | 'released';
+    prepared_at: string;
+    fenced_at: string | null;
+    released_at: string | null;
+  };
+  candidate_archive_restored?: boolean;
+  controller_shutdown?: {
+    status: 'prepared' | 'committed';
+    prepared_at: string;
+    committed_at: string | null;
+  };
+  post_handoff_recovery?: {
+    status: 'pending' | 'ownership_transferred';
+    evidence: string[];
+    owner_identity: PersistedProcessIdentity | null;
+    recovery_daemon_identity: PersistedProcessIdentity | null;
+    challenge: string;
+    owner_spec_id?: string | null;
+    ready_receipt_id?: string | null;
+    owner_spec?: AutonomousOwnerSpec | null;
+    ready_receipt?: AutonomousSupervisorReadyReceipt | null;
+    updated_at: string;
+  };
   migration_content_hash?: string;
   superseded_migration_content_hash?: string;
   target_runtime_supersessions?: Array<{
@@ -194,6 +233,7 @@ interface LegacyAdoptionDependencies {
   inspectProcess?: (identity: PersistedProcessIdentity) => 'not-running' | 'matched' | 'reused';
   inspectChild?: (identity: PersistedProcessIdentity) => 'not-running' | 'matched' | 'ambiguous';
   reapChild?: (identity: PersistedProcessIdentity) => OrphanReapResult;
+  reapRunner?: (identity: PersistedProcessIdentity) => OrphanReapResult;
   tmuxExists?: (name: string) => boolean;
   tmuxPanePid?: (name: string) => number | null;
   tmuxBinding?: (name: string) => LegacyTmuxBinding | null;
@@ -208,6 +248,12 @@ interface LegacyAdoptionDependencies {
     | 'post_adoption_repin_journal_applied' | 'post_adoption_repin_migration_applied'
     | 'post_adoption_repin_record_applied') => void;
   afterChildQuiesced?: () => void;
+  afterFinalEvidenceCheck?: () => void;
+  ensurePostHandoffOwner?: (sessionDir: string) => number | null;
+  afterOwnershipTransferRecorded?: () => void;
+  candidateRestoreCheckpoint?: (checkpoint: 'prepared' | 'patch_applied' | 'applied' | 'archive_invalidated') => void;
+  afterCandidateArchiveCleanup?: () => void;
+  simulateProcessDeath?: (error: unknown) => boolean;
   afterLaunchReservationsAcquired?: () => void;
   sealSession?: (sessionDir: string) => unknown;
   launch?: (sessionDir: string, runtimeRoot: string) => void;
@@ -635,9 +681,10 @@ function assertSessionMapOwnership(sessionDir: string, workingDir: string): void
   }
 }
 
-function clearQuiescedOwnership(sessionDir: string): void {
-  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
-    state.tmux_runner_pid = null;
+function applyQuiescedOwnershipClear(state: PersistedState): PersistedState {
+  assertNoModernOwnershipEvidence(state,
+    'Legacy adoption refuses modern evidence at the atomic ownership-clear boundary.');
+  state.tmux_runner_pid = null;
     state.tmux_session_name = null;
     state.tmux_runner_binding = null;
     state.worker_pid = null;
@@ -645,14 +692,145 @@ function clearQuiescedOwnership(sessionDir: string): void {
     state.active_child_kind = null;
     state.active_child_command = null;
     state.active_child_identity = null;
-    state.active_child_controller_pid = null;
-    state.active_child_controller_identity = null;
+    if (Object.hasOwn(state, 'active_child_controller_pid')) state.active_child_controller_pid = null;
+    if (Object.hasOwn(state, 'active_child_controller_identity')) state.active_child_controller_identity = null;
     state.step = 'verification_contract_repair';
     state.failure_kind = 'verification_contract_failed';
     state.failure_reason = 'legacy session adoption requires structured verification contract repair';
-    state.active = true;
-    return state;
+  state.active = true;
+  return state;
+}
+
+function clearQuiescedOwnership(sessionDir: string): void {
+  new StateManager().update(path.join(sessionDir, 'state.json'), applyQuiescedOwnershipClear);
+}
+
+function workingTreeEntryMatchesRef(workingDir: string, ref: string, relative: string): boolean {
+  const listed = spawnSync('git', ['ls-tree', '-z', ref, '--', relative], {
+    cwd: workingDir, encoding: 'buffer', timeout: 30_000,
   });
+  if (listed.status !== 0) return false;
+  const terminator = listed.stdout.indexOf(0);
+  const raw = listed.stdout.subarray(0, terminator >= 0 ? terminator : listed.stdout.length).toString('utf8');
+  const expected = raw.match(/^(\d+) (\S+) ([a-f0-9]+)\t/);
+  const absolute = path.join(workingDir, relative);
+  let stats: fs.Stats;
+  try { stats = fs.lstatSync(absolute); } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' && !expected;
+  }
+  if (!expected || expected[2] !== 'blob') return false;
+  const mode = stats.isSymbolicLink() ? '120000'
+    : stats.isFile() ? ((stats.mode & 0o111) !== 0 ? '100755' : '100644') : '';
+  if (!mode || mode !== expected[1]) return false;
+  const content = stats.isSymbolicLink() ? Buffer.from(fs.readlinkSync(absolute)) : fs.readFileSync(absolute);
+  const hashed = spawnSync('git', ['hash-object', '--stdin'], {
+    cwd: workingDir, input: content, encoding: 'utf8', timeout: 30_000,
+  });
+  return hashed.status === 0 && hashed.stdout.trim() === expected[3];
+}
+
+function resumeFencedLegacyController(
+  sessionDir: string,
+  transactionPath: string,
+  transaction: LegacyAdoptionTransaction,
+  workingDir: string,
+  state: PersistedState,
+  deps: LegacyAdoptionDependencies,
+  signalController = true,
+): LegacyAdoptionTransaction {
+  if (!transaction.candidate_archive.ref) {
+    const discovered = readJsonFile<{
+      cleanup_complete?: boolean; ticket_id?: string; paths?: string[]; staged_paths?: string[]; ref?: string;
+    }>(path.join(sessionDir, 'legacy-candidate-archive.json'), null);
+    const ticketId = typeof state.current_ticket === 'string' ? state.current_ticket : '';
+    const checkpoint = ticketId ? readRejectedCandidateCheckpoint(sessionDir, ticketId) : null;
+    if (discovered?.cleanup_complete === true && discovered.ticket_id === ticketId
+      && typeof discovered.ref === 'string' && checkpoint?.recovery_ref === discovered.ref
+      && Array.isArray(discovered.paths) && Array.isArray(discovered.staged_paths)) {
+      transaction = {
+        ...transaction,
+        candidate_archive: {
+          paths: discovered.paths.map(String), staged_paths: discovered.staged_paths.map(String), ref: discovered.ref,
+        },
+      };
+      atomicWriteJson(transactionPath, transaction);
+    }
+  }
+  if (transaction.candidate_archive.ref && !transaction.candidate_archive_restored) {
+    const ticketId = typeof state.current_ticket === 'string' ? state.current_ticket : '';
+    const restorePath = path.join(sessionDir, 'legacy-candidate-restore.json');
+    type RestoreWal = {
+      schema_version: 1; status: 'prepared' | 'applied' | 'invalidated'; ticket_id: string;
+      archive: LegacyAdoptionTransaction['candidate_archive']; updated_at: string;
+    };
+    let wal = readJsonFile<RestoreWal>(restorePath, null);
+    if (!wal || wal.ticket_id !== ticketId || JSON.stringify(wal.archive) !== JSON.stringify(transaction.candidate_archive)) {
+      wal = {
+        schema_version: 1, status: 'prepared', ticket_id: ticketId, archive: transaction.candidate_archive,
+        updated_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      atomicWriteJson(restorePath, wal);
+      deps.candidateRestoreCheckpoint?.('prepared');
+    }
+    const checkpoint = ticketId ? readRejectedCandidateCheckpoint(sessionDir, ticketId) : null;
+    const restoredContentMatches = Boolean(checkpoint && checkpoint.base_head === getHeadSha(workingDir)
+      && checkpoint.changed_paths.every((relative) => (
+        workingTreeEntryMatchesRef(workingDir, checkpoint.recovery_ref, relative)
+      ))
+      && (() => {
+        const actual = execFileSync('git', ['diff', '--cached', '--binary', checkpoint.base_head, '--',
+          ...checkpoint.changed_paths], { cwd: workingDir, encoding: 'buffer' });
+        const expected = checkpoint.staged_patch_base64
+          ? Buffer.from(checkpoint.staged_patch_base64, 'base64') : Buffer.alloc(0);
+        return actual.equals(expected);
+      })());
+    if (wal.status === 'prepared' && !restoredContentMatches) {
+      const restored = ticketId ? restoreRejectedCandidateCheckpoint({
+        sessionDir,
+        workingDir,
+        ticketId,
+        expectedBaseHead: getHeadSha(workingDir),
+        validateScope: (changedPaths) => {
+          if (JSON.stringify([...changedPaths].sort()) !== JSON.stringify([...transaction.candidate_archive.paths].sort())) {
+            throw new Error('Legacy candidate restore changed scope before controller resume.');
+          }
+        },
+      }) : null;
+      if (!restored) throw new Error('Legacy adoption cannot resume a cleaned candidate without its exact recovery checkpoint.');
+      deps.candidateRestoreCheckpoint?.('patch_applied');
+    }
+    wal = { ...wal, status: 'applied', updated_at: (deps.now?.() ?? new Date()).toISOString() };
+    atomicWriteJson(restorePath, wal);
+    deps.candidateRestoreCheckpoint?.('applied');
+    transaction = {
+      ...transaction,
+      candidate_archive: { paths: [], staged_paths: [], ref: null },
+      candidate_archive_restored: true,
+    };
+    fs.rmSync(path.join(sessionDir, 'legacy-candidate-archive.json'), { force: true });
+    deps.candidateRestoreCheckpoint?.('archive_invalidated');
+    atomicWriteJson(transactionPath, transaction);
+    atomicWriteJson(restorePath, {
+      ...wal, status: 'invalidated', updated_at: (deps.now?.() ?? new Date()).toISOString(),
+    });
+  }
+  if (signalController) {
+    try {
+      (deps.resumeController || ((identity) => process.kill(identity.pid, 'SIGCONT')))(transaction.runner);
+    } catch (error) {
+      throw new Error(`Legacy controller remains durably fenced for watchdog retry after resume failure: ${String(error)}`,
+        { cause: error });
+    }
+  }
+  transaction = { ...transaction, controller_fenced: false };
+  transaction.controller_fence = {
+    ...(transaction.controller_fence || {
+      prepared_at: (deps.now?.() ?? new Date()).toISOString(), fenced_at: null,
+    }),
+    status: 'released', released_at: (deps.now?.() ?? new Date()).toISOString(),
+  };
+  atomicWriteJson(transactionPath, transaction);
+  return transaction;
 }
 
 function jsonSha256(value: unknown): string {
@@ -724,16 +902,19 @@ function assertPostAdoptionRepinBoundary(
   deps: LegacyAdoptionDependencies,
 ): void {
   const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  const legacyOwnershipFields = [
+    'tmux_runner_pid', 'tmux_session_name', 'tmux_runner_binding', 'worker_pid',
+    'active_child_pid', 'active_child_identity', 'active_child_controller_pid',
+    'active_child_controller_identity',
+  ];
+  const hasPersistedOwnershipEvidence = legacyOwnershipFields.some((field) => state[field] !== null
+    && state[field] !== undefined);
   if (transaction.stage !== 'adopted' || transaction.launch_attempt !== undefined || state.active !== true
     || state.step !== 'verification_contract_repair'
     || state.failure_kind !== 'verification_contract_failed'
     || state.failure_reason !== 'legacy session adoption requires structured verification contract repair'
-    || state.tmux_runner_pid !== null || state.tmux_session_name !== null || state.tmux_runner_binding !== null
-    || state.worker_pid !== null || state.active_child_pid !== null || state.active_child_identity !== null
-    || state.active_child_controller_pid !== null || state.active_child_controller_identity !== null
-    || (Array.isArray(state.active_child_identities) && state.active_child_identities.length > 0)
-    || (Array.isArray(state.refinement_child_identities) && state.refinement_child_identities.length > 0)
-    || state.recovery_required === true || Number(state.orphan_child_pid || 0) > 0) {
+    || hasPersistedOwnershipEvidence
+    || modernOwnershipEvidence(state).length > 0) {
     throw new Error('Post-adoption target supersession requires the exact ownerless verification-repair boundary.');
   }
   const logical = readLogicalPipeline(sessionDir);
@@ -987,16 +1168,25 @@ export function adoptActiveLegacyMuxSession(
   if (state.active !== true) throw new Error('Legacy adoption requires a session that is currently active.');
   const schemaVersion = Number(state.schema_version ?? 1);
   if (!Number.isInteger(schemaVersion) || schemaVersion < 1) throw new Error('Legacy session state schema is invalid.');
+  const workingDir = fs.realpathSync(String(state.working_dir || ''));
+  assertSessionMapOwnership(sessionDir, workingDir);
+  const exists = deps.tmuxExists || tmuxSessionExists;
+  const observe = deps.observeProcess || observeProcess;
+  const inspect = deps.inspectProcess || inspectProcessLivenessIdentity;
+  const bindingFor = deps.tmuxBinding || defaultTmuxBinding;
+  let transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
+  if (transaction?.stage === 'fenced' && transaction.controller_fenced) {
+    const controllerStillLive = inspect(transaction.runner) === 'matched';
+    transaction = resumeFencedLegacyController(sessionDir, transactionPath, transaction, workingDir, state, deps,
+      exists(transaction.tmux.session_name) || controllerStillLive);
+  }
+  if (transaction?.stage !== 'quiesced') {
+    assertNoModernOwnershipEvidence(state,
+      'Legacy adoption refuses modern authority, recovery, or cancellation evidence.');
+  }
   if (!fs.existsSync(transactionPath)) for (const forbidden of ['logical-pipeline.json', 'pipeline.json', 'pipeline-state.json', 'prd.lock.json']) {
     if (fs.existsSync(path.join(sessionDir, forbidden))) throw new Error(`Legacy adoption refuses existing ${forbidden}.`);
   }
-  const workingDir = fs.realpathSync(String(state.working_dir || ''));
-  assertSessionMapOwnership(sessionDir, workingDir);
-  const observe = deps.observeProcess || observeProcess;
-  const inspect = deps.inspectProcess || inspectProcessLivenessIdentity;
-  const exists = deps.tmuxExists || tmuxSessionExists;
-  const bindingFor = deps.tmuxBinding || defaultTmuxBinding;
-  let transaction = readJsonFile<LegacyAdoptionTransaction>(transactionPath, null);
   if (!transaction) {
     const sourceRuntime = describeInstalledRuntime(sourceRuntimeRoot);
     const targetRuntime = describeInstalledRuntime(targetRuntimeRoot);
@@ -1046,6 +1236,16 @@ export function adoptActiveLegacyMuxSession(
       }
       verifiedLegacyControllerTopology(transaction.runner.pid, transaction.tmux, sessionDir, sourceRuntimeRoot, observe, inspect,
         { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane });
+      transaction = {
+        ...transaction,
+        controller_fenced: true,
+        controller_fence: {
+          status: 'preparing', prepared_at: (deps.now?.() ?? new Date()).toISOString(),
+          fenced_at: null, released_at: null,
+        },
+      };
+      atomicWriteJson(transactionPath, transaction);
+      try {
       (deps.stopController || ((identity) => process.kill(identity.pid, 'SIGSTOP')))(transaction.runner);
       const stoppedBinding = bindingFor(transaction.tmux.session_name);
       if (JSON.stringify(stoppedBinding) !== JSON.stringify(transaction.tmux)) {
@@ -1057,6 +1257,11 @@ export function adoptActiveLegacyMuxSession(
       const child = validPersistedIdentity(fencedState.active_child_identity) ? fencedState.active_child_identity : null;
       if (fencedState.active_child_pid && !child) throw new Error('Legacy controller respawned a child without immutable identity.');
       transaction.active_child = child;
+      transaction.controller_fenced = true;
+      transaction.controller_fence = {
+        ...transaction.controller_fence!, status: 'fenced',
+        fenced_at: (deps.now?.() ?? new Date()).toISOString(), released_at: null,
+      };
       atomicWriteJson(transactionPath, transaction);
       if (child) {
         const childStatus = (deps.inspectChild || inspectRecordedLiveProcessIdentity)(child);
@@ -1067,8 +1272,13 @@ export function adoptActiveLegacyMuxSession(
         }
       }
       deps.afterChildQuiesced?.();
-      transaction.candidate_archive = archiveAttributableCandidate(sessionDir, workingDir,
+      assertNoModernOwnershipEvidence(new StateManager().read(statePath),
+        'Legacy adoption refuses modern evidence published after child quiescence.');
+      const archivedCandidate = archiveAttributableCandidate(sessionDir, workingDir,
         typeof fencedState.current_ticket === 'string' ? fencedState.current_ticket : null);
+      deps.afterCandidateArchiveCleanup?.();
+      transaction.candidate_archive = archivedCandidate;
+      transaction.candidate_archive_restored = false;
       atomicWriteJson(transactionPath, transaction);
       deps.checkpoint?.('candidate_archived');
       if (JSON.stringify(bindingFor(transaction.tmux.session_name)) !== JSON.stringify(transaction.tmux)) {
@@ -1076,20 +1286,110 @@ export function adoptActiveLegacyMuxSession(
       }
       verifiedLegacyControllerTopology(transaction.runner.pid, transaction.tmux, sessionDir, sourceRuntimeRoot, observe, inspect,
         { runner: transaction.runner, supervisor: transaction.supervisor, pane: transaction.pane });
-      (deps.killTmux || killTmuxSessionById)(transaction.tmux.session_id);
-      try { (deps.resumeController || ((identity) => process.kill(identity.pid, 'SIGCONT')))(transaction.runner); } catch { /* tmux already reaped it */ }
-      if (!(deps.waitForRunnerExit || defaultWaitForExit)(transaction.runner) || exists(transaction.tmux.session_name)) {
-        throw new Error('Legacy mux owner did not stop after exact tmux shutdown.');
+      assertNoModernOwnershipEvidence(new StateManager().read(statePath),
+        'Legacy adoption refuses modern evidence published before tmux shutdown.');
+      transaction = {
+        ...transaction,
+        controller_shutdown: {
+          status: 'prepared', prepared_at: (deps.now?.() ?? new Date()).toISOString(), committed_at: null,
+        },
+      };
+      atomicWriteJson(transactionPath, transaction);
+      const shutdownFence = new StateManager();
+      let shutdownError: unknown = null;
+      let ownershipCleared = false;
+      let shutdownRunnerExited = false;
+      let shutdownTmuxStillExists = true;
+      shutdownFence.acquireLock(statePath);
+      try {
+        assertNoModernOwnershipEvidence(shutdownFence.read(statePath),
+          'Legacy adoption refuses modern evidence at the atomic tmux shutdown fence.');
+        deps.afterFinalEvidenceCheck?.();
+        (deps.killTmux || killTmuxSessionById)(transaction!.tmux.session_id);
+        shutdownRunnerExited = (deps.waitForRunnerExit || defaultWaitForExit)(transaction!.runner);
+        shutdownTmuxStillExists = exists(transaction!.tmux.session_name);
+        if (!shutdownRunnerExited || shutdownTmuxStillExists) {
+          throw new Error('Legacy mux owner did not stop after exact tmux shutdown.');
+        }
+        transaction = {
+          ...transaction!,
+          controller_shutdown: {
+            prepared_at: transaction!.controller_shutdown!.prepared_at,
+            status: 'committed', committed_at: (deps.now?.() ?? new Date()).toISOString(),
+          },
+        };
+        const clearedState = applyQuiescedOwnershipClear(shutdownFence.read(statePath));
+        atomicWriteJson(statePath, clearedState);
+        transaction = {
+          ...transaction,
+          stage: 'quiesced',
+          updated_at: (deps.now?.() ?? new Date()).toISOString(),
+        };
+        atomicWriteJson(transactionPath, transaction);
+        ownershipCleared = true;
+      } catch (error) {
+        shutdownError = error;
+      } finally {
+        shutdownFence.releaseLock(statePath);
+      }
+      if (shutdownError) {
+        if (!shutdownRunnerExited && !shutdownTmuxStillExists) {
+          transaction = resumeFencedLegacyController(sessionDir, transactionPath, transaction!, workingDir,
+            new StateManager().read(statePath), deps);
+        } else if (shutdownRunnerExited && shutdownTmuxStillExists) {
+          (deps.killTmux || killTmuxSessionById)(transaction!.tmux.session_id);
+          transaction = {
+            ...transaction!, controller_fenced: false,
+            controller_fence: {
+              ...transaction!.controller_fence!, status: 'released',
+              released_at: (deps.now?.() ?? new Date()).toISOString(),
+            },
+          };
+          atomicWriteJson(transactionPath, transaction);
+        } else if (exists(transaction!.tmux.session_name) && inspect(transaction!.runner) === 'matched') {
+          transaction = resumeFencedLegacyController(sessionDir, transactionPath, transaction!, workingDir,
+            new StateManager().read(statePath), deps);
+        }
+        throw shutdownError;
+      }
+      if (!ownershipCleared) throw new Error('Legacy ownership handoff did not commit under its state fence.');
+      } catch (error) {
+        if (deps.simulateProcessDeath?.(error) === true) throw error;
+        if (transaction!.controller_fenced && transaction!.controller_shutdown?.status !== 'committed'
+          && exists(transaction!.tmux.session_name) && inspect(transaction!.runner) === 'matched') {
+          transaction = resumeFencedLegacyController(sessionDir, transactionPath, transaction!, workingDir,
+            new StateManager().read(statePath), deps);
+        }
+        throw error;
       }
     } else if (runnerStatus === 'matched') {
-      throw new Error('Legacy tmux disappeared while its recorded controller remained live.');
+      if (transaction.controller_shutdown?.status !== 'prepared') {
+        throw new Error('Legacy tmux disappeared while its recorded controller remained live.');
+      }
+      const result = (deps.reapRunner || reapRecordedLiveProcessGroup)(transaction.runner);
+      if (result.status !== 'reaped' && result.status !== 'not-running') {
+        throw new Error(`Could not safely reconcile the exact legacy controller after tmux loss: ${result.reason}`);
+      }
+      if (inspect(transaction.runner) === 'matched') {
+        throw new Error('Exact legacy controller remained live after bounded tmux-loss reconciliation.');
+      }
     }
-    if (typeof transaction.operation_lock_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(transaction.operation_lock_sha256)) {
+    if (typeof transaction!.operation_lock_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(transaction!.operation_lock_sha256)) {
       throw new Error('Legacy adoption transaction lacks authenticated session-operation lock evidence.');
     }
-    clearQuiescedOwnership(sessionDir);
-    transaction = { ...transaction, stage: 'quiesced', updated_at: (deps.now?.() ?? new Date()).toISOString() };
-    atomicWriteJson(transactionPath, transaction);
+    if (transaction!.stage === 'fenced') {
+      assertNoModernOwnershipEvidence(new StateManager().read(statePath),
+        'Legacy adoption refuses modern authority, recovery, or cancellation evidence at quiescence.');
+      if (!transaction!.candidate_archive.ref && listWorkingTreeDirtyPaths(workingDir).length > 0) {
+        transaction!.candidate_archive = archiveAttributableCandidate(sessionDir, workingDir,
+          typeof state.current_ticket === 'string' ? state.current_ticket : null);
+        transaction!.candidate_archive_restored = false;
+        atomicWriteJson(transactionPath, transaction);
+      }
+      clearQuiescedOwnership(sessionDir);
+      transaction = { ...transaction!, stage: 'quiesced', updated_at: (deps.now?.() ?? new Date()).toISOString() };
+      atomicWriteJson(transactionPath, transaction);
+    }
     deps.checkpoint?.('quiesced');
   }
 
@@ -1098,10 +1398,115 @@ export function adoptActiveLegacyMuxSession(
     if (typeof transaction.operation_lock_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(transaction.operation_lock_sha256)) {
       throw new Error('Legacy adoption transaction lacks authenticated session-operation lock evidence.');
     }
-    retireLegacyOperationLock(sessionDir, {
+    const legacyLockPath = path.join(sessionDir, '.session-operation.lock');
+    const legacyLockRetired = retireLegacyOperationLock(sessionDir, {
       pid: transaction.operation_lock_pid,
       sha256: transaction.operation_lock_sha256,
     });
+    if (!legacyLockRetired && fs.existsSync(legacyLockPath)) {
+      throw new Error('Legacy adoption refuses ownership transfer across a replaced session-operation lock.');
+    }
+    const postHandoffState = new StateManager().read(statePath);
+    if (validCommittedLegacyAdoptionTransfer(sessionDir, transaction, postHandoffState as Record<string, unknown>)) {
+      throw new Error('Legacy adoption ownership transferred to the authenticated modern recovery owner.');
+    }
+    const postHandoffEvidence = modernOwnershipEvidence(postHandoffState);
+    if (postHandoffEvidence.length > 0) {
+      const recoveryChallenge = transaction.post_handoff_recovery?.challenge || crypto.randomUUID();
+      transaction = {
+        ...transaction,
+        post_handoff_recovery: {
+          status: 'pending', evidence: postHandoffEvidence, owner_identity: null,
+          recovery_daemon_identity: transaction.post_handoff_recovery?.recovery_daemon_identity || null,
+          challenge: recoveryChallenge,
+          owner_spec_id: transaction.post_handoff_recovery?.owner_spec_id || null,
+          ready_receipt_id: transaction.post_handoff_recovery?.ready_receipt_id || null,
+          owner_spec: transaction.post_handoff_recovery?.owner_spec || null,
+          ready_receipt: transaction.post_handoff_recovery?.ready_receipt || null,
+          updated_at: (deps.now?.() ?? new Date()).toISOString(),
+        },
+      };
+      atomicWriteJson(transactionPath, transaction);
+      if (!runtimeRootMatchesDescriptor(targetRuntimeRoot, transaction.target_runtime)) {
+        throw new Error('Legacy post-handoff recovery refuses drifted target runtime ownership.');
+      }
+      if (postHandoffState.autonomous_owner_spec == null) {
+        const runtimeBin = path.join(targetRuntimeRoot, 'extension', 'bin');
+        const genericOwner = deriveAutonomousProcessOwnerSpec(sessionDir, workingDir,
+          postHandoffState.pipeline_mode === true ? 'pipeline-runner.js' : 'mux-runner.js',
+          ['--on-failure=retry'], runtimeBin);
+        new StateManager().update(statePath, (current) => {
+          if (current.autonomous_owner_spec == null) current.autonomous_owner_spec = genericOwner;
+          return current;
+        });
+      }
+      new StateManager().update(statePath, (current) => {
+        if (current.legacy_adoption_supervisor_challenge != null
+          && current.legacy_adoption_supervisor_challenge !== recoveryChallenge) {
+          throw new Error('Legacy adoption supervisor challenge changed before target readiness.');
+        }
+        current.legacy_adoption_supervisor_challenge = recoveryChallenge;
+        return current;
+      });
+      const ensuredDaemonPid = deps.ensurePostHandoffOwner
+        ? deps.ensurePostHandoffOwner(sessionDir)
+        : ensureAutonomousOwnerRecoveryDaemon(sessionDir, path.join(targetRuntimeRoot, 'extension', 'bin'));
+      const ownedState = new StateManager().read(statePath);
+      const recoveryDaemon = validPersistedIdentity(ownedState.autonomous_owner_recovery_daemon_identity)
+        && Number(ensuredDaemonPid) === ownedState.autonomous_owner_recovery_daemon_identity.pid
+        && inspectProcessLivenessIdentity(ownedState.autonomous_owner_recovery_daemon_identity) === 'matched'
+        ? ownedState.autonomous_owner_recovery_daemon_identity : null;
+      if (recoveryDaemon) {
+        transaction = {
+          ...transaction,
+          post_handoff_recovery: {
+            ...transaction.post_handoff_recovery!, recovery_daemon_identity: recoveryDaemon,
+            updated_at: (deps.now?.() ?? new Date()).toISOString(),
+          },
+        };
+        atomicWriteJson(transactionPath, transaction);
+      }
+      const ownerSpec = validateAutonomousOwnerSpec(ownedState.autonomous_owner_spec);
+      const ownerIdentity = validPersistedIdentity(ownedState.autonomous_supervisor_identity)
+        ? ownedState.autonomous_supervisor_identity : null;
+      const restoration = ownedState.autonomous_owner_restoration as {
+        status?: string; owner_spec_id?: string; rollover_intent_id?: string; rollover_epoch?: number;
+      } | null;
+      const readyOwner = authenticatedReadyProcessOwner(
+        sessionDir, ownedState as Record<string, unknown>, recoveryDaemon, recoveryChallenge,
+      );
+      const acceptedRestoration = Boolean(recoveryDaemon && ownerSpec && ownerIdentity && readyOwner
+        && JSON.stringify(readyOwner) === JSON.stringify(ownerIdentity)
+        && Number(ownedState.autonomous_supervisor_pid) === ownerIdentity.pid
+        && restoration?.status === 'restored'
+        && restoration.owner_spec_id === ownerSpec.spec_id
+        && restoration.rollover_intent_id === ownedState.autonomous_budget_rollover_intent_id
+        && Number(restoration.rollover_epoch) === Math.max(1, Number(ownedState.autonomous_budget_epoch || 1)));
+      if (acceptedRestoration) {
+        const readyReceipt = ownedState.autonomous_supervisor_ready_receipt as { receipt_id?: unknown } | null;
+        transaction = {
+          ...transaction,
+          post_handoff_recovery: {
+            status: 'ownership_transferred', evidence: postHandoffEvidence, owner_identity: ownerIdentity,
+            recovery_daemon_identity: recoveryDaemon, challenge: recoveryChallenge,
+            owner_spec_id: ownerSpec!.spec_id, ready_receipt_id: String(readyReceipt?.receipt_id || ''),
+            owner_spec: ownerSpec, ready_receipt: readyReceipt as AutonomousSupervisorReadyReceipt,
+            updated_at: (deps.now?.() ?? new Date()).toISOString(),
+          },
+        };
+        atomicWriteJson(transactionPath, transaction);
+        deps.afterOwnershipTransferRecorded?.();
+        new StateManager().update(statePath, (current) => {
+          if (current.legacy_adoption_supervisor_challenge === recoveryChallenge
+            && JSON.stringify(current.autonomous_supervisor_identity) === JSON.stringify(ownerIdentity)) {
+            current.legacy_adoption_supervisor_challenge = null;
+          }
+          return current;
+        });
+        throw new Error('Legacy adoption ownership transferred to the authenticated modern recovery owner.');
+      }
+      throw new Error('Legacy adoption recovery evidence is pending an authenticated target supervisor.');
+    }
   }
   const releaseOperation = acquireSessionOperation(sessionDir, 'Could not fence the quiesced legacy session for adoption.');
   try {

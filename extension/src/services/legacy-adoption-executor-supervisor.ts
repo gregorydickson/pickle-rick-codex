@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readLogicalPipeline } from './durable-supervisor.js';
+import { validCommittedLegacyAdoptionTransfer } from './legacy-adoption-transfer-proof.js';
 import {
   captureProcessLivenessIdentity,
   inspectProcessLivenessIdentity,
@@ -136,10 +137,14 @@ function spawnExecutor(spec: LegacyAdoptionExecutorSpec): number {
   return child.pid;
 }
 
-function defaultOutcome(sessionDir: string): 'running' | 'launched' | 'cancelled' | 'terminal' {
+export function legacyAdoptionOutcome(sessionDir: string): 'running' | 'launched' | 'cancelled' | 'terminal' {
   const record = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'legacy-session-adoption.json'), null);
   if (record?.status === 'launched') return 'launched';
   const state = readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'state.json'), null);
+  const transaction = readJsonFile<Record<string, unknown>>(
+    path.join(sessionDir, 'legacy-session-adoption-transaction.json'), null,
+  );
+  if (validCommittedLegacyAdoptionTransfer(sessionDir, transaction, state)) return 'terminal';
   if (state?.cancel_requested_at || state?.cancelled === true) return 'cancelled';
   try {
     if (readLogicalPipeline(sessionDir).terminal_state !== null) return 'terminal';
@@ -766,7 +771,7 @@ export function runLegacyAdoptionExecutorSupervisor(
     }
     for (;;) {
       assertAcceptedWal();
-      const outcome = (deps.outcome || defaultOutcome)(sessionDir);
+      const outcome = (deps.outcome || legacyAdoptionOutcome)(sessionDir);
       if (outcome !== 'running') {
         const terminalAccepted = accepted;
         const terminalRestartPath = path.join(sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE);
@@ -829,7 +834,7 @@ export function runLegacyAdoptionExecutorSupervisor(
         }
       }
       if (accepted?.stage === 'accepted') {
-        if ((deps.outcome || defaultOutcome)(sessionDir) !== 'running') continue;
+        if ((deps.outcome || legacyAdoptionOutcome)(sessionDir) !== 'running') continue;
         const predecessorState = inspect(accepted.predecessor_identity);
         if (predecessorState === 'matched') reapExecutor(accepted.predecessor_identity, reap);
         else if (predecessorState === 'reused') {
@@ -858,7 +863,7 @@ export function runLegacyAdoptionExecutorSupervisor(
         deps.checkpoint?.('restart_launch_persisted');
       }
       if (accepted?.stage === 'launch_pending') {
-        if ((deps.outcome || defaultOutcome)(sessionDir) !== 'running') continue;
+        if ((deps.outcome || legacyAdoptionOutcome)(sessionDir) !== 'running') continue;
         const finder = deps.discoverExecutors || discoverExecutors;
         const candidates = finder({ ...spec, sessionDir })
           .filter((candidate) => candidate.fingerprint !== accepted!.predecessor_identity.fingerprint

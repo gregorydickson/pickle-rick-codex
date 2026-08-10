@@ -11,12 +11,15 @@ import {
 import {
   assertRecordedActiveChildRecovered,
   captureProcessLivenessIdentity,
+  isPersistedProcessIdentityValid,
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
 import { StateManager } from '../services/state-manager.js';
 import { reconcileValidatedCitadelTelemetry } from '../services/citadel.js';
 import {
   ensureAutonomousOwnerRecoveryDaemon,
+  authenticatedReadyProcessOwner,
+  publishAutonomousSupervisorReadyReceipt,
   reconcileAutonomousOwnerHandoffTransaction,
   registerAutonomousOwnerSpec,
 } from '../services/autonomous-owner-recovery.js';
@@ -39,6 +42,16 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+export function adoptionSupervisorProvenanceReady(sessionDir: string): boolean {
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  const challenge = typeof state.legacy_adoption_supervisor_challenge === 'string'
+    ? state.legacy_adoption_supervisor_challenge : null;
+  if (!challenge) return true;
+  const daemon = state.autonomous_owner_recovery_daemon_identity;
+  return isPersistedProcessIdentityValid(daemon)
+    && Boolean(authenticatedReadyProcessOwner(sessionDir, state, daemon, challenge));
+}
+
 async function initializeAutonomousOwnerRecovery(
   sessionDir: string,
   runnerBin: string,
@@ -55,7 +68,14 @@ async function initializeAutonomousOwnerRecovery(
         undefined,
         path.join(runtimeBin, 'supervised-runner.js'),
       );
-      if (spec) ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
+      if (spec?.owner_mode === 'process') {
+        publishAutonomousSupervisorReadyReceipt(
+          sessionDir, spec, runnerBin, forwarded, path.join(runtimeBin, 'supervised-runner.js'),
+        );
+      }
+      if (spec) {
+        ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
+      }
       return;
     } catch (error) {
       if (!(error instanceof Error)
@@ -127,8 +147,10 @@ export async function runSupervisedRunner(
         !arg.startsWith('--handoff-request=') && !arg.startsWith('--target-runtime=')
       ));
       acceptingHandoff = false;
+      await initializeAutonomousOwnerRecovery(sessionDir, runnerBin, effectiveRunnerArgs, runtimeBin);
     }
     if (!acceptingHandoff) ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
+    if (!acceptingHandoff && !adoptionSupervisorProvenanceReady(sessionDir)) return 1;
     const before = supervisedRunnerDecision(sessionDir);
     if (before === 'completed') return 0;
     if (before === 'cancelled') return 130;

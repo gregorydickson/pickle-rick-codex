@@ -1518,6 +1518,94 @@ test('legacy max_time reconciliation does not resurrect unsealed, completed, can
   }
 });
 
+test('legacy max_time migration rejects every modern side ledger without state or bootstrap writes', () => {
+  const evidenceCases = [
+    ['active-child-pid', { active_child_pid: 7000 }],
+    ['malformed-active-child-pid', { active_child_pid: '0' }],
+    ['worker-pid', { worker_pid: 7000 }],
+    ['malformed-worker-pid', { worker_pid: '0' }],
+    ['tmux-runner-pid', { tmux_runner_pid: 7000 }],
+    ['malformed-tmux-runner-pid', { tmux_runner_pid: '0' }],
+    ['active-child-identity', { active_child_identity: deadProcessIdentity() }],
+    ['controller-pid', { active_child_controller_pid: 7001 }],
+    ['controller-identity', { active_child_controller_identity: deadProcessIdentity() }],
+    ['active-ledger', { active_child_identities: [deadProcessIdentity()] }],
+    ['malformed-active-ledger', { active_child_identities: {} }],
+    ['refinement-ledger', { refinement_child_identities: [deadProcessIdentity()] }],
+    ['malformed-refinement-ledger', { refinement_child_identities: 'corrupt' }],
+    ['supervisor-pid', { autonomous_supervisor_pid: 7002 }],
+    ['malformed-supervisor-pid', { autonomous_supervisor_pid: '0' }],
+    ['supervisor-identity', { autonomous_supervisor_identity: deadProcessIdentity() }],
+    ['owner-spec', { autonomous_owner_spec: { spec_id: 'modern-owner' } }],
+    ['owner-restoration', { autonomous_owner_restoration: { status: 'pending' } }],
+    ['owner-handoff', { autonomous_owner_handoff_transaction: { status: 'prepared' } }],
+    ['recovery-daemon-pid', { autonomous_owner_recovery_daemon_pid: 7003 }],
+    ['recovery-daemon-identity', { autonomous_owner_recovery_daemon_identity: deadProcessIdentity() }],
+    ['watchdog-pid', { cancellation_recovery_watchdog_pid: 7004 }],
+    ['watchdog-identity', { cancellation_recovery_watchdog_identity: deadProcessIdentity() }],
+    ['watchdog-arm-id', { cancellation_recovery_watchdog_arm_id: 'arm-1' }],
+    ['watchdog-arm', { cancellation_recovery_watchdog_arm: { arm_id: 'arm-1' } }],
+    ['runtime-binding', { cancellation_recovery_runtime_binding: { runtime_root: '/runtime' } }],
+    ['cancellation-recovery', { cancellation_recovery: { status: 'pending' } }],
+    ['recovery-required', { recovery_required: true }],
+    ['malformed-recovery-required', { recovery_required: 'false' }],
+    ['recovery-kind', { recovery_kind: 'cancellation_ownership' }],
+    ['recovery-reason', { recovery_reason: 'pending recovery' }],
+    ['orphan-recovery', { orphan_recovery: { status: 'ambiguous' } }],
+    ['orphan-child', { orphan_child_pid: 7005 }],
+    ['malformed-zero-orphan-child', { orphan_child_pid: '0' }],
+    ['recovery-suspended', { autonomous_owner_recovery_suspended: true }],
+    ['malformed-recovery-suspended', { autonomous_owner_recovery_suspended: 'false' }],
+    ['handoff-suspended', { autonomous_owner_recovery_suspended_for_handoff: 'handoff-1' }],
+    ['cancel-requested', { cancel_requested_at: '2026-08-10T00:00:00.000Z' }],
+    ['cancelled-flag', { cancelled: true }],
+    ['manager-relaunch-epoch', { manager_relaunch_recovery_epoch: 2 }],
+    ['malformed-manager-relaunch-epoch', { manager_relaunch_recovery_epoch: '0' }],
+    ['manager-relaunch-route', { manager_relaunch_recovery_route: 'fenced_executor_takeover' }],
+    ['manager-relaunch-status', { manager_relaunch_recovery_status: 'active' }],
+    ['manager-relaunch-activated', { manager_relaunch_recovery_activated_at: '2026-08-10T00:00:00.000Z' }],
+    ['manager-relaunch-consumed', { manager_relaunch_recovery_consumed_at: '2026-08-10T00:00:00.000Z' }],
+    ['artifact-contract-recovery', { artifact_contract_recovery: { status: 'pending' } }],
+    ['budget-rollover-intent', { autonomous_budget_rollover_intent_id: 'rollover-1' }],
+    ['budget-rollover-checkpoint', { autonomous_budget_rollover_checkpoint_pending: { intent_id: 'rollover-1' } }],
+    ['budget-consumed-intent', { autonomous_budget_consumed_intent_id: 'rollover-1' }],
+    ['budget-consumed-checkpoint', { autonomous_budget_consumed_checkpoint_pending: { intent_id: 'rollover-1' } }],
+    ['budget-checkpoint-error', { autonomous_budget_checkpoint_error: 'checkpoint transport failed' }],
+  ];
+  for (const [label, evidence] of evidenceCases) {
+    const workingDir = makeTempRoot(`pickle-legacy-side-ledger-${label}-work-`);
+    const sessionDir = makeTempRoot(`pickle-legacy-side-ledger-${label}-session-`);
+    const statePath = path.join(sessionDir, 'state.json');
+    const startCommit = initializeGitRepository(workingDir);
+    writeJson(statePath, state({
+      active: false,
+      working_dir: fs.realpathSync(workingDir),
+      session_dir: fs.realpathSync(sessionDir),
+      step: 'paused',
+      last_exit_reason: 'max_time',
+      start_commit: startCommit,
+      pinned_sha: startCommit,
+      history: [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }],
+      ...evidence,
+    }));
+    sealLegacySession(sessionDir, workingDir);
+    createLogicalPipeline(sessionDir, `legacy-side-ledger-${label}`);
+    beginAutonomousExecution(sessionDir);
+    const paths = [
+      statePath,
+      path.join(sessionDir, 'logical-pipeline.json'),
+      path.join(sessionDir, 'prd_refined.md'),
+      path.join(sessionDir, 'refinement-acceptance.json'),
+    ];
+    const before = paths.map((file) => fs.existsSync(file) ? fs.readFileSync(file) : null);
+
+    const result = reconcileSessionLiveness(sessionDir, undefined, Date.now(), { allowLegacyMaxTimeMigration: true });
+    assert.equal(result.state.active, false, label);
+    assert.equal(result.state.legacy_max_time_migration, undefined, label);
+    assert.deepEqual(paths.map((file) => fs.existsSync(file) ? fs.readFileSync(file) : null), before, label);
+  }
+});
+
 test('tampered legacy max_time migration transaction blocks owner recovery', () => {
   const sessionDir = makeTempRoot('pickle-legacy-migration-tamper-');
   writeJson(path.join(sessionDir, 'state.json'), state({
