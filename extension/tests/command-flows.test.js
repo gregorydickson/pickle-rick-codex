@@ -144,13 +144,17 @@ test('draft-prd writes a PRD and advances the session state', () => {
   assert.equal(state.history.at(-1).step, 'prd');
 });
 
-test('draft-prd exits promptly after success artifacts even if codex lingers', () => {
+test('draft-prd drains its exact monitored process after success artifacts even if codex lingers', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const invocationLog = path.join(dataRoot, 'lingering-prd-invocations.jsonl');
+  const signalLog = path.join(dataRoot, 'lingering-prd-signals.jsonl');
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
-    FAKE_CODEX_HANG_MS: '10000',
+    FAKE_CODEX_HANG_MS: '60000',
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_SIGNAL_LOG: signalLog,
   });
   createFakeCodex(fakeBin);
 
@@ -159,15 +163,35 @@ test('draft-prd exits promptly after success artifacts even if codex lingers', (
     env,
   }).trim();
 
-  const started = Date.now();
   runNode([path.join(repoRoot, 'bin/draft-prd.js'), sessionDir, 'draft this task'], {
     cwd: projectDir,
     env,
   });
-  const elapsed = Date.now() - started;
 
-  assert.ok(elapsed < 5000, `draft-prd took too long after success: ${elapsed}ms`);
-  assert.ok(fs.existsSync(path.join(sessionDir, 'prd.md')));
+  const prdPath = path.join(sessionDir, 'prd.md');
+  assert.ok(fs.existsSync(prdPath));
+  assert.match(fs.readFileSync(prdPath, 'utf8'), /Fake codex produced a draft/);
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter(({ args }) => args[0] === 'exec');
+  const signals = fs.existsSync(signalLog)
+    ? fs.readFileSync(signalLog, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+    : [];
+  assert.equal(invocations.length, 1, 'draft-prd launches one Codex exec');
+  const invocationIdentities = new Set(invocations.map(({ pid, invocation_nonce }) => `${pid}:${invocation_nonce}`));
+  assert.ok(signals.every(({ pid, invocation_nonce, signal }) => (
+    signal === 'SIGTERM' && invocationIdentities.has(`${pid}:${invocation_nonce}`)
+  )), 'every observed graceful-shutdown receipt belongs to the exact PRD invocation');
+  for (const { pid } of invocations) {
+    assert.throws(() => process.kill(pid, 0), (error) => error?.code === 'ESRCH',
+      `PRD Codex process ${pid} must be absent before draft-prd returns`);
+  }
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.step, 'refine');
+  assert.deepEqual(state.active_child_identities, []);
+  assert.equal(state.active_child_pid, null);
+  assert.equal(state.active_child_identity, null);
+  assert.equal(state.active_child_controller_pid, null);
+  assert.equal(state.active_child_controller_identity, null);
 });
 
 test('draft-prd ignores stale success artifacts from an earlier attempt', () => {

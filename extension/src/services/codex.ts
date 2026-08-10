@@ -154,6 +154,12 @@ function processGroupAlive(pgid: number): boolean {
   }
 }
 
+const BROKER_KILL_FALLBACK_MS = 3_000;
+const PROCESS_IDENTITY_PS_TIMEOUT_MS = 5_000;
+const POST_CLOSE_ATTESTATION_WINDOW_MS = BROKER_KILL_FALLBACK_MS
+  + (2 * PROCESS_IDENTITY_PS_TIMEOUT_MS);
+const MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS = 2;
+
 async function runSpawnedCommand({
   command,
   args = [],
@@ -355,7 +361,7 @@ async function runSpawnedCommand({
         if (!shutdownAckObserved || processGroupAlive(brokerIdentity?.pgid || 0)) {
           signalAttestedGroup('SIGKILL');
         }
-      }, 3_000);
+      }, BROKER_KILL_FALLBACK_MS);
       fallbackTimer.unref?.();
     };
 
@@ -678,7 +684,13 @@ async function runSpawnedCommand({
       if (terminationCause === null && !successObserved) checkForSuccess();
       cleanup();
       const flushStarted = Date.now();
-      const attestationDeadline = Date.now() + 2_000;
+      // One immutable identity observation can require two `ps` calls. The old
+      // two-second window could therefore expire during its first exact
+      // observation and reject a broker that had already drained. Cover the
+      // broker kill fallback plus both bounded `ps` calls, and always permit a
+      // second observation when the first still sees a live identity/group.
+      const attestationDeadline = Date.now() + POST_CLOSE_ATTESTATION_WINDOW_MS;
+      let attestationObservations = 0;
       let stableSignature = currentProgressSignature();
       const flushQuietMs = Math.max(50, Math.min(successSignalGraceMs, 250));
       const finalizeAfterFlush = (): void => {
@@ -688,6 +700,7 @@ async function runSpawnedCommand({
           setTimeout(finalizeAfterFlush, flushQuietMs);
           return;
         }
+        attestationObservations += 1;
         const brokerLiveness = brokerIdentity
           ? inspectProcessLivenessIdentity(brokerIdentity) : 'not-running';
         const targetLiveness = targetIdentity
@@ -709,10 +722,13 @@ async function runSpawnedCommand({
           brokerDrainAttested = true;
         } else if ((brokerLiveness === 'matched' || targetLiveness === 'matched'
           || descendantLiveness.includes('matched'))
-          && Date.now() < attestationDeadline) {
+          && (attestationObservations < MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS
+            || Date.now() < attestationDeadline)) {
           setTimeout(finalizeAfterFlush, 25);
           return;
-        } else if (!groupsAbsent && Date.now() < attestationDeadline) {
+        } else if (!groupsAbsent
+          && (attestationObservations < MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS
+            || Date.now() < attestationDeadline)) {
           setTimeout(finalizeAfterFlush, 25);
           return;
         }

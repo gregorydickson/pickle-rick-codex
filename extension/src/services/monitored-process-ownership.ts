@@ -54,6 +54,66 @@ function allAbsent(identities: PersistedProcessIdentity[]): boolean {
     && [...new Set(identities.map((identity) => identity.pgid))].every(processGroupAbsent);
 }
 
+function assertMonotonicRecoveryExtension(
+  prior: PersistedProcessIdentity[],
+  current: PersistedProcessIdentity[],
+): void {
+  if (prior.length === 0 || current.length < prior.length
+    || !prior.every((identity, index) => sameIdentity(identity, current[index]))) {
+    throw new Error('Monitored process ownership changed during recovery.');
+  }
+  const root = current[0];
+  if (root.pid !== root.pgid) {
+    throw new Error('Monitored recovery ledger root is not its exact broker group leader.');
+  }
+  const seenPids = new Set<number>();
+  for (const identity of current) {
+    if (seenPids.has(identity.pid)) {
+      throw new Error('Monitored recovery ledger contains a duplicate process identity.');
+    }
+    seenPids.add(identity.pid);
+  }
+  for (const pgid of new Set(current.map((identity) => identity.pgid))) {
+    if (pgid === root.pgid) continue;
+    const group = current.filter((identity) => identity.pgid === pgid);
+    if (!group.some((identity) => identity.pid === pgid)
+      || group.some((identity) => identity.identity_kind !== 'descendant')) {
+      throw new Error('Monitored recovery ledger added an unattested descendant process group.');
+    }
+  }
+}
+
+function reapMonitoredLedger(identities: PersistedProcessIdentity[]): void {
+  const groups = new Map<number, PersistedProcessIdentity[]>();
+  for (const identity of identities) {
+    const group = groups.get(identity.pgid) || [];
+    group.push(identity);
+    groups.set(identity.pgid, group);
+  }
+  for (const group of groups.values()) {
+    const leader = group.find((identity) => identity.pid === identity.pgid);
+    if (leader && inspectProcessLivenessIdentity(leader) === 'matched') {
+      const result = reapRecordedLiveProcessGroup(leader);
+      if (!['reaped', 'not-running'].includes(result.status)) {
+        throw new Error(`Cannot recover monitored broker ${leader.pid}: ${result.reason}`);
+      }
+    }
+    for (const identity of group) {
+      const liveness = inspectProcessLivenessIdentity(identity);
+      if (liveness === 'not-running') continue;
+      if (liveness === 'reused') {
+        throw new Error(`Cannot recover monitored process ${identity.pid}: immutable identity was reused.`);
+      }
+      const result = identity.pid === identity.pgid
+        ? reapRecordedLiveProcessGroup(identity)
+        : reapRecordedProcessGroupFromMember(identity);
+      if (!['reaped', 'not-running'].includes(result.status)) {
+        throw new Error(`Cannot recover monitored process ${identity.pid}: ${result.reason}`);
+      }
+    }
+  }
+}
+
 function clearLedger(state: PersistedState): PersistedState {
   state.active_child_identities = [];
   state.active_child_pid = null;
@@ -84,48 +144,32 @@ export function recoverMonitoredProcessOwnership(
     // A legacy bare PID is not durable ownership evidence: PID reuse must not
     // permanently fence recovery of an otherwise exact child ledger.
   }
-  const groups = new Map<number, PersistedProcessIdentity[]>();
-  for (const identity of recorded) {
-    const group = groups.get(identity.pgid) || [];
-    group.push(identity);
-    groups.set(identity.pgid, group);
-  }
-  for (const group of groups.values()) {
-    const leader = group.find((identity) => identity.pid === identity.pgid);
-    if (leader && inspectProcessLivenessIdentity(leader) === 'matched') {
-      const result = reapRecordedLiveProcessGroup(leader);
-      if (!['reaped', 'not-running'].includes(result.status)) {
-        throw new Error(`Cannot recover monitored broker ${leader.pid}: ${result.reason}`);
-      }
+  let observed = recorded;
+  const recoveryDeadline = Date.now() + 10_000;
+  while (Date.now() < recoveryDeadline) {
+    reapMonitoredLedger(observed);
+    const absenceDeadline = Math.min(recoveryDeadline, Date.now() + 2_000);
+    while (!allAbsent(observed) && Date.now() < absenceDeadline) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
-    for (const identity of group) {
-      const liveness = inspectProcessLivenessIdentity(identity);
-      if (liveness === 'not-running') continue;
-      if (liveness === 'reused') {
-        throw new Error(`Cannot recover monitored process ${identity.pid}: immutable identity was reused.`);
-      }
-      const result = identity.pid === identity.pgid
-        ? reapRecordedLiveProcessGroup(identity)
-        : reapRecordedProcessGroupFromMember(identity);
-      if (!['reaped', 'not-running'].includes(result.status)) {
-        throw new Error(`Cannot recover monitored process ${identity.pid}: ${result.reason}`);
-      }
+    if (!allAbsent(observed)) {
+      throw new Error('Cannot clear monitored process ownership: an attested process or group remains live.');
     }
+
+    manager.update(statePath, (current) => {
+      const latest = activeMonitoredProcessIdentities(current);
+      if (latest.length === 0) return clearLedger(current);
+      if (!exactLedgerMatches(current, observed)) {
+        assertMonotonicRecoveryExtension(observed, latest);
+      }
+      return allAbsent(latest) ? clearLedger(current) : current;
+    });
+    const remaining = activeMonitoredProcessIdentities(manager.read(statePath));
+    if (remaining.length === 0) return;
+    assertMonotonicRecoveryExtension(observed, remaining);
+    observed = remaining;
   }
-  const absenceDeadline = Date.now() + 2_000;
-  while (!allAbsent(recorded) && Date.now() < absenceDeadline) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-  }
-  if (!allAbsent(recorded)) {
-    throw new Error('Cannot clear monitored process ownership: an attested process or group remains live.');
-  }
-  manager.update(statePath, (current) => {
-    if (activeMonitoredProcessIdentities(current).length === 0) return clearLedger(current);
-    if (!exactLedgerMatches(current, recorded)) {
-      throw new Error('Monitored process ownership changed during recovery.');
-    }
-    return clearLedger(current);
-  });
+  throw new Error('Cannot clear monitored process ownership: publication did not quiesce during recovery.');
 }
 
 /** Recover the parallel refinement fan-out ledger with the same exact

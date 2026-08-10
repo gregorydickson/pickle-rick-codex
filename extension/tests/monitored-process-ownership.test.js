@@ -26,11 +26,42 @@ function identity(pid, pgid = pid) {
   };
 }
 
+function descendantIdentity(pid, pgid, sessionId = pgid) {
+  const startTime = `start-${pid}`;
+  const commandSha256 = '0'.repeat(64);
+  return {
+    pid,
+    pgid,
+    start_time: startTime,
+    fingerprint: crypto.createHash('sha256')
+      .update(`v2-descendant\0${pid}\0${pgid}\0${sessionId}\0${startTime}`).digest('hex'),
+    identity_version: 2,
+    session_id: sessionId,
+    command_sha256: commandSha256,
+    identity_kind: 'descendant',
+    strict_command: false,
+  };
+}
+
 function fixture() {
   const root = makeTempRoot('pickle-monitored-ownership-');
   const statePath = path.join(root, 'state.json');
   fs.writeFileSync(statePath, `${JSON.stringify({ schema_version: 1, active: true })}\n`);
   return { manager: new StateManager(), statePath };
+}
+
+class PublishingStateManager extends StateManager {
+  publication = null;
+
+  publicationInjected = false;
+
+  update(statePath, updater) {
+    if (this.publication && !this.publicationInjected) {
+      this.publicationInjected = true;
+      new StateManager().update(statePath, this.publication);
+    }
+    return super.update(statePath, updater);
+  }
 }
 
 async function waitFor(predicate, message) {
@@ -174,6 +205,93 @@ test('restart recovery clears a stranded ledger only after exact groups are abse
   recoverMonitoredProcessOwnership(manager, statePath);
   assert.deepEqual(manager.read(statePath).active_child_identities, []);
   assert.equal(manager.read(statePath).active_child_identity, null);
+});
+
+test('restart recovery converges when target publication monotonically extends the broker ledger during drain', () => {
+  const root = makeTempRoot('pickle-monitored-publication-race-');
+  const statePath = path.join(root, 'state.json');
+  fs.writeFileSync(statePath, `${JSON.stringify({ schema_version: 1, active: false })}\n`);
+  const manager = new PublishingStateManager();
+  const broker = identity(98411);
+  const target = identity(98412, broker.pgid);
+  manager.update(statePath, (state) => {
+    state.active_child_identities = [broker];
+    state.active_child_pid = broker.pid;
+    state.active_child_identity = broker;
+    return state;
+  });
+  manager.publication = (state) => {
+    state.active_child_identities = [broker, target];
+    return state;
+  };
+
+  recoverMonitoredProcessOwnership(manager, statePath, { allowLiveController: true });
+
+  assert.equal(manager.publicationInjected, true);
+  assert.deepEqual(manager.read(statePath).active_child_identities, []);
+  assert.equal(manager.read(statePath).active_child_identity, null);
+});
+
+test('restart recovery converges only for a completely attested added descendant group', () => {
+  const root = makeTempRoot('pickle-monitored-descendant-publication-');
+  const statePath = path.join(root, 'state.json');
+  fs.writeFileSync(statePath, `${JSON.stringify({ schema_version: 1, active: false })}\n`);
+  const manager = new PublishingStateManager();
+  const broker = identity(98415);
+  const target = identity(98416, broker.pgid);
+  const descendantLeader = descendantIdentity(98417, 98417);
+  const descendantMember = descendantIdentity(98418, descendantLeader.pgid);
+  manager.update(statePath, (state) => {
+    state.active_child_identities = [broker, target];
+    state.active_child_pid = broker.pid;
+    state.active_child_identity = broker;
+    return state;
+  });
+  manager.publication = (state) => {
+    state.active_child_identities = [broker, target, descendantLeader, descendantMember];
+    return state;
+  };
+
+  recoverMonitoredProcessOwnership(manager, statePath, { allowLiveController: true });
+
+  assert.deepEqual(manager.read(statePath).active_child_identities, []);
+});
+
+test('restart recovery rejects removal, reorder, replacement, and unattested group drift during drain', () => {
+  const broker = identity(98421);
+  const target = identity(98422, broker.pgid);
+  const replacement = identity(98423);
+  const unattestedGroup = identity(98424);
+  const corruptions = [
+    { name: 'removal', ledger: [broker], pattern: /ownership changed during recovery/ },
+    { name: 'reorder', ledger: [target, broker], pattern: /ownership changed during recovery/ },
+    { name: 'replacement', ledger: [replacement, target], pattern: /ownership changed during recovery/ },
+    { name: 'group drift', ledger: [broker, target, unattestedGroup], pattern: /unattested descendant process group/ },
+  ];
+
+  for (const corruption of corruptions) {
+    const root = makeTempRoot(`pickle-monitored-${corruption.name.replace(' ', '-')}-`);
+    const statePath = path.join(root, 'state.json');
+    fs.writeFileSync(statePath, `${JSON.stringify({ schema_version: 1, active: false })}\n`);
+    const manager = new PublishingStateManager();
+    manager.update(statePath, (state) => {
+      state.active_child_identities = [broker, target];
+      state.active_child_pid = broker.pid;
+      state.active_child_identity = broker;
+      return state;
+    });
+    manager.publication = (state) => {
+      state.active_child_identities = corruption.ledger;
+      return state;
+    };
+
+    assert.throws(
+      () => recoverMonitoredProcessOwnership(manager, statePath, { allowLiveController: true }),
+      corruption.pattern,
+      corruption.name,
+    );
+    assert.deepEqual(manager.read(statePath).active_child_identities, corruption.ledger);
+  }
 });
 
 test('restart recovery reaps a stubborn target after its broker is SIGKILLed', async () => {

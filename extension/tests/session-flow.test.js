@@ -32,6 +32,113 @@ function initGitRepo(repoDir) {
   runGit(repoDir, ['config', 'user.email', 'pickle-rick-tests@example.com']);
 }
 
+function configureStartupWorkerBound(sessionDir, workerTimeoutSeconds = 10) {
+  const statePath = path.join(sessionDir, 'state.json');
+  const state = readJsonFile(statePath);
+  state.worker_timeout_seconds = workerTimeoutSeconds;
+  writeJson(statePath, state);
+}
+
+function exactActiveChildIsReady(state, { minimumIdentities = 1 } = {}) {
+  const primary = state.active_child_identity || null;
+  if (!primary || state.active_child_pid !== primary.pid
+    || inspectProcessLivenessIdentity(primary) !== 'matched') return false;
+  const identities = Array.isArray(state.active_child_identities) && state.active_child_identities.length > 0
+    ? state.active_child_identities
+    : [primary];
+  return identities.length >= minimumIdentities
+    && identities.every((identity) => inspectProcessLivenessIdentity(identity) === 'matched');
+}
+
+function sessionStartupDiagnostics(sessionDir, child, state, extra = {}) {
+  const logTail = (name) => {
+    const filePath = path.join(sessionDir, name);
+    if (!fs.existsSync(filePath)) return '<missing>';
+    return fs.readFileSync(filePath, 'utf8').slice(-8_000);
+  };
+  return JSON.stringify({
+    child_exit_code: child.exitCode,
+    child_signal: child.signalCode,
+    state,
+    active_identity_liveness: state?.active_child_identity
+      ? inspectProcessLivenessIdentity(state.active_child_identity) : 'absent',
+    active_identity_set_liveness: Array.isArray(state?.active_child_identities)
+      ? state.active_child_identities.map((identity) => ({
+        pid: identity.pid,
+        pgid: identity.pgid,
+        liveness: inspectProcessLivenessIdentity(identity),
+      })) : [],
+    ...extra,
+    pipeline_log_tail: logTail('pipeline-runner.log'),
+    loop_log_tail: logTail('loop-runner.log'),
+    mux_log_tail: logTail('mux-runner.log'),
+  }, null, 2);
+}
+
+async function waitForSessionStartupMilestone({
+  sessionDir,
+  child,
+  label,
+  predicate,
+  semanticProjection,
+  diagnostics = () => ({}),
+}) {
+  const statePath = path.join(sessionDir, 'state.json');
+  const configuredWorkerMs = Math.max(
+    1_000,
+    Number(readJsonFile(statePath).worker_timeout_seconds || 10) * 1_000,
+  );
+  const inactivityMs = configuredWorkerMs + 30_000;
+  const absoluteMs = configuredWorkerMs * 3 + 60_000;
+  const startedAt = Date.now();
+  let lastProgressAt = startedAt;
+  let highWater = [];
+  let latestState = null;
+  let runnerIdentity = null;
+
+  while (Date.now() - startedAt < absoluteMs) {
+    runnerIdentity ||= captureProcessLivenessIdentity(child.pid);
+    latestState = readJsonFile(statePath);
+    const extra = diagnostics(latestState);
+    if (runnerIdentity && inspectProcessLivenessIdentity(runnerIdentity) === 'matched'
+      && predicate(latestState, extra)) return { state: latestState, extra };
+    if (child.exitCode !== null || child.signalCode !== null
+      || (runnerIdentity && inspectProcessLivenessIdentity(runnerIdentity) !== 'matched')) {
+      assert.fail(`${label} runner exited before its durable startup milestone\n${sessionStartupDiagnostics(sessionDir, child, latestState, extra)}`);
+    }
+
+    const semantic = semanticProjection(latestState, extra).map((value) => Number(value) || 0);
+    if (semantic.some((value, index) => value > (highWater[index] || 0))) {
+      highWater = semantic.map((value, index) => Math.max(value, highWater[index] || 0));
+      lastProgressAt = Date.now();
+    }
+    if (Date.now() - lastProgressAt >= inactivityMs) {
+      assert.fail(`${label} made no durable semantic progress for ${inactivityMs}ms\n${sessionStartupDiagnostics(sessionDir, child, latestState, { ...extra, high_water: highWater })}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  assert.fail(`${label} exceeded its ${absoluteMs}ms phase-derived convergence safeguard\n${sessionStartupDiagnostics(sessionDir, child, latestState, { ...diagnostics(latestState), high_water: highWater })}`);
+}
+
+async function assertExactIdentityGroupsDrained(identities, label) {
+  const exactIdentities = [...new Map(identities.filter(Boolean).map((identity) => [identity.fingerprint, identity])).values()];
+  await waitFor(() => exactIdentities.every((identity) => (
+    inspectProcessLivenessIdentity(identity) === 'not-running'
+  )), {
+    timeoutMs: 10_000,
+    intervalMs: 20,
+    message: `${label} left an exact recorded identity running`,
+  });
+  for (const pgid of new Set(exactIdentities.map((identity) => identity.pgid))) {
+    assert.throws(
+      () => process.kill(-pgid, 0),
+      (error) => error?.code === 'ESRCH',
+      `${label} left attested process group ${pgid} running`,
+    );
+  }
+}
+
 async function waitForMicroverseWorkerGate({ sessionDir, child, runnerIdentity, readyPath }) {
   const statePath = path.join(sessionDir, 'state.json');
   const startedAt = Date.now();
@@ -4745,6 +4852,7 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
       dry_run: false,
     },
   });
+  configureStartupWorkerBound(sessionDir);
 
   const child = spawn('node', [path.join(repoRoot, 'bin/pipeline-runner.js'), sessionDir], {
     cwd: projectDir,
@@ -4754,14 +4862,36 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let pipelineError = '';
-  child.stderr.on('data', (chunk) => { pipelineError += chunk.toString(); });
-
-  await waitFor(() => {
-    if (child.exitCode !== null) throw new Error(`pipeline exited before anatomy: ${pipelineError}\n${fs.readFileSync(path.join(sessionDir, 'pipeline-runner.log'), 'utf8')}`);
-    const pipelineState = readJsonFile(path.join(sessionDir, 'pipeline-state.json'), null);
-    return pipelineState?.phase_statuses?.['anatomy-park'] === 'running';
-  }, { timeoutMs: 15_000, message: 'pipeline did not enter anatomy-park' });
+  const anatomyMilestone = await waitForSessionStartupMilestone({
+    sessionDir,
+    child,
+    label: 'pipeline anatomy-park startup',
+    diagnostics: () => ({
+      pipeline_state: readJsonFile(path.join(sessionDir, 'pipeline-state.json'), null),
+    }),
+    predicate: (state, { pipeline_state: pipelineState }) => (
+      pipelineState?.phase_statuses?.['anatomy-park'] === 'running'
+      && state.pipeline_phase === 'anatomy-park'
+      && state.active_child_kind === 'codex'
+      && exactActiveChildIsReady(state, { minimumIdentities: 2 })
+    ),
+    semanticProjection: (state, { pipeline_state: pipelineState }) => {
+      const statuses = pipelineState?.phase_statuses || {};
+      const anatomyRank = ['todo', 'running', 'done'].indexOf(statuses['anatomy-park']) + 1;
+      return [
+        statuses.pickle === 'done' ? 1 : 0,
+        Math.max(0, anatomyRank),
+        new Set((state.history || []).map((entry) => entry?.step).filter(Boolean)).size,
+        Number(state.iteration || 0),
+        state.active_child_kind === 'codex' ? 1 : 0,
+        Array.isArray(state.active_child_identities) ? state.active_child_identities.length : 0,
+      ];
+    },
+  });
+  const anatomyIdentities = [
+    ...(anatomyMilestone.state.active_child_identities || []),
+    anatomyMilestone.state.active_child_identity,
+  ];
 
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
     env,
@@ -4790,6 +4920,7 @@ test('pickle-pipeline records cancel against anatomy and does not advance', asyn
   assert.equal(pipelineState.phase_statuses['anatomy-park'], 'cancelled');
   assert.equal(pipelineState.phase_statuses['szechuan-sauce'], 'todo');
   assert.equal(pipelineState.last_exit_reason, 'cancelled');
+  await assertExactIdentityGroupsDrained(anatomyIdentities, 'cancelled anatomy-park');
 
   const failingDataRoot = makeTempRoot();
   const failingProjectDir = makeTempRoot('pickle-rick-project-');
@@ -5274,6 +5405,7 @@ setTimeout(() => process.exit(0), 10000);
     env,
     cwd: projectDir,
   }).trim();
+  configureStartupWorkerBound(sessionDir);
 
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'microverse',
@@ -5288,11 +5420,29 @@ setTimeout(() => process.exit(0), 10000);
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-
-  await waitFor(() => {
-    const state = readJsonFile(path.join(sessionDir, 'state.json'));
-    return state.active_child_kind === 'codex';
-  }, { message: 'loop-runner never entered codex phase' });
+  const codexMilestone = await waitForSessionStartupMilestone({
+    sessionDir,
+    child,
+    label: 'loop-runner Codex startup',
+    diagnostics: () => ({
+      attempt: readJsonFile(path.join(sessionDir, 'microverse-attempt.json'), null),
+      experiments: readJsonFile(path.join(sessionDir, 'microverse-experiments.json'), null),
+    }),
+    predicate: (state) => state.active_child_kind === 'codex'
+      && exactActiveChildIsReady(state, { minimumIdentities: 2 }),
+    semanticProjection: (state, { attempt, experiments }) => [
+      new Set((state.history || []).map((entry) => entry?.step).filter(Boolean)).size,
+      Number(state.iteration || 0),
+      attempt?.phase === 'running' ? 1 : 0,
+      Array.isArray(experiments?.experiments) ? experiments.experiments.length : 0,
+      state.active_child_kind === 'codex' ? 1 : 0,
+      Array.isArray(state.active_child_identities) ? state.active_child_identities.length : 0,
+    ],
+  });
+  const codexIdentities = [
+    ...(codexMilestone.state.active_child_identities || []),
+    codexMilestone.state.active_child_identity,
+  ];
 
   fs.writeFileSync(path.join(projectDir, 'tracked.txt'), 'concurrent user work\n');
   fs.writeFileSync(path.join(projectDir, 'user-note.txt'), 'preserve me\n');
@@ -5318,6 +5468,7 @@ setTimeout(() => process.exit(0), 10000);
   assert.match(log, /microverse iteration rolled back after cancelled/);
   assert.match(log, /loop-runner finished: cancelled/);
   assert.doesNotMatch(log, /finished: success/);
+  await assertExactIdentityGroupsDrained(codexIdentities, 'cancelled loop-runner Codex worker');
 });
 
 test('microverse retains the isolated candidate and transaction when durable archive fails', () => {
@@ -5372,6 +5523,7 @@ test('cancel stops live verification work without blocking the ticket', async ()
     env,
     cwd: projectDir,
   }).trim();
+  configureStartupWorkerBound(sessionDir);
 
   writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
     tickets: [
@@ -5394,14 +5546,25 @@ test('cancel stops live verification work without blocking the ticket', async ()
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let childError = '';
-  child.stderr.on('data', (chunk) => { childError += chunk.toString(); });
-
-  await waitFor(() => {
-    if (child.exitCode !== null) throw new Error(`mux-runner exited before verification: ${childError}\n${fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8')}`);
-    const state = readJsonFile(path.join(sessionDir, 'state.json'));
-    return state.active_child_kind === 'verification';
-  }, { timeoutMs: 10_000, message: 'mux-runner never entered verification phase' });
+  const verificationMilestone = await waitForSessionStartupMilestone({
+    sessionDir,
+    child,
+    label: 'mux-runner verification startup',
+    predicate: (state) => state.active_child_kind === 'verification'
+      && exactActiveChildIsReady(state),
+    semanticProjection: (state) => {
+      const stepRank = ['research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'simplify', 'verify']
+        .indexOf(String(state.step || '')) + 1;
+      return [
+        new Set((state.history || []).map((entry) => entry?.step).filter(Boolean)).size,
+        Number(state.iteration || 0),
+        Math.max(0, stepRank),
+        state.current_ticket ? 1 : 0,
+        state.active_child_kind === 'verification' ? 1 : 0,
+      ];
+    },
+  });
+  const verificationIdentities = [verificationMilestone.state.active_child_identity];
 
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: projectDir });
 
@@ -5419,6 +5582,7 @@ test('cancel stops live verification work without blocking the ticket', async ()
   assert.equal(ticket.status, 'Todo');
   assert.match(log, /mux-runner finished: cancelled/);
   assert.doesNotMatch(log, /finished: success/);
+  await assertExactIdentityGroupsDrained(verificationIdentities, 'cancelled verification worker');
 });
 
 test('cancel stops a live pipeline child before pipeline teardown clears runtime pids', async () => {

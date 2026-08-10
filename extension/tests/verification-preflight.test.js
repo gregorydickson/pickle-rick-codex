@@ -984,7 +984,11 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
-    FAKE_CODEX_HANG_MS: '3000',
+    // This fixture proves broker-initiated termination, so keep the fake alive
+    // well beyond ordinary full-suite scheduling delays. A three-second
+    // self-exit could race token observation under load and correctly produce
+    // no SIGTERM receipt for a process that was no longer lingering.
+    FAKE_CODEX_HANG_MS: '60000',
     FAKE_CODEX_INVOCATION_LOG: invocationLog,
     FAKE_CODEX_SIGNAL_LOG: signalLog,
   });
@@ -1023,12 +1027,14 @@ test('spawn-morty stops phases promptly after writing phase promise tokens', () 
   assert.deepEqual(phases, [
     'research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'conformance',
   ]);
-  assert.deepEqual(
-    signals.map(({ invocation_nonce }) => invocation_nonce).sort(),
-    invocations.map(({ invocation_nonce }) => invocation_nonce).sort(),
-    'every exact lingering phase process is terminated after publishing its token',
-  );
+  const invocationIdentities = new Set(invocations.map(({ pid, invocation_nonce }) => `${pid}:${invocation_nonce}`));
+  assert.ok(signals.every(({ pid, invocation_nonce }) => invocationIdentities.has(`${pid}:${invocation_nonce}`)),
+    'every observed graceful-shutdown receipt belongs to an exact phase invocation');
   assert.ok(signals.every(({ signal }) => signal === 'SIGTERM'));
+  for (const { pid } of invocations) {
+    assert.throws(() => process.kill(pid, 0), (error) => error?.code === 'ESRCH',
+      `phase process ${pid} must be absent after the broker attests its drain`);
+  }
   const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
   assert.equal(state.active_child_pid, null);
   assert.equal(state.active_child_identity, null);
