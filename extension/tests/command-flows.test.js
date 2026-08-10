@@ -1744,7 +1744,7 @@ setTimeout(() => {
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'draft prd',
-    timeoutMs: 2_000,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     successCheck: ({ lastMessage }) =>
       fs.existsSync(prdPath) && /<promise>\s*PRD_COMPLETE\s*<\/promise>/.test(lastMessage),
@@ -1752,6 +1752,8 @@ setTimeout(() => {
 
   assert.ok(Date.now() - started >= 500);
   assert.notEqual(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.match(result.stderr, /fake codex failed/);
   assert.equal(result.cancelled, false);
   assert.equal(result.lastMessage, '');
 });
@@ -1847,7 +1849,7 @@ setInterval(() => {}, 1000);
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'drain',
-    timeoutMs: 2_000,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     progressArtifactPaths: [artifactPath],
     successSignalGraceMs: 100,
@@ -1872,12 +1874,17 @@ test('terminal-usage grace yields before the absolute deadline and drains observ
 import fs from 'node:fs';
 const args = process.argv.slice(2);
 const output = args[args.indexOf('--output-last-message') + 1];
+const startedAt = Date.now();
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'deadline-test' }));
 fs.writeFileSync(output, '<promise>DONE</promise>');
 fs.writeFileSync(${JSON.stringify(artifactPath)}, JSON.stringify({ stage: 'started' }));
 process.on('SIGTERM', () => {
   fs.appendFileSync(output, '\\nUSAGE-WAIT-DRAINED');
-  fs.writeFileSync(${JSON.stringify(artifactPath)}, JSON.stringify({ stage: 'started', final: true }));
+  fs.writeFileSync(${JSON.stringify(artifactPath)}, JSON.stringify({
+    stage: 'started',
+    final: true,
+    signalDelayMs: Date.now() - startedAt,
+  }));
   setTimeout(() => process.exit(0), 30);
 });
 setInterval(() => {}, 1000);
@@ -1886,11 +1893,12 @@ setInterval(() => {}, 1000);
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'bounded usage wait',
-    timeoutMs: 800,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     progressArtifactPaths: [artifactPath],
     successSignalGraceMs: 100,
     successPollMs: 20,
+    usageCompletionGraceMs: 1_000,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
   });
 
@@ -1899,7 +1907,13 @@ setInterval(() => {}, 1000);
   assert.equal(result.terminatedAfterSuccess, true);
   assert.equal(result.usageReported, false);
   assert.match(result.lastMessage, /USAGE-WAIT-DRAINED/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(artifactPath, 'utf8')), { stage: 'started', final: true });
+  const finalArtifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  assert.equal(finalArtifact.stage, 'started');
+  assert.equal(finalArtifact.final, true);
+  assert.ok(finalArtifact.signalDelayMs >= 750,
+    `usage grace did not remain armed long enough: ${finalArtifact.signalDelayMs}ms`);
+  assert.ok(finalArtifact.signalDelayMs < 7_000,
+    `success shutdown waited for the absolute deadline: ${finalArtifact.signalDelayMs}ms`);
 });
 
 test('terminal usage cannot rearm observed success beyond the absolute deadline', async () => {
@@ -1924,7 +1938,7 @@ setInterval(() => {}, 1000);
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'terminal usage deadline',
-    timeoutMs: 5_000,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     successPollMs: 20,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
@@ -1998,15 +2012,20 @@ fs.writeFileSync(output, '<promise>DONE</promise>');
 process.exit(17);
 `, { mode: 0o755 });
 
+  let closeSuccessCheckCalls = 0;
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'close success check',
-    timeoutMs: 2_000,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
-    successPollMs: 10_000,
-    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+    successPollMs: 60_000,
+    successCheck: ({ lastMessage }) => {
+      closeSuccessCheckCalls += 1;
+      return closeSuccessCheckCalls > 1 && lastMessage.includes('<promise>DONE</promise>');
+    },
   });
 
+  assert.equal(closeSuccessCheckCalls, 2, 'process close performs the second and final success evaluation');
   assert.equal(result.exitCode, 0);
   assert.equal(result.timedOut, false);
   assert.equal(result.terminatedAfterSuccess, false);
@@ -2041,7 +2060,7 @@ const timer = setInterval(() => {
     command: codexPath,
     prompt: 'progress',
     env: { FINITE_PROGRESS: '1' },
-    timeoutMs: 2_000,
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     progressArtifactPaths: [artifactPath],
     successSignalGraceMs: 100,
@@ -2053,24 +2072,29 @@ const timer = setInterval(() => {
   assert.equal(finite.drainAttested, true);
   assert.equal(fs.readFileSync(artifactPath, 'utf8'), '01234');
 
+  const ongoingInitialBytes = fs.statSync(artifactPath).size;
   const ongoing = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'progress forever',
-    timeoutMs: 350,
+    timeoutMs: 5_000,
     outputLastMessagePath: messagePath,
     progressArtifactPaths: [artifactPath],
-    successSignalGraceMs: 100,
+    successSignalGraceMs: 2_000,
     successPollMs: 20,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
   });
   assert.equal(ongoing.exitCode, 124);
   assert.equal(ongoing.timedOut, true);
+  const ongoingFinalBytes = fs.statSync(artifactPath).size;
+  assert.ok(ongoingFinalBytes > ongoingInitialBytes,
+    'the ongoing-progress fixture ran and advanced its artifact before timing out');
 
+  const noSuccessInitialBytes = ongoingFinalBytes;
   const noSuccess = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'progress without success',
     env: { NO_SUCCESS: '1' },
-    timeoutMs: 350,
+    timeoutMs: 5_000,
     outputLastMessagePath: messagePath,
     progressArtifactPaths: [artifactPath],
     successSignalGraceMs: 100,
@@ -2079,4 +2103,6 @@ const timer = setInterval(() => {
   });
   assert.equal(noSuccess.exitCode, 124);
   assert.equal(noSuccess.timedOut, true);
+  assert.ok(fs.statSync(artifactPath).size > noSuccessInitialBytes,
+    'the no-success fixture ran and advanced its artifact before timing out');
 });
