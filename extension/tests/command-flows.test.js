@@ -1656,6 +1656,7 @@ test('cancel stops every concurrent refinement analyst and releases session owne
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     PICKLE_TEST_BROKER_ACK_DELAY_MS: '1500',
+    PICKLE_TEST_CANCEL_FORCE_FINAL_BACKOFF: '1',
     PICKLE_TEST_SIGNAL_LOG: signalLog,
     PICKLE_TEST_READY_LOG: readyLog,
   });

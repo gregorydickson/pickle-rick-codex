@@ -189,6 +189,16 @@ function recoverRememberedGroups(
   return null;
 }
 
+async function settleDurableCancellation(sessionDir: string): Promise<boolean> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const outcome = reconcileCancellationRecovery(sessionDir, new StateManager(), Date.now() + 60_000);
+    if (outcome === 'completed' || outcome === 'noop') return true;
+    await sleep(25);
+  }
+  return false;
+}
+
 async function main(argv: string[]): Promise<void> {
   let cwd = process.cwd();
   let sessionDir: string | undefined;
@@ -359,7 +369,29 @@ async function main(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  reconcileCancellationRecovery(resolved);
+  if (process.env.PICKLE_TEST_MODE === '1'
+    && process.env.PICKLE_TEST_CANCEL_FORCE_FINAL_BACKOFF === '1') {
+    new StateManager().update(getStatePath(resolved), (current) => {
+      const intent = current.cancellation_recovery as Record<string, unknown> | null;
+      if (!intent) return current;
+      current.cancellation_recovery = {
+        ...intent,
+        status: 'pending',
+        not_before: new Date(Date.now() + 30_000).toISOString(),
+        last_error: 'injected final convergence backoff',
+      };
+      current.recovery_required = true;
+      current.recovery_kind = 'cancellation_ownership';
+      current.recovery_reason = 'injected final convergence backoff';
+      return current;
+    });
+  }
+  if (!await settleDurableCancellation(resolved)) {
+    ensureAutonomousOwnerRecoveryDaemon(resolved, runtimeBin);
+    console.log(`Cancellation remains under autonomous recovery for ${resolved}.`);
+    process.exitCode = 1;
+    return;
+  }
   cleanupTerminalTmuxSession(resolved);
   console.log(`Cancelled ${resolved}`);
 }
