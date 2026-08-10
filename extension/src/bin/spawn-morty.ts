@@ -1369,6 +1369,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
 
       for (let phaseAttempt = 1; phaseAttempt <= maxPhaseAttempts; phaseAttempt += 1) {
         assertOwnership();
+        if (isSessionCancelled(manager, statePath)) throw new CancellationError();
         const phaseState = manager.update(statePath, (current) => {
           current.current_ticket = normalizedTicketId;
           current.step = phase;
@@ -1446,6 +1447,16 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
           const artifactContractFailure = readOnlyPhase
             && isLifecycleArtifactContractError(error)
             && repositoryMutationFingerprint(workingDir) === phaseRepositoryBoundary;
+          const transientEmptyModelFailure = readOnlyPhase
+            && modelResult !== null
+            && modelResult.exitCode !== 0
+            && !modelResult.timedOut
+            && !modelResult.cancelled
+            && modelResult.stdout.trim() === ''
+            && modelResult.stderr.trim() === ''
+            && repositoryMutationFingerprint(workingDir) === phaseRepositoryBoundary;
+          const cancellationObserved = error instanceof CancellationError
+            || isSessionCancelled(manager, statePath);
           if (artifactContractFailure) {
             archiveLifecycleArtifactFailure({
               sessionDir,
@@ -1458,12 +1469,15 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
               error,
             });
           }
-          const mayRetryArtifact = artifactContractFailure && phaseAttempt < maxPhaseAttempts;
-          if (!mayRetryArtifact) throw error;
+          if (cancellationObserved && !(error instanceof CancellationError)) throw new CancellationError();
+          const mayRetryReadOnlyPhase = !cancellationObserved
+            && (artifactContractFailure || transientEmptyModelFailure)
+            && phaseAttempt < maxPhaseAttempts;
+          if (!mayRetryReadOnlyPhase) throw error;
           appendRunnerLog(
             sessionDir,
             runnerMode,
-            `retrying read-only ${phase} artifact in place after attempt ${phaseAttempt}/${maxPhaseAttempts}: ${error instanceof Error ? error.message : String(error)}`,
+            `retrying read-only ${phase} in place after attempt ${phaseAttempt}/${maxPhaseAttempts}: ${error instanceof Error ? error.message : String(error)}`,
           );
           artifactRecoveryFeedback = error instanceof Error ? error.message : String(error);
           acceptedArtifact = null;

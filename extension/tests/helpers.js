@@ -579,6 +579,15 @@ if (prompt.includes('You are the autonomous Citadel criterion-shard review worke
   lastMessage = '<promise>PRD_COMPLETE</promise>';
 } else if (prompt.includes('You are executing the "')) {
   const phase = extractTicketPhase();
+  const emptyFailOncePhase = process.env.FAKE_LIFECYCLE_EMPTY_FAIL_ONCE_PHASE || '';
+  const emptyFailOnceMarker = path.join(
+    extractPathAfter('Session dir: ') || sessionDir,
+    '.fake-' + phase + '-empty-fail-once',
+  );
+  if (phase === emptyFailOncePhase && !fs.existsSync(emptyFailOnceMarker)) {
+    fs.writeFileSync(emptyFailOnceMarker, 'consumed\\n');
+    process.exit(1);
+  }
   writeLifecycleArtifact(phase);
   const mutatePhase = process.env.FAKE_CODEX_MUTATE_PHASE || 'implement';
   const mutateFile = process.env.FAKE_CODEX_MUTATE_FILE || '';

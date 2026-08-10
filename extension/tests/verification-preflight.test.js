@@ -2210,13 +2210,14 @@ test('spawn-morty infers sibling roots from repo wrapper verification commands',
   assert.match(ticket.frontmatter.failure_reason, /ATTRACTOR_ROOT/);
 });
 
-test('spawn-morty ignores vars assigned inside verification commands', () => {
+test('spawn-morty retries one empty read-only phase failure and ignores vars assigned inside verification commands', () => {
   const dataRoot = makeTempRoot();
   const projectDir = cleanWorkerProject('pickle-local-assignment-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
+    FAKE_LIFECYCLE_EMPTY_FAIL_ONCE_PHASE: 'plan_review',
   });
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'local assignment verification env'], {
@@ -2245,8 +2246,14 @@ test('spawn-morty ignores vars assigned inside verification commands', () => {
 
   const result = JSON.parse(output);
   const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const telemetry = readJsonFile(path.join(sessionDir, 'execution-telemetry.json'));
+  const planReviewAttempts = telemetry.events.filter(({ phase }) => phase === 'plan_review');
   assert.equal(result.status, 'done');
   assert.equal(ticket.status, 'Done');
+  assert.deepEqual(planReviewAttempts.map(({ phase_attempt, outcome }) => ({ phase_attempt, outcome })), [
+    { phase_attempt: 1, outcome: 'failed' },
+    { phase_attempt: 2, outcome: 'success' },
+  ]);
 });
 
 test('pickle-tmux infers required env vars from verification commands before launch', () => {
