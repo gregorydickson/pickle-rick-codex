@@ -11,6 +11,7 @@ import {
   recordExecutionControlTelemetry,
   reserveModelCallTelemetry,
 } from '../services/productive-autonomy.js';
+import { inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
 import { fileURLToPath } from 'node:url';
 import { makeTempRoot, repoRoot } from './helpers.js';
 
@@ -30,6 +31,19 @@ if (process.env.FAKE_OUTCOME === 'wait') {
 `, { mode: 0o755 });
   fs.chmodSync(executable, 0o755);
   return executable;
+}
+
+function assertExactDrain(result) {
+  assert.equal(result.drainAttested, true);
+  const identities = [
+    result.processIdentities.broker,
+    result.processIdentities.target,
+    ...result.processIdentities.descendants,
+  ].filter(Boolean);
+  assert.ok(identities.length >= 2);
+  for (const identity of identities) {
+    assert.equal(inspectProcessLivenessIdentity(identity), 'not-running');
+  }
 }
 
 async function invoke(sessionDir, command, outcome, phase, options = {}) {
@@ -63,7 +77,8 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   assert.equal(failed.exitCode, 7);
   assert.equal(timedOut.timedOut, true);
   assert.equal(fs.readFileSync(timeoutMarker, 'utf8'), 'ready');
-  assert.ok(timedOut.durationMs >= 500 && timedOut.durationMs < 2_000);
+  assert.ok(timedOut.durationMs >= 500);
+  assertExactDrain(timedOut);
   assert.equal(cancelled.cancelled, true);
   for (const result of [success, failed, timedOut, cancelled]) {
     assert.equal(result.usageReported, true);
@@ -115,7 +130,8 @@ setInterval(() => {}, 1000);
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
   });
-  assert.ok(result.durationMs >= 80 && result.durationMs < 2_000);
+  assert.ok(result.durationMs >= 80);
+  assertExactDrain(result);
   const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
   assert.equal(event.outcome, 'timed_out');
   assert.equal(event.telemetry_status, 'telemetry_unavailable');
