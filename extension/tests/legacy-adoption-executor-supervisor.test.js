@@ -4,17 +4,22 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { makeTempRoot, writeJson } from './helpers.js';
 import {
   LEGACY_ADOPTION_EXECUTOR_FILE,
+  LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE,
   LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_FILE,
   LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_QUARANTINE_PREFIX,
   LEGACY_ADOPTION_EXECUTOR_RESTART_FILE,
   LEGACY_ADOPTION_EXECUTOR_RESTART_REJECTED_FILE,
+  discoverLegacyAdoptionExecutors,
+  legacyAdoptionExecutorArgs,
+  legacyAdoptionExecutorSpecHash,
   publishLegacyAdoptionExecutorRestart,
   requestLegacyAdoptionExecutorRestart,
   runLegacyAdoptionExecutorSupervisor,
+  spawnDetachedThroughReapedLauncher,
 } from '../services/legacy-adoption-executor-supervisor.js';
 import { prepareLiveSessionMigration, verifyLiveSessionMigration } from '../services/live-session-migration.js';
 import { captureProcessLivenessIdentity } from '../services/orphan-reaper.js';
@@ -43,6 +48,161 @@ function fixture() {
 function spec(value) {
   return { sessionDir: value.sessionDir, sourceRuntimeRoot: value.sourceRuntimeRoot, targetRuntimeRoot: value.targetRuntimeRoot };
 }
+
+test('executor discovery uses one immutable process snapshot regardless of candidate count', () => {
+  const value = fixture();
+  // Use the real module path rather than duplicating its location contract.
+  const command = [process.execPath, ...legacyAdoptionExecutorArgs(spec(value))].join(' ');
+  let snapshots = 0;
+  const rows = [71001, 71002, 71003].map((pid) => (
+    `${pid} ${pid} ${pid} S Mon Aug 10 12:00:00 2026 ${command}`
+  )).join('\n');
+  const found = discoverLegacyAdoptionExecutors(spec(value), () => {
+    snapshots += 1;
+    return { status: 0, stdout: rows };
+  });
+  assert.equal(snapshots, 1);
+  assert.equal(found.length, 3);
+  assert.deepEqual(found.map(({ pid }) => pid), [71001, 71002, 71003]);
+  assert.ok(found.every((candidate) => candidate.identity_version === 2));
+});
+
+test('executor discovery adopts pre-marker executors only when argv rendering is unambiguous', () => {
+  const value = fixture();
+  const currentArgs = legacyAdoptionExecutorArgs(spec(value));
+  const legacyCommand = [process.execPath, ...currentArgs.slice(0, -2)].join(' ');
+  const found = discoverLegacyAdoptionExecutors(spec(value), () => ({
+    status: 0,
+    stdout: `71299 71299 71299 S Mon Aug 10 12:00:00 2026 ${legacyCommand}\n`,
+  }));
+  assert.deepEqual(found.map(({ pid }) => pid), [71299]);
+});
+
+test('executor discovery preserves exact whitespace-bearing process arguments', () => {
+  const value = {
+    sessionDir: makeTempRoot('legacy adoption executor session '),
+    sourceRuntimeRoot: makeTempRoot('legacy adoption executor source '),
+    targetRuntimeRoot: makeTempRoot('legacy adoption executor target '),
+  };
+  const command = [process.execPath, ...legacyAdoptionExecutorArgs(spec(value))].join(' ');
+  const mismatched = command.replace(/[a-f0-9]{64}$/, '0'.repeat(64));
+  const found = discoverLegacyAdoptionExecutors(spec(value), () => ({
+    status: 0,
+    stdout: [
+      `71300 71300 71300 S Mon Aug 10 12:00:00 2026 ${command}`,
+      `71301 71301 71301 S Mon Aug 10 12:00:00 2026 ${mismatched}`,
+    ].join('\n'),
+  }));
+  assert.deepEqual(found.map(({ pid }) => pid), [71300]);
+});
+
+test('executor discovery fails closed for ambiguous pre-marker whitespace argv', () => {
+  const value = {
+    sessionDir: makeTempRoot('legacy adoption executor session '),
+    sourceRuntimeRoot: makeTempRoot('legacy adoption executor source '),
+    targetRuntimeRoot: makeTempRoot('legacy adoption executor target '),
+  };
+  const currentArgs = legacyAdoptionExecutorArgs(spec(value));
+  const ambiguousLegacy = [process.execPath, ...currentArgs.slice(0, -2)].join(' ');
+  assert.throws(() => discoverLegacyAdoptionExecutors(spec(value), () => ({
+    status: 0,
+    stdout: `71302 71302 71302 S Mon Aug 10 12:00:00 2026 ${ambiguousLegacy}\n`,
+  })), /Pre-marker adoption executor argv is ambiguous/);
+});
+
+test('executor discovery fails closed when the immutable process snapshot fails', () => {
+  const value = fixture();
+  assert.throws(() => discoverLegacyAdoptionExecutors(spec(value), () => ({
+    status: 1, stdout: '', stderr: 'ps failed',
+  })), /Could not capture the adoption executor process snapshot/);
+});
+
+test('detached launcher leaves no executor child owned by the synchronous supervisor', () => {
+  const launched = [];
+  try {
+    for (let index = 0; index < 8; index += 1) {
+      launched.push(spawnDetachedThroughReapedLauncher(process.execPath, [
+        '-e', 'setTimeout(() => process.exit(0), 5000)',
+      ]));
+    }
+    for (const pid of launched) {
+      const observed = spawnSync('ps', ['-p', String(pid), '-o', 'ppid=,state='], { encoding: 'utf8' });
+      assert.equal(observed.status, 0);
+      const match = observed.stdout.trim().match(/^(\d+)\s+(\S+)/);
+      assert.ok(match);
+      assert.notEqual(Number(match[1]), process.pid);
+      assert.equal(match[2].startsWith('Z'), false);
+    }
+  } finally {
+    for (const pid of launched) {
+      try { process.kill(-pid, 'SIGKILL'); } catch {}
+    }
+  }
+});
+
+test('short-lived detached executors cannot become zombies of a blocked supervisor', () => {
+  for (let index = 0; index < 16; index += 1) {
+    spawnDetachedThroughReapedLauncher(process.execPath, ['-e', 'process.exit(0)']);
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  const listed = spawnSync('ps', ['-axo', 'ppid=,state='], { encoding: 'utf8' });
+  assert.equal(listed.status, 0);
+  const ownedZombies = listed.stdout.split('\n').filter((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\S+)/);
+    return Number(match?.[1]) === process.pid && match?.[2].startsWith('Z');
+  });
+  assert.deepEqual(ownedZombies, []);
+});
+
+test('durable initial launch fence recovers one exact executor and reaps duplicates before spawning', () => {
+  const value = fixture();
+  const candidates = [identity(71200), identity(71201), identity(71202)];
+  const reaped = [];
+  let outcome = 'running';
+  let discoveries = 0;
+  const result = runLegacyAdoptionExecutorSupervisor(spec(value), {
+    managerIdentity: identity(70002),
+    discoverExecutors: () => { discoveries += 1; return candidates; },
+    spawnExecutor: () => assert.fail('recovery must not spawn a duplicate executor'),
+    capture: (pid) => identity(pid), inspect: () => 'matched',
+    reap: (candidate) => {
+      reaped.push(candidate.pid);
+      return { status: 'reaped', pid: candidate.pid, pgid: candidate.pgid, reason: 'duplicate', signals: ['SIGTERM'] };
+    },
+    wait: () => undefined, outcome: () => outcome,
+    onIteration: () => { outcome = 'launched'; },
+  });
+  assert.equal(discoveries, 1);
+  assert.deepEqual(reaped, [71201, 71202, 71200]);
+  assert.equal(result.executor_generation, 1);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, 'legacy-session-adoption-executor-launch.json')), false);
+});
+
+test('terminal recovery reaps executors left behind after a launch-fence crash', () => {
+  const value = fixture();
+  const candidate = identity(71310);
+  writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE), {
+    schema_version: 1, session_id: path.basename(value.sessionDir), status: 'launch_pending',
+    executor_spec_sha256: legacyAdoptionExecutorSpecHash(spec(value)), owner_nonce: '',
+    launch_nonce: crypto.randomUUID(), requested_at: new Date().toISOString(),
+  });
+  let discoveries = 0;
+  const reaped = [];
+  const result = runLegacyAdoptionExecutorSupervisor(spec(value), {
+    managerIdentity: identity(70005), outcome: () => 'terminal',
+    discoverExecutors: () => { discoveries += 1; return [candidate]; },
+    inspect: () => 'matched',
+    reap: (owner) => {
+      reaped.push(owner.pid);
+      return { status: 'reaped', pid: owner.pid, pgid: owner.pgid, reason: 'terminal', signals: ['SIGTERM'] };
+    },
+    spawnExecutor: () => assert.fail('terminal recovery must not spawn'),
+  });
+  assert.equal(result.status, 'terminal');
+  assert.equal(discoveries, 1);
+  assert.deepEqual(reaped, [candidate.pid]);
+  assert.equal(fs.existsSync(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE)), false);
+});
 
 test('dead adoption executor is exclusively replaced and converges without installer participation', () => {
   const value = fixture();
@@ -686,6 +846,11 @@ test('live supervisor fence refuses a duplicate manager and launcher', () => {
 test('executor supervision telemetry remains outside the migration seal', () => {
   const value = fixture();
   writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_FILE), { schema_version: 1, status: 'supervising' });
+  writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE), { schema_version: 1, status: 'launch_pending' });
+  const launchTemporaryPath = path.join(
+    value.sessionDir, `${LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE}.tmp.999.fixture`,
+  );
+  fs.writeFileSync(launchTemporaryPath, 'pending');
   writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_FILE), { stage: 'accepted' });
   const quarantinePath = path.join(
     value.sessionDir, `${LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_QUARANTINE_PREFIX}fixture`,
@@ -698,12 +863,17 @@ test('executor supervision telemetry remains outside the migration seal', () => 
   const runtime = { runtime_id: 'test', version: '1', build_hash: 'hash', min_state_schema: 1, max_state_schema: 1 };
   const migration = prepareLiveSessionMigration(value.sessionDir, runtime, runtime);
   assert.equal(migration.preserved_artifacts.some((artifact) => artifact.path === LEGACY_ADOPTION_EXECUTOR_FILE), false);
+  assert.equal(migration.preserved_artifacts.some((artifact) => artifact.path === LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE), false);
+  assert.equal(migration.preserved_artifacts.some(
+    (artifact) => artifact.path === path.basename(launchTemporaryPath),
+  ), false);
   assert.equal(migration.preserved_artifacts.some(
     (artifact) => artifact.path === LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_FILE,
   ), false);
   assert.equal(migration.preserved_artifacts.some((artifact) => artifact.path === path.basename(quarantinePath)), false);
   assert.equal(migration.preserved_artifacts.some((artifact) => artifact.path === path.basename(publishPath)), false);
   writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_FILE), { schema_version: 1, status: 'launched' });
+  fs.writeFileSync(launchTemporaryPath, 'changed');
   writeJson(path.join(value.sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_FILE), { stage: 'committed' });
   writeJson(quarantinePath, { quarantined: 'changed' });
   fs.writeFileSync(publishPath, 'changed');

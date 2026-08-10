@@ -5,16 +5,19 @@ import path from 'node:path';
 import { atomicWriteJson } from './pickle-utils.js';
 import { readLogicalPipeline, type InstalledRuntimeDescriptor } from './durable-supervisor.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
+import { StateManager } from './state-manager.js';
 
 export const LIVE_SESSION_MIGRATION_SCHEMA_VERSION = 1;
 export const LIVE_SESSION_MIGRATION_FILE = 'installed-runtime-migration.json';
 
 export class LiveSessionMigrationContentionError extends Error {
   readonly code = 'live_session_migration_contention';
+  readonly retryable: boolean;
 
-  constructor(message: string) {
+  constructor(message: string, retryable = true) {
     super(message);
     this.name = 'LiveSessionMigrationContentionError';
+    this.retryable = retryable;
   }
 }
 
@@ -48,7 +51,13 @@ export interface InstalledRuntimeMigration {
 
 export interface PrepareLiveSessionMigrationOptions {
   forceVerificationContractRepair?: boolean;
+  maxSnapshotAttempts?: number;
+  retryDelayMs?: number;
+  wait?: (milliseconds: number) => void;
+  checkpoint?: (stage: 'migration_written', attempt: number, migration: InstalledRuntimeMigration) => void;
 }
+
+const migrationWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
 
 // Bounded operational telemetry may be updated by readiness diagnostics after
 // a migration is sealed. It remains in place, but is not continuity authority.
@@ -80,6 +89,8 @@ function sessionFiles(root: string, current = root): string[] {
       || relative === 'watch-material-ledger.json'
       || relative === 'watch-strategy-authority.json'
       || relative === 'legacy-session-adoption-executor.json'
+      || relative === 'legacy-session-adoption-executor-launch.json'
+      || relative.startsWith('legacy-session-adoption-executor-launch.json.tmp.')
       || relative.startsWith('legacy-session-adoption-executor-restart')
       || relative.startsWith('.legacy-session-adoption-executor-restart')
       || relative === 'legacy-session-adoption-supervisor-owner.json'
@@ -213,33 +224,78 @@ export function prepareLiveSessionMigration(
   now = new Date(),
   options: PrepareLiveSessionMigrationOptions = {},
 ): InstalledRuntimeMigration {
-  const state = readJson(path.join(sessionDir, 'state.json'));
-  if (!state) throw new Error('Live session migration requires a valid state.json.');
-  if (state.active !== true) throw new Error('Live session migration requires an active session.');
-  const sessionSchema = Number(state.schema_version ?? 1);
-  if (!Number.isInteger(sessionSchema) || sessionSchema < 1) throw new Error('Live session has an invalid schema version.');
-  validateRuntime(sourceRuntime, sessionSchema);
-  validateRuntime(targetRuntime, sessionSchema);
-  const payload = {
-    schema_version: LIVE_SESSION_MIGRATION_SCHEMA_VERSION as 1,
-    migration_id: crypto.randomUUID(),
-    source_runtime: sourceRuntime,
-    target_runtime: targetRuntime,
-    session_schema: sessionSchema,
-    session_was_active: true as const,
-    resume_checkpoint: deriveResumeCheckpoint(sessionDir, state, options),
-    preserved_artifacts: stableInventory(sessionDir),
-    salvage_refs: listSessionSalvageRefs(String(state.working_dir || ''), path.basename(sessionDir)),
-    created_at: now.toISOString(),
-  };
-  const migration = { ...payload, content_hash: sha256(canonicalize(payload)) };
-  atomicWriteJson(path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE), migration);
-  const confirmed = inventory(sessionDir);
-  if (canonicalize(confirmed) !== canonicalize(payload.preserved_artifacts)) {
-    fs.rmSync(path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE), { force: true });
-    throw new LiveSessionMigrationContentionError('Live session changed before its migration snapshot could be sealed.');
+  const migrationPath = path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE);
+  const maxAttempts = Math.max(1, Math.min(10, options.maxSnapshotAttempts ?? 3));
+  const retryDelayMs = Math.max(0, Math.min(250, options.retryDelayMs ?? 25));
+  const wait = options.wait || ((milliseconds: number) => (
+    Atomics.wait(migrationWaitBuffer, 0, 0, milliseconds)
+  ));
+  const lock = new StateManager({ acquireTimeoutMs: 30_000, staleLockThresholdMs: 30_000 });
+  lock.acquireLock(migrationPath);
+  try {
+    let lastContention: LiveSessionMigrationContentionError | null = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const preservedArtifacts = stableInventory(sessionDir);
+        // Read state after the stable inventory. The confirmation below then
+        // rejects a state transition on either side of this semantic capture.
+        const state = readJson(path.join(sessionDir, 'state.json'));
+        if (!state) throw new Error('Live session migration requires a valid state.json.');
+        if (state.active !== true) throw new Error('Live session migration requires an active session.');
+        const sessionSchema = Number(state.schema_version ?? 1);
+        if (!Number.isInteger(sessionSchema) || sessionSchema < 1) throw new Error('Live session has an invalid schema version.');
+        validateRuntime(sourceRuntime, sessionSchema);
+        validateRuntime(targetRuntime, sessionSchema);
+        const payload = {
+          schema_version: LIVE_SESSION_MIGRATION_SCHEMA_VERSION as 1,
+          migration_id: crypto.randomUUID(),
+          source_runtime: sourceRuntime,
+          target_runtime: targetRuntime,
+          session_schema: sessionSchema,
+          session_was_active: true as const,
+          resume_checkpoint: deriveResumeCheckpoint(sessionDir, state, options),
+          preserved_artifacts: preservedArtifacts,
+          salvage_refs: listSessionSalvageRefs(String(state.working_dir || ''), path.basename(sessionDir)),
+          created_at: now.toISOString(),
+        };
+        const migration = { ...payload, content_hash: sha256(canonicalize(payload)) };
+        atomicWriteJson(migrationPath, migration);
+        options.checkpoint?.('migration_written', attempt, migration);
+        const confirmed = inventory(sessionDir);
+        const persisted = readJson(migrationPath);
+        const receiptMatches = persisted?.migration_id === migration.migration_id
+          && persisted.content_hash === migration.content_hash;
+        if (canonicalize(confirmed) === canonicalize(payload.preserved_artifacts)
+          && receiptMatches) return migration;
+
+        if (!receiptMatches) {
+          throw new LiveSessionMigrationContentionError(
+            'Another migration receipt won while the live session snapshot was being sealed.', false,
+          );
+        }
+
+        // Delete only this attempt's exact receipt. A concurrent or recovered
+        // writer's migration must never be removed by our contention cleanup.
+        if (persisted?.migration_id === migration.migration_id
+          && persisted.content_hash === migration.content_hash) {
+          fs.rmSync(migrationPath, { force: true });
+        }
+        lastContention = new LiveSessionMigrationContentionError(
+          'Live session changed before its migration snapshot could be sealed.',
+        );
+      } catch (error) {
+        if (!(error instanceof LiveSessionMigrationContentionError)) throw error;
+        if (!error.retryable) throw error;
+        lastContention = error;
+      }
+      if (attempt < maxAttempts && retryDelayMs > 0) wait(retryDelayMs);
+    }
+    throw lastContention || new LiveSessionMigrationContentionError(
+      'Live session migration exhausted its bounded snapshot attempts.',
+    );
+  } finally {
+    lock.releaseLock(migrationPath);
   }
-  return migration;
 }
 
 /** Rebind an already sealed migration to a compatible replacement runtime

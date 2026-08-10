@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,6 +17,7 @@ import { StateManager } from './state-manager.js';
 import { readTmuxRunnerBinding, tmuxSessionExists, type TmuxRunnerBinding } from './tmux.js';
 
 export const LEGACY_ADOPTION_EXECUTOR_FILE = 'legacy-session-adoption-executor.json';
+export const LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE = 'legacy-session-adoption-executor-launch.json';
 export const LEGACY_ADOPTION_EXECUTOR_RESTART_FILE = 'legacy-session-adoption-executor-restart.json';
 export const LEGACY_ADOPTION_EXECUTOR_RESTART_REJECTED_FILE = 'legacy-session-adoption-executor-restart-rejected.json';
 export const LEGACY_ADOPTION_EXECUTOR_RESTART_ACCEPTED_FILE = 'legacy-session-adoption-executor-restart-accepted.json';
@@ -118,7 +119,7 @@ function reapExecutor(
 
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
 
-export function legacyAdoptionExecutorArgs(spec: LegacyAdoptionExecutorSpec): string[] {
+function legacyAdoptionExecutorBaseArgs(spec: LegacyAdoptionExecutorSpec): string[] {
   const args = [
     path.resolve(fileURLToPath(new URL('../bin/adopt-legacy-session.js', import.meta.url))),
     'watch', '--session-dir', spec.sessionDir,
@@ -130,11 +131,85 @@ export function legacyAdoptionExecutorArgs(spec: LegacyAdoptionExecutorSpec): st
   return args;
 }
 
+export function legacyAdoptionExecutorArgs(spec: LegacyAdoptionExecutorSpec): string[] {
+  const args = legacyAdoptionExecutorBaseArgs(spec);
+  // `ps command` is not an injective argv representation when arguments contain
+  // whitespace. This final no-space marker binds that rendering to one exact
+  // canonical executor spec instead of trusting inferred token boundaries.
+  args.push('--executor-spec-sha256', legacyAdoptionExecutorSpecHash(spec));
+  return args;
+}
+
+export function spawnDetachedThroughReapedLauncher(executable: string, args: string[]): number {
+  // This supervisor deliberately uses synchronous waits. Owning an asynchronous
+  // child here prevents libuv from processing SIGCHLD and leaves every exited
+  // executor as a zombie until the supervisor itself terminates. A short-lived
+  // launcher is synchronously reaped by us and reparents the detached executor.
+  const launcher = spawnSync(process.execPath, ['-e', [
+    "const { spawn } = require('node:child_process');",
+    'const [executable, encodedArgs] = process.argv.slice(1);',
+    "const child = spawn(executable, JSON.parse(Buffer.from(encodedArgs, 'base64').toString('utf8')),",
+    "  { detached: true, stdio: 'ignore', env: process.env });",
+    "if (!child.pid) process.exit(70);",
+    "process.stdout.write(String(child.pid));",
+    'child.unref();',
+  ].join('\n'), executable, Buffer.from(JSON.stringify(args)).toString('base64')], {
+    encoding: 'utf8', timeout: 5_000,
+  });
+  const pid = Number(launcher.stdout.trim());
+  if (launcher.status !== 0 || !Number.isInteger(pid) || pid <= 0) {
+    throw new Error(`Could not start the legacy adoption watchdog executor: ${launcher.stderr.trim() || 'launcher failed'}`);
+  }
+  return pid;
+}
+
 function spawnExecutor(spec: LegacyAdoptionExecutorSpec): number {
-  const child = spawn(process.execPath, legacyAdoptionExecutorArgs(spec), { detached: true, stdio: 'ignore', env: process.env });
-  if (!child.pid) throw new Error('Could not start the legacy adoption watchdog executor.');
-  child.unref();
-  return child.pid;
+  return spawnDetachedThroughReapedLauncher(process.execPath, legacyAdoptionExecutorArgs(spec));
+}
+
+function launchAndCaptureExecutor(
+  spec: LegacyAdoptionExecutorSpec,
+  deps: Dependencies,
+  capture: NonNullable<Dependencies['capture']>,
+): PersistedProcessIdentity {
+  const injected = deps.spawnExecutor;
+  const pid = (injected || spawnExecutor)(spec);
+  const identity = capture(pid);
+  if (identity) return identity;
+  // The durable launch fence lets the next manager recover this process. Never
+  // signal a bare pid/pgid after capture failed: the process may already have
+  // exited and the numeric identity may have been reused.
+  throw new Error(`Could not capture immutable adoption executor identity for pid ${pid}.`);
+}
+
+function recoverOrLaunchExecutor(
+  spec: LegacyAdoptionExecutorSpec,
+  deps: Dependencies,
+  capture: NonNullable<Dependencies['capture']>,
+  reap: NonNullable<Dependencies['reap']>,
+): PersistedProcessIdentity {
+  const launchPath = path.join(spec.sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE);
+  const hash = legacyAdoptionExecutorSpecHash(spec);
+  const pending = readJsonFile<Record<string, unknown>>(launchPath, null);
+  if (pending && (pending.schema_version !== 1 || pending.session_id !== path.basename(spec.sessionDir)
+    || pending.executor_spec_sha256 !== hash || pending.owner_nonce !== (spec.ownerNonce || ''))) {
+    throw new Error('Persisted adoption executor initial launch fence is invalid.');
+  }
+  if (!pending) atomicWriteJson(launchPath, {
+    schema_version: 1, session_id: path.basename(spec.sessionDir), status: 'launch_pending',
+    executor_spec_sha256: hash, owner_nonce: spec.ownerNonce || '',
+    launch_nonce: crypto.randomUUID(), requested_at: new Date().toISOString(),
+  });
+  if (!deps.spawnExecutor || deps.discoverExecutors) {
+    const candidates = (deps.discoverExecutors || discoverExecutors)(spec)
+      .sort((left, right) => left.pid - right.pid);
+    if (candidates.length > 0) {
+      const [keeper, ...duplicates] = candidates;
+      for (const duplicate of duplicates) reapExecutor(duplicate, reap);
+      return keeper;
+    }
+  }
+  return launchAndCaptureExecutor(spec, deps, capture);
 }
 
 export function legacyAdoptionOutcome(sessionDir: string): 'running' | 'launched' | 'cancelled' | 'terminal' {
@@ -191,14 +266,14 @@ export function readLegacyAdoptionExecutorStatus(sessionDir: string): LegacyAdop
   return status;
 }
 
-function processArgv(pid: number): string[] | null {
+function processMatchesExpectedArgv(pid: number, expected: string[]): boolean {
   try {
     const content = fs.readFileSync(`/proc/${pid}/cmdline`);
-    return content.toString('utf8').split('\0').filter(Boolean);
+    return exactArgv(content.toString('utf8').split('\0').filter(Boolean), expected);
   } catch {
     const result = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 5_000 });
-    if (result.status !== 0 || !result.stdout.trim()) return null;
-    return result.stdout.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((token) => token.replace(/^["']|["']$/g, '')) || null;
+    if (result.status !== 0 || !result.stdout.trim()) return false;
+    return result.stdout.trim() === expected.join(' ');
   }
 }
 
@@ -207,22 +282,86 @@ function exactArgv(actual: string[] | null, expected: string[]): boolean {
     && actual.every((token, index) => path.resolve(token) === path.resolve(expected[index] || '')));
 }
 
-function discoverExecutors(spec: LegacyAdoptionExecutorSpec): PersistedProcessIdentity[] {
-  const listed = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', timeout: 5_000 });
-  if (listed.status !== 0) return [];
+interface ProcessSnapshotRow {
+  pid: number;
+  pgid: number;
+  sessionId: number;
+  state: string;
+  startTime: string;
+  command: string;
+}
+
+function parseProcessSnapshot(raw: string): ProcessSnapshotRow[] {
+  const rows: ProcessSnapshotRow[] = [];
+  for (const line of raw.split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+)$/);
+    if (!match) continue;
+    rows.push({
+      pid: Number(match[1]), pgid: Number(match[2]), sessionId: Number(match[3]),
+      state: match[4], startTime: match[5].trim(), command: match[6].trim(),
+    });
+  }
+  return rows;
+}
+
+function exactSnapshotCommand(
+  command: string,
+  expected: string[],
+  legacyExpected: string[],
+  expectedSpecHash: string,
+): boolean {
+  // `ps command` joins argv with spaces and does not quote whitespace-bearing
+  // arguments on macOS. Comparing the complete deterministic rendering keeps
+  // those paths recoverable without guessing token boundaries.
+  const marked = expected.at(-2) === '--executor-spec-sha256'
+    && expected.at(-1) === expectedSpecHash
+    && command.endsWith(` --executor-spec-sha256 ${expectedSpecHash}`)
+    && command === expected.join(' ');
+  // Pre-marker executors can be adopted only when every argv token is itself
+  // whitespace-free, making the ps rendering unambiguous. Otherwise recovery
+  // fails closed instead of guessing boundaries and signalling a wrong group.
+  if (marked) return true;
+  if (command !== legacyExpected.join(' ')) return false;
+  if (legacyExpected.some((token) => token.length === 0 || /\s/.test(token))) {
+    throw new Error('Pre-marker adoption executor argv is ambiguous in the immutable process snapshot.');
+  }
+  return true;
+}
+
+function snapshotIdentity(row: ProcessSnapshotRow): PersistedProcessIdentity {
+  const commandSha256 = crypto.createHash('sha256').update(row.command).digest('hex');
+  return {
+    pid: row.pid, pgid: row.pgid, start_time: row.startTime, identity_version: 2,
+    session_id: row.sessionId, command_sha256: commandSha256, identity_kind: 'managed', strict_command: true,
+    fingerprint: crypto.createHash('sha256')
+      .update(`v2\0${row.pid}\0${row.pgid}\0${row.sessionId}\0${row.startTime}\0${commandSha256}`).digest('hex'),
+  };
+}
+
+export function discoverLegacyAdoptionExecutors(
+  spec: LegacyAdoptionExecutorSpec,
+  listProcesses: () => ReturnType<typeof spawnSync> = () => spawnSync(
+    'ps', ['-ww', '-axo', 'pid=,pgid=,sess=,state=,lstart=,command='],
+    { encoding: 'utf8', timeout: 5_000 },
+  ),
+): PersistedProcessIdentity[] {
+  const listed = listProcesses();
+  if (listed.status !== 0) {
+    throw new Error('Could not capture the adoption executor process snapshot.');
+  }
   const expected = [process.execPath, ...legacyAdoptionExecutorArgs(spec)];
+  const legacyExpected = [process.execPath, ...legacyAdoptionExecutorBaseArgs(spec)];
+  const expectedSpecHash = legacyAdoptionExecutorSpecHash(spec);
   const found: PersistedProcessIdentity[] = [];
-  for (const line of listed.stdout.split('\n')) {
-    const match = line.match(/^\s*(\d+)\s+(.+)$/);
-    const pid = Number(match?.[1]);
-    const argv = match?.[2].trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)
-      ?.map((token) => token.replace(/^["']|["']$/g, '')) || null;
-    if (!Number.isInteger(pid) || pid <= 0 || !exactArgv(argv, expected)) continue;
-    const identity = captureProcessLivenessIdentity(pid);
-    if (identity && inspectProcessLivenessIdentity(identity) === 'matched') found.push(identity);
+  for (const row of parseProcessSnapshot(String(listed.stdout))) {
+    if (row.state.startsWith('Z')
+      || !exactSnapshotCommand(row.command, expected, legacyExpected, expectedSpecHash)) continue;
+    found.push(snapshotIdentity(row));
   }
   return found;
 }
+
+const discoverExecutors = discoverLegacyAdoptionExecutors;
 
 function validAcceptedRestart(
   value: LegacyAdoptionExecutorRestartAccepted | null,
@@ -469,9 +608,15 @@ export function readAuthenticatedLegacyAdoptionExecutorStatus(
   const executor = [process.execPath, ...legacyAdoptionExecutorArgs({
     ...spec, sessionDir, ownerNonce: owner.launch_nonce,
   })];
+  const legacyExecutor = [process.execPath, ...legacyAdoptionExecutorBaseArgs({
+    ...spec, sessionDir, ownerNonce: owner.launch_nonce,
+  })];
+  const legacyExecutorUnambiguous = legacyExecutor.every((token) => token.length > 0 && !/\s/.test(token));
   if (status.manager_argv_sha256 !== crypto.createHash('sha256').update(JSON.stringify(managerArgs)).digest('hex')
-    || !exactArgv(processArgv(status.manager_identity.pid), managerArgs)
-    || !exactArgv(processArgv(status.executor_identity.pid), executor)) return null;
+    || !processMatchesExpectedArgv(status.manager_identity.pid, managerArgs)
+    || (!processMatchesExpectedArgv(status.executor_identity.pid, executor)
+      && !(legacyExecutorUnambiguous
+        && processMatchesExpectedArgv(status.executor_identity.pid, legacyExecutor)))) return null;
   try {
     const lock = JSON.parse(fs.readFileSync(path.join(sessionDir, `${LEGACY_ADOPTION_EXECUTOR_FILE}.lock`), 'utf8')) as Record<string, unknown>;
     if (lock.pid !== status.manager_identity.pid) return null;
@@ -773,10 +918,23 @@ export function runLegacyAdoptionExecutorSupervisor(
       assertAcceptedWal();
       const outcome = (deps.outcome || legacyAdoptionOutcome)(sessionDir);
       if (outcome !== 'running') {
+        const initialLaunchPath = path.join(sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE);
+        const initialLaunch = readJsonFile<Record<string, unknown>>(initialLaunchPath, null);
+        if (initialLaunch && (initialLaunch.schema_version !== 1
+          || initialLaunch.session_id !== path.basename(sessionDir)
+          || initialLaunch.executor_spec_sha256 !== hash
+          || initialLaunch.owner_nonce !== (spec.ownerNonce || ''))) {
+          throw new Error('Persisted adoption executor initial launch fence is invalid.');
+        }
         const terminalAccepted = accepted;
         const terminalRestartPath = path.join(sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_FILE);
         const terminalPending = readJsonFile<LegacyAdoptionExecutorRestartRequest>(terminalRestartPath, null);
-        const terminalCandidates = [executor, terminalAccepted?.predecessor_identity, terminalAccepted?.successor_identity]
+        const pendingLaunchCandidates = initialLaunch
+          ? (deps.discoverExecutors || discoverExecutors)({ ...spec, sessionDir }) : [];
+        const terminalCandidates = [
+          executor, terminalAccepted?.predecessor_identity, terminalAccepted?.successor_identity,
+          ...pendingLaunchCandidates,
+        ]
           .filter((identity): identity is PersistedProcessIdentity => Boolean(identity));
         const seen = new Set<string>();
         for (const candidate of terminalCandidates) {
@@ -784,6 +942,7 @@ export function runLegacyAdoptionExecutorSupervisor(
           seen.add(candidate.fingerprint);
           if (inspect(candidate) === 'matched') reapExecutor(candidate, reap);
         }
+        fs.rmSync(initialLaunchPath, { force: true });
         if (terminalAccepted && terminalAccepted.stage !== 'committed') {
           atomicWriteJson(path.join(sessionDir, LEGACY_ADOPTION_EXECUTOR_RESTART_REJECTED_FILE), {
             ...terminalAccepted.request, rejected_at: new Date(now()).toISOString(),
@@ -866,8 +1025,7 @@ export function runLegacyAdoptionExecutorSupervisor(
         if ((deps.outcome || legacyAdoptionOutcome)(sessionDir) !== 'running') continue;
         const finder = deps.discoverExecutors || discoverExecutors;
         const candidates = finder({ ...spec, sessionDir })
-          .filter((candidate) => candidate.fingerprint !== accepted!.predecessor_identity.fingerprint
-            && inspect(candidate) === 'matched');
+          .filter((candidate) => candidate.fingerprint !== accepted!.predecessor_identity.fingerprint);
         if (candidates.length > 1) throw new Error('Multiple adoption executor restart successors matched the launch fence.');
         let successor: PersistedProcessIdentity | null = candidates[0] || null;
         if (!successor && accepted.launch_manager_fingerprint !== managerIdentity.fingerprint
@@ -876,10 +1034,7 @@ export function runLegacyAdoptionExecutorSupervisor(
           continue;
         }
         if (!successor) {
-          const pid = (deps.spawnExecutor || spawnExecutor)({ ...spec, sessionDir });
-          const captured = capture(pid);
-          if (!captured) throw new Error(`Could not capture immutable adoption executor identity for pid ${pid}.`);
-          successor = captured;
+          successor = launchAndCaptureExecutor({ ...spec, sessionDir }, deps, capture);
         }
         deps.checkpoint?.('restart_successor_started');
         const timestamp = new Date(now()).toISOString();
@@ -939,9 +1094,7 @@ export function runLegacyAdoptionExecutorSupervisor(
         accepted = null;
       }
       if (!executor) {
-        const pid = (deps.spawnExecutor || spawnExecutor)({ ...spec, sessionDir });
-        executor = capture(pid);
-        if (!executor) throw new Error(`Could not capture immutable adoption executor identity for pid ${pid}.`);
+        executor = recoverOrLaunchExecutor({ ...spec, sessionDir }, deps, capture, reap);
         generation += 1;
       }
       if (inspect(executor) !== 'matched') {
@@ -1001,6 +1154,7 @@ export function runLegacyAdoptionExecutorSupervisor(
         last_restart_request_id: lastRestartRequestId,
       };
       atomicWriteJson(statusPath, status);
+      fs.rmSync(path.join(sessionDir, LEGACY_ADOPTION_EXECUTOR_LAUNCH_FILE), { force: true });
       prior = status;
       deps.onIteration?.(status);
       wait(pollMs);

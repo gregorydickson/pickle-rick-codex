@@ -8,6 +8,7 @@ import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import {
   LIVE_SESSION_MIGRATION_FILE,
+  LiveSessionMigrationContentionError,
   deriveRepinnedLiveSessionMigration,
   finalizeLiveSessionMigrationAfterHandoff,
   prepareLiveSessionHandoffCheckpoint,
@@ -114,6 +115,58 @@ test('active legacy session migrates in place to contract repair without losing 
     assert.equal(fs.readFileSync(path.join(sessionDir, relative), 'utf8'), content, `${relative} changed during migration`);
   }
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8')).unknown_legacy_field, { must_survive: true });
+});
+
+test('migration recaptures bounded transient active-session contention and seals the new snapshot', () => {
+  const { sessionDir } = fixture();
+  const telemetryPath = path.join(sessionDir, 'ticket-recovery-history.json');
+  const attempts = [];
+  const waits = [];
+  const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date(), {
+    maxSnapshotAttempts: 3,
+    retryDelayMs: 17,
+    wait: (milliseconds) => waits.push(milliseconds),
+    checkpoint: (_stage, attempt) => {
+      attempts.push(attempt);
+      if (attempt === 1) writeJson(telemetryPath, { schema_version: 1, events: [{ strategy: 'advanced' }] });
+    },
+  });
+  assert.deepEqual(attempts, [1, 2]);
+  assert.deepEqual(waits, [17]);
+  assert.equal(migration.preserved_artifacts.find(({ path: artifactPath }) => (
+    artifactPath === 'ticket-recovery-history.json'
+  )).sha256, crypto.createHash('sha256').update(fs.readFileSync(telemetryPath)).digest('hex'));
+  assert.doesNotThrow(() => verifyLiveSessionMigration(sessionDir, migration));
+});
+
+test('migration exhaustion fails closed without deleting another writer receipt', () => {
+  const { sessionDir } = fixture();
+  const migrationPath = path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE);
+  const foreign = { schema_version: 1, migration_id: 'foreign-writer', content_hash: 'f'.repeat(64) };
+  assert.throws(() => prepareLiveSessionMigration(
+    sessionDir, sourceRuntime, targetRuntime, new Date(), {
+      maxSnapshotAttempts: 3,
+      checkpoint: () => writeJson(migrationPath, foreign),
+    },
+  ), (error) => error instanceof LiveSessionMigrationContentionError);
+  assert.deepEqual(JSON.parse(fs.readFileSync(migrationPath, 'utf8')), foreign);
+});
+
+test('migration fails closed after bounded repeated artifact contention', () => {
+  const { sessionDir } = fixture();
+  const telemetryPath = path.join(sessionDir, 'ticket-recovery-history.json');
+  let attempts = 0;
+  assert.throws(() => prepareLiveSessionMigration(
+    sessionDir, sourceRuntime, targetRuntime, new Date(), {
+      maxSnapshotAttempts: 2,
+      checkpoint: (_stage, attempt) => {
+        attempts = attempt;
+        writeJson(telemetryPath, { schema_version: 1, events: [{ attempt }] });
+      },
+    },
+  ), (error) => error instanceof LiveSessionMigrationContentionError);
+  assert.equal(attempts, 2);
+  assert.equal(fs.existsSync(path.join(sessionDir, LIVE_SESSION_MIGRATION_FILE)), false);
 });
 
 test('installed runtime migration fails closed when target cannot read the active schema', () => {
