@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logActivity } from '../services/activity-logger.js';
-import { readJsonFile } from '../services/pickle-utils.js';
 import { loadConfig } from '../services/config.js';
 import { canExecute, loadCircuitState, openCircuitBreaker, resetCircuitBreaker } from '../services/circuit-breaker.js';
 import { appendHistory, getRunStartEpoch, markRunStart } from '../services/session.js';
@@ -221,13 +220,7 @@ async function runSequentialWithLease(
     appendRunnerLog(sessionDir, runnerMode, `verification repair transaction ${reconciledVerificationTransaction} before scheduler dispatch`);
   }
   const pendingReviewerRecovery = readCitadelSystemBlock(sessionDir);
-  const pendingReviewerState = readJsonFile<Record<string, unknown>>(
-    path.join(sessionDir, 'citadel-review-state.json'),
-    null,
-  );
-  const pendingArtifactRecovery = pendingReviewerState?.artifact_contract_recovery as Record<string, unknown> | undefined;
-  if (pendingReviewerRecovery?.recovery_action === 'repair_reviewer_artifact_contract'
-    && pendingArtifactRecovery?.status !== 'resolved') {
+  if (pendingReviewerRecovery?.recovery_action === 'repair_reviewer_artifact_contract') {
     const recovery = await (deps.repairCitadelReviewerArtifactContract ?? repairCitadelReviewerArtifactContract)(
       sessionDir,
       pendingReviewerRecovery,

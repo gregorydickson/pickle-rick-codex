@@ -242,7 +242,12 @@ test('VAL-ORACLE-031 fast-exit stress: concurrent no-op workers leave no untrack
     const projectDir = baseRepo();
     const fakeBin = makeTempRoot(`pickle-oracle-fast-exit-${index}-`);
     createFakeCodex(fakeBin);
-    const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: makeTempRoot() });
+    const env = prependPath(fakeBin, {
+      PICKLE_DATA_ROOT: makeTempRoot(),
+      PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURES: '3',
+      PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURE_DELAY_MS: '100',
+      PICKLE_TEST_CONVERGENCE_EPOCH_MS: '200',
+    });
     const sessionDir = setupSession(projectDir, env, `oracle fast exit ${index}`, [R1_TICKET]);
     return { projectDir, env, sessionDir };
   });

@@ -435,7 +435,7 @@ export interface RunSpawnedCommandOptions {
   ) => void;
   onDrain?: (
     brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
-    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity | null,
     descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
   ) => void;
   captureSpawnedIdentity?: (
@@ -470,7 +470,7 @@ export interface CodexExecOptions {
   ) => void;
   onDrain?: (
     brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
-    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity | null,
     descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
   ) => void;
   captureSpawnedIdentity?: (

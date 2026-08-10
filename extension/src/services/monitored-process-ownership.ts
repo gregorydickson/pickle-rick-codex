@@ -255,7 +255,7 @@ export function monitoredProcessStateCallbacks(
   ) => void;
   onDrain: (
     brokerIdentity: PersistedProcessIdentity,
-    targetIdentity: PersistedProcessIdentity,
+    targetIdentity: PersistedProcessIdentity | null,
     descendantIdentities: PersistedProcessIdentity[],
   ) => void;
 } {
@@ -306,7 +306,7 @@ export function monitoredProcessStateCallbacks(
       });
     },
     onDrain: (brokerIdentity, targetIdentity, descendantIdentities) => {
-      const drained = [brokerIdentity, targetIdentity, ...descendantIdentities];
+      const drained = [brokerIdentity, ...(targetIdentity ? [targetIdentity] : []), ...descendantIdentities];
       if (!allAbsent(drained)) {
         throw new Error('Cannot clear monitored process ownership before exact group drain.');
       }

@@ -123,7 +123,12 @@ test('draft-prd writes a PRD and advances the session state', () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
-  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURES: '3',
+    PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURE_DELAY_MS: '100',
+    PICKLE_TEST_CONVERGENCE_EPOCH_MS: '200',
+  });
   createFakeCodex(fakeBin);
 
   const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'draft this task'], {

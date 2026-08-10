@@ -47,15 +47,21 @@ const descendantCommand = process.env.TRANSITION_DESCENDANT === '1' ? '/bin/sh' 
 const descendantArgs = process.env.TRANSITION_DESCENDANT === '1'
   ? ['-c', 'if [ "$HOLD_TRANSITION" = "1" ]; then : > "$TRANSITION_READY"; while [ ! -f "$TRANSITION_GATE" ]; do sleep 0.01; done; else sleep 0.2; fi; exec "$NODE_BIN" "$DESCENDANT_PATH"']
   : [${JSON.stringify(descendantPath)}];
-const descendant = spawn(descendantCommand, descendantArgs, {
-  detached: process.env.DETACHED_DESCENDANT === '1',
-  stdio: 'ignore',
-  env: { ...process.env, NODE_BIN: process.execPath, DESCENDANT_PATH: ${JSON.stringify(descendantPath)} },
-});
+let descendant = null;
+const spawnDescendant = () => {
+  descendant = spawn(descendantCommand, descendantArgs, {
+    detached: process.env.DETACHED_DESCENDANT === '1',
+    stdio: 'ignore',
+    env: { ...process.env, NODE_BIN: process.execPath, DESCENDANT_PATH: ${JSON.stringify(descendantPath)} },
+  });
+};
+const descendantDelayMs = Math.max(0, Number(process.env.DELAY_DESCENDANT_MS || 0));
+if (descendantDelayMs > 0) setTimeout(spawnDescendant, descendantDelayMs);
+else spawnDescendant();
 process.on('SIGTERM', () => {
   fs.appendFileSync(process.env.SIGNAL_LOG, JSON.stringify({ role: 'target', pid: process.pid, nonce, signal: 'SIGTERM' }) + '\\n');
 });
-fs.appendFileSync(process.env.READINESS_LOG, JSON.stringify({ role: 'target', pid: process.pid, nonce, descendant_pid: descendant.pid }) + '\\n');
+fs.appendFileSync(process.env.READINESS_LOG, JSON.stringify({ role: 'target', pid: process.pid, nonce }) + '\\n');
 const ready = setInterval(() => {
   const lines = fs.existsSync(process.env.READINESS_LOG) ? fs.readFileSync(process.env.READINESS_LOG, 'utf8') : '';
   if (!lines.includes('"role":"descendant"')) return;
@@ -325,6 +331,165 @@ test('shutdown ledger reaps a detached setsid descendant outside the broker proc
   assert.ok(acknowledgement.descendant_identities.some(({ fingerprint }) => (
     fingerprint === tree.descendant.identity.fingerprint
   )));
+  await send(run.child, {
+    type: 'shutdown_release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  await run.closed;
+  await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+    tree.target.identity, tree.descendant.identity);
+});
+
+test('shutdown converges the descendant ledger when the periodic tracker has not observed the ready tree', {
+  timeout: 30_000,
+}, async (t) => {
+  const root = makeTempRoot('pickle-broker-final-descendant-convergence-');
+  const run = startBroker(t);
+  const fixture = launchFixture(run, root, {
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+    DETACHED_DESCENDANT: '1',
+  });
+  await send(run.child, fixture.request);
+  const launched = await waitForMessage(run, 'launched');
+  await send(run.child, {
+    type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+  await waitFor(() => fs.existsSync(fixture.env.SUCCESS_ARTIFACT), { timeoutMs: 10_000 });
+
+  await send(run.child, {
+    type: 'terminate', launch_id: fixture.launchId, cause: 'success', grace_ms: 150,
+  });
+  const acknowledgement = await waitForMessage(run, 'shutdown_ack');
+  assert.deepEqual(
+    new Set(acknowledgement.descendant_identities.map(({ fingerprint }) => fingerprint)),
+    new Set([tree.target.identity.fingerprint, tree.descendant.identity.fingerprint]),
+  );
+  await send(run.child, {
+    type: 'shutdown_release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  await run.closed;
+  await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+    tree.target.identity, tree.descendant.identity);
+});
+
+test('shutdown waits for two identical snapshots when a descendant appears during convergence', {
+  timeout: 30_000,
+}, async (t) => {
+  const root = makeTempRoot('pickle-broker-descendant-born-during-convergence-');
+  const run = startBroker(t);
+  const fixture = launchFixture(run, root, {
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+    PICKLE_TEST_DESCENDANT_CONVERGENCE_DELAY_MS: '100',
+    DELAY_DESCENDANT_MS: '50',
+    DETACHED_DESCENDANT: '1',
+  });
+  await send(run.child, fixture.request);
+  const launched = await waitForMessage(run, 'launched');
+  await send(run.child, {
+    type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  await waitFor(() => appendJsonLines(fixture.env.READINESS_LOG)
+    .some(({ role }) => role === 'target'), { timeoutMs: 10_000 });
+  await send(run.child, {
+    type: 'terminate', launch_id: fixture.launchId, cause: 'success', grace_ms: 150,
+  });
+  const acknowledgement = await waitForMessage(run, 'shutdown_ack');
+  const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+  assert.ok(acknowledgement.descendant_identities.some(({ fingerprint }) => (
+    fingerprint === tree.descendant.identity.fingerprint
+  )), 'the child first seen in snapshot two must be promoted by a matching third snapshot');
+  await send(run.child, {
+    type: 'shutdown_release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  await run.closed;
+  await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+    tree.target.identity, tree.descendant.identity);
+});
+
+test('failed shutdown convergence kills a once-observed detached candidate', {
+  timeout: 30_000,
+}, async (t) => {
+  const root = makeTempRoot('pickle-broker-candidate-convergence-failure-');
+  const run = startBroker(t);
+  const fixture = launchFixture(run, root, {
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+    PICKLE_TEST_DESCENDANT_CONVERGENCE_FORCE_FAILURE: '1',
+    DETACHED_DESCENDANT: '1',
+  });
+  await send(run.child, fixture.request);
+  const launched = await waitForMessage(run, 'launched');
+  await send(run.child, {
+    type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+  await send(run.child, {
+    type: 'terminate', launch_id: fixture.launchId, cause: 'success', grace_ms: 0,
+  });
+  await run.closed;
+  assert.equal(run.messages.some(({ type }) => type === 'shutdown_ack'), false,
+    'an unstable descendant snapshot must not be published as an authoritative ledger');
+  await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+    tree.target.identity, tree.descendant.identity);
+});
+
+for (const [label, override] of [
+  ['candidate immutable mismatch', { PICKLE_TEST_DESCENDANT_IDENTITY_CONFLICT: '1' }],
+  ['SIGSTOP authority loss', { PICKLE_TEST_SIGSTOP_EPERM: '1' }],
+]) {
+  test(`${label} is an integrity failure with no ledger adoption`, { timeout: 30_000 }, async (t) => {
+    const root = makeTempRoot('pickle-broker-integrity-convergence-');
+    const run = startBroker(t);
+    const fixture = launchFixture(run, root, {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+      DETACHED_DESCENDANT: '1',
+      ...override,
+    });
+    await send(run.child, fixture.request);
+    const launched = await waitForMessage(run, 'launched');
+    await send(run.child, {
+      type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+    });
+    const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+    await send(run.child, {
+      type: 'terminate', launch_id: fixture.launchId, cause: 'success', grace_ms: 0,
+    });
+    await run.closed;
+    assert.equal(run.messages.some(({ type }) => type === 'shutdown_ack'), false,
+      'integrity-conflicted identities must never be adopted into an authoritative acknowledgement');
+    await assertTreeAbsent(launched.broker_identity, launched.target_identity,
+      tree.target.identity, tree.descendant.identity);
+  });
+}
+
+test('shutdown ledger retains a once-observed detached candidate after it reparents outside the final tree', {
+  timeout: 30_000,
+}, async (t) => {
+  const root = makeTempRoot('pickle-broker-reparented-candidate-');
+  const run = startBroker(t);
+  const fixture = launchFixture(run, root, {
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+    PICKLE_TEST_REPARENT_CANDIDATE_AFTER_FIRST_SNAPSHOT: '1',
+    PICKLE_TEST_DESCENDANT_CONVERGENCE_DELAY_MS: '100',
+    DETACHED_DESCENDANT: '1',
+  });
+  await send(run.child, fixture.request);
+  const launched = await waitForMessage(run, 'launched');
+  await send(run.child, {
+    type: 'release', launch_id: fixture.launchId, command_digest: fixture.digest,
+  });
+  const tree = await waitForFixtureIdentities(fixture.env.READINESS_LOG);
+  await send(run.child, {
+    type: 'terminate', launch_id: fixture.launchId, cause: 'success', grace_ms: 150,
+  });
+  const acknowledgement = await waitForMessage(run, 'shutdown_ack');
+  assert.ok(acknowledgement.descendant_identities.some(({ fingerprint }) => (
+    fingerprint === tree.descendant.identity.fingerprint
+  )), 'the live reparented candidate must be sealed into the authoritative shutdown ledger');
   await send(run.child, {
     type: 'shutdown_release', launch_id: fixture.launchId, command_digest: fixture.digest,
   });

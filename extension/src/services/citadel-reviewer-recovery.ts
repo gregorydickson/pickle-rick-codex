@@ -9,7 +9,11 @@ import {
   hasPromiseToken,
   runCodexExecMonitored,
 } from './codex.js';
-import { deriveCitadelAcceptanceCriteria, type CitadelSystemBlockArtifact } from './citadel.js';
+import {
+  citadelSystemBlockFailureIdentity,
+  deriveCitadelAcceptanceCriteria,
+  type CitadelSystemBlockArtifact,
+} from './citadel.js';
 import { assertRecordedActiveChildRecovered } from './orphan-reaper.js';
 import { atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
@@ -31,6 +35,11 @@ interface ReviewerAttempt {
   started_at: string;
   completed_at?: string;
   error?: string;
+  strategy_epoch?: number;
+  strategy_id?: string;
+  strategy_instruction?: string;
+  strategy_material_hash?: string;
+  input_identity?: string;
 }
 
 interface ReviewerRecoveryJournal {
@@ -43,6 +52,14 @@ interface ReviewerRecoveryJournal {
   mechanism_history: RecoveryMechanism[];
   status: 'started' | 'interrupted' | 'rejected' | 'resolved';
   attempts: ReviewerAttempt[];
+  resolution?: {
+    artifact_path: string;
+    instruction: string;
+    runtime_artifacts: RuntimeArtifacts;
+    runtime_manifest_sha256: string;
+    resolved_at: string;
+  };
+  strategy_epoch?: number;
   updated_at: string;
 }
 
@@ -125,7 +142,8 @@ interface CriterionShardJournal {
 interface RecoveryOptions {
   timeoutMs?: number;
   assertDurableOwnership?: () => void;
-  faultInjection?: (point: 'artifact-ready-before-resolution') => void;
+  faultInjection?: (point: 'artifact-ready-before-resolution' | 'journal-resolved-before-state'
+    | 'resolved-after-persist' | 'controller-strategy-ready-before-child') => void;
 }
 
 interface ReviewState extends Record<string, unknown> {
@@ -180,6 +198,7 @@ function expectedCriterionShardStrategy(ordinal: number): {
 }
 class ReviewerRecoveryFault extends Error {}
 class ReviewerRecoveryPending extends Error {}
+class ReviewerRecoveryIntegrityError extends Error {}
 const VALIDATOR_INVARIANTS = [
   'The candidate is exactly one JSON object with only the canonical Citadel report keys.',
   'reviewed_range exactly matches the immutable requested git range.',
@@ -277,6 +296,57 @@ function diagnosticContext(
     validator_invariants: VALIDATOR_INVARIANTS,
   });
   return { mechanism, hashes, diagnosticIdentity };
+}
+
+function controllerCanonicalStrategy(
+  sessionDir: string,
+  state: ReviewState,
+  block: CitadelSystemBlockArtifact,
+  diagnosticIdentity: string,
+  hashes: string[],
+  strategyEpoch: number,
+  priorAttempts: ReviewerAttempt[],
+) {
+  const strategyId = 'controller_canonical_synthesis';
+  const strategyInstruction = `Deterministically synthesize the canonical criterion-sharded diagnostic for outer strategy epoch ${strategyEpoch}, then independently validate every criterion shard.`;
+  const priorLedgerRoot = sha256(priorAttempts.map((entry) => ({
+    ordinal: entry.ordinal,
+    status: entry.status,
+    strategy_epoch: entry.strategy_epoch ?? null,
+    strategy_id: entry.strategy_id ?? null,
+    strategy_instruction: entry.strategy_instruction ?? null,
+    strategy_material_hash: entry.strategy_material_hash ?? null,
+    input_identity: entry.input_identity ?? null,
+    error: entry.error ?? null,
+    completed_at: entry.completed_at ?? null,
+  })));
+  const inputIdentity = sha256({
+    review_identity: state.review_identity,
+    failure_identity: block.failure_identity,
+    ordered_failed_candidate_hashes: hashes,
+    validator_invariants: VALIDATOR_INVARIANTS,
+    prior_ledger_root: priorLedgerRoot,
+    mechanism: 'criterion_sharded_reconstruction',
+    strategy_epoch: strategyEpoch,
+  });
+  const materialHash = sha256({ strategyId, strategyInstruction, inputIdentity });
+  const candidatePath = path.join(
+    sessionDir,
+    'citadel-reviewer-contract-repairs',
+    'controller-strategies',
+    `${diagnosticIdentity}-epoch-${strategyEpoch}.json`,
+  );
+  const artifact: DiagnosticArtifact = {
+    schema_version: 1,
+    review_identity: state.review_identity,
+    diagnostic_identity: diagnosticIdentity,
+    mechanism: 'criterion_sharded_reconstruction',
+    failed_candidate_hashes: hashes,
+    validator_invariants: [...VALIDATOR_INVARIANTS],
+    instruction: strategyInstruction,
+    rationale: `Trusted controller synthesis ${materialHash} advances exhausted outer recovery without weakening the canonical validator.`,
+  };
+  return { strategyId, strategyInstruction, priorLedgerRoot, inputIdentity, materialHash, candidatePath, artifact };
 }
 
 function validateArtifact(value: unknown, expected: {
@@ -1111,6 +1181,7 @@ function persistResolved(
   journal: ReviewerRecoveryJournal,
   artifact: DiagnosticArtifact,
   runtimeArtifacts: RuntimeArtifacts,
+  options: RecoveryOptions,
 ): CitadelReviewerRecoveryResult {
   const artifactPath = path.join(
     ensureDir(path.join(sessionDir, 'citadel-reviewer-contract-repairs')),
@@ -1125,7 +1196,30 @@ function persistResolved(
   }
   journal.status = 'resolved';
   journal.updated_at = completedAt;
+  journal.resolution = {
+    artifact_path: artifactPath,
+    instruction: artifact.instruction.trim(),
+    runtime_artifacts: runtimeArtifacts,
+    runtime_manifest_sha256: fileSha256(runtimeArtifacts.manifest_path),
+    resolved_at: completedAt,
+  };
   atomicWriteJson(recoveryJournalPath(sessionDir), journal);
+  try {
+    options.faultInjection?.('journal-resolved-before-state');
+  } catch (error) {
+    throw new ReviewerRecoveryFault('Injected failure after reviewer recovery journal resolution.', { cause: error });
+  }
+  return projectResolvedReviewerState(sessionDir, state, journal, artifact);
+}
+
+function projectResolvedReviewerState(
+  sessionDir: string,
+  state: ReviewState,
+  journal: ReviewerRecoveryJournal,
+  artifact: DiagnosticArtifact,
+): CitadelReviewerRecoveryResult {
+  const resolution = journal.resolution;
+  if (!resolution) throw new Error('Resolved Citadel reviewer journal lacks its durable resolution projection.');
   state.recovery_epoch += 1;
   state.status = 'running';
   state.strategy_id = 'artifact-contract-reconstruction';
@@ -1134,28 +1228,218 @@ function persistResolved(
     schema_version: 1,
     status: 'resolved',
     diagnostic_identity: artifact.diagnostic_identity,
-    artifact_path: artifactPath,
-    instruction: artifact.instruction.trim(),
+    artifact_path: resolution.artifact_path,
+    instruction: resolution.instruction,
     mechanism: artifact.mechanism,
     failed_candidate_hashes: artifact.failed_candidate_hashes,
     validator_invariants: artifact.validator_invariants,
     mechanism_history: journal.mechanism_history,
-    runtime_artifacts: runtimeArtifacts,
-    resolved_at: completedAt,
+    runtime_artifacts: resolution.runtime_artifacts,
+    runtime_manifest_sha256: resolution.runtime_manifest_sha256,
+    resolved_at: resolution.resolved_at,
   };
-  state.updated_at = completedAt;
+  state.updated_at = resolution.resolved_at;
   atomicWriteJson(path.join(sessionDir, 'citadel-review-state.json'), state);
   return { kind: 'resolved', diagnostic_identity: artifact.diagnostic_identity };
+}
+
+function validateResolvedRuntimeArtifacts(
+  sessionDir: string,
+  diagnosticIdentity: string,
+  mechanism: RecoveryMechanism,
+  runtime: RuntimeArtifacts,
+): void {
+  const artifactDir = path.join(sessionDir, 'citadel-reviewer-contract-runtime', diagnosticIdentity);
+  const expected = {
+    manifest: path.join(artifactDir, 'runtime-manifest.json'),
+    validator: path.join(artifactDir, 'validate-citadel-candidate.mjs'),
+    scaffold: mechanism === 'schema_scaffold_replay' ? path.join(artifactDir, 'citadel-report-scaffold.json') : null,
+    evidence: mechanism === 'evidence_bundle_reconstruction' ? path.join(artifactDir, 'evidence-bundle.json') : null,
+  };
+  if (runtime.schema_version !== 1 || runtime.mechanism !== mechanism
+    || runtime.manifest_path !== expected.manifest || runtime.validator_path !== expected.validator
+    || runtime.scaffold_path !== expected.scaffold || runtime.evidence_bundle_path !== expected.evidence
+    || runtime.validator_command !== `node ${JSON.stringify(expected.validator)} <candidate-path>`) {
+    throw new Error('Resolved Citadel reviewer runtime artifact projection is invalid.');
+  }
+  const manifest = readJsonFile<Record<string, unknown>>(expected.manifest, null);
+  const fileBindingValid = (binding: unknown, expectedPath: string | null): boolean => {
+    if (expectedPath === null) return binding === null;
+    if (!binding || typeof binding !== 'object' || Array.isArray(binding)) return false;
+    const record = binding as Record<string, unknown>;
+    return record.path === expectedPath && record.sha256 === fileSha256(expectedPath);
+  };
+  if (!manifest || manifest.schema_version !== 1 || manifest.mechanism !== mechanism
+    || manifest.diagnostic_identity !== diagnosticIdentity
+    || !fileBindingValid(manifest.scaffold, expected.scaffold)
+    || !fileBindingValid(manifest.evidence_bundle, expected.evidence)
+    || !fileBindingValid(manifest.validator, expected.validator)) {
+    throw new Error('Resolved Citadel reviewer runtime manifest is stale or unauthenticated.');
+  }
+  const criterion = manifest.criterion_shards as Record<string, unknown> | null;
+  if (mechanism === 'criterion_sharded_reconstruction') {
+    if (!runtime.criterion_shard_bundle_path || !fileBindingValid(criterion, runtime.criterion_shard_bundle_path)) {
+      throw new Error('Resolved Citadel reviewer criterion shard bundle is unauthenticated.');
+    }
+  } else if (criterion !== null || runtime.criterion_shard_bundle_path !== null) {
+    throw new Error('Resolved Citadel reviewer runtime has an unexpected criterion shard bundle.');
+  }
+}
+
+function authenticateResolvedCitadelReviewerArtifactContract(
+  sessionDir: string,
+  block: CitadelSystemBlockArtifact,
+): CitadelReviewerRecoveryResult | { kind: 'fresh_epoch' } | null {
+  const state = readReviewState(sessionDir);
+  const recovery = state.artifact_contract_recovery as Record<string, unknown> | undefined;
+  let journal = readJsonFile<ReviewerRecoveryJournal>(recoveryJournalPath(sessionDir), null);
+  const recoveryResolved = recovery?.status === 'resolved';
+  const journalResolved = journal?.status === 'resolved';
+  if (block.code !== 'reviewer_artifact_strategy_exhausted'
+    || block.recovery_action !== 'repair_reviewer_artifact_contract'
+    || block.failure_identity !== citadelSystemBlockFailureIdentity(block)) {
+    throw new Error('Citadel reviewer recovery system block identity is unauthenticated.');
+  }
+  if (journal && !journalResolved && journal.review_identity === state.review_identity) {
+    const currentHashes = failedCandidateHashes(state);
+    const activeAttempt = journal.attempts.at(-1);
+    if (journal.schema_version !== 1
+      || !['started', 'interrupted', 'rejected'].includes(journal.status)
+      || !activeAttempt || activeAttempt.status !== journal.status
+      || !Number.isInteger(journal.strategy_epoch ?? 0) || Number(journal.strategy_epoch ?? 0) < 0
+      || journal.mechanism_history.length === 0 || journal.mechanism_history.at(-1) !== journal.mechanism
+      || journal.mechanism_history.some((entry) => !MECHANISMS.includes(entry))
+      || !MECHANISMS.includes(journal.mechanism)
+      || JSON.stringify(journal.failed_candidate_hashes) !== JSON.stringify(currentHashes)
+      || JSON.stringify(journal.validator_invariants) !== JSON.stringify(VALIDATOR_INVARIANTS)
+      || diagnosticContext(state, block, journal.mechanism).diagnosticIdentity !== journal.diagnostic_identity) {
+      throw new Error('Pending Citadel reviewer recovery journal is stale or unauthenticated.');
+    }
+    return null;
+  }
+  if (!recoveryResolved && !journalResolved) return null;
+  const mechanism = (recoveryResolved ? recovery.mechanism : journal?.mechanism) as RecoveryMechanism;
+  if (!MECHANISMS.includes(mechanism)) throw new Error('Resolved Citadel reviewer recovery mechanism is invalid.');
+  const hashes = failedCandidateHashes(state);
+  const priorHashes = (recoveryResolved ? recovery.failed_candidate_hashes : journal?.failed_candidate_hashes) as unknown;
+  if (!Array.isArray(priorHashes) || priorHashes.some((value) => typeof value !== 'string')) {
+    throw new Error('Resolved Citadel reviewer recovery failed-candidate history is invalid.');
+  }
+  if (JSON.stringify(priorHashes) !== JSON.stringify(hashes)) {
+    if (hashes.length > priorHashes.length && priorHashes.every((hash, index) => hashes[index] === hash)) {
+      return { kind: 'fresh_epoch' };
+    }
+    throw new Error('Resolved Citadel reviewer recovery evidence does not match the current failed candidates.');
+  }
+  const { diagnosticIdentity } = diagnosticContext(state, block, mechanism);
+  if (!journal || journal.diagnostic_identity !== diagnosticIdentity) {
+    if (state.status === 'diagnostic_scheduled') return { kind: 'fresh_epoch' };
+    throw new Error('Resolved Citadel reviewer recovery is not bound to the current diagnostic block.');
+  }
+  const artifactPath = path.join(
+    sessionDir, 'citadel-reviewer-contract-repairs', `${diagnosticIdentity}.json`,
+  );
+  const artifact = validateArtifact(readJsonFile(artifactPath, null), {
+    reviewIdentity: state.review_identity,
+    diagnosticIdentity,
+    mechanism,
+    hashes,
+  });
+  const activeAttempt = journal?.attempts.at(-1);
+  if (!journal || journal.schema_version !== 1 || journal.review_identity !== state.review_identity
+    || journal.diagnostic_identity !== diagnosticIdentity || journal.mechanism !== mechanism
+    || journal.status !== 'resolved' || activeAttempt?.status !== 'resolved'
+    || activeAttempt.completed_at !== journal.updated_at
+    || JSON.stringify(journal.failed_candidate_hashes) !== JSON.stringify(hashes)
+    || JSON.stringify(journal.validator_invariants) !== JSON.stringify(VALIDATOR_INVARIANTS)
+    || journal.mechanism_history.length === 0 || journal.mechanism_history.at(-1) !== mechanism
+    || journal.mechanism_history.some((entry) => !MECHANISMS.includes(entry))) {
+    throw new Error('Resolved Citadel reviewer recovery evidence is stale or internally inconsistent.');
+  }
+  if (!journal.resolution && recoveryResolved) {
+    const runtime = recovery.runtime_artifacts as RuntimeArtifacts | undefined;
+    if (!runtime || typeof recovery.artifact_path !== 'string' || typeof recovery.instruction !== 'string'
+      || typeof recovery.resolved_at !== 'string') {
+      throw new Error('Legacy resolved Citadel reviewer recovery cannot be upgraded safely.');
+    }
+    const candidateResolution = {
+      artifact_path: recovery.artifact_path,
+      instruction: recovery.instruction,
+      runtime_artifacts: runtime,
+      runtime_manifest_sha256: '',
+      resolved_at: recovery.resolved_at,
+    };
+    if (candidateResolution.artifact_path !== artifactPath
+      || candidateResolution.instruction !== artifact.instruction.trim()
+      || candidateResolution.resolved_at !== journal.updated_at) {
+      throw new Error('Legacy resolved Citadel reviewer projection is stale or unauthenticated.');
+    }
+    validateResolvedRuntimeArtifacts(sessionDir, diagnosticIdentity, mechanism, runtime);
+    candidateResolution.runtime_manifest_sha256 = fileSha256(runtime.manifest_path);
+    if (recovery.schema_version !== 1 || recovery.diagnostic_identity !== diagnosticIdentity
+      || recovery.artifact_path !== artifactPath || recovery.instruction !== artifact.instruction.trim()
+      || recovery.mechanism !== mechanism
+      || JSON.stringify(recovery.failed_candidate_hashes) !== JSON.stringify(hashes)
+      || JSON.stringify(recovery.validator_invariants) !== JSON.stringify(VALIDATOR_INVARIANTS)
+      || JSON.stringify(recovery.mechanism_history) !== JSON.stringify(journal.mechanism_history)
+      || JSON.stringify(recovery.runtime_artifacts) !== JSON.stringify(runtime)
+      || recovery.resolved_at !== candidateResolution.resolved_at) {
+      throw new Error('Legacy resolved Citadel reviewer state is stale or internally inconsistent.');
+    }
+    journal = { ...journal, resolution: candidateResolution };
+    atomicWriteJson(recoveryJournalPath(sessionDir), journal);
+  }
+  const resolution = journal.resolution;
+  if (!resolution || resolution.artifact_path !== artifactPath
+    || resolution.instruction !== artifact.instruction.trim()
+    || resolution.resolved_at !== journal.updated_at
+    || !/^[a-f0-9]{64}$/.test(resolution.runtime_manifest_sha256)
+    || resolution.runtime_manifest_sha256 !== fileSha256(resolution.runtime_artifacts.manifest_path)) {
+    throw new Error('Resolved Citadel reviewer journal projection is stale or incomplete.');
+  }
+  validateResolvedRuntimeArtifacts(sessionDir, diagnosticIdentity, mechanism, resolution.runtime_artifacts);
+  if (!recoveryResolved) return projectResolvedReviewerState(sessionDir, state, journal, artifact);
+  const legacyManifestHashMissing = recovery.runtime_manifest_sha256 === undefined;
+  if (recovery.schema_version !== 1 || recovery.diagnostic_identity !== diagnosticIdentity
+    || recovery.artifact_path !== artifactPath || recovery.instruction !== artifact.instruction.trim()
+    || recovery.mechanism !== mechanism
+    || JSON.stringify(recovery.failed_candidate_hashes) !== JSON.stringify(hashes)
+    || JSON.stringify(recovery.validator_invariants) !== JSON.stringify(VALIDATOR_INVARIANTS)
+    || JSON.stringify(recovery.mechanism_history) !== JSON.stringify(journal.mechanism_history)
+    || JSON.stringify(recovery.runtime_artifacts) !== JSON.stringify(resolution.runtime_artifacts)
+    || (!legacyManifestHashMissing && recovery.runtime_manifest_sha256 !== resolution.runtime_manifest_sha256)
+    || recovery.resolved_at !== resolution.resolved_at) {
+    throw new Error('Resolved Citadel reviewer state projection is stale or internally inconsistent.');
+  }
+  if (legacyManifestHashMissing) {
+    recovery.runtime_manifest_sha256 = resolution.runtime_manifest_sha256;
+    state.artifact_contract_recovery = recovery;
+    atomicWriteJson(path.join(sessionDir, 'citadel-review-state.json'), state);
+  }
+  return { kind: 'resolved', diagnostic_identity: diagnosticIdentity };
+}
+
+function persistResolvedWithFaultBoundary(
+  sessionDir: string,
+  state: ReviewState,
+  journal: ReviewerRecoveryJournal,
+  artifact: DiagnosticArtifact,
+  runtimeArtifacts: RuntimeArtifacts,
+  options: RecoveryOptions,
+): CitadelReviewerRecoveryResult {
+  const resolved = persistResolved(sessionDir, state, journal, artifact, runtimeArtifacts, options);
+  try {
+    options.faultInjection?.('resolved-after-persist');
+  } catch (error) {
+    throw new ReviewerRecoveryFault('Injected failure after reviewer recovery resolution was persisted.', { cause: error });
+  }
+  return resolved;
 }
 
 export async function repairCitadelReviewerArtifactContract(
   sessionDir: string,
   block: CitadelSystemBlockArtifact,
-  options: {
-    timeoutMs?: number;
-    assertDurableOwnership?: () => void;
-    faultInjection?: (point: 'artifact-ready-before-resolution') => void;
-  } = {},
+  options: RecoveryOptions = {},
 ): Promise<CitadelReviewerRecoveryResult> {
   if (block.code !== 'reviewer_artifact_strategy_exhausted'
     || block.recovery_action !== 'repair_reviewer_artifact_contract') {
@@ -1166,7 +1450,12 @@ export async function repairCitadelReviewerArtifactContract(
   assertRecordedActiveChildRecovered(sessionDir, manager);
   options.assertDurableOwnership?.();
   const state = readReviewState(sessionDir);
-  const priorJournal = readJsonFile<ReviewerRecoveryJournal>(recoveryJournalPath(sessionDir), null);
+  const authenticatedResolved = authenticateResolvedCitadelReviewerArtifactContract(sessionDir, block);
+  if (authenticatedResolved?.kind === 'resolved') return authenticatedResolved;
+  const freshEpoch = authenticatedResolved?.kind === 'fresh_epoch';
+  const priorJournal = freshEpoch ? null : readJsonFile<ReviewerRecoveryJournal>(recoveryJournalPath(sessionDir), null);
+  // A strict extension starts a new diagnostic transaction and never resumes the old journal attempt.
+  // Retain only the bounded mechanism history so new evidence cannot reset all safeguards forever.
   const priorRecovery = state.artifact_contract_recovery as Record<string, unknown> | undefined;
   const resumableMechanism = priorJournal?.review_identity === state.review_identity
     && ['started', 'interrupted'].includes(priorJournal.status)
@@ -1182,18 +1471,13 @@ export async function repairCitadelReviewerArtifactContract(
     ...(MECHANISMS.includes(priorRecovery?.mechanism as RecoveryMechanism)
       ? [priorRecovery?.mechanism as RecoveryMechanism] : []),
   ]);
-  const mechanism = resumableMechanism ?? selectMechanism(state, usedMechanisms, priorRecovery);
+  let mechanism = resumableMechanism ?? selectMechanism(state, usedMechanisms, priorRecovery);
+  let strategyEpoch = Number(priorJournal?.strategy_epoch || 0);
+  let controllerCanonicalSynthesis = false;
   if (!mechanism) {
-    return {
-      kind: 'recovery_scheduled',
-      diagnostic_identity: priorJournal?.diagnostic_identity || sha256({
-        review_identity: state.review_identity,
-        system_failure_identity: block.failure_identity,
-        failed_candidate_hashes: failedCandidateHashes(state),
-        validator_invariants: VALIDATOR_INVARIANTS,
-        mechanisms_exhausted: [...usedMechanisms].sort(),
-      }),
-    };
+    mechanism = 'criterion_sharded_reconstruction';
+    strategyEpoch += 1;
+    controllerCanonicalSynthesis = true;
   }
   const { hashes, diagnosticIdentity } = diagnosticContext(state, block, mechanism);
   const resolved = state.artifact_contract_recovery as Record<string, unknown> | undefined;
@@ -1210,16 +1494,36 @@ export async function repairCitadelReviewerArtifactContract(
       failed_candidate_hashes: hashes,
       validator_invariants: [...VALIDATOR_INVARIANTS],
       mechanism_history: [...new Set([...usedMechanisms, mechanism])],
+      strategy_epoch: strategyEpoch,
       status: 'started',
       attempts: [],
       updated_at: new Date().toISOString(),
     };
   }
+  journal.strategy_epoch = strategyEpoch;
   const interrupted = journal.attempts.at(-1);
   if (interrupted?.status === 'started' && fs.existsSync(interrupted.candidate_path)) {
     try {
+      const candidateValue = readJsonFile(interrupted.candidate_path, null);
+      if (interrupted.strategy_id === 'controller_canonical_synthesis') {
+        const epoch = Number(interrupted.strategy_epoch);
+        const expected = controllerCanonicalStrategy(
+          sessionDir, state, block, diagnosticIdentity, hashes, epoch, journal.attempts.slice(0, -1),
+        );
+        if (!Number.isInteger(epoch) || epoch <= 0 || journal.strategy_epoch !== epoch
+          || mechanism !== 'criterion_sharded_reconstruction'
+          || interrupted.candidate_path !== expected.candidatePath
+          || interrupted.strategy_instruction !== expected.strategyInstruction
+          || interrupted.input_identity !== expected.inputIdentity
+          || interrupted.strategy_material_hash !== expected.materialHash
+          || JSON.stringify(candidateValue) !== JSON.stringify(expected.artifact)) {
+          throw new ReviewerRecoveryIntegrityError(
+            'Persisted controller recovery strategy or candidate does not match its canonical material identity.',
+          );
+        }
+      }
       const artifact = validateArtifact(
-        readJsonFile(interrupted.candidate_path, null),
+        candidateValue,
         { reviewIdentity: state.review_identity, diagnosticIdentity, mechanism, hashes },
       );
       try {
@@ -1230,9 +1534,9 @@ export async function repairCitadelReviewerArtifactContract(
       const runtimeArtifacts = await materializeRuntimeArtifacts(
         sessionDir, state, block, artifact, options, manager, statePath,
       );
-      return persistResolved(sessionDir, state, journal, artifact, runtimeArtifacts);
+      return persistResolvedWithFaultBoundary(sessionDir, state, journal, artifact, runtimeArtifacts, options);
     } catch (error) {
-      if (error instanceof ReviewerRecoveryFault) throw error;
+      if (error instanceof ReviewerRecoveryFault || error instanceof ReviewerRecoveryIntegrityError) throw error;
       if (error instanceof ReviewerRecoveryPending) {
         return { kind: 'recovery_scheduled', diagnostic_identity: diagnosticIdentity };
       }
@@ -1249,6 +1553,56 @@ export async function repairCitadelReviewerArtifactContract(
     journal.status = 'interrupted';
     journal.updated_at = interrupted.completed_at;
     atomicWriteJson(recoveryJournalPath(sessionDir), journal);
+  }
+  if (controllerCanonicalSynthesis) {
+    const canonical = controllerCanonicalStrategy(
+      sessionDir, state, block, diagnosticIdentity, hashes, strategyEpoch, journal.attempts,
+    );
+    const { strategyId, strategyInstruction, inputIdentity, materialHash, candidatePath, artifact } = canonical;
+    if (journal.attempts.some((entry) => entry.strategy_material_hash === materialHash)) {
+      throw new Error('Citadel reviewer outer recovery refused an identical material strategy replay.');
+    }
+    ensureDir(path.dirname(candidatePath));
+    const attempt: ReviewerAttempt = {
+      ordinal: journal.attempts.length + 1,
+      status: 'started',
+      candidate_path: candidatePath,
+      started_at: new Date().toISOString(),
+      strategy_epoch: strategyEpoch,
+      strategy_id: strategyId,
+      strategy_instruction: strategyInstruction,
+      strategy_material_hash: materialHash,
+      input_identity: inputIdentity,
+    };
+    journal.attempts.push(attempt);
+    journal.status = 'started';
+    journal.updated_at = attempt.started_at;
+    atomicWriteJson(recoveryJournalPath(sessionDir), journal);
+    atomicWriteJson(candidatePath, artifact);
+    try {
+      options.faultInjection?.('controller-strategy-ready-before-child');
+    } catch (error) {
+      throw new ReviewerRecoveryFault('Injected failure after controller recovery strategy persistence.', { cause: error });
+    }
+    try {
+      const runtimeArtifacts = await materializeRuntimeArtifacts(
+        sessionDir, state, block, artifact, options, manager, statePath,
+      );
+      return persistResolvedWithFaultBoundary(sessionDir, state, journal, artifact, runtimeArtifacts, options);
+    } catch (error) {
+      if (error instanceof ReviewerRecoveryPending) {
+        return { kind: 'recovery_scheduled', diagnostic_identity: diagnosticIdentity };
+      }
+      const ownershipDrain = durableOwnershipDrainCause(error);
+      if (ownershipDrain) throw ownershipDrain;
+      attempt.status = 'rejected';
+      attempt.error = error instanceof Error ? error.message : String(error);
+      attempt.completed_at = new Date().toISOString();
+      journal.status = 'rejected';
+      journal.updated_at = attempt.completed_at;
+      atomicWriteJson(recoveryJournalPath(sessionDir), journal);
+      return { kind: 'recovery_scheduled', diagnostic_identity: diagnosticIdentity };
+    }
   }
   const candidateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pickle-citadel-reviewer-contract-'));
   const candidatePath = path.join(candidateDir, 'reviewer-contract-recovery.json');
@@ -1268,6 +1622,7 @@ export async function repairCitadelReviewerArtifactContract(
     `Review identity: ${state.review_identity}`,
     `Diagnostic identity: ${diagnosticIdentity}`,
     `Closed recovery mechanism: ${mechanism}`,
+    `Autonomous recovery strategy epoch: ${strategyEpoch}`,
     `Exact failed candidate hashes JSON: ${JSON.stringify(hashes)}`,
     `Exact validator invariants JSON: ${JSON.stringify(VALIDATOR_INVARIANTS)}`,
     `Persisted system evidence: ${block.evidence}`,
@@ -1313,7 +1668,7 @@ export async function repairCitadelReviewerArtifactContract(
     const runtimeArtifacts = await materializeRuntimeArtifacts(
       sessionDir, state, block, artifact, options, manager, statePath,
     );
-    return persistResolved(sessionDir, state, journal, artifact, runtimeArtifacts);
+    return persistResolvedWithFaultBoundary(sessionDir, state, journal, artifact, runtimeArtifacts, options);
   } catch (error) {
     if (error instanceof ReviewerRecoveryFault) throw error;
     if (error instanceof ReviewerRecoveryPending) {

@@ -191,6 +191,19 @@ test('attested drain clears only the exact complete immutable ledger', () => {
   assert.equal(drained.active_child_pid, null);
 });
 
+test('attested prelaunch drain clears the exact broker-only ownership ledger', () => {
+  const { manager, statePath } = fixture();
+  const callbacks = monitoredProcessStateCallbacks(manager, statePath, 'codex', 'worker');
+  const broker = identity(98311);
+  callbacks.onSpawn({ pid: broker.pid }, broker);
+
+  callbacks.onDrain(broker, null, []);
+  const drained = manager.read(statePath);
+  assert.deepEqual(drained.active_child_identities, []);
+  assert.equal(drained.active_child_identity, null);
+  assert.equal(drained.active_child_pid, null);
+});
+
 test('restart recovery clears a stranded ledger only after exact groups are absent', () => {
   const { manager, statePath } = fixture();
   const broker = identity(98401);

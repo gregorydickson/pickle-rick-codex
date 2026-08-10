@@ -28,8 +28,10 @@ import type {
   SuccessCheckContext,
 } from '../types/index.js';
 import {
+  BROKER_CONVERGENCE_PROGRESS_STALL_TIMEOUT_MS,
   CONTROLLER_BROKER_FORCE_KILL_TIMEOUT_MS,
   MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS,
+  MIN_TARGET_STOP_ATTESTATION_OBSERVATIONS,
   POST_CLOSE_ATTESTATION_WINDOW_MS,
 } from './monitored-process-protocol.js';
 
@@ -149,6 +151,32 @@ function sameIdentity(left: PersistedProcessIdentity | null, right: unknown): bo
     && candidate.fingerprint === left.fingerprint;
 }
 
+export function isAuthenticatedBrokerOnlyShutdownLedger(
+  launchAttested: boolean,
+  targetIdentity: PersistedProcessIdentity | null,
+  rawTargetIdentity: unknown,
+  rawDescendantIdentities: unknown,
+  cause: unknown,
+): boolean {
+  const permittedCause = typeof cause === 'string' && [
+    'target-stop-attestation-failed',
+    'target-identity-attestation-failed',
+    'target-spawn-error',
+    'broker-SIGTERM',
+    'broker-SIGINT',
+    'broker-SIGHUP',
+    'controller-disconnect',
+  ].includes(cause);
+  return !launchAttested && !targetIdentity && rawTargetIdentity === null
+    && Array.isArray(rawDescendantIdentities) && rawDescendantIdentities.length === 0
+    && permittedCause;
+}
+
+function sameIdentityLedger(left: PersistedProcessIdentity[], right: unknown): boolean {
+  return Array.isArray(right) && left.length === right.length
+    && left.every((identity, index) => sameIdentity(identity, right[index]));
+}
+
 function processGroupAlive(pgid: number): boolean {
   if (process.platform === 'win32') return false;
   try {
@@ -234,6 +262,12 @@ async function runSpawnedCommand({
     let launchAttested = false;
     let releaseAttested = false;
     let shutdownAckObserved = false;
+    let brokerOnlyShutdownAttested = false;
+    let authenticatedShutdownAck: {
+      cause: string;
+      targetIdentity: PersistedProcessIdentity | null;
+      descendantIdentities: PersistedProcessIdentity[];
+    } | null = null;
     let brokerShutdownCause = '';
     let targetOutcome: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let protocolFailure = '';
@@ -243,6 +277,22 @@ async function runSpawnedCommand({
     let shutdownReleaseDeliveryFailure = '';
     let targetPublicationError: Error | null = null;
     let fallbackTimer: NodeJS.Timeout | null = null;
+    let shutdownProgressSequence = 0;
+    let shutdownProgressCause = '';
+    let shutdownProgressObservationCount = -1;
+    let shutdownProgressSnapshotDigest = '';
+    let identicalShutdownProgressObservations = 0;
+    let shutdownProgressEpoch = -1;
+    const shutdownProgressDigests = new Set<string>();
+    const testProtocolTiming = env.PICKLE_TEST_MODE === '1';
+    const boundedTestTiming = (name: string, fallback: number): number => testProtocolTiming
+      ? Math.max(100, Math.min(Number(env[name] || fallback), fallback)) : fallback;
+    const controllerForceKillTimeoutMs = boundedTestTiming(
+      'PICKLE_TEST_CONTROLLER_FORCE_KILL_TIMEOUT_MS', CONTROLLER_BROKER_FORCE_KILL_TIMEOUT_MS,
+    );
+    const convergenceProgressStallTimeoutMs = boundedTestTiming(
+      'PICKLE_TEST_CONVERGENCE_PROGRESS_STALL_TIMEOUT_MS', BROKER_CONVERGENCE_PROGRESS_STALL_TIMEOUT_MS,
+    );
     const launchId = crypto.randomUUID();
     const launchCommandDigest = commandDigest(command, args, cwd);
 
@@ -348,6 +398,16 @@ async function runSpawnedCommand({
       }
     };
 
+    const armBrokerFallback = (delayMs: number): void => {
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      fallbackTimer = setTimeout(() => {
+        if (!shutdownAckObserved || processGroupAlive(brokerIdentity?.pgid || 0)) {
+          signalAttestedGroup('SIGKILL');
+        }
+      }, delayMs);
+      fallbackTimer.unref?.();
+    };
+
     const requestBrokerShutdown = (cause: string): void => {
       sendBrokerControl(
         { type: 'terminate', launch_id: launchId, cause, grace_ms: 500 },
@@ -356,17 +416,11 @@ async function runSpawnedCommand({
           shutdownDeliveryFailure = `Monitored broker termination delivery failed: ${safeErrorMessage(error)}`;
         },
       );
-      if (fallbackTimer) clearTimeout(fallbackTimer);
       // Do not let an expired controller timer run before a queued IPC ack and
       // destroy the broker's authenticated ledger. The broker gets its full
       // release/fallback budget first; this is only the final wedged-broker
       // safeguard after that autonomous path should already have drained.
-      fallbackTimer = setTimeout(() => {
-        if (!shutdownAckObserved || processGroupAlive(brokerIdentity?.pgid || 0)) {
-          signalAttestedGroup('SIGKILL');
-        }
-      }, CONTROLLER_BROKER_FORCE_KILL_TIMEOUT_MS);
-      fallbackTimer.unref?.();
+      armBrokerFallback(controllerForceKillTimeoutMs);
     };
 
     const requestTermination = (
@@ -630,21 +684,83 @@ async function runSpawnedCommand({
         return;
       }
 
+      if (record.type === 'shutdown_progress') {
+        const envelopeValid = bound && targetIdentity && sameIdentity(targetIdentity, record.target_identity)
+          && typeof record.cause === 'string' && record.cause.length > 0
+          && Number.isInteger(record.sequence) && Number(record.sequence) === shutdownProgressSequence + 1
+          && typeof record.stage === 'string' && record.stage.length > 0
+          && Number.isInteger(record.epoch) && Number(record.epoch) >= 0
+          && Number.isInteger(record.observation_count) && Number(record.observation_count) >= 0
+          && (!shutdownProgressCause || shutdownProgressCause === record.cause);
+        if (!envelopeValid) return;
+        const observationCount = Number(record.observation_count);
+        const epoch = Number(record.epoch);
+        const digest = typeof record.snapshot_digest === 'string'
+          && /^[a-f0-9]{64}$/.test(record.snapshot_digest) ? record.snapshot_digest : '';
+        const initialAuthority = shutdownProgressSequence === 0 && observationCount === 0
+          && epoch === 0 && record.stage === 'shutdown-started' && record.snapshot_digest === null;
+        const revisitsPriorState = Boolean(digest) && shutdownProgressDigests.has(digest)
+          && digest !== shutdownProgressSnapshotDigest;
+        const nextIdenticalCount = digest && digest === shutdownProgressSnapshotDigest
+          ? identicalShutdownProgressObservations + 1 : 1;
+        const materialObservation = observationCount > shutdownProgressObservationCount
+          && epoch >= shutdownProgressEpoch && Boolean(digest) && !revisitsPriorState
+          && nextIdenticalCount <= MIN_TARGET_STOP_ATTESTATION_OBSERVATIONS;
+        if (!initialAuthority && !materialObservation) return;
+        shutdownProgressSequence = Number(record.sequence);
+        shutdownProgressCause = String(record.cause);
+        shutdownProgressObservationCount = observationCount;
+        shutdownProgressEpoch = epoch;
+        if (digest) {
+          identicalShutdownProgressObservations = nextIdenticalCount;
+          shutdownProgressSnapshotDigest = digest;
+          shutdownProgressDigests.add(digest);
+        }
+        armBrokerFallback(convergenceProgressStallTimeoutMs);
+        return;
+      }
+
       if (record.type === 'shutdown_ack') {
-        if (!bound || shutdownAckObserved
-          || typeof record.cause !== 'string' || !record.cause
-          || (targetIdentity && !sameIdentity(targetIdentity, record.target_identity))) {
-          if (shutdownAckObserved && bound
-            && (!targetIdentity || sameIdentity(targetIdentity, record.target_identity))) return;
+        if (shutdownAckObserved) {
+          const exactDuplicate = bound && authenticatedShutdownAck
+            && record.cause === authenticatedShutdownAck.cause
+            && (authenticatedShutdownAck.targetIdentity
+              ? sameIdentity(authenticatedShutdownAck.targetIdentity, record.target_identity)
+              : record.target_identity === null)
+            && sameIdentityLedger(authenticatedShutdownAck.descendantIdentities, record.descendant_identities);
+          if (exactDuplicate) return;
+          protocolFailure = 'Monitored process broker sent a conflicting shutdown attestation.';
+          return;
+        }
+        const brokerOnlyShutdown = isAuthenticatedBrokerOnlyShutdownLedger(
+          launchAttested,
+          targetIdentity,
+          record.target_identity,
+          record.descendant_identities,
+          record.cause,
+        );
+        const targetBound = targetIdentity
+          ? sameIdentity(targetIdentity, record.target_identity)
+          : brokerOnlyShutdown;
+        if (!bound || typeof record.cause !== 'string' || !record.cause || !targetBound) {
           protocolFailure = 'Monitored process broker shutdown attestation failed.';
           return;
         }
-        shutdownAckObserved = true;
-        brokerShutdownCause = record.cause;
-        if (!persistDescendantLedger(record.descendant_identities)) {
+        if (brokerOnlyShutdown) {
+          brokerOnlyShutdownAttested = true;
+        } else if (!persistDescendantLedger(record.descendant_identities)) {
           protocolFailure = 'Monitored descendant shutdown ledger was malformed or conflicted.';
           return;
         }
+        shutdownAckObserved = true;
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+        brokerShutdownCause = record.cause;
+        authenticatedShutdownAck = {
+          cause: record.cause,
+          targetIdentity,
+          descendantIdentities: [...descendantIdentities],
+        };
         targetOutcome = {
           code: typeof record.target_exit_code === 'number' ? record.target_exit_code : null,
           signal: typeof record.target_signal === 'string' ? record.target_signal as NodeJS.Signals : null,
@@ -658,6 +774,10 @@ async function runSpawnedCommand({
             shutdownReleaseDeliveryFailure = `Monitored broker shutdown release delivery failed: ${safeErrorMessage(error)}`;
           },
         );
+        // The pre-ack semantic-progress lease ends here. A distinct bounded
+        // post-ack watchdog now covers immediate release delivery and exact
+        // group drain; a broker wedged after publishing authority is reaped.
+        armBrokerFallback(controllerForceKillTimeoutMs);
       }
     });
 
@@ -724,8 +844,12 @@ async function runSpawnedCommand({
         const groupsAbsent = groupLiveness.every(({ alive }) => !alive);
         const identitiesAbsent = brokerLiveness === 'not-running' && targetLiveness === 'not-running'
           && descendantLiveness.every((liveness) => liveness === 'not-running');
+        if (attestationObservations < MIN_POST_CLOSE_ATTESTATION_OBSERVATIONS) {
+          setTimeout(finalizeAfterFlush, 25);
+          return;
+        }
         if (shutdownAckObserved && identitiesAbsent && groupsAbsent && !protocolFailure
-          && brokerIdentity && targetIdentity) {
+          && brokerIdentity && (targetIdentity || brokerOnlyShutdownAttested)) {
           brokerDrainAttested = true;
         } else if ((brokerLiveness === 'matched' || targetLiveness === 'matched'
           || descendantLiveness.includes('matched'))
@@ -739,7 +863,7 @@ async function runSpawnedCommand({
           setTimeout(finalizeAfterFlush, 25);
           return;
         }
-        if (brokerDrainAttested && brokerIdentity && targetIdentity) {
+        if (brokerDrainAttested && brokerIdentity) {
           try {
             onDrain?.(brokerIdentity, targetIdentity, descendantIdentities);
           } catch (error) {

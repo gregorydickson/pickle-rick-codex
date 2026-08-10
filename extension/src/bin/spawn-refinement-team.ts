@@ -365,7 +365,7 @@ async function runRefinementCodex(
       },
       onDrain: (brokerIdentity, targetIdentity, descendants) => {
         manager.update(statePath, (current) => {
-          const drainedFingerprints = new Set([brokerIdentity, targetIdentity, ...descendants]
+          const drainedFingerprints = new Set([brokerIdentity, ...(targetIdentity ? [targetIdentity] : []), ...descendants]
             .map((identity) => identity.fingerprint));
           const identities = refinementChildIdentities(current)
             .filter((entry) => !drainedFingerprints.has(entry.fingerprint));

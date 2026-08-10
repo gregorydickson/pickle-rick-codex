@@ -45,6 +45,7 @@ import { StateManager } from '../services/state-manager.js';
 import { assertSessionOperationAvailable } from '../services/session-operation.js';
 import {
   assertCitadelReleaseApproval,
+  citadelSystemBlockFailureIdentity,
   deriveCitadelAcceptanceCriteria,
   persistCitadelReleaseApproval,
   readCitadelSystemBlock,
@@ -79,7 +80,7 @@ function assertExactProcessesAndGroupsAbsent(identities) {
 }
 
 function writeCitadelSystemBlock(sessionDir, overrides = {}) {
-  writeJson(path.join(sessionDir, 'citadel-system-block.json'), {
+  const artifact = {
     schema_version: 1,
     artifact_kind: 'citadel_system_block',
     category: 'infrastructure',
@@ -91,14 +92,15 @@ function writeCitadelSystemBlock(sessionDir, overrides = {}) {
     checks: [{ command: 'npm test', status: 'failed', exit_code: 7, output: 'fixture failure' }],
     recovery_action: 'retry_checks',
     recovery_ticket_ids: [],
-    failure_identity: 'f'.repeat(64),
     attempt: 2,
     recovery_epoch: 1,
     bounded_attempt: 2,
     next_action: 'restart_executor',
     generated_at: new Date().toISOString(),
     ...overrides,
-  });
+  };
+  artifact.failure_identity = overrides.failure_identity || citadelSystemBlockFailureIdentity(artifact);
+  writeJson(path.join(sessionDir, 'citadel-system-block.json'), artifact);
 }
 
 test('pipeline runner decodes and forwards green runtime handoff arguments', () => {
@@ -1170,7 +1172,7 @@ test('standalone mux consumes reviewer artifact-contract recovery and retries Ci
 
   assert.equal(result, 'success');
   assert.equal(citadelRuns, 2);
-  assert.equal(recoveryCalls, 1);
+  assert.equal(recoveryCalls, 2);
   assert.match(
     fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'),
     /Resolved Citadel reviewer contract diagnostic/,
@@ -1727,6 +1729,274 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
 });
 
+test('pipeline restart projects a resolved reviewer WAL and resumes Citadel without another recovery call', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'resume Citadel immediately after reviewer resolution persistence',
+  }));
+  ensurePipelineState(sessionDir);
+  const reviewIdentity = 'd'.repeat(64);
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 2,
+    strategy_id: 'adversarial-two-pass',
+    strategy_hash: 'e'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: [{
+      ordinal: 1,
+      epoch: 1,
+      attempt: 1,
+      candidate_path: path.join(sessionDir, 'invalid-review.json'),
+      candidate_hash: '1'.repeat(64),
+      status: 'rejected',
+      validation_error: 'findings must be an array',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    }, {
+      ordinal: 2,
+      epoch: 1,
+      attempt: 2,
+      candidate_path: path.join(sessionDir, 'invalid-review-2.json'),
+      candidate_hash: '2'.repeat(64),
+      status: 'rejected',
+      validation_error: 'findings must be an array',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    }],
+    updated_at: new Date().toISOString(),
+  });
+  const fakeBin = makeTempRoot('resolved-reviewer-wal-bin-');
+  const invocationLog = path.join(sessionDir, 'resolved-reviewer-wal-invocations.jsonl');
+  createFakeCodex(fakeBin);
+  const environment = prependPath(fakeBin, { FAKE_CODEX_INVOCATION_LOG: invocationLog });
+  let citadelRuns = 0;
+  const runCitadel = async (dir) => {
+    citadelRuns += 1;
+    if (citadelRuns === 1) {
+      writeCitadelSystemBlock(dir, {
+        code: 'reviewer_artifact_strategy_exhausted',
+        title: 'Citadel reviewer artifact strategies are exhausted',
+        evidence: `All bounded reviewer artifact strategies are exhausted for review ${reviewIdentity}.`,
+        recommendation: 'Persist and reuse the authenticated reviewer reconstruction.',
+        recovery_action: 'repair_reviewer_artifact_contract',
+        recovery_ticket_ids: [],
+      });
+      return 'citadel-system-blocked';
+    }
+    return await approveCitadelFixture(dir);
+  };
+  let injectCrash = true;
+  const repairWithJournalCrash = async (dir, block, options) => await repairCitadelReviewerArtifactContract(
+    dir,
+    block,
+    {
+      ...options,
+      faultInjection: (point) => {
+        if (injectCrash && point === 'journal-resolved-before-state') {
+          injectCrash = false;
+          throw new Error('crash-after-resolved-reviewer-journal');
+        }
+      },
+    },
+  );
+  await assert.rejects(
+    () => withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+      runSequential: async () => 'success',
+      runCitadel,
+      repairCitadelReviewerArtifactContract: repairWithJournalCrash,
+    })),
+    /Injected failure after reviewer recovery journal resolution/,
+  );
+  const journalBeforeRestart = fs.readFileSync(
+    path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'), 'utf8',
+  );
+  assert.equal(JSON.parse(journalBeforeRestart).status, 'resolved');
+  const reviewStatePath = path.join(sessionDir, 'citadel-review-state.json');
+  const staleStateBytes = fs.readFileSync(reviewStatePath, 'utf8');
+  const staleState = JSON.parse(staleStateBytes);
+  assert.notEqual(staleState.artifact_contract_recovery?.status, 'resolved');
+  const recoveryInvocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length;
+  const block = readCitadelSystemBlock(sessionDir);
+  const journalPath = path.join(sessionDir, 'citadel-reviewer-contract-recovery.json');
+  const durableJournal = JSON.parse(journalBeforeRestart);
+  const artifactPath = durableJournal.resolution.artifact_path;
+  const artifactBytes = fs.readFileSync(artifactPath, 'utf8');
+  const manifestPath = durableJournal.resolution.runtime_artifacts.manifest_path;
+  const manifestBytes = fs.readFileSync(manifestPath, 'utf8');
+  const reorderedState = JSON.parse(staleStateBytes);
+  reorderedState.attempts.reverse();
+  writeJson(reviewStatePath, reorderedState);
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /current failed candidates/);
+  const interleavedState = JSON.parse(staleStateBytes);
+  interleavedState.attempts.splice(1, 0, {
+    ...interleavedState.attempts[0], ordinal: 99, candidate_hash: '3'.repeat(64),
+  });
+  writeJson(reviewStatePath, interleavedState);
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /current failed candidates/);
+  fs.writeFileSync(reviewStatePath, staleStateBytes);
+  const tamperedJournal = structuredClone(durableJournal);
+  tamperedJournal.failed_candidate_hashes = ['2'.repeat(64)];
+  writeJson(journalPath, tamperedJournal);
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /failed candidates|stale|unauthenticated/);
+  fs.writeFileSync(journalPath, journalBeforeRestart);
+  const tamperedArtifact = JSON.parse(artifactBytes);
+  tamperedArtifact.instruction = 'forged resolution instruction';
+  writeJson(artifactPath, tamperedArtifact);
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /stale|incomplete|instruction/);
+  fs.writeFileSync(artifactPath, artifactBytes);
+  fs.chmodSync(manifestPath, 0o600);
+  fs.appendFileSync(manifestPath, ' ');
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /manifest|projection|stale/);
+  fs.writeFileSync(manifestPath, manifestBytes);
+  fs.chmodSync(manifestPath, 0o400);
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, {
+    ...block,
+    evidence: `${block.evidence} forged`,
+  }, {}), /block identity is unauthenticated/);
+
+  const projectedRecovery = await repairWithJournalCrash(sessionDir, block, {});
+  assert.equal(projectedRecovery.kind, 'resolved');
+  const projectedStateBytes = fs.readFileSync(reviewStatePath, 'utf8');
+  assert.equal((await repairWithJournalCrash(sessionDir, block, {})).kind, 'resolved');
+  assert.equal(fs.readFileSync(reviewStatePath, 'utf8'), projectedStateBytes);
+  assert.equal(fs.readFileSync(journalPath, 'utf8'), journalBeforeRestart);
+  assert.equal(fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length, recoveryInvocations);
+  const legacyJournal = JSON.parse(journalBeforeRestart);
+  delete legacyJournal.resolution;
+  const legacyProjectedState = JSON.parse(projectedStateBytes);
+  delete legacyProjectedState.artifact_contract_recovery.runtime_manifest_sha256;
+  const legacyEpoch = legacyProjectedState.recovery_epoch;
+  writeJson(journalPath, legacyJournal);
+  writeJson(reviewStatePath, legacyProjectedState);
+  assert.equal((await repairWithJournalCrash(sessionDir, block, {})).kind, 'resolved');
+  const upgradedJournal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  const upgradedState = JSON.parse(fs.readFileSync(reviewStatePath, 'utf8'));
+  assert.match(upgradedJournal.resolution.runtime_manifest_sha256, /^[a-f0-9]{64}$/);
+  assert.equal(upgradedState.artifact_contract_recovery.runtime_manifest_sha256,
+    upgradedJournal.resolution.runtime_manifest_sha256);
+  assert.equal(upgradedState.recovery_epoch, legacyEpoch);
+  const forgedLegacyState = structuredClone(legacyProjectedState);
+  forgedLegacyState.artifact_contract_recovery.runtime_artifacts.manifest_path = '/etc/hosts';
+  writeJson(journalPath, legacyJournal);
+  writeJson(reviewStatePath, forgedLegacyState);
+  const legacyJournalBytes = fs.readFileSync(journalPath, 'utf8');
+  await assert.rejects(() => repairWithJournalCrash(sessionDir, block, {}), /runtime artifact projection is invalid/);
+  assert.equal(fs.readFileSync(journalPath, 'utf8'), legacyJournalBytes);
+  fs.writeFileSync(journalPath, journalBeforeRestart);
+  fs.writeFileSync(reviewStatePath, staleStateBytes);
+
+  const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel,
+    repairCitadelReviewerArtifactContract: repairWithJournalCrash,
+  }));
+  assert.equal(result, 'success');
+  assert.equal(citadelRuns, 2);
+  assert.equal(fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length, recoveryInvocations);
+  assert.equal(fs.readFileSync(path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'), 'utf8'), journalBeforeRestart);
+  const projected = JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-review-state.json'), 'utf8'));
+  assert.equal(projected.artifact_contract_recovery.status, 'resolved');
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+});
+
+test('pipeline restart after resolved state persistence runs Citadel once with byte-identical recovery evidence', async () => {
+  const { sessionDir, workingDir } = createAcceptedSession('Done');
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+  writePipelineContract(sessionDir, createPipelineContract({
+    working_dir: workingDir,
+    target: workingDir,
+    phases: ['pickle', 'citadel'],
+    bootstrap_source: 'task',
+    task: 'resume after the resolved reviewer state is durable',
+  }));
+  ensurePipelineState(sessionDir);
+  const reviewIdentity = '9'.repeat(64);
+  writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
+    schema_version: 1,
+    review_identity: reviewIdentity,
+    recovery_epoch: 1,
+    strategy_id: 'adversarial-two-pass',
+    strategy_hash: '8'.repeat(64),
+    status: 'diagnostic_scheduled',
+    attempts: [{
+      ordinal: 1,
+      candidate_path: path.join(sessionDir, 'invalid-post-state-review.json'),
+      candidate_hash: '7'.repeat(64),
+      status: 'rejected',
+      validation_error: 'findings must be an array',
+    }],
+    updated_at: new Date().toISOString(),
+  });
+  const fakeBin = makeTempRoot('resolved-reviewer-state-bin-');
+  const invocationLog = path.join(sessionDir, 'resolved-reviewer-state-invocations.jsonl');
+  createFakeCodex(fakeBin);
+  const environment = prependPath(fakeBin, { FAKE_CODEX_INVOCATION_LOG: invocationLog });
+  let citadelRuns = 0;
+  const runCitadel = async (dir) => {
+    citadelRuns += 1;
+    if (citadelRuns === 1) {
+      writeCitadelSystemBlock(dir, {
+        code: 'reviewer_artifact_strategy_exhausted',
+        title: 'Citadel reviewer state persistence requires restart',
+        evidence: `All reviewer artifact strategies are exhausted for review ${reviewIdentity}.`,
+        recommendation: 'Resume the exact authenticated resolution.',
+        recovery_action: 'repair_reviewer_artifact_contract',
+        recovery_ticket_ids: [],
+      });
+      return 'citadel-system-blocked';
+    }
+    return await approveCitadelFixture(dir);
+  };
+  let crash = true;
+  const repairAfterStateCrash = async (dir, block, options) => await repairCitadelReviewerArtifactContract(
+    dir,
+    block,
+    {
+      ...options,
+      faultInjection: (point) => {
+        if (crash && point === 'resolved-after-persist') {
+          crash = false;
+          throw new Error('fixture crash after resolved state persistence');
+        }
+      },
+    },
+  );
+  await assert.rejects(
+    () => withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+      runSequential: async () => 'success',
+      runCitadel,
+      repairCitadelReviewerArtifactContract: repairAfterStateCrash,
+    })),
+    /Injected failure after reviewer recovery resolution was persisted/,
+  );
+  const journalPath = path.join(sessionDir, 'citadel-reviewer-contract-recovery.json');
+  const statePath = path.join(sessionDir, 'citadel-review-state.json');
+  const journalBytes = fs.readFileSync(journalPath, 'utf8');
+  const stateBytes = fs.readFileSync(statePath, 'utf8');
+  assert.equal(JSON.parse(journalBytes).status, 'resolved');
+  assert.equal(JSON.parse(stateBytes).artifact_contract_recovery.status, 'resolved');
+  const invocationCount = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length;
+
+  const result = await withProcessEnvironment(environment, async () => await runPipeline(sessionDir, {
+    runSequential: async () => 'success',
+    runCitadel,
+    repairCitadelReviewerArtifactContract: repairAfterStateCrash,
+  }));
+  assert.equal(result, 'success');
+  assert.equal(citadelRuns, 2);
+  assert.equal(fs.readFileSync(invocationLog, 'utf8').trim().split('\n').length, invocationCount);
+  assert.equal(fs.readFileSync(journalPath, 'utf8'), journalBytes);
+  assert.equal(fs.readFileSync(statePath, 'utf8'), stateBytes);
+});
+
 test('live reviewer diagnostic ownership drain reaps its worker and remains resumable without consuming its mechanism', async () => {
   const { sessionDir } = createAcceptedSession('Done');
   const reviewIdentity = '4'.repeat(64);
@@ -1854,7 +2124,11 @@ test('criterion shard ownership drain reaps its worker while preserving resumabl
       status: 'resolved',
       diagnostic_identity: '6'.repeat(64),
       mechanism: 'evidence_bundle_reconstruction',
-      mechanism_history: ['schema_scaffold_replay', 'evidence_bundle_reconstruction'],
+      mechanism_history: [
+        'schema_scaffold_replay',
+        'evidence_bundle_reconstruction',
+        'criterion_sharded_reconstruction',
+      ],
       failed_candidate_hashes: ['5'.repeat(64)],
       validator_invariants: ['findings is an array'],
     },
@@ -1875,6 +2149,48 @@ test('criterion shard ownership drain reaps its worker while preserving resumabl
   const manager = new StateManager();
   let drainedIdentities = [];
   await assert.rejects(
+    () => withProcessEnvironment(prependPath(fakeBin), async () => await repairCitadelReviewerArtifactContract(
+      sessionDir,
+      block,
+      {
+        faultInjection: (point) => {
+          if (point === 'controller-strategy-ready-before-child') {
+            throw new Error('fixture crash after controller strategy ledger');
+          }
+        },
+      },
+    )),
+    /Injected failure after controller recovery strategy persistence/,
+  );
+  const strategyJournalPath = path.join(sessionDir, 'citadel-reviewer-contract-recovery.json');
+  const strategyJournal = JSON.parse(fs.readFileSync(strategyJournalPath, 'utf8'));
+  assert.equal(strategyJournal.attempts.length, 1);
+  const persistedMaterialHash = strategyJournal.attempts[0].strategy_material_hash;
+  assert.equal(fs.existsSync(strategyJournal.attempts[0].candidate_path), true);
+  const strategyJournalBytes = fs.readFileSync(strategyJournalPath, 'utf8');
+  const strategyStatePath = path.join(sessionDir, 'citadel-review-state.json');
+  const strategyStateBytes = fs.readFileSync(strategyStatePath, 'utf8');
+  const candidateBytes = fs.readFileSync(strategyJournal.attempts[0].candidate_path, 'utf8');
+  const forgedCandidate = JSON.parse(candidateBytes);
+  forgedCandidate.instruction = 'forged controller instruction';
+  writeJson(strategyJournal.attempts[0].candidate_path, forgedCandidate);
+  await assert.rejects(
+    () => repairCitadelReviewerArtifactContract(sessionDir, block),
+    /does not match its canonical material identity/,
+  );
+  assert.equal(fs.readFileSync(strategyJournalPath, 'utf8'), strategyJournalBytes);
+  assert.equal(fs.readFileSync(strategyStatePath, 'utf8'), strategyStateBytes);
+  fs.writeFileSync(strategyJournal.attempts[0].candidate_path, candidateBytes);
+  const forgedLedger = JSON.parse(strategyJournalBytes);
+  forgedLedger.attempts[0].input_identity = 'f'.repeat(64);
+  writeJson(strategyJournalPath, forgedLedger);
+  await assert.rejects(
+    () => repairCitadelReviewerArtifactContract(sessionDir, block),
+    /does not match its canonical material identity/,
+  );
+  assert.equal(fs.readFileSync(strategyStatePath, 'utf8'), strategyStateBytes);
+  fs.writeFileSync(strategyJournalPath, strategyJournalBytes);
+  await assert.rejects(
     () => withProcessEnvironment(prependPath(fakeBin, {
       FAKE_CRITERION_SHARD_DELAY_MS: '10000',
     }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block, {
@@ -1891,6 +2207,12 @@ test('criterion shard ownership drain reaps its worker while preserving resumabl
   const recoveryJournal = JSON.parse(fs.readFileSync(
     path.join(sessionDir, 'citadel-reviewer-contract-recovery.json'), 'utf8',
   ));
+  assert.equal(recoveryJournal.strategy_epoch, 1);
+  assert.equal(recoveryJournal.attempts.length, 1);
+  assert.equal(recoveryJournal.attempts[0].strategy_material_hash, persistedMaterialHash);
+  assert.equal(recoveryJournal.attempts.at(-1).strategy_id, 'controller_canonical_synthesis');
+  assert.match(recoveryJournal.attempts.at(-1).strategy_material_hash, /^[a-f0-9]{64}$/);
+  assert.match(recoveryJournal.attempts.at(-1).input_identity, /^[a-f0-9]{64}$/);
   const shardJournalPath = path.join(
     sessionDir,
     'citadel-reviewer-contract-runtime',

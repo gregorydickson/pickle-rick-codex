@@ -12,7 +12,7 @@ import {
   inspectCodexUsage,
   observeCodexToolCallStream,
 } from '../services/classifier-utils.js';
-import { runCommand } from '../services/codex.js';
+import { isAuthenticatedBrokerOnlyShutdownLedger, runCommand } from '../services/codex.js';
 import { makeTempRoot } from './helpers.js';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -201,15 +201,239 @@ test('authenticated target exit supersedes a timeout callback that runs before d
   assert.deepEqual(result.targetOutcome, { code: 0, signal: null });
 });
 
-test('explicit cancellation remains terminal when a prior target-exit ack is delayed', async () => {
+test('target stop attestation retries after one load-delayed indeterminate probe', async () => {
   const result = await runCommand({
     command: '/usr/bin/true',
     env: {
       PICKLE_TEST_MODE: '1',
-      PICKLE_TEST_BROKER_ACK_DELAY_MS: '500',
+      PICKLE_TEST_TARGET_STOP_PROBE_FAILURES: '1',
+      PICKLE_TEST_TARGET_STOP_PROBE_DELAY_MS: '2000',
     },
     timeoutMs: 10_000,
-    cancelCheck: () => true,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'target-exit');
+  assert.ok(result.processIdentities.target, 'the stopped guardian was published after retry');
+});
+
+test('authenticated convergence progress prevents force-kill across cumulative slow observations', {
+  // Deadlock guard only: injected work is 48s before real identity probes,
+  // scheduler contention, acknowledgement delivery, and drain attestation.
+  timeout: 120_000,
+}, async () => {
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write("CONVERGENCE_READY\\n"); setInterval(() => {}, 1000)'],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+      PICKLE_TEST_DESCENDANT_CONVERGENCE_DELAY_MS: '24000',
+    },
+    timeoutMs: 70_000,
+    successSignalGraceMs: 0,
+    successCheck: ({ stdout }) => stdout.includes('CONVERGENCE_READY'),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'success');
+  assert.ok(result.durationMs > 45_000, 'material progress remains authoritative beyond any former hard total');
+});
+
+test('a broker wedged after initial convergence authority is still force-killed at the progress lease', {
+  timeout: 15_000,
+}, async () => {
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write("WEDGE_READY\\n"); setInterval(() => {}, 1000)'],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+      PICKLE_TEST_DESCENDANT_CONVERGENCE_DELAY_MS: '3000',
+      PICKLE_TEST_CONTROLLER_FORCE_KILL_TIMEOUT_MS: '500',
+      PICKLE_TEST_CONVERGENCE_PROGRESS_STALL_TIMEOUT_MS: '1000',
+    },
+    timeoutMs: 10_000,
+    successSignalGraceMs: 0,
+    successCheck: ({ stdout }) => stdout.includes('WEDGE_READY'),
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.drainAttested, false);
+  assert.match(result.stderr, /shutdown_ack_observed.*false/);
+  assert.match(result.stderr, /"attestation_observations":2/,
+    'missing acknowledgement remains a failure after the mandatory second absence observation');
+  assert.ok(result.durationMs < 8_000, 'silent convergence exceeded its bounded progress lease');
+});
+
+test('transient discovery exhaustion advances strategy epoch and later drains exactly', {
+  timeout: 15_000,
+}, async () => {
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write("EPOCH_READY\\n"); setInterval(() => {}, 1000)'],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_DISABLE_DESCENDANT_TRACKER: '1',
+      PICKLE_TEST_CONVERGENCE_EPOCH_MS: '200',
+      PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURES: '3',
+      PICKLE_TEST_DESCENDANT_DISCOVERY_FAILURE_DELAY_MS: '100',
+    },
+    timeoutMs: 10_000,
+    successSignalGraceMs: 0,
+    successCheck: ({ stdout }) => stdout.includes('EPOCH_READY'),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'success');
+});
+
+test('foreign shutdown progress is inert while valid monotonic progress still drains', async () => {
+  const result = await runCommand({
+    command: '/usr/bin/true',
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_FORGED_SHUTDOWN_PROGRESS: '1',
+    },
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'target-exit');
+});
+
+test('authenticated A-B-A snapshot oscillation cannot renew the convergence lease', {
+  timeout: 15_000,
+}, async () => {
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write("OSCILLATION_READY\\n"); setInterval(() => {}, 1000)'],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_OSCILLATING_SHUTDOWN_PROGRESS: '1',
+      PICKLE_TEST_DESCENDANT_CONVERGENCE_DELAY_MS: '3000',
+      PICKLE_TEST_CONVERGENCE_PROGRESS_STALL_TIMEOUT_MS: '1000',
+    },
+    timeoutMs: 10_000,
+    successSignalGraceMs: 0,
+    successCheck: ({ stdout }) => stdout.includes('OSCILLATION_READY'),
+  });
+
+  assert.equal(result.drainAttested, false);
+  assert.match(result.stderr, /shutdown_ack_observed.*false/);
+  assert.ok(result.durationMs < 8_000, 'oscillating semantic state renewed the progress lease');
+});
+
+test('post-ack watchdog reaps a broker wedged before consuming shutdown release', {
+  timeout: 15_000,
+}, async () => {
+  const startedAt = Date.now();
+  const result = await runCommand({
+    command: '/usr/bin/true',
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_BROKER_WEDGE_AFTER_ACK_MS: '5000',
+      PICKLE_TEST_CONTROLLER_FORCE_KILL_TIMEOUT_MS: '500',
+    },
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(result.drainAttested, true, result.stderr);
+  assert.equal(result.shutdownCause, 'target-exit');
+  assert.ok(Date.now() - startedAt < 4_000, 'post-ack broker wedge exceeded its release/drain watchdog');
+});
+
+test('prelaunch stop-attestation failure releases and drains the exact broker-only ledger', {
+  timeout: 20_000,
+}, async () => {
+  const fixtureDir = makeTempRoot('pickle-prelaunch-stop-failure-');
+  const targetMarker = path.join(fixtureDir, 'target-ran');
+  let drainedTarget = undefined;
+  let drainedDescendants = undefined;
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(targetMarker)}, 'ran')`],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_TARGET_STOP_PROBE_FAILURES: '9999',
+    },
+    timeoutMs: 10_000,
+    onDrain: (_broker, target, descendants) => {
+      drainedTarget = target;
+      drainedDescendants = descendants;
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.drainAttested, true, result.stderr);
+  assert.equal(result.shutdownCause, 'target-stop-attestation-failed');
+  assert.equal(drainedTarget, null);
+  assert.deepEqual(drainedDescendants, []);
+  assert.equal(fs.existsSync(targetMarker), false, 'an unattested guardian was never released');
+  assert.doesNotMatch(result.stderr, /controller-release-timeout|malformed or conflicted/);
+});
+
+test('broker-only shutdown attestation rejects a null target with descendants', () => {
+  assert.equal(isAuthenticatedBrokerOnlyShutdownLedger(
+    false, null, null, [], 'target-stop-attestation-failed',
+  ), true);
+  assert.equal(isAuthenticatedBrokerOnlyShutdownLedger(
+    false, null, null, [{ pid: 42 }], 'target-stop-attestation-failed',
+  ), false);
+  assert.equal(isAuthenticatedBrokerOnlyShutdownLedger(
+    true, null, null, [], 'target-stop-attestation-failed',
+  ), false);
+  assert.equal(isAuthenticatedBrokerOnlyShutdownLedger(
+    false, null, { pid: 42 }, [], 'target-stop-attestation-failed',
+  ), false);
+});
+
+test('broker-only shutdown attestation rejects target-shaped and success causes', () => {
+  for (const cause of ['success', 'target-exit', 'target-SIGTERM', 'timeout', 'cancel']) {
+    assert.equal(isAuthenticatedBrokerOnlyShutdownLedger(false, null, null, [], cause), false, cause);
+  }
+});
+
+test('a conflicting duplicate cannot replace an authenticated broker-only shutdown ack', {
+  timeout: 20_000,
+}, async () => {
+  const result = await runCommand({
+    command: '/usr/bin/true',
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_TARGET_STOP_PROBE_FAILURES: '9999',
+      PICKLE_TEST_BROKER_CONFLICTING_SHUTDOWN_ACK: '1',
+    },
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.drainAttested, false);
+  assert.equal(result.shutdownCause, 'target-stop-attestation-failed');
+  assert.match(result.stderr, /conflicting shutdown attestation/);
+});
+
+test('explicit cancellation remains terminal when a prior target-exit ack is delayed', async () => {
+  const fixtureDir = makeTempRoot('pickle-prior-target-exit-');
+  const targetExitMarker = path.join(fixtureDir, 'target-exiting');
+  let targetMarkerObservedAt = 0;
+  const result = await runCommand({
+    command: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(targetExitMarker)}, 'exiting')`],
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_BROKER_ACK_DELAY_MS: '3000',
+    },
+    timeoutMs: 10_000,
+    cancelCheck: () => {
+      if (!fs.existsSync(targetExitMarker)) return false;
+      if (!targetMarkerObservedAt) targetMarkerObservedAt = Date.now();
+      return Date.now() - targetMarkerObservedAt >= 1_000;
+    },
   });
 
   assert.equal(result.exitCode, 130);

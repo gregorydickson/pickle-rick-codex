@@ -126,6 +126,24 @@ export interface CitadelSystemBlockArtifact {
   generated_at: string;
 }
 
+export function citadelSystemBlockFailureIdentity(
+  input: Pick<CitadelSystemBlockArtifact,
+    'category' | 'code' | 'reviewed_range' | 'title' | 'evidence' | 'recommendation' | 'checks'
+    | 'recovery_action' | 'recovery_ticket_ids'>,
+): string {
+  return reportHash({
+    category: input.category,
+    code: input.code,
+    reviewed_range: input.reviewed_range,
+    title: input.title,
+    evidence: input.evidence.replace(/\s+/g, ' ').trim(),
+    recommendation: input.recommendation,
+    recovery_action: input.recovery_action,
+    recovery_ticket_ids: input.recovery_ticket_ids,
+    checks: input.checks.map(({ command, status, exit_code, output }) => ({ command, status, exit_code, output })),
+  });
+}
+
 export class CitadelReviewerArtifactError extends Error {
   readonly code = 'CITADEL_REVIEWER_ARTIFACT_INVALID';
   readonly attempts: number;
@@ -683,6 +701,7 @@ interface CitadelReviewState {
     validator_invariants: string[];
     mechanism_history?: CitadelReviewerRecoveryMechanism[];
     runtime_artifacts: CitadelArtifactContractRuntime;
+    runtime_manifest_sha256?: string;
   };
   updated_at: string;
 }
@@ -942,7 +961,9 @@ function artifactContractExecution(
       : manifest?.criterion_shards as Record<string, unknown> | null;
   const validator = manifest?.validator as Record<string, unknown> | null;
   const selectedPath = scaffoldPath ?? evidenceBundlePath ?? criterionShardBundlePath;
-  if (!manifest || manifest.schema_version !== 1 || manifest.mechanism !== recovery.mechanism
+  if (!manifest || (recovery.runtime_manifest_sha256 !== undefined
+      && recovery.runtime_manifest_sha256 !== fileHash(manifestPath))
+    || manifest.schema_version !== 1 || manifest.mechanism !== recovery.mechanism
     || selected?.path !== selectedPath || selected?.sha256 !== (selectedPath ? fileHash(selectedPath) : null)
     || validator?.path !== validatorPath || validator?.sha256 !== fileHash(validatorPath)) {
     throw new Error('Citadel artifact-contract runtime manifest does not authenticate its inputs.');
@@ -2683,17 +2704,7 @@ function persistCitadelSystemBlock(
     'category' | 'code' | 'reviewed_range' | 'title' | 'evidence' | 'recommendation' | 'checks'
     | 'recovery_action' | 'recovery_ticket_ids'>,
 ): CitadelSystemBlockArtifact {
-  const failureIdentity = reportHash({
-    category: input.category,
-    code: input.code,
-    reviewed_range: input.reviewed_range,
-    title: input.title,
-    evidence: input.evidence.replace(/\s+/g, ' ').trim(),
-    recommendation: input.recommendation,
-    recovery_action: input.recovery_action,
-    recovery_ticket_ids: input.recovery_ticket_ids,
-    checks: input.checks.map(({ command, status, exit_code, output }) => ({ command, status, exit_code, output })),
-  });
+  const failureIdentity = citadelSystemBlockFailureIdentity(input);
   const prior = readCitadelSystemBlock(sessionDir);
   const attempt = prior?.failure_identity === failureIdentity ? prior.attempt + 1 : 1;
   const boundedAttempt = ((attempt - 1) % 2) + 1;
