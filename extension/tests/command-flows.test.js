@@ -1959,21 +1959,29 @@ fs.writeFileSync(output, '<promise>DONE</promise>');
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
 
+  let successCheckCalls = 0;
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'deadline success check',
-    // Keep the poll beyond the hard deadline while allowing process startup
-    // under saturated CI. The command itself publishes success immediately.
-    timeoutMs: 2_000,
+    // Keep polling far beyond the hard deadline while giving the separately
+    // scheduled fixture process a realistic startup budget under saturated
+    // full-suite load. The deadline callback itself must discover success.
+    timeoutMs: 8_000,
     outputLastMessagePath: messagePath,
     successSignalGraceMs: 100,
-    successPollMs: 10_000,
-    successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
+    successPollMs: 60_000,
+    successCheck: ({ lastMessage }) => {
+      successCheckCalls += 1;
+      return successCheckCalls > 1 && lastMessage.includes('<promise>DONE</promise>');
+    },
   });
 
+  assert.equal(successCheckCalls, 2, 'the deadline performs the second and final success evaluation');
   assert.equal(result.exitCode, 0);
   assert.equal(result.timedOut, false);
   assert.equal(result.terminatedAfterSuccess, true);
+  assert.ok(result.durationMs >= 7_500,
+    `success was polled before the absolute-deadline decision: ${result.durationMs}ms`);
   assert.match(result.lastMessage, /DEADLINE-DRAINED/);
 });
 
