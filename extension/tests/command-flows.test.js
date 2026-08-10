@@ -6,6 +6,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runCodexExecMonitored } from '../services/codex.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
+import { captureProcessLivenessIdentity } from '../services/orphan-reaper.js';
+import { StateManager } from '../services/state-manager.js';
+import { createLogicalPipeline, readLogicalPipeline } from '../services/durable-supervisor.js';
 import { makeTempRoot, repoRoot, runNode, createFakeCodex, prependPath, waitFor, writeExecutable } from './helpers.js';
 
 async function runNodeWithProgressBudgets(args, {
@@ -1649,10 +1652,12 @@ test('cancel stops every concurrent refinement analyst and releases session owne
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   const signalLog = path.join(dataRoot, 'refinement-signal-times.log');
+  const readyLog = path.join(dataRoot, 'refinement-ready-pids.log');
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
     PICKLE_TEST_BROKER_ACK_DELAY_MS: '1500',
     PICKLE_TEST_SIGNAL_LOG: signalLog,
+    PICKLE_TEST_READY_LOG: readyLog,
   });
   writeExecutable(
     path.join(fakeBin, 'codex'),
@@ -1671,6 +1676,7 @@ const stop = () => {
 };
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
+fs.appendFileSync(process.env.PICKLE_TEST_READY_LOG, String(process.pid) + '\\n');
 setInterval(() => {}, 1000);
 `,
   );
@@ -1702,6 +1708,11 @@ setInterval(() => {}, 1000);
       ? state.refinement_child_identities
       : null;
   }, { timeoutMs: 10_000, message: 'refinement did not persist all broker/target analyst identities' });
+  await waitFor(() => fs.existsSync(readyLog)
+    && fs.readFileSync(readyLog, 'utf8').trim().split('\n').length === 3, {
+    timeoutMs: 10_000,
+    message: 'refinement targets did not install their cancellation handlers',
+  });
 
   const cancelStartedAtMs = Date.now();
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
@@ -1725,6 +1736,178 @@ setInterval(() => {}, 1000);
     'cancel raced the live refinement controller instead of allowing cooperative broker drain');
   assert.ok(signalTimes.every((timestamp) => timestamp - cancelStartedAtMs < 9_500),
     'cancel reached the fallback deadline instead of completing through cooperative broker drain');
+});
+
+test('cancel recovery converges autonomously after the live controller exceeds cooperative drain', async (t) => {
+  if (process.platform === 'win32') return t.skip('process-group recovery is POSIX-only');
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot, PICKLE_TEST_MODE: '1', PICKLE_TEST_CANCEL_DRAIN_TIMEOUT_MS: '100' };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'autonomous cancel recovery'], {
+    cwd: projectDir, env,
+  }).trim();
+  const target = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000)"], {
+    detached: true, stdio: 'ignore',
+  });
+  const targetIdentity = await waitFor(() => captureProcessLivenessIdentity(target.pid), {
+    timeoutMs: 5_000, message: 'target identity was not captured',
+  });
+  const stateManagerUrl = new URL('../services/state-manager.js', import.meta.url).href;
+  const controller = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { StateManager } from ${JSON.stringify(stateManagerUrl)};
+    const [statePath, targetPgid] = process.argv.slice(1);
+    const manager = new StateManager();
+    const timer = setInterval(() => {
+      const state = manager.read(statePath);
+      if (!state.cancel_requested_at) return;
+      clearInterval(timer);
+      setTimeout(() => {
+        try { process.kill(-Number(targetPgid), 'SIGTERM'); } catch {}
+        setTimeout(() => {
+          manager.update(statePath, (current) => {
+            current.refinement_child_identities = [];
+            current.active_child_identities = [];
+            current.active_child_pid = null;
+            current.active_child_identity = null;
+            current.active_child_controller_pid = null;
+            current.active_child_controller_identity = null;
+            return current;
+          });
+          process.exit(0);
+        }, 100);
+      }, 600);
+    }, 20);
+  `, path.join(sessionDir, 'state.json'), String(targetIdentity.pgid)], { stdio: 'ignore' });
+  const controllerIdentity = await waitFor(() => captureProcessLivenessIdentity(controller.pid), {
+    timeoutMs: 5_000, message: 'controller identity was not captured',
+  });
+  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+    state.refinement_child_identities = [targetIdentity];
+    state.active_child_pid = targetIdentity.pid;
+    state.active_child_kind = 'refinement';
+    state.active_child_identity = targetIdentity;
+    state.active_child_controller_pid = controllerIdentity.pid;
+    state.active_child_controller_identity = controllerIdentity;
+    return state;
+  });
+  t.after(() => {
+    for (const pid of [controller.pid, target.pid]) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already absent */ }
+    }
+  });
+
+  const cancellation = spawn(process.execPath, [path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    cwd: projectDir, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  cancellation.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  const cancellationExit = await new Promise((resolve) => cancellation.once('exit', resolve));
+  assert.equal(cancellationExit, 1);
+  assert.match(output, /Cancellation blocked on recovery/);
+  const recovered = await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return state.cancellation_recovery?.status === 'completed' ? state : null;
+  }, { timeoutMs: 10_000, message: 'detached cancellation recovery did not converge' });
+  assert.equal(recovered.recovery_required, false);
+  assert.deepEqual(recovered.refinement_child_identities, []);
+  assert.equal(recovered.active_child_pid, null);
+  assert.throws(() => process.kill(targetIdentity.pid, 0));
+});
+
+test('cancel crash after its first durable write cannot leave a marker without an exact recovery intent', async (t) => {
+  if (process.platform === 'win32') return t.skip('process-group recovery is POSIX-only');
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_CANCEL_KILL_PREPARED_WATCHDOG: '1',
+    PICKLE_TEST_CANCEL_CRASH_AFTER_INTENT: '1',
+  };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'atomic cancel intent'], {
+    cwd: projectDir, env,
+  }).trim();
+  createLogicalPipeline(sessionDir, 'crash-after-cancel-intent');
+  const target = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+  const identity = await waitFor(() => captureProcessLivenessIdentity(target.pid), {
+    timeoutMs: 5_000, message: 'target identity was not captured',
+  });
+  t.after(() => {
+    try { process.kill(-identity.pgid, 'SIGKILL'); } catch { /* already absent */ }
+  });
+  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+    state.active_child_pid = identity.pid;
+    state.active_child_identity = identity;
+    state.active_child_identities = [identity];
+    return state;
+  });
+  const cancellation = spawn(process.execPath, [path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    cwd: projectDir, env: { ...process.env, ...env }, stdio: 'ignore',
+  });
+  const outcome = await new Promise((resolve) => cancellation.once('exit', (code, signal) => resolve({ code, signal })));
+  assert.equal(outcome.signal, 'SIGKILL');
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.ok(state.cancel_requested_at);
+  assert.equal(state.last_exit_reason, 'cancelled');
+  assert.equal(state.cancellation_recovery.schema_version, 1);
+  assert.deepEqual(state.cancellation_recovery.identities, [identity]);
+  assert.equal(state.cancellation_recovery.status, 'pending');
+  const recovered = await waitFor(() => {
+    const current = readJsonFile(path.join(sessionDir, 'state.json'));
+    return current.cancellation_recovery?.status === 'completed'
+      && !current.autonomous_owner_recovery_daemon_identity
+      && !current.cancellation_recovery_watchdog_identity
+      && current.cancellation_recovery_runtime_binding == null ? current : null;
+  }, { timeoutMs: 10_000, message: 'pre-armed watchdog did not recover the crashed cancel command' });
+  assert.equal(recovered.recovery_required, false);
+  assert.equal(recovered.active_child_pid, null);
+  assert.deepEqual(recovered.active_child_identities, []);
+  assert.throws(() => process.kill(identity.pid, 0));
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'cancelled');
+});
+
+test('pre-armed cancellation watchdog exits without cancelling when the command crashes before commit', async () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_MODE: '1',
+    PICKLE_TEST_CANCEL_CRASH_BEFORE_INTENT: '1',
+    PICKLE_TEST_CANCEL_WATCHDOG_ARM_TIMEOUT_MS: '1500',
+  };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'pre-commit cancel crash'], {
+    cwd: projectDir, env,
+  }).trim();
+  const cancellation = spawn(process.execPath, [path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
+    cwd: projectDir, env: { ...process.env, ...env }, stdio: 'ignore',
+  });
+  const outcome = await new Promise((resolve) => cancellation.once('exit', (code, signal) => resolve({ code, signal })));
+  assert.equal(outcome.signal, 'SIGKILL');
+  const settled = await waitFor(() => {
+    const state = readJsonFile(path.join(sessionDir, 'state.json'));
+    return !state.cancellation_recovery_watchdog_identity
+      && !state.cancellation_recovery_watchdog_arm ? state : null;
+  }, { timeoutMs: 5_000, message: 'unactivated cancellation watchdog did not expire cleanly' });
+  assert.equal(settled.cancel_requested_at ?? null, null);
+  assert.notEqual(settled.last_exit_reason, 'cancelled');
+  assert.equal(settled.cancellation_recovery, undefined);
+  assert.equal(Boolean(settled.recovery_required), false);
+  assert.equal(settled.cancellation_recovery_runtime_binding, null);
+});
+
+test('cancel with no child still atomically completes the logical cancellation journal', () => {
+  const dataRoot = makeTempRoot();
+  const projectDir = makeTempRoot('pickle-rick-project-');
+  const env = { PICKLE_DATA_ROOT: dataRoot, PICKLE_TEST_MODE: '1' };
+  const sessionDir = runNode([path.join(repoRoot, 'bin/setup.js'), 'cancel empty session'], {
+    cwd: projectDir, env,
+  }).trim();
+  createLogicalPipeline(sessionDir, 'empty-cancel-pipeline');
+  runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { cwd: projectDir, env });
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  assert.equal(state.cancellation_recovery.status, 'completed');
+  assert.equal(state.recovery_required, false);
+  assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'cancelled');
 });
 
 test('runCodexExecMonitored ignores stale last-message success artifacts', async () => {

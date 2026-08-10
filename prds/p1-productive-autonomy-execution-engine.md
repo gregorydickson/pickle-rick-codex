@@ -1,7 +1,7 @@
 # PRD: Productive Autonomous Development Engine
 
-Status: Approved  
-Priority: P0  
+Status: Approved
+Priority: P0
 Target package: `pickle-rick-codex`
 
 ## Summary

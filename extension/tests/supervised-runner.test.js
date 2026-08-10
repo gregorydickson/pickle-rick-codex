@@ -23,6 +23,8 @@ import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import { reconcileSessionLiveness } from '../services/session.js';
 import { inspectRecordedLiveProcessIdentity, reapRecordedLiveProcessGroup } from '../services/orphan-reaper.js';
+import { createCancellationRecoveryIntent } from '../services/cancellation-recovery.js';
+import { StateManager } from '../services/state-manager.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
@@ -168,6 +170,24 @@ test('supervised runner exits for cooperative logical cancellation', () => {
   const cancelledLease = acquireSupervisorLease(cancelled, { ownerId: 'cancelled-test', ttlMs: 60_000 });
   terminateLogicalPipeline(cancelled, 'cancelled', { ownerId: cancelledLease.owner_id, token: cancelledLease.token });
   assert.equal(supervisedRunnerDecision(cancelled), 'cancelled');
+});
+
+test('supervised runner waits for cancellation recovery instead of restarting development', () => {
+  const sessionDir = autonomousSession();
+  new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+    state.active = false;
+    state.cancel_requested_at = new Date().toISOString();
+    state.last_exit_reason = 'cancel_recovery_required';
+    state.recovery_required = true;
+    state.recovery_kind = 'cancellation_ownership';
+    state.cancellation_recovery = createCancellationRecoveryIntent([]);
+    return state;
+  });
+  assert.equal(supervisedRunnerDecision(sessionDir), 'wait_for_cancel_recovery');
+  const lease = acquireSupervisorLease(sessionDir, { ownerId: 'cancel-recovery-test', ttlMs: 60_000 });
+  terminateLogicalPipeline(sessionDir, 'cancelled', { ownerId: lease.owner_id, token: lease.token });
+  assert.equal(supervisedRunnerDecision(sessionDir), 'wait_for_cancel_recovery',
+    'pending ownership recovery takes precedence over the cancelled logical journal');
 });
 
 test('SIGKILL of an executor is replaced and the logical pipeline still completes', async (t) => {

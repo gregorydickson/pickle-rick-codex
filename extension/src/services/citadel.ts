@@ -163,6 +163,7 @@ export interface CitadelCheckExitOutcome {
 
 export interface CitadelCheckRunOptions {
   timeoutMs: number;
+  repositoryHygieneRange?: string;
   absoluteTimeoutMs?: number;
   wholeGateTimeoutMs?: number;
   journalBindingHash?: string;
@@ -1328,6 +1329,7 @@ function deriveCitadelChecksAuthorityContext(
   sessionDir: string,
   checksWorkingDir: string,
   state: Record<string, unknown>,
+  startCommit: string,
   checkpointHead: string,
   releaseFingerprint: string,
   reviewedRange: string,
@@ -1346,7 +1348,12 @@ function deriveCitadelChecksAuthorityContext(
     deterministicCheckTimeoutMs,
   );
   const descriptors = deduplicateCitadelCheckExecutions(
-    citadelCheckDescriptors(checksWorkingDir, sessionDir, verificationSteps),
+    citadelCheckDescriptors(
+      checksWorkingDir,
+      sessionDir,
+      verificationSteps,
+      `${startCommit}..${checkpointHead}`,
+    ),
     checksWorkingDir,
   );
   const deterministicTimeoutBinding = {
@@ -1553,6 +1560,7 @@ export function validateCitadelRecoveryEvidence(
     sessionDir,
     workingDir,
     state,
+    startCommit,
     checksHead,
     checksFingerprint,
     reviewedRange,
@@ -1981,13 +1989,14 @@ function citadelCheckDescriptors(
   workingDir: string,
   sessionDir: string,
   ticketVerificationSteps: VerificationStep[],
+  repositoryHygieneRange?: string,
 ): CitadelCheckDescriptor[] {
   const packageChecks = ['typecheck', 'lint', 'test']
     .map((script) => packageCheckDescriptor(workingDir, script));
   const repositoryCheck: CitadelCheckDescriptor = {
     command: 'git diff --check',
     executable: 'git',
-    args: ['diff', '--check'],
+    args: ['diff', '--check', ...(repositoryHygieneRange ? [repositoryHygieneRange] : [])],
   };
   const ticketChecks = ticketVerificationSteps.map((step): CitadelCheckDescriptor => {
     const command = verificationStepCommand(step);
@@ -2314,7 +2323,12 @@ export async function runCitadelChecksMonitored(
   options: CitadelCheckRunOptions,
 ): Promise<CitadelCheckResult[]> {
   const results: CitadelCheckResult[] = [];
-  const discoveredDescriptors = citadelCheckDescriptors(workingDir, sessionDir, ticketVerificationSteps);
+  const discoveredDescriptors = citadelCheckDescriptors(
+    workingDir,
+    sessionDir,
+    ticketVerificationSteps,
+    options.repositoryHygieneRange,
+  );
   if (options.environment) {
     for (const descriptor of discoveredDescriptors) descriptor.env = options.environment;
   }
@@ -2893,6 +2907,7 @@ export async function runCitadel(
     sessionDir,
     citadelWorkingDir,
     state,
+    startCommit,
     checkpointHead,
     releaseCheckpointFingerprint,
     reviewedRange,
@@ -2928,6 +2943,7 @@ export async function runCitadel(
       verificationSteps,
       {
         timeoutMs: deterministicCheckTimeoutMs,
+        repositoryHygieneRange: `${startCommit}..${checkpointHead}`,
         wholeGateTimeoutMs: checksAuthorityContext.wholeGateTimeoutMs,
         journalBindingHash: checksBindingHash,
         isCancelled: shouldCancel,

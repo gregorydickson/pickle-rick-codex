@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { appendHistory, getStatePath, reconcileSessionLiveness } from './session.js';
 import { LockError, StateManager } from './state-manager.js';
 import {
@@ -17,6 +18,11 @@ import {
   readLogicalPipeline,
   type InstalledRuntimeDescriptor,
 } from './durable-supervisor.js';
+import {
+  cancellationRecoveryIntent,
+  hasPendingCancellationRecovery,
+  reconcileCancellationRecovery,
+} from './cancellation-recovery.js';
 import {
   finalizeLiveSessionMigrationAfterHandoff,
   LiveSessionMigrationContentionError,
@@ -53,6 +59,72 @@ export interface AutonomousOwnerSpec {
   runner_sha256?: string;
   node_path?: string;
   node_sha256?: string;
+}
+
+interface CancellationRecoveryRuntimeBinding {
+  schema_version: 1;
+  runtime_bin: string;
+  daemon_path: string;
+  daemon_sha256: string;
+  watchdog_path: string;
+  watchdog_sha256: string;
+  node_path: string;
+  node_sha256: string;
+}
+
+interface CancellationRecoveryWatchdogArm {
+  schema_version: 1;
+  arm_id: string;
+  status: 'prepared' | 'activated';
+  prepared_at: string;
+  expires_at: string;
+  activated_at: string | null;
+}
+
+function cancellationRecoveryWatchdogArm(value: unknown): CancellationRecoveryWatchdogArm | null {
+  const arm = value as CancellationRecoveryWatchdogArm | null;
+  return arm && arm.schema_version === 1 && typeof arm.arm_id === 'string' && arm.arm_id
+    && ['prepared', 'activated'].includes(arm.status)
+    && Number.isFinite(Date.parse(arm.prepared_at)) && Number.isFinite(Date.parse(arm.expires_at))
+    && (arm.activated_at === null || Number.isFinite(Date.parse(arm.activated_at))) ? arm : null;
+}
+
+function cancellationRecoveryRuntimeBinding(runtimeBin: string): CancellationRecoveryRuntimeBinding {
+  const exactRuntimeBin = fs.realpathSync(runtimeBin);
+  const daemonPath = fs.realpathSync(path.join(exactRuntimeBin, 'autonomous-owner-recovery-daemon.js'));
+  const watchdogPath = fs.realpathSync(path.join(exactRuntimeBin, 'cancellation-recovery-watchdog.js'));
+  const nodePath = fs.realpathSync(process.execPath);
+  if (path.dirname(daemonPath) !== exactRuntimeBin || path.dirname(watchdogPath) !== exactRuntimeBin) {
+    throw new Error('Cancellation recovery runtime binaries escape the authenticated runtime directory.');
+  }
+  const digest = (filePath: string): string => crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  return {
+    schema_version: 1,
+    runtime_bin: exactRuntimeBin,
+    daemon_path: daemonPath,
+    daemon_sha256: digest(daemonPath),
+    watchdog_path: watchdogPath,
+    watchdog_sha256: digest(watchdogPath),
+    node_path: nodePath,
+    node_sha256: digest(nodePath),
+  };
+}
+
+function bindCancellationRecoveryRuntime(
+  stateManager: StateManager,
+  statePath: string,
+  runtimeBin: string,
+): CancellationRecoveryRuntimeBinding {
+  const binding = cancellationRecoveryRuntimeBinding(runtimeBin);
+  stateManager.update(statePath, (current) => {
+    const existing = current.cancellation_recovery_runtime_binding;
+    if (existing && JSON.stringify(existing) !== JSON.stringify(binding)) {
+      throw new Error('Cancellation recovery runtime identity changed after durable publication.');
+    }
+    current.cancellation_recovery_runtime_binding = binding;
+    return current;
+  });
+  return binding;
 }
 
 export interface AutonomousOwnerRestorationIntent {
@@ -767,22 +839,125 @@ export function restoreAutonomousBudgetOwner(
   }
 }
 
+export async function prepareCancellationRecoveryWatchdog(
+  sessionDir: string,
+  runtimeBin: string,
+  stateManager: StateManager = new StateManager(),
+  options: { readinessTimeoutMs?: number; armTimeoutMs?: number } = {},
+): Promise<string | null> {
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const statePath = getStatePath(resolvedSessionDir);
+  const initial = stateManager.read(statePath);
+  if (ownerSpec(initial.autonomous_owner_spec)) return null;
+  const existingIntent = cancellationRecoveryIntent(initial.cancellation_recovery);
+  const armId = existingIntent?.intent_id || crypto.randomUUID();
+  const now = Date.now();
+  const arm: CancellationRecoveryWatchdogArm = {
+    schema_version: 1,
+    arm_id: armId,
+    status: 'prepared',
+    prepared_at: new Date(now).toISOString(),
+    expires_at: new Date(now + (options.armTimeoutMs ?? 30_000)).toISOString(),
+    activated_at: null,
+  };
+  const runtimeBinding = cancellationRecoveryRuntimeBinding(runtimeBin);
+  stateManager.update(statePath, (current) => {
+    if (ownerSpec(current.autonomous_owner_spec)) return current;
+    const existingBinding = current.cancellation_recovery_runtime_binding;
+    if (existingBinding && JSON.stringify(existingBinding) !== JSON.stringify(runtimeBinding)) {
+      throw new Error('Cancellation recovery runtime identity changed before watchdog preparation.');
+    }
+    current.cancellation_recovery_runtime_binding = runtimeBinding;
+    current.cancellation_recovery_watchdog_arm = arm;
+    return current;
+  });
+  ensureCancellationRecoveryWatchdog(resolvedSessionDir, runtimeBin, stateManager);
+  ensureAutonomousOwnerRecoveryDaemon(resolvedSessionDir, runtimeBin, stateManager);
+  const deadline = Date.now() + (options.readinessTimeoutMs ?? 5_000);
+  while (Date.now() < deadline) {
+    const state = stateManager.read(statePath);
+    const watchdogIdentity = state.cancellation_recovery_watchdog_identity as PersistedProcessIdentity | null;
+    const daemonIdentity = state.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity | null;
+    if (state.cancellation_recovery_watchdog_arm_id === armId
+      && watchdogIdentity && inspectProcessLivenessIdentity(watchdogIdentity) === 'matched'
+      && daemonIdentity && inspectProcessLivenessIdentity(daemonIdentity) === 'matched') return armId;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  stateManager.update(statePath, (current) => {
+    const exact = cancellationRecoveryWatchdogArm(current.cancellation_recovery_watchdog_arm);
+    if (exact?.arm_id === armId && exact.status === 'prepared') {
+      current.cancellation_recovery_watchdog_arm = null;
+    }
+    return current;
+  });
+  throw new Error('Cancellation recovery watchdog did not publish exact readiness before cancellation.');
+}
+
 export function ensureAutonomousOwnerRecoveryDaemon(
+  sessionDir: string,
+  runtimeBin: string,
+  stateManager: StateManager = new StateManager(),
+  options: { skipCancellationWatchdog?: boolean } = {},
+): number | null {
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const statePath = getStatePath(resolvedSessionDir);
+  const state = stateManager.read(statePath);
+  const cancellationRecovery = hasPendingCancellationRecovery(state);
+  const watchdogArm = cancellationRecoveryWatchdogArm(state.cancellation_recovery_watchdog_arm);
+  const preparedDirectRecovery = !ownerSpec(state.autonomous_owner_spec)
+    && watchdogArm?.status === 'prepared';
+  if (!ownerSpec(state.autonomous_owner_spec) && !cancellationRecovery && !preparedDirectRecovery) return null;
+  const directCancellationRecovery = (cancellationRecovery || preparedDirectRecovery)
+    && !ownerSpec(state.autonomous_owner_spec);
+  const cancellationRuntime = directCancellationRecovery
+    ? bindCancellationRecoveryRuntime(stateManager, statePath, runtimeBin) : null;
+  if (directCancellationRecovery
+    && !options.skipCancellationWatchdog) {
+    ensureCancellationRecoveryWatchdog(resolvedSessionDir, runtimeBin, stateManager);
+  }
+  if (state.autonomous_owner_recovery_suspended === true) return null;
+  if ((state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled')
+    && !cancellationRecovery) return null;
+  const daemonIdentity = state.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity | null;
+  if (daemonIdentity && inspectProcessLivenessIdentity(daemonIdentity) === 'matched') {
+    return Number(state.autonomous_owner_recovery_daemon_pid);
+  }
+  const child = spawn(
+    cancellationRuntime?.node_path || process.execPath,
+    [cancellationRuntime?.daemon_path || path.join(runtimeBin, 'autonomous-owner-recovery-daemon.js'), resolvedSessionDir], {
+    cwd: String(state.working_dir || process.cwd()),
+    env: process.env,
+    detached: true,
+    stdio: 'ignore',
+    },
+  );
+  child.unref();
+  return child.pid ?? null;
+}
+
+/** Direct sessions have no supervised runner to replace a killed recovery
+ * daemon. A mutually supervised watchdog gives those sessions the same durable
+ * replacement path: the watchdog re-ensures the daemon, and the daemon
+ * re-ensures the watchdog until the cancellation intent is complete. */
+export function ensureCancellationRecoveryWatchdog(
   sessionDir: string,
   runtimeBin: string,
   stateManager: StateManager = new StateManager(),
 ): number | null {
   const resolvedSessionDir = fs.realpathSync(sessionDir);
-  const statePath = getStatePath(resolvedSessionDir);
-  const state = stateManager.read(statePath);
-  if (!ownerSpec(state.autonomous_owner_spec)) return null;
-  if (state.autonomous_owner_recovery_suspended === true) return null;
-  if (state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled') return null;
-  const daemonIdentity = state.autonomous_owner_recovery_daemon_identity as PersistedProcessIdentity | null;
-  if (daemonIdentity && inspectProcessLivenessIdentity(daemonIdentity) === 'matched') {
-    return Number(state.autonomous_owner_recovery_daemon_pid);
+  const state = stateManager.read(getStatePath(resolvedSessionDir));
+  const arm = cancellationRecoveryWatchdogArm(state.cancellation_recovery_watchdog_arm);
+  if (ownerSpec(state.autonomous_owner_spec)
+    || (!hasPendingCancellationRecovery(state) && arm?.status !== 'prepared')) return null;
+  const runtime = bindCancellationRecoveryRuntime(stateManager, getStatePath(resolvedSessionDir), runtimeBin);
+  const identity = state.cancellation_recovery_watchdog_identity as PersistedProcessIdentity | null;
+  if (identity && inspectProcessLivenessIdentity(identity) === 'matched') {
+    return Number(state.cancellation_recovery_watchdog_pid);
   }
-  const child = spawn(process.execPath, [path.join(runtimeBin, 'autonomous-owner-recovery-daemon.js'), resolvedSessionDir], {
+  const child = spawn(runtime.node_path, [
+    runtime.watchdog_path,
+    resolvedSessionDir,
+  ], {
     cwd: String(state.working_dir || process.cwd()),
     env: process.env,
     detached: true,
@@ -1127,7 +1302,7 @@ export function reconcileAutonomousOwnerHandoffTransaction(
 
 export async function runAutonomousOwnerRecoveryDaemon(
   sessionDir: string,
-  options: { intervalMs?: number; stateManager?: StateManager } = {},
+  options: { intervalMs?: number; stateManager?: StateManager; runtimeBin?: string } = {},
 ): Promise<void> {
   const resolvedSessionDir = fs.realpathSync(sessionDir);
   const manager = options.stateManager || new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });
@@ -1146,6 +1321,30 @@ export async function runAutonomousOwnerRecoveryDaemon(
       return current;
     });
     while (true) {
+      const beforeRecovery = manager.read(statePath);
+      const pendingCancellation = hasPendingCancellationRecovery(beforeRecovery);
+      const watchdogArm = cancellationRecoveryWatchdogArm(
+        beforeRecovery.cancellation_recovery_watchdog_arm,
+      );
+      if (!ownerSpec(beforeRecovery.autonomous_owner_spec)
+        && (pendingCancellation || watchdogArm)) {
+        ensureCancellationRecoveryWatchdog(
+          resolvedSessionDir,
+          options.runtimeBin || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin'),
+          manager,
+        );
+      }
+      if (!ownerSpec(beforeRecovery.autonomous_owner_spec)
+        && !pendingCancellation && !watchdogArm) return;
+      if (watchdogArm?.status === 'prepared') {
+        await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
+        continue;
+      }
+      try {
+        reconcileCancellationRecovery(resolvedSessionDir, manager);
+      } catch {
+        // The exact durable cancellation intent remains for the next pass.
+      }
       try {
         reconcileAutonomousOwnerHandoffTransaction(resolvedSessionDir, manager);
       } catch {
@@ -1153,7 +1352,11 @@ export async function runAutonomousOwnerRecoveryDaemon(
       }
       const state = manager.read(statePath);
       if (state.cancel_requested_at || state.cancelled === true || state.last_exit_reason === 'cancelled'
-        || state.step === 'complete' || state.last_exit_reason === 'success') return;
+        || state.step === 'complete' || state.last_exit_reason === 'success') {
+        if (!hasPendingCancellationRecovery(state)) return;
+        await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
+        continue;
+      }
       if (state.autonomous_owner_recovery_suspended === true) {
         await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
         continue;
@@ -1172,10 +1375,88 @@ export async function runAutonomousOwnerRecoveryDaemon(
           current.autonomous_owner_recovery_daemon_pid = null;
           current.autonomous_owner_recovery_daemon_identity = null;
         }
+        if (!hasPendingCancellationRecovery(current)
+          && !cancellationRecoveryWatchdogArm(current.cancellation_recovery_watchdog_arm)) {
+          current.cancellation_recovery_runtime_binding = null;
+        }
         return current;
       });
     } finally {
       manager.releaseLock(daemonLeasePath);
+    }
+  }
+}
+
+export async function runCancellationRecoveryWatchdog(
+  sessionDir: string,
+  runtimeBin: string,
+  options: { intervalMs?: number; stateManager?: StateManager } = {},
+): Promise<void> {
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const manager = options.stateManager || new StateManager({ acquireTimeoutMs: 250, staleLockThresholdMs: 0 });
+  const statePath = getStatePath(resolvedSessionDir);
+  const leasePath = path.join(resolvedSessionDir, '.cancellation-recovery-watchdog');
+  try {
+    manager.acquireLock(leasePath);
+  } catch {
+    return;
+  }
+  let armedIntentId: string | null = null;
+  try {
+    manager.update(statePath, (current) => {
+      const arm = cancellationRecoveryWatchdogArm(current.cancellation_recovery_watchdog_arm);
+      armedIntentId = arm?.arm_id || null;
+      current.cancellation_recovery_watchdog_pid = process.pid;
+      current.cancellation_recovery_watchdog_identity = captureProcessLivenessIdentity(process.pid);
+      current.cancellation_recovery_watchdog_arm_id = armedIntentId;
+      appendHistory(current, 'cancellation_recovery_watchdog_started');
+      return current;
+    });
+    while (true) {
+      const state = manager.read(statePath);
+      const arm = cancellationRecoveryWatchdogArm(state.cancellation_recovery_watchdog_arm);
+      if (armedIntentId) {
+        if (!arm || arm.arm_id !== armedIntentId) return;
+        if (arm.status === 'prepared') {
+          if (Date.now() >= Date.parse(arm.expires_at)) {
+            manager.update(statePath, (current) => {
+              const exact = cancellationRecoveryWatchdogArm(current.cancellation_recovery_watchdog_arm);
+              if (exact?.arm_id === armedIntentId && exact.status === 'prepared') {
+                current.cancellation_recovery_watchdog_arm = null;
+              }
+              return current;
+            });
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
+          continue;
+        }
+        const intent = cancellationRecoveryIntent(state.cancellation_recovery);
+        if (!intent || intent.intent_id !== armedIntentId) return;
+      }
+      if (!hasPendingCancellationRecovery(state)) return;
+      ensureAutonomousOwnerRecoveryDaemon(resolvedSessionDir, runtimeBin, manager, {
+        skipCancellationWatchdog: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
+    }
+  } finally {
+    try {
+      manager.update(statePath, (current) => {
+        if (Number(current.cancellation_recovery_watchdog_pid) === process.pid) {
+          current.cancellation_recovery_watchdog_pid = null;
+          current.cancellation_recovery_watchdog_identity = null;
+          current.cancellation_recovery_watchdog_arm_id = null;
+          const arm = cancellationRecoveryWatchdogArm(current.cancellation_recovery_watchdog_arm);
+          if (arm?.arm_id === armedIntentId) current.cancellation_recovery_watchdog_arm = null;
+          if (!hasPendingCancellationRecovery(current)) {
+            current.cancellation_recovery_runtime_binding = null;
+          }
+        }
+        return current;
+      });
+    } finally {
+      manager.releaseLock(leasePath);
     }
   }
 }

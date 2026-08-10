@@ -20,6 +20,7 @@ import {
   reconcileAutonomousOwnerHandoffTransaction,
   registerAutonomousOwnerSpec,
 } from '../services/autonomous-owner-recovery.js';
+import { hasPendingCancellationRecovery } from '../services/cancellation-recovery.js';
 
 const ALLOWED_RUNNERS = new Set(['mux-runner.js', 'pipeline-runner.js', 'loop-runner.js']);
 
@@ -79,13 +80,14 @@ export function recordSupervisorSignalTermination(
 export function supervisedRunnerDecision(
   sessionDir: string,
   nowMs = Date.now(),
-): 'restart' | 'wait_for_budget' | 'wait_for_prd' | 'wait_for_handoff' | 'completed' | 'cancelled' {
+): 'restart' | 'wait_for_budget' | 'wait_for_prd' | 'wait_for_handoff' | 'wait_for_cancel_recovery' | 'completed' | 'cancelled' {
   abortExpiredRuntimeHandoff(sessionDir);
   const logical = readLogicalPipeline(sessionDir);
+  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
+  if (hasPendingCancellationRecovery(state)) return 'wait_for_cancel_recovery';
   if (logical.terminal_state === 'completed') return 'completed';
   if (logical.terminal_state === 'cancelled') return 'cancelled';
   if (hasPendingRuntimeHandoff(sessionDir)) return 'wait_for_handoff';
-  const state = new StateManager().read(path.join(sessionDir, 'state.json'));
   const budgetWakeupMs = Date.parse(String(state.autonomous_relaunch_not_before || ''));
   if (state.active === true && state.last_exit_reason === 'autonomous_budget_rollover'
     && Number.isFinite(budgetWakeupMs) && budgetWakeupMs > nowMs) return 'wait_for_budget';
@@ -130,6 +132,11 @@ export async function runSupervisedRunner(
     const before = supervisedRunnerDecision(sessionDir);
     if (before === 'completed') return 0;
     if (before === 'cancelled') return 130;
+    if (before === 'wait_for_cancel_recovery') {
+      ensureAutonomousOwnerRecoveryDaemon(sessionDir, runtimeBin);
+      await delay(1_000);
+      continue;
+    }
     if (before === 'wait_for_budget' || before === 'wait_for_prd'
       || (before === 'wait_for_handoff' && !acceptingHandoff)) {
       await delay(1_000);

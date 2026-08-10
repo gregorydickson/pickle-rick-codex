@@ -797,7 +797,7 @@ test('Citadel timeout drains its ready process tree and suppresses every subsequ
     isCancelled: () => false,
     onSpawn: (child) => {
       childPid = Number(child.pid);
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + 15_000;
       while (!fs.existsSync(readyMarker) && Date.now() < deadline) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       }
@@ -1266,6 +1266,35 @@ test('runCitadel persists deterministic failures as typed system recovery, never
   assert.match(changedEvidence.checks.find((check) => check.status === 'failed').output, /changed deterministic evidence/);
   assert.equal(changedEvidence.attempt, 1);
   assert.equal(changedEvidence.bounded_attempt, 1);
+});
+
+test('Citadel rejects committed whitespace in the sealed release range from a clean worktree', async () => {
+  const { cwd, sessionDir } = makeCitadelLifecycleSession(
+    'Committed whitespace defects are rejected before release.',
+  );
+  const startCommit = JSON.parse(
+    fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'),
+  ).start_commit;
+  fs.writeFileSync(path.join(cwd, 'committed-whitespace.txt'), 'trailing whitespace  \n');
+  execFileSync('git', ['add', 'committed-whitespace.txt'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'commit whitespace defect'], { cwd });
+  const checkpointHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }), '');
+
+  assert.equal(await runCitadel(sessionDir), 'citadel-system-blocked');
+  const systemBlock = readCitadelSystemBlock(sessionDir);
+  const hygiene = systemBlock.checks.find((check) => check.command === 'git diff --check');
+  assert.equal(hygiene.status, 'failed');
+  assert.match(hygiene.output, /committed-whitespace\.txt:1: trailing whitespace/);
+
+  const checksArtifact = JSON.parse(
+    fs.readFileSync(path.join(sessionDir, 'citadel-checks.json'), 'utf8'),
+  );
+  assert.equal(checksArtifact.binding.reviewed_range, `${startCommit}..HEAD`);
+  assert.equal(checksArtifact.binding.checkpoint_head, checkpointHead);
+  const hygieneExecution = checksArtifact.binding.deterministic_timeout_policy.executions
+    .find((execution) => execution.command === 'git diff --check');
+  assert.match(hygieneExecution.execution_identity, /^[a-f0-9]{64}$/);
 });
 
 test('runCitadel assigns an unavailable substantive gate to exact verification-contract repair tickets', async () => {

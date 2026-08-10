@@ -12,12 +12,22 @@ import {
 } from '../services/orphan-reaper.js';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
 import { sessionOperationOwnerPid } from '../services/session-operation.js';
-import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { cancelLogicalPipelineByOperator, readLogicalPipeline } from '../services/durable-supervisor.js';
+import { fileURLToPath } from 'node:url';
+import {
+  activateCancellationRecoveryIntent,
+  mergeCancellationRecoveryIntent,
+  reconcileCancellationRecovery,
+} from '../services/cancellation-recovery.js';
+import {
+  ensureAutonomousOwnerRecoveryDaemon,
+  prepareCancellationRecoveryWatchdog,
+} from '../services/autonomous-owner-recovery.js';
 
-const COOPERATIVE_DRAIN_TIMEOUT_MS = 10_000;
+const COOPERATIVE_DRAIN_TIMEOUT_MS = process.env.PICKLE_TEST_MODE === '1'
+  ? Math.max(50, Math.min(Number(process.env.PICKLE_TEST_CANCEL_DRAIN_TIMEOUT_MS || 10_000), 10_000))
+  : 10_000;
 const COOPERATIVE_DRAIN_POLL_MS = 50;
 const groupDrainWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
 
@@ -44,26 +54,6 @@ function processAlive(pid: unknown): boolean {
   } catch {
     return false;
   }
-}
-
-function persistedChildIdentity(state: PersistedState, pid: number): PersistedProcessIdentity | null {
-  const refinementIdentity = Array.isArray(state.refinement_child_identities)
-    ? state.refinement_child_identities.find((entry) => Number((entry as Record<string, unknown> | null)?.pid) === pid)
-    : null;
-  const monitoredIdentity = Array.isArray(state.active_child_identities)
-    ? state.active_child_identities.find((entry) => Number((entry as Record<string, unknown> | null)?.pid) === pid)
-    : null;
-  const value = monitoredIdentity || refinementIdentity || state.active_child_identity;
-  if (!isPersistedProcessIdentityValid(value) || value.pid !== pid) return null;
-  return value;
-}
-
-function hasLiveController(state: PersistedState): boolean {
-  if (isPersistedProcessIdentityValid(state.active_child_controller_identity)
-    && inspectProcessLivenessIdentity(state.active_child_controller_identity) === 'matched') return true;
-  return state.active === true && (
-    processAlive(state.worker_pid) || processAlive(state.tmux_runner_pid)
-  );
 }
 
 function sleep(milliseconds: number): Promise<void> {
@@ -223,17 +213,55 @@ async function main(argv: string[]): Promise<void> {
   const stateBeforeCancel = loadSessionState(resolved);
   const knownIdentities = new Map<string, PersistedProcessIdentity>();
   rememberChildIdentities(knownIdentities, stateBeforeCancel);
-  const pidsToSignal = runtimePids(stateBeforeCancel);
-  const liveController = hasLiveController(stateBeforeCancel) || Boolean(sessionOperationOwnerPid(resolved));
-  const hasRecordedChild = pidsToSignal.some((pid) => persistedChildIdentity(stateBeforeCancel, pid));
-  if (liveController || hasRecordedChild) {
-    new StateManager().update(getStatePath(resolved), (current) => {
-      current.active = false;
-      current.last_exit_reason = 'cancelled';
-      current.cancel_requested_at = new Date().toISOString();
-      return current;
-    });
+  const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
+  const preparedRecoveryIntentId = await prepareCancellationRecoveryWatchdog(
+    resolved,
+    runtimeBin,
+    undefined,
+    process.env.PICKLE_TEST_MODE === '1' ? {
+      readinessTimeoutMs: Number(process.env.PICKLE_TEST_CANCEL_WATCHDOG_READY_TIMEOUT_MS || 5_000),
+      armTimeoutMs: Number(process.env.PICKLE_TEST_CANCEL_WATCHDOG_ARM_TIMEOUT_MS || 10_000),
+    } : {},
+  );
+  if (process.env.PICKLE_TEST_MODE === '1'
+    && process.env.PICKLE_TEST_CANCEL_KILL_PREPARED_WATCHDOG === '1') {
+    const prepared = loadSessionState(resolved).cancellation_recovery_watchdog_identity;
+    if (!isPersistedProcessIdentityValid(prepared)
+      || inspectProcessLivenessIdentity(prepared) !== 'matched') {
+      throw new Error('Prepared cancellation watchdog was not exactly live at the injected crash seam.');
+    }
+    process.kill(prepared.pid, 'SIGKILL');
   }
+  if (process.env.PICKLE_TEST_MODE === '1'
+    && process.env.PICKLE_TEST_CANCEL_CRASH_BEFORE_INTENT === '1') process.kill(process.pid, 'SIGKILL');
+  new StateManager().update(getStatePath(resolved), (current) => {
+    rememberChildIdentities(knownIdentities, current);
+    current.active = false;
+    current.last_exit_reason = 'cancelled';
+    current.cancel_requested_at = new Date().toISOString();
+    current.cancellation_recovery = preparedRecoveryIntentId
+      ? activateCancellationRecoveryIntent(
+        current.cancellation_recovery,
+        knownIdentities.values(),
+        preparedRecoveryIntentId,
+      )
+      : mergeCancellationRecoveryIntent(current.cancellation_recovery, knownIdentities.values());
+    if (preparedRecoveryIntentId) {
+      const arm = current.cancellation_recovery_watchdog_arm as Record<string, unknown> | null;
+      if (!arm || arm.arm_id !== preparedRecoveryIntentId || arm.status !== 'prepared') {
+        throw new Error('Cancellation recovery watchdog readiness changed before atomic activation.');
+      }
+      current.cancellation_recovery_watchdog_arm = {
+        ...arm,
+        status: 'activated',
+        activated_at: new Date().toISOString(),
+      };
+    }
+    current.recovery_kind = 'cancellation_ownership';
+    return current;
+  });
+  if (process.env.PICKLE_TEST_MODE === '1'
+    && process.env.PICKLE_TEST_CANCEL_CRASH_AFTER_INTENT === '1') process.kill(process.pid, 'SIGKILL');
   let current = await waitForCooperativeDrain(resolved, knownIdentities);
   let unsafeRecovery: OrphanReapResult | null = null;
   if (controllerOwnsShutdown(resolved, current)
@@ -313,27 +341,25 @@ async function main(argv: string[]): Promise<void> {
   if (recoveryFailure) {
     new StateManager().update(getStatePath(resolved), (current) => {
       current.recovery_required = true;
+      current.recovery_kind = 'cancellation_ownership';
       current.recovery_reason = recoveryFailure;
       current.orphan_child_pid = unsafeRecovery?.pid || current.active_child_pid;
       current.orphan_recovery = unsafeRecovery;
+      const merged = mergeCancellationRecoveryIntent(current.cancellation_recovery, knownIdentities.values());
+      current.cancellation_recovery = {
+        ...merged,
+        status: 'pending',
+        not_before: new Date().toISOString(),
+        last_error: recoveryFailure,
+      };
       return current;
     });
+    ensureAutonomousOwnerRecoveryDaemon(resolved, runtimeBin);
     console.log(`Cancellation blocked on recovery for ${resolved}: ${recoveryFailure}`);
     process.exitCode = 1;
     return;
   }
-  new StateManager().update(getStatePath(resolved), (latest) => {
-    latest.recovery_required = false;
-    latest.recovery_kind = null;
-    latest.recovery_reason = null;
-    latest.orphan_child_pid = null;
-    latest.orphan_recovery = null;
-    return latest;
-  });
-  const logicalPath = path.join(resolved, 'logical-pipeline.json');
-  if (fs.existsSync(logicalPath) && readLogicalPipeline(resolved).terminal_state === null) {
-    cancelLogicalPipelineByOperator(resolved, 'explicit pickle-cancel operator request');
-  }
+  reconcileCancellationRecovery(resolved);
   cleanupTerminalTmuxSession(resolved);
   console.log(`Cancelled ${resolved}`);
 }
