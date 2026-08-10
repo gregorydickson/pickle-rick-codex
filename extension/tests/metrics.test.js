@@ -56,7 +56,12 @@ test('buildMetricsReport aggregates rows by ISO week when --weekly is set', () =
   mondayThisWeek.setUTCDate(mondayThisWeek.getUTCDate() - (weekday - 1));
   const mondayLastWeek = new Date(mondayThisWeek.getTime() - (7 * 86_400_000));
 
-  const thisWeekEvent = new Date(now.getTime() - (60 * 60 * 1000));
+  // Pin the event to the current UTC date instead of "one hour ago": around
+  // 00:00 UTC on Monday, subtracting an hour crosses into the prior ISO week
+  // and collapses this fixture's two intended buckets into one.
+  const thisWeekEvent = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 12,
+  ));
   const lastWeekEvent = new Date(mondayLastWeek.getTime() + (12 * 60 * 60 * 1000));
 
   writeActivityLog(dataRoot, thisWeekEvent, [

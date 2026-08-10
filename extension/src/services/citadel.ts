@@ -4,7 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { runCodexExecMonitored, assertCodexSucceeded, hasPromiseToken } from './codex.js';
-import { getHeadSha, getWorkingTreeFingerprint, listChangedPathsSince, listWorkingTreeDirtyPaths } from './git-utils.js';
+import {
+  commitIsAncestorWithPathsUnchanged,
+  getHeadSha,
+  getWorkingTreeFingerprint,
+  listChangedPathsSince,
+  listWorkingTreeDirtyPaths,
+} from './git-utils.js';
 import { recoverableHardReset } from './recoverable-git.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
@@ -69,6 +75,23 @@ export interface CitadelCheckResult {
   elapsed_ms?: number;
   lifecycle_error?: string;
   process_tree_quiescent?: false;
+}
+
+export interface CitadelRecoveryAuthority {
+  schema_version: 1;
+  repository_head: string;
+  release_fingerprint: string;
+  reviewed_range: string;
+  manifest_sha256: string;
+  checks_sha256: string;
+  journal_sha256: string;
+  review_state_sha256: string;
+  report_sha256: string;
+  report_verdict: 'approve' | 'block';
+  checks_binding_hash: string;
+  verification_hash: string;
+  acceptance_criteria_hash: string;
+  review_identity: string;
 }
 
 export type CitadelSystemBlockCode =
@@ -1121,14 +1144,14 @@ function readBoundedReviewerCandidateBytes(
   reportPath: string,
   expectedAttemptDir: string,
 ): Buffer {
-  const expectedPath = path.join(path.resolve(expectedAttemptDir), 'citadel-review-candidate.json');
-  if (path.resolve(reportPath) !== expectedPath) {
-    throw new Error('Invalid Citadel reviewer artifact: candidate path escapes its assigned attempt directory.');
-  }
   const directoryStat = fs.lstatSync(expectedAttemptDir);
   const stat = fs.lstatSync(reportPath);
   if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink()) {
     throw new Error('Invalid Citadel reviewer artifact: candidate must be a regular non-symlink file.');
+  }
+  const expectedPath = path.join(fs.realpathSync(expectedAttemptDir), 'citadel-review-candidate.json');
+  if (fs.realpathSync(reportPath) !== expectedPath) {
+    throw new Error('Invalid Citadel reviewer artifact: candidate path escapes its assigned attempt directory.');
   }
   if (stat.size > CITADEL_REVIEWER_MAX_ARTIFACT_BYTES) {
     throw new Error(`Invalid Citadel reviewer artifact: candidate exceeds ${CITADEL_REVIEWER_MAX_ARTIFACT_BYTES} bytes.`);
@@ -1263,6 +1286,368 @@ function preserveInvalidReviewerAttempt(
 
 function reportHash(report: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(report)).digest('hex');
+}
+
+interface CitadelChecksAuthorityContext {
+  binding: Record<string, unknown>;
+  bindingHash: string;
+  verificationHash: string;
+  acceptanceCriteriaHash: string;
+  descriptors: CitadelCheckDescriptor[];
+  wholeGateTimeoutMs: number;
+}
+
+function deriveCitadelChecksAuthorityContext(
+  sessionDir: string,
+  checksWorkingDir: string,
+  state: Record<string, unknown>,
+  checkpointHead: string,
+  releaseFingerprint: string,
+  reviewedRange: string,
+  expectedAcceptanceCriteria: string[],
+): CitadelChecksAuthorityContext {
+  const verificationGate = verificationGateFromManifest(sessionDir, checksWorkingDir);
+  if (verificationGate.repairBeforeChecks) {
+    throw new Error(
+      `Citadel recovery evidence has an unavailable verification contract for: ${verificationGate.repairTicketIds.join(', ')}.`,
+    );
+  }
+  const verificationSteps = verificationGate.steps;
+  const deterministicCheckTimeoutMs = Number(state.worker_timeout_seconds || 900) * 1000;
+  const trustedTestInventory = resolvePickleTrustedTestInventory(
+    checksWorkingDir,
+    deterministicCheckTimeoutMs,
+  );
+  const descriptors = deduplicateCitadelCheckExecutions(
+    citadelCheckDescriptors(checksWorkingDir, sessionDir, verificationSteps),
+    checksWorkingDir,
+  );
+  const deterministicTimeoutBinding = {
+    schema_version: 1,
+    generic_command_policy: 'fixed-monotonic-deadline-v1',
+    inactivity_timeout_ms: deterministicCheckTimeoutMs,
+    absolute_timeout_ms: deterministicCheckTimeoutMs,
+    whole_gate_timeout_ms: trustedTestInventory?.whole_gate_timeout_ms
+      ?? deterministicCheckTimeoutMs * Math.max(
+        1,
+        descriptors.filter((descriptor) => !descriptor.skipped).length,
+      ),
+    executions: descriptors.map((descriptor) => ({
+      command: descriptor.command,
+      execution_identity: citadelLogicalCheckExecutionIdentity(descriptor, checksWorkingDir),
+      verification_identity: descriptor.verificationStep
+        ? verificationStepIdentity([descriptor.verificationStep]) : null,
+    })),
+    progress_protocol: trustedTestInventory ? {
+      transport: 'controller-owned-child-exit',
+      adapter_id: trustedTestInventory.adapter_id,
+      schema_version: trustedTestInventory.schema_version,
+      inventory: citadelTrustedInventoryBinding(trustedTestInventory, checksWorkingDir),
+    } : null,
+  };
+  const verificationHash = reportHash(verificationSteps);
+  const acceptanceCriteriaHash = reportHash(expectedAcceptanceCriteria);
+  const binding = {
+    checkpoint_head: checkpointHead,
+    release_fingerprint: releaseFingerprint,
+    reviewed_range: reviewedRange,
+    verification_hash: verificationHash,
+    acceptance_criteria_hash: acceptanceCriteriaHash,
+    deterministic_timeout_policy: deterministicTimeoutBinding,
+  };
+  return {
+    binding,
+    bindingHash: reportHash(binding),
+    verificationHash,
+    acceptanceCriteriaHash,
+    descriptors,
+    wholeGateTimeoutMs: deterministicTimeoutBinding.whole_gate_timeout_ms,
+  };
+}
+
+function recoveryArtifactPath(sessionDir: string, name: string): string {
+  const artifactPath = path.join(sessionDir, name);
+  const stat = fs.lstatSync(artifactPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`Citadel recovery evidence must be a regular non-symlink file: ${name}.`);
+  }
+  return artifactPath;
+}
+
+function assertRecoverableChecks(
+  checks: unknown,
+  descriptors: CitadelCheckDescriptor[],
+): asserts checks is CitadelCheckResult[] {
+  if (!Array.isArray(checks) || checks.length !== descriptors.length) {
+    throw new Error('Citadel recovery checks do not match the current deterministic execution inventory.');
+  }
+  for (let index = 0; index < checks.length; index += 1) {
+    const check = checks[index];
+    const descriptor = descriptors[index];
+    if (!check || typeof check !== 'object' || Array.isArray(check)) {
+      throw new Error(`Citadel recovery check ${index + 1} is malformed.`);
+    }
+    const value = check as Record<string, unknown>;
+    const expectedStatus = descriptor.skipped ? 'skipped' : 'passed';
+    if (value.command !== descriptor.command || value.status !== expectedStatus
+      || (expectedStatus === 'passed' && value.exit_code !== 0)
+      || (expectedStatus === 'skipped' && value.exit_code !== null)
+      || typeof value.output !== 'string' || value.process_tree_quiescent === false) {
+      throw new Error(`Citadel recovery check ${index + 1} is not a successful result for the bound execution.`);
+    }
+  }
+  if (!checks.some((check) => check.status === 'passed' && check.command !== 'git diff --check')) {
+    throw new Error('Citadel recovery evidence has no substantive deterministic release gate.');
+  }
+}
+
+function normalizedRecoveryTimeoutPolicy(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Citadel recovery deterministic timeout policy is malformed.');
+  }
+  const policy = value as Record<string, unknown>;
+  const executions = Array.isArray(policy.executions)
+    ? policy.executions as Array<Record<string, unknown>> : [];
+  if (executions.some((entry) => !entry || typeof entry !== 'object'
+    || typeof entry.command !== 'string'
+    || !/^[a-f0-9]{64}$/.test(String(entry.execution_identity || ''))
+    || (entry.verification_identity !== null
+      && (typeof entry.verification_identity !== 'string' || !entry.verification_identity)))) {
+    throw new Error('Citadel recovery deterministic execution identity is malformed.');
+  }
+  const progress = policy.progress_protocol as Record<string, unknown> | null;
+  let normalizedProgress: Record<string, unknown> | null = null;
+  if (progress !== null) {
+    if (!progress || typeof progress !== 'object' || Array.isArray(progress)) {
+      throw new Error('Citadel recovery trusted progress protocol is malformed.');
+    }
+    const inventory = progress.inventory as Record<string, unknown> | null;
+    const items = Array.isArray(inventory?.items)
+      ? inventory.items as Array<Record<string, unknown>> : [];
+    if (!inventory || !/^[a-f0-9]{64}$/.test(String(inventory.environment_hash || ''))
+      || !/^[a-f0-9]{64}$/.test(String(inventory.inventory_id || ''))
+      || items.some((item) => !/^[a-f0-9]{64}$/.test(String(item.execution_identity || '')))) {
+      throw new Error('Citadel recovery trusted work inventory identity is malformed.');
+    }
+    const { inventory_id: inventoryId, ...unsignedInventory } = inventory;
+    if (inventoryId !== reportHash(unsignedInventory)) {
+      throw new Error('Citadel recovery trusted work inventory digest does not match its exact contents.');
+    }
+    normalizedProgress = {
+      transport: progress.transport,
+      adapter_id: progress.adapter_id,
+      schema_version: progress.schema_version,
+      inventory: {
+        schema_version: inventory.schema_version,
+        adapter_id: inventory.adapter_id,
+        script_hashes: inventory.script_hashes,
+        timeout_policy: inventory.timeout_policy,
+        whole_gate_timeout_ms: inventory.whole_gate_timeout_ms,
+        items: items.map((item) => ({
+          id: item.id,
+          ordinal: item.ordinal,
+          command: item.command,
+          executable: item.executable,
+          args: item.args,
+          inactivity_timeout_ms: item.inactivity_timeout_ms,
+          absolute_timeout_ms: item.absolute_timeout_ms,
+        })),
+      },
+    };
+  }
+  return {
+    schema_version: policy.schema_version,
+    generic_command_policy: policy.generic_command_policy,
+    inactivity_timeout_ms: policy.inactivity_timeout_ms,
+    absolute_timeout_ms: policy.absolute_timeout_ms,
+    whole_gate_timeout_ms: policy.whole_gate_timeout_ms,
+    executions: executions.map((entry) => ({
+      command: entry.command,
+      verification_identity: entry.verification_identity,
+    })),
+    progress_protocol: normalizedProgress,
+  };
+}
+
+/**
+ * Authenticate a completed Citadel evidence bundle for crash recovery. This is
+ * intentionally read-only: callers may persist the returned authority, but the
+ * validator never repairs or rewrites evidence at the trust boundary.
+ */
+export function validateCitadelRecoveryEvidence(
+  sessionDir: string,
+  workingDir: string,
+  state: Record<string, unknown>,
+  options: { allowRepositoryDescendantOf?: string } = {},
+): CitadelRecoveryAuthority {
+  if (!workingDir || path.resolve(String(state.working_dir || '')) !== path.resolve(workingDir)) {
+    throw new Error('Citadel recovery evidence working_dir does not match the persisted session authority.');
+  }
+  const dirtyPaths = listWorkingTreeDirtyPaths(workingDir);
+  if (dirtyPaths.length > 0) {
+    throw new Error(`Citadel recovery evidence requires a clean release tree; dirty paths: ${dirtyPaths.join(', ')}`);
+  }
+  const startCommit = reachableCitadelBase(workingDir, state.start_commit);
+  if (!startCommit) {
+    throw new Error('Citadel recovery evidence requires a reachable persisted start_commit.');
+  }
+  const repositoryHead = getHeadSha(workingDir);
+  const releaseFingerprint = getCitadelRepositoryFingerprint(workingDir);
+  const reviewedRange = `${startCommit}..HEAD`;
+  const expectedAcceptanceCriteria = deriveCitadelAcceptanceCriteria(sessionDir);
+  if (expectedAcceptanceCriteria.length === 0) {
+    throw new Error('Citadel recovery evidence declares no acceptance criteria.');
+  }
+
+  const manifestPath = recoveryArtifactPath(sessionDir, 'refinement_manifest.json');
+  const checksPath = recoveryArtifactPath(sessionDir, 'citadel-checks.json');
+  const journalPath = recoveryArtifactPath(sessionDir, 'citadel-deterministic-check-journal.json');
+  const reviewStatePath = recoveryArtifactPath(sessionDir, 'citadel-review-state.json');
+  const reportPath = recoveryArtifactPath(sessionDir, 'citadel-report.json');
+  const checksArtifact = readJsonFile<Record<string, unknown>>(checksPath, null);
+  const journal = readJsonFile<Record<string, unknown>>(journalPath, null);
+  const reviewState = readJsonFile<CitadelReviewState>(reviewStatePath, null);
+  const rawReport = readJsonFile<Record<string, unknown>>(reportPath, null);
+  if (!checksArtifact || !journal || !reviewState || !rawReport) {
+    throw new Error('Citadel recovery evidence contains an unreadable JSON artifact.');
+  }
+
+  const persistedBinding = checksArtifact.binding as Record<string, unknown> | null;
+  const boundHead = String(persistedBinding?.checkpoint_head || '');
+  const boundFingerprint = String(persistedBinding?.release_fingerprint || '');
+  const staleRepositoryAuthority = Boolean(options.allowRepositoryDescendantOf
+    && boundHead === options.allowRepositoryDescendantOf
+    && repositoryHead !== boundHead
+    && commitIsAncestorWithPathsUnchanged(workingDir, boundHead, []));
+  const checksHead = staleRepositoryAuthority ? boundHead : repositoryHead;
+  const checksFingerprint = staleRepositoryAuthority ? boundFingerprint : releaseFingerprint;
+
+  const context = deriveCitadelChecksAuthorityContext(
+    sessionDir,
+    workingDir,
+    state,
+    checksHead,
+    checksFingerprint,
+    reviewedRange,
+    expectedAcceptanceCriteria,
+  );
+  const checks = checksArtifact.checks;
+  assertRecoverableChecks(checks, context.descriptors);
+  const checksHash = reportHash(checks);
+  const journalHash = reportHash(journal);
+  if (checksArtifact.schema_version !== 1 || checksArtifact.reviewed_range !== reviewedRange) {
+    throw new Error('Citadel recovery checks do not declare the current release range.');
+  }
+  const observedBinding = checksArtifact.binding && typeof checksArtifact.binding === 'object'
+    && !Array.isArray(checksArtifact.binding)
+    ? checksArtifact.binding as Record<string, unknown> : {};
+  const staticBindingFields = [
+    'checkpoint_head', 'release_fingerprint', 'reviewed_range',
+    'verification_hash', 'acceptance_criteria_hash',
+  ];
+  const mismatchedFields = staticBindingFields.filter((field) => (
+    JSON.stringify(observedBinding[field]) !== JSON.stringify(context.binding[field])
+  ));
+  if (mismatchedFields.length > 0) {
+    throw new Error(`Citadel recovery checks binding does not match the current release authority: ${mismatchedFields.join(', ') || 'schema'}.`);
+  }
+  if (JSON.stringify(normalizedRecoveryTimeoutPolicy(observedBinding.deterministic_timeout_policy))
+    !== JSON.stringify(normalizedRecoveryTimeoutPolicy(context.binding.deterministic_timeout_policy))) {
+    throw new Error('Citadel recovery deterministic policy does not match the current release execution topology.');
+  }
+  const observedBindingHash = reportHash(observedBinding);
+  if (checksArtifact.checks_hash !== checksHash
+    || checksArtifact.journal_hash !== journalHash
+    || journal.schema_version !== 1 || journal.status !== 'completed'
+    || journal.binding_hash !== observedBindingHash || journal.checks_hash !== checksHash) {
+    throw new Error('Citadel recovery completed journal does not match the bound deterministic checks.');
+  }
+
+  const reviewIdentity = reportHash({
+    reviewed_range: reviewedRange,
+    checkpoint_head: checksHead,
+    checks_hash: checksHash,
+    checks_binding_hash: observedBindingHash,
+    acceptance_criteria_hash: context.acceptanceCriteriaHash,
+  });
+  if (reviewState.schema_version !== 1 || reviewState.review_identity !== reviewIdentity
+    || reviewState.status !== 'accepted' || !Array.isArray(reviewState.attempts)) {
+    throw new Error('Citadel recovery review state is not the accepted review for the current evidence.');
+  }
+  const acceptedAttempt = [...reviewState.attempts].reverse().find((attempt) => (
+    attempt.epoch === reviewState.recovery_epoch && attempt.status === 'accepted'
+  ));
+  if (!acceptedAttempt?.candidate_hash || acceptedAttempt.approval_signal !== true) {
+    throw new Error('Citadel recovery review state lacks an accepted candidate and durable approval signal.');
+  }
+  const catalogStrategy = CITADEL_REVIEWER_STRATEGIES.find(
+    (entry) => entry.id === acceptedAttempt.strategy_id,
+  );
+  const expectedStrategy = catalogStrategy
+    ? citadelReviewerStrategy(catalogStrategy.id)
+    : acceptedAttempt.strategy_id === 'artifact-contract-reconstruction'
+      && reviewState.artifact_contract_recovery
+      ? artifactContractReviewerStrategy(
+        reviewState.artifact_contract_recovery,
+        artifactContractExecution(
+          sessionDir,
+          workingDir,
+          repositoryHead,
+          reviewState.artifact_contract_recovery,
+          reviewIdentity,
+          reviewedRange,
+          expectedAcceptanceCriteria,
+          checks,
+        ),
+      )
+      : null;
+  if (!expectedStrategy) {
+    throw new Error('Citadel recovery review strategy is not a supported authenticated strategy.');
+  }
+  if (acceptedAttempt.material_strategy_hash !== expectedStrategy.hash
+    || reviewState.strategy_id !== acceptedAttempt.strategy_id
+    || reviewState.strategy_hash !== expectedStrategy.hash) {
+    throw new Error('Citadel recovery review strategy identity does not match the accepted candidate.');
+  }
+  const expectedAttemptDir = path.join(
+    sessionDir,
+    'citadel-review-attempts',
+    `${reviewIdentity.slice(0, 12)}-${acceptedAttempt.ordinal}`,
+  );
+  const candidate = readReviewerCandidate(acceptedAttempt.candidate_path, expectedAttemptDir);
+  if (candidate.hash !== acceptedAttempt.candidate_hash) {
+    throw new Error('Citadel recovery accepted candidate digest changed after review.');
+  }
+  const validatedCandidate = validateCitadelReport(
+    candidate.value,
+    reviewedRange,
+    expectedAcceptanceCriteria,
+  );
+  const validatedReport = validateCitadelReport(
+    rawReport,
+    reviewedRange,
+    expectedAcceptanceCriteria,
+  );
+  if (reportHash(validatedCandidate) !== reportHash(validatedReport)) {
+    throw new Error('Citadel recovery report does not match its accepted reviewer candidate.');
+  }
+
+  return {
+    schema_version: 1,
+    repository_head: repositoryHead,
+    release_fingerprint: releaseFingerprint,
+    reviewed_range: reviewedRange,
+    manifest_sha256: fileHash(manifestPath),
+    checks_sha256: fileHash(checksPath),
+    journal_sha256: fileHash(journalPath),
+    review_state_sha256: fileHash(reviewStatePath),
+    report_sha256: fileHash(reportPath),
+    report_verdict: validatedReport.verdict,
+    checks_binding_hash: observedBindingHash,
+    verification_hash: context.verificationHash,
+    acceptance_criteria_hash: context.acceptanceCriteriaHash,
+    review_identity: reviewIdentity,
+  };
 }
 
 export function assertCitadelReleaseApproval(sessionDir: string): void {
@@ -1469,7 +1854,13 @@ function canonicalCitadelCheckCwd(workingDir: string, requestedCwd?: string): st
 }
 
 function canonicalCitadelCheckEnv(env: NodeJS.ProcessEnv): Array<[string, string | null]> {
-  return Object.keys(env).sort().map((name) => [name, env[name] ?? null]);
+  // These shell bookkeeping variables are not command inputs: cwd is bound
+  // independently and shells rewrite the others while preserving the effective
+  // execution environment. Excluding them keeps recovery identity stable across
+  // the supervisor boundary without dropping PATH, credentials, or tool config.
+  const shellBookkeeping = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'NODE_TEST_CONTEXT']);
+  return Object.keys(env).filter((name) => !shellBookkeeping.has(name)).sort()
+    .map((name) => [name, env[name] ?? null]);
 }
 
 export function citadelCheckExecutionIdentity(
@@ -2481,46 +2872,17 @@ export async function runCitadel(
   }
   const verificationSteps = verificationGate.steps;
   const deterministicCheckTimeoutMs = Number(state.worker_timeout_seconds || 900) * 1000;
-  const trustedTestInventory = resolvePickleTrustedTestInventory(
+  const checksAuthorityContext = deriveCitadelChecksAuthorityContext(
+    sessionDir,
     citadelWorkingDir,
-    deterministicCheckTimeoutMs,
+    state,
+    checkpointHead,
+    releaseCheckpointFingerprint,
+    reviewedRange,
+    expectedAcceptanceCriteria,
   );
-  const deterministicCheckDescriptors = deduplicateCitadelCheckExecutions(
-    citadelCheckDescriptors(citadelWorkingDir, sessionDir, verificationSteps),
-    citadelWorkingDir,
-  );
-  const deterministicTimeoutBinding = {
-    schema_version: 1,
-    generic_command_policy: 'fixed-monotonic-deadline-v1',
-    inactivity_timeout_ms: deterministicCheckTimeoutMs,
-    absolute_timeout_ms: deterministicCheckTimeoutMs,
-    whole_gate_timeout_ms: trustedTestInventory?.whole_gate_timeout_ms
-      ?? deterministicCheckTimeoutMs * Math.max(
-        1,
-        deterministicCheckDescriptors.filter((descriptor) => !descriptor.skipped).length,
-      ),
-    executions: deterministicCheckDescriptors.map((descriptor) => ({
-      command: descriptor.command,
-      execution_identity: citadelLogicalCheckExecutionIdentity(descriptor, citadelWorkingDir),
-      verification_identity: descriptor.verificationStep
-        ? verificationStepIdentity([descriptor.verificationStep]) : null,
-    })),
-    progress_protocol: trustedTestInventory ? {
-      transport: 'controller-owned-child-exit',
-      adapter_id: trustedTestInventory.adapter_id,
-      schema_version: trustedTestInventory.schema_version,
-      inventory: citadelTrustedInventoryBinding(trustedTestInventory, citadelWorkingDir),
-    } : null,
-  };
-  const checksBinding = {
-    checkpoint_head: checkpointHead,
-    release_fingerprint: releaseCheckpointFingerprint,
-    reviewed_range: reviewedRange,
-    verification_hash: reportHash(verificationSteps),
-    acceptance_criteria_hash: reportHash(expectedAcceptanceCriteria),
-    deterministic_timeout_policy: deterministicTimeoutBinding,
-  };
-  const checksBindingHash = reportHash(checksBinding);
+  const checksBinding = checksAuthorityContext.binding;
+  const checksBindingHash = checksAuthorityContext.bindingHash;
   const cachedChecks = readJsonFile<Record<string, unknown>>(checksPath, null);
   const cachedJournal = readJsonFile<Record<string, unknown>>(
     path.join(sessionDir, 'citadel-deterministic-check-journal.json'), null,
@@ -2549,7 +2911,7 @@ export async function runCitadel(
       verificationSteps,
       {
         timeoutMs: deterministicCheckTimeoutMs,
-        wholeGateTimeoutMs: deterministicTimeoutBinding.whole_gate_timeout_ms,
+        wholeGateTimeoutMs: checksAuthorityContext.wholeGateTimeoutMs,
         journalBindingHash: checksBindingHash,
         isCancelled: shouldCancel,
         onSpawn: (child, command) => {
@@ -2660,6 +3022,7 @@ export async function runCitadel(
     reviewed_range: reviewedRange,
     checkpoint_head: checkpointHead,
     checks_hash: reportHash(checks),
+    checks_binding_hash: checksBindingHash,
     acceptance_criteria_hash: reportHash(expectedAcceptanceCriteria),
   })).digest('hex');
   const reviewStatePath = path.join(sessionDir, 'citadel-review-state.json');
@@ -3012,6 +3375,7 @@ export async function runCitadel(
     persistCitadelReleaseApproval(sessionDir, report);
   }
   assertReleaseWorkspaceUnchanged();
+  validateCitadelRecoveryEvidence(sessionDir, workingDir, manager.read(statePath));
   return report.verdict === 'approve' ? 'success' : 'citadel-blocked';
   } finally {
     if (!preserveIsolatedEvidence) isolated.cleanup();

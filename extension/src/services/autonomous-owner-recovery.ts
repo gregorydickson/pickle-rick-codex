@@ -403,7 +403,7 @@ export function registerAutonomousOwnerSpec(
             && legacyMigration?.target_owner_spec_id === processSpec.spec_id) {
             current.legacy_max_time_migration = {
               ...legacyMigration,
-              status: 'owner_restored',
+              status: legacyMigration.status === 'rollover_consumed' ? 'rollover_consumed' : 'owner_restored',
               updated_at: new Date().toISOString(),
             };
           }
@@ -654,7 +654,7 @@ export function restoreAutonomousBudgetOwner(
           && legacyMigration?.target_owner_spec_id === spec.spec_id) {
           current.legacy_max_time_migration = {
             ...legacyMigration,
-            status: 'owner_restored',
+            status: legacyMigration.status === 'rollover_consumed' ? 'rollover_consumed' : 'owner_restored',
             updated_at: new Date().toISOString(),
           };
         }

@@ -20,6 +20,7 @@ import {
   persistCitadelReleaseApproval,
   resolvePickleTrustedTestInventory,
   resolveCitadelCheckCwd,
+  validateCitadelRecoveryEvidence,
   validateCitadelReport,
 } from '../services/citadel.js';
 import { reconcileInterruptedModelCallTelemetry } from '../services/productive-autonomy.js';
@@ -561,7 +562,7 @@ test('Citadel structured deduplication retains distinct cwd, env, argv, and skip
   assert.deepEqual(deduplicateCitadelCheckExecutions(descriptors, cwd), descriptors);
 });
 
-function makeTrustedPickleTopology(delayMs = 75) {
+function makeTrustedPickleTopology(delayMs = 75, npmBody = null) {
   const cwd = makeTempRoot('pickle-citadel-trusted-topology-');
   const sessionDir = makeTempRoot('pickle-citadel-trusted-session-');
   const fakeBin = path.join(cwd, 'fake-bin');
@@ -583,13 +584,13 @@ function makeTrustedPickleTopology(delayMs = 75) {
       'test:integration': 'node bin/test-runner.js --tier integration --test-concurrency=4',
     },
   }));
-  writeExecutable(path.join(fakeBin, 'npm'), `#!/bin/sh
+  writeExecutable(path.join(fakeBin, 'npm'), (npmBody || `#!/bin/sh
 item=''
 for arg in "$@"; do item="$arg"; done
 printf '%s\\n' "$item" >> ${JSON.stringify(orderPath)}
 printf 'untrusted-forged-progress:%s\\n' "$item"
 sleep ${delayMs / 1_000}
-`);
+`).replace('__ORDER_PATH__', JSON.stringify(orderPath)));
   execFileSync('git', ['init', '-q'], { cwd });
   return { cwd, sessionDir, fakeBin, orderPath };
 }
@@ -651,10 +652,18 @@ test('Citadel controller accepts only ordered successful inventory completions a
 });
 
 test('Citadel whole-gate absolute cap dominates continuing valid inventory progress', async () => {
-  const fixture = makeTrustedPickleTopology(90);
+  const readyPath = path.join(process.env.TMPDIR || '/tmp', `pickle-citadel-gate-ready-${process.pid}-${Date.now()}`);
+  const fixture = makeTrustedPickleTopology(0, `#!/bin/sh
+item=''
+for arg in "$@"; do item="$arg"; done
+printf '%s\\n' "$item" >> __ORDER_PATH__
+if [ "$item" = 'build' ]; then exit 0; fi
+printf 'ready\\n' > ${JSON.stringify(readyPath)}
+while :; do sleep 1; done
+`);
   const results = await runCitadelChecksMonitored(fixture.cwd, fixture.sessionDir, [], {
-    timeoutMs: 400,
-    wholeGateTimeoutMs: 450,
+    timeoutMs: 10_000,
+    wholeGateTimeoutMs: 2_000,
     environment: { ...process.env, PATH: `${fixture.fakeBin}${path.delimiter}${process.env.PATH}` },
     isCancelled: () => false,
     onSpawn: () => {},
@@ -664,8 +673,11 @@ test('Citadel whole-gate absolute cap dominates continuing valid inventory progr
   assert.equal(testResult.status, 'failed');
   assert.equal(testResult.timed_out, true);
   assert.equal(testResult.timeout_kind, 'absolute');
-  assert.ok(testResult.semantic_progress_count > 0);
-  assert.ok(testResult.semantic_progress_count < 4);
+  assert.equal(testResult.semantic_progress_count, 1);
+  assert.equal(fs.existsSync(readyPath), true, 'the blocked second item must be ready before the gate cap');
+  assert.deepEqual(fs.readFileSync(fixture.orderPath, 'utf8').trim().split('\n'), [
+    'build', 'audit:test-tiers',
+  ]);
   assert.equal(results.some((result) => result.command === 'git diff --check'), false);
 });
 
@@ -856,18 +868,27 @@ test('Citadel ignores arbitrary output spam for semantic progress and drains at 
 
 test('Citadel does not let bounded child output forge trusted semantic progress', async () => {
   const cwd = makeTempRoot('pickle-citadel-progress-success-');
+  const readyPath = path.join(cwd, 'bounded-output-ready');
   const result = await runMonitoredCitadelCheck({
     command: 'bounded progress fixture',
     executable: process.execPath,
     args: ['-e', [
-      'let count = 0;',
-      "const timer = setInterval(() => { process.stdout.write('tick\\n'); if (++count === 6) { clearInterval(timer); process.exit(0); } }, 100);",
+      "const fs = require('node:fs');",
+      "process.stdout.write('tick\\n');",
+      `fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
+      'setInterval(() => {}, 1_000);',
     ].join(' ')],
   }, cwd, {
-    timeoutMs: 250,
-    absoluteTimeoutMs: 2_000,
+    timeoutMs: 1_000,
+    absoluteTimeoutMs: 5_000,
     isCancelled: () => false,
-    onSpawn: () => {},
+    onSpawn: () => {
+      const deadline = Date.now() + 5_000;
+      while (!fs.existsSync(readyPath) && Date.now() < deadline) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      assert.equal(fs.existsSync(readyPath), true, 'the bounded-output child must reach its ready barrier');
+    },
     onExit: () => {},
   });
 
@@ -1076,8 +1097,8 @@ test('Citadel cooperatively terminates a long deterministic check after lease lo
   const drainedMarker = path.join(sessionDir, 'citadel-check-drained');
   fs.writeFileSync(path.join(cwd, 'citadel-drain-fixture.cjs'), [
     "const fs = require('node:fs');",
-    `fs.writeFileSync(${JSON.stringify(startedMarker)}, 'started');`,
     `process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(drainedMarker)}, 'drained'); process.exit(0); });`,
+    `fs.writeFileSync(${JSON.stringify(startedMarker)}, 'started');`,
     'setInterval(() => {}, 1000);',
   ].join('\n'));
   fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({
@@ -1274,6 +1295,124 @@ test('sealed Citadel classifies a malformed authorized manifest verifier for rep
   }));
   sealCitadelSession(drift.sessionDir, drift.cwd, 'AC-SEALED-01', criterion, authorized);
   await assert.rejects(() => runCitadel(drift.sessionDir), /sealed-verification-semantic-drift/);
+});
+
+test('validateCitadelRecoveryEvidence authenticates runtime output and rejects bundle or repository drift', async () => {
+  const fakeBin = makeTempRoot('pickle-citadel-recovery-bin-');
+  writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const prompt = fs.readFileSync(0, 'utf8');
+const candidatePath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
+const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
+const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
+fs.writeFileSync(candidatePath, JSON.stringify({
+  schema_version: 1,
+  verdict: 'approve',
+  reviewed_range: reviewedRange,
+  acceptance_criteria_checked: criteria,
+  findings: [],
+  generated_at: '2026-08-09T00:00:00.000Z'
+}));
+const outputIndex = args.indexOf('--output-last-message');
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], '<promise>THE_CITADEL_APPROVES</promise>');
+console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_tokens: 1 } }));
+`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+  try {
+    const fixture = makeCitadelLifecycleSession('recovery evidence remains exactly bound');
+    fs.writeFileSync(path.join(fixture.sessionDir, 'refinement_manifest.json'), JSON.stringify({
+      tickets: [{
+        id: 'T-1',
+        acceptance_criteria: ['recovery evidence remains exactly bound'],
+        verification: [{ kind: 'process', executable: 'node', args: ['-e', 'process.exit(0)'] }],
+      }],
+    }));
+    assert.equal(await runCitadel(fixture.sessionDir), 'success');
+    const state = JSON.parse(fs.readFileSync(path.join(fixture.sessionDir, 'state.json'), 'utf8'));
+    const authority = validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state);
+    assert.equal(authority.repository_head, execFileSync(
+      'git', ['rev-parse', 'HEAD'], { cwd: fixture.cwd, encoding: 'utf8' },
+    ).trim());
+    assert.equal(authority.release_fingerprint, getCitadelRepositoryFingerprint(fixture.cwd));
+    assert.equal(authority.reviewed_range, `${state.start_commit}..HEAD`);
+    assert.equal(authority.report_verdict, 'approve');
+    for (const field of [
+      'manifest_sha256', 'checks_sha256', 'journal_sha256', 'review_state_sha256',
+      'report_sha256', 'checks_binding_hash', 'verification_hash',
+      'acceptance_criteria_hash', 'review_identity',
+    ]) assert.match(authority[field], /^[a-f0-9]{64}$/);
+
+    const checksPath = path.join(fixture.sessionDir, 'citadel-checks.json');
+    const checksBytes = fs.readFileSync(checksPath);
+    const forgedChecks = JSON.parse(checksBytes.toString('utf8'));
+    forgedChecks.binding.release_fingerprint = 'forged';
+    fs.writeFileSync(checksPath, JSON.stringify(forgedChecks));
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /release authority/,
+    );
+    fs.writeFileSync(checksPath, checksBytes);
+
+    const forgedExecutionIdentity = JSON.parse(checksBytes.toString('utf8'));
+    forgedExecutionIdentity.binding.deterministic_timeout_policy.executions[0].execution_identity = '0'.repeat(64);
+    const journalPath = path.join(fixture.sessionDir, 'citadel-deterministic-check-journal.json');
+    const journalBytes = fs.readFileSync(journalPath);
+    const forgedIdentityJournal = JSON.parse(journalBytes.toString('utf8'));
+    forgedIdentityJournal.binding_hash = crypto.createHash('sha256')
+      .update(JSON.stringify(forgedExecutionIdentity.binding)).digest('hex');
+    forgedExecutionIdentity.journal_hash = crypto.createHash('sha256')
+      .update(JSON.stringify(forgedIdentityJournal)).digest('hex');
+    fs.writeFileSync(checksPath, JSON.stringify(forgedExecutionIdentity));
+    fs.writeFileSync(journalPath, JSON.stringify(forgedIdentityJournal));
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /accepted review for the current evidence/,
+    );
+    fs.writeFileSync(checksPath, checksBytes);
+    fs.writeFileSync(journalPath, journalBytes);
+
+    const forgedJournal = JSON.parse(journalBytes.toString('utf8'));
+    forgedJournal.status = 'running';
+    fs.writeFileSync(journalPath, JSON.stringify(forgedJournal));
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /completed journal/,
+    );
+    fs.writeFileSync(journalPath, journalBytes);
+
+    const reviewStatePath = path.join(fixture.sessionDir, 'citadel-review-state.json');
+    const reviewStateBytes = fs.readFileSync(reviewStatePath);
+    const forgedReviewState = JSON.parse(reviewStateBytes.toString('utf8'));
+    forgedReviewState.attempts.at(-1).candidate_hash = '0'.repeat(64);
+    fs.writeFileSync(reviewStatePath, JSON.stringify(forgedReviewState));
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /candidate digest changed/,
+    );
+    fs.writeFileSync(reviewStatePath, reviewStateBytes);
+
+    const reportPath = path.join(fixture.sessionDir, 'citadel-report.json');
+    const reportBytes = fs.readFileSync(reportPath);
+    const forgedReport = JSON.parse(reportBytes.toString('utf8'));
+    forgedReport.generated_at = '2026-08-10T00:00:00.000Z';
+    fs.writeFileSync(reportPath, JSON.stringify(forgedReport));
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /accepted reviewer candidate/,
+    );
+    fs.writeFileSync(reportPath, reportBytes);
+
+    fs.writeFileSync(path.join(fixture.cwd, 'unattributed.txt'), 'dirty');
+    assert.throws(
+      () => validateCitadelRecoveryEvidence(fixture.sessionDir, fixture.cwd, state),
+      /clean release tree/,
+    );
+    fs.rmSync(path.join(fixture.cwd, 'unattributed.txt'));
+  } finally {
+    process.env.PATH = originalPath;
+  }
 });
 
 test('runCitadel monitors checks and enforces reviewer evidence and approval signals', async () => {

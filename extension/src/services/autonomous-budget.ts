@@ -26,11 +26,13 @@ interface AuthenticatedLegacyMaxTimeRolloverOptions extends AutonomousBudgetRoll
     prdSealHash: string;
     startCommit: string;
     pinnedSha: string | null;
-    sourceOwnerSpecId: string;
+    sourceOwnerSpecId: string | null;
     targetOwnerSpecId: string;
     targetOwnerSpec: Record<string, unknown>;
     targetRuntimeRoot: string;
     targetRuntime: Record<string, unknown>;
+    executionProfile: Record<string, unknown>;
+    logicalPipelineId: string;
   };
 }
 
@@ -145,13 +147,17 @@ function scheduleAutonomousBudgetRolloverInternal(
         || (history.at(-1) as Record<string, unknown> | undefined)?.step !== 'max_time'
         || crypto.createHash('sha256').update(JSON.stringify(current)).digest('hex')
           !== legacyMigration.sourceStateSha256
-        || (current.autonomous_owner_spec as Record<string, unknown> | null)?.spec_id
-          !== legacyMigration.sourceOwnerSpecId
+        || (legacyMigration.sourceOwnerSpecId === null
+          ? current.autonomous_owner_spec != null
+          : (current.autonomous_owner_spec as Record<string, unknown> | null)?.spec_id
+            !== legacyMigration.sourceOwnerSpecId)
         || legacyMigration.targetOwnerSpec.spec_id !== legacyMigration.targetOwnerSpecId
         || legacyMigration.targetOwnerSpec.session_dir !== current.session_dir
         || legacyMigration.targetOwnerSpec.working_dir !== current.working_dir
-        || legacyMigration.targetOwnerSpec.runner_bin
-          !== (current.autonomous_owner_spec as Record<string, unknown> | null)?.runner_bin) {
+        || legacyMigration.targetOwnerSpec.runner_bin !== legacyMigration.executionProfile.runner_bin
+        || JSON.stringify(legacyMigration.targetOwnerSpec.runner_args)
+          !== JSON.stringify(legacyMigration.executionProfile.runner_args)
+        || legacyMigration.targetOwnerSpec.working_dir !== legacyMigration.executionProfile.working_dir) {
         throw new Error('Legacy max_time migration authority does not match the exact inactive source state.');
       }
     }
@@ -202,7 +208,17 @@ function scheduleAutonomousBudgetRolloverInternal(
       current.autonomous_time_budget_window_minutes = nextWindow;
       current.max_time_minutes = nextWindow;
     }
-    if (legacyMigration) current.autonomous_owner_spec = legacyMigration.targetOwnerSpec;
+    if (legacyMigration) {
+      current.autonomous_owner_spec = legacyMigration.targetOwnerSpec;
+      current.autonomous_supervisor_pid = null;
+      current.autonomous_supervisor_identity = null;
+      current.autonomous_owner_recovery_daemon_pid = null;
+      current.autonomous_owner_recovery_daemon_identity = null;
+      current.tmux_mode = false;
+      current.tmux_runner_pid = null;
+      current.tmux_runner_binding = null;
+      current.tmux_session_name = null;
+    }
     markRunStart(current, new Date(nowMs));
     current.active = true;
     current.last_exit_reason = AUTONOMOUS_BUDGET_ROLLOVER_REASON;
@@ -211,6 +227,20 @@ function scheduleAutonomousBudgetRolloverInternal(
     current.autonomous_budget_reason = reason;
     current.autonomous_relaunch_not_before = wakeupAt;
     current.autonomous_relaunch_deadline = deadlineAt;
+    if (legacyMigration) {
+      current.autonomous_owner_restoration = {
+        schema_version: 1,
+        intent_id: crypto.randomUUID(),
+        rollover_intent_id: intentId,
+        rollover_epoch: epoch,
+        owner_spec_id: legacyMigration.targetOwnerSpecId,
+        status: 'pending',
+        attempt: 0,
+        not_before: wakeupAt,
+        restorer_pid: null,
+        restorer_identity: null,
+      };
+    }
     const durableCheckpoint: DurableBudgetCheckpoint = {
       kind: AUTONOMOUS_BUDGET_ROLLOVER_REASON,
       receipt_id: `autonomous-budget:scheduled:${intentId}`,
@@ -237,13 +267,15 @@ function scheduleAutonomousBudgetRolloverInternal(
         target_owner_spec_id: legacyMigration.targetOwnerSpecId,
         target_runtime_root: legacyMigration.targetRuntimeRoot,
         target_runtime: legacyMigration.targetRuntime,
+        execution_profile: legacyMigration.executionProfile,
+        logical_pipeline_id: legacyMigration.logicalPipelineId,
         rollover_intent_id: intentId,
         rollover_epoch: epoch,
       };
       current.legacy_max_time_migration = {
         ...contract,
         contract_sha256: crypto.createHash('sha256').update(JSON.stringify(contract)).digest('hex'),
-        status: 'rollover_scheduled',
+        status: 'owner_restoration_planned',
         created_at: new Date(nowMs).toISOString(),
         updated_at: new Date(nowMs).toISOString(),
       };

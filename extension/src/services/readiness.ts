@@ -89,14 +89,15 @@ function validatePositiveInteger(value: unknown, field: string): void {
   }
 }
 
-function validateAdvancedLoopConfig(
+export function validateAdvancedLoopConfig(
   sessionDir: string,
   workingDir: string,
-): { advanced: boolean; findings: ReadinessFinding[] } {
+): { advanced: boolean; findings: ReadinessFinding[]; config: Record<string, unknown> | null } {
   const loopConfigPath = path.join(sessionDir, 'loop_config.json');
-  if (!fs.existsSync(loopConfigPath)) return { advanced: false, findings: [] };
+  if (!fs.existsSync(loopConfigPath)) return { advanced: false, findings: [], config: null };
 
   const findings: ReadinessFinding[] = [];
+  let validatedConfig: Record<string, unknown> | null = null;
   try {
     const config = readJsonStrict<Record<string, unknown>>(loopConfigPath);
     if (!config || typeof config !== 'object' || Array.isArray(config)) {
@@ -159,10 +160,11 @@ function validateAdvancedLoopConfig(
     }
 
     findings.push(finding('info', 'advanced-loop-config-valid', `${mode} loop_config.json passed readiness validation.`));
+    validatedConfig = config;
   } catch (error) {
     findings.push(finding('error', 'advanced-loop-config-invalid', error instanceof Error ? error.message : String(error)));
   }
-  return { advanced: true, findings };
+  return { advanced: true, findings, config: validatedConfig };
 }
 
 function checkRuntimeLayout(runtimeRoot: string): ReadinessFinding[] {

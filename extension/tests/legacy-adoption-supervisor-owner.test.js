@@ -14,6 +14,7 @@ import {
 } from '../services/legacy-adoption-executor-supervisor.js';
 import { startLegacyAdoptionSupervisorOwner } from '../bin/adopt-legacy-session.js';
 import { killTmuxSessionById, tmuxSessionExists } from '../services/tmux.js';
+import { inspectRecordedLiveProcessIdentity, reapRecordedLiveProcessGroup } from '../services/orphan-reaper.js';
 
 function identity(pid) {
   return { pid, pgid: pid, start_time: `start-${pid}`, fingerprint: `fingerprint-${pid}` };
@@ -38,6 +39,26 @@ function executorStatus(value, manager = identity(81000), status = 'supervising'
     executor_spec_sha256: owner.executor_spec_sha256, replacement_count: 0, last_loss_at: null,
     last_restart_request_id: null, updated_at: '2026-08-09T00:00:01.000Z',
   });
+}
+
+function cleanupRealOwner(value, owner) {
+  let exactOwner = owner;
+  if (!exactOwner) {
+    try {
+      exactOwner = JSON.parse(fs.readFileSync(
+        path.join(value.sessionDir, LEGACY_ADOPTION_SUPERVISOR_OWNER_FILE), 'utf8',
+      ));
+    } catch {}
+  }
+  const executor = readLegacyAdoptionExecutorStatus(value.sessionDir);
+  if (exactOwner?.binding?.session_id && tmuxSessionExists(exactOwner.binding.session_name)) {
+    killTmuxSessionById(exactOwner.binding.session_id);
+  }
+  if (executor?.executor_identity) {
+    const result = reapRecordedLiveProcessGroup(executor.executor_identity);
+    assert.ok(['reaped', 'not-running'].includes(result.status));
+    assert.notEqual(inspectRecordedLiveProcessIdentity(executor.executor_identity), 'matched');
+  }
 }
 
 test('prepare owner waits for authenticated supervisor readiness and attaches without duplication', () => {
@@ -181,9 +202,7 @@ test('real prepare seam tmux owner replaces a SIGKILLed node supervisor and conv
     assert.ok(terminal, 'replacement supervisor did not converge the launched result');
     assert.equal(terminal.manager_generation, 2);
   } finally {
-    if (owner?.binding?.session_id && tmuxSessionExists(owner.binding.session_name)) {
-      killTmuxSessionById(owner.binding.session_id);
-    }
+    cleanupRealOwner(value, owner);
   }
 });
 
@@ -223,9 +242,7 @@ test('dead ready tmux owner rebinds its old status to a new nonce and converges 
         path.join(value.sessionDir, LEGACY_ADOPTION_SUPERVISOR_OWNER_FILE), 'utf8',
       ));
     }
-    if (currentOwner?.binding?.session_id && tmuxSessionExists(currentOwner.binding.session_name)) {
-      killTmuxSessionById(currentOwner.binding.session_id);
-    }
+    cleanupRealOwner(value, currentOwner);
   }
 });
 
@@ -271,8 +288,6 @@ test('successor manager processes an exact pending restart request after predece
     }
     assert.equal(readLegacyAdoptionExecutorStatus(value.sessionDir)?.status, 'launched');
   } finally {
-    if (owner?.binding?.session_id && tmuxSessionExists(owner.binding.session_name)) {
-      killTmuxSessionById(owner.binding.session_id);
-    }
+    cleanupRealOwner(value, owner);
   }
 });

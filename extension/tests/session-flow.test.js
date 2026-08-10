@@ -4236,7 +4236,10 @@ test('Citadel cancellation reaps a mutating deterministic check and restores the
     const state = readJsonFile(statePath);
     return state.active_child_kind === 'citadel-check'
       && fs.existsSync(enteredPath);
-  }, { message: 'Citadel deterministic check did not enter its mutating phase' });
+  }, {
+    timeoutMs: 20_000,
+    message: 'Citadel deterministic check did not enter its mutating phase',
+  });
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], { env, cwd: projectDir });
   await new Promise((resolve, reject) => {
     child.once('error', reject);

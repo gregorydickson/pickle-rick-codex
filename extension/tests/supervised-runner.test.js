@@ -22,6 +22,7 @@ import { executionTelemetrySummary, recordUnexpectedNoncompletionTermination } f
 import { writeRefinementAcceptance } from '../services/refinement-artifacts.js';
 import { ensureSessionPrdSeal } from '../services/session-prd-seal.js';
 import { reconcileSessionLiveness } from '../services/session.js';
+import { inspectRecordedLiveProcessIdentity, reapRecordedLiveProcessGroup } from '../services/orphan-reaper.js';
 
 function autonomousSession() {
   const sessionDir = makeTempRoot('pickle-supervised-runner-');
@@ -169,7 +170,7 @@ test('supervised runner exits for cooperative logical cancellation', () => {
   assert.equal(supervisedRunnerDecision(cancelled), 'cancelled');
 });
 
-test('SIGKILL of an executor is replaced and the logical pipeline still completes', async () => {
+test('SIGKILL of an executor is replaced and the logical pipeline still completes', async (t) => {
   const sessionDir = autonomousSession();
   fs.writeFileSync(path.join(sessionDir, 'state.json'), JSON.stringify({
     schema_version: 1, active: true, active_child_pid: null, active_child_identity: null,
@@ -190,6 +191,13 @@ setInterval(() => {}, 1000);
   const stateManagerModule = new URL('../services/state-manager.js', import.meta.url).href;
   const orphanReaperModule = new URL('../services/orphan-reaper.js', import.meta.url).href;
   const runnerPath = path.join(fixtureDir, 'executor.mjs');
+  let exactModelIdentity = null;
+  t.after(() => {
+    if (!exactModelIdentity) return;
+    const result = reapRecordedLiveProcessGroup(exactModelIdentity);
+    assert.ok(['reaped', 'not-running'].includes(result.status));
+    assert.notEqual(inspectRecordedLiveProcessIdentity(exactModelIdentity), 'matched');
+  });
   fs.writeFileSync(runnerPath, `
 import fs from 'node:fs';
 const [sessionDir, countPath, pidPath, modelPidPath, recoverySnapshotPath, fakeCodexPath, durableModule, codexModule, stateManagerModule, orphanReaperModule] = process.argv.slice(2);
@@ -243,6 +251,8 @@ if (count === 1) {
   assert.ok(fs.existsSync(pidPath) && fs.existsSync(modelPidPath), 'monitored model call did not start');
   const killedPid = Number(fs.readFileSync(pidPath, 'utf8'));
   const modelPid = Number(fs.readFileSync(modelPidPath, 'utf8'));
+  exactModelIdentity = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8')).active_child_identity;
+  assert.ok(exactModelIdentity, 'cleanup must bind the exact journaled fake Codex process group');
   await new Promise((resolve) => setTimeout(resolve, 20));
   process.kill(killedPid, 'SIGKILL');
   assert.equal(await run, 130);
@@ -426,6 +436,10 @@ test('production supervisor fatal boundary persists unexpected non-completion an
   assert.equal(summary.qualityScore, 0);
   const telemetry = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8'));
   assert.match(telemetry.unexpected_noncompletion_termination.reason, /supervisor fatal error/);
+  const state = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
+  assert.equal(state.autonomous_owner_recovery_daemon_pid, undefined);
+  assert.equal(state.autonomous_owner_recovery_daemon_identity, undefined);
+  assert.equal(state.autonomous_owner_spec, undefined);
 });
 
 test('green supervisor fatal before handoff acceptance zeroes every score', () => {

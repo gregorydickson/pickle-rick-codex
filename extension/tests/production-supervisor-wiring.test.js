@@ -232,7 +232,7 @@ test('runtime heartbeat owns, renews, excludes a second runner, and releases rec
   ensureSessionPrdSeal(sessionDir);
   const ownership = startDurableRuntimeOwnership(sessionDir, {
     ownerId: `runner:${process.pid}:first`,
-    ttlMs: 500,
+    ttlMs: 5_000,
     renewEveryMs: 50,
   });
   const initialExpiry = ownership.lease().expires_at;

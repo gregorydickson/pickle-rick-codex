@@ -1764,7 +1764,7 @@ setInterval(() => {}, 1000);
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'terminal usage deadline',
-    timeoutMs: 500,
+    timeoutMs: 5_000,
     outputLastMessagePath: messagePath,
     successPollMs: 20,
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),

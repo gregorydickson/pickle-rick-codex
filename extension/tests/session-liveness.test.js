@@ -26,6 +26,7 @@ import {
   beginAutonomousExecution,
   cancelLogicalPipelineByOperator,
   createLogicalPipeline,
+  readLogicalPipeline,
   releaseRuntimeHandoffLease,
   requestRuntimeHandoff,
 } from '../services/durable-supervisor.js';
@@ -41,7 +42,8 @@ import {
   tmuxSessionExists,
 } from '../services/tmux.js';
 import { StateManager } from '../services/state-manager.js';
-import { makeTempRoot, writeJson } from './helpers.js';
+import { fakeLifecycleArtifactWriterSource, makeTempRoot, writeJson } from './helpers.js';
+import { runCitadel, validateCitadelRecoveryEvidence } from '../services/citadel.js';
 
 function state(overrides = {}) {
   return {
@@ -153,7 +155,8 @@ function sealLegacySession(sessionDir, workingDir) {
     prd,
     repository: { identity: 'fixture@base', working_directory: workingDir, execution_base_policy: 'sealed' },
     acceptance_criteria: [{ id: 'AC-1', text: 'The autonomous owner performs productive work.' }],
-    scope_and_ownership: {}, dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [],
+    scope_and_ownership: [{ ticket_id: 'release-validation', allowed_paths: ['tracked.txt'], output_artifacts: [] }],
+    dependencies_and_external_prerequisites: [], risk: [], decision_precedence: [],
     preservation_and_rollback: {}, completion_definition: {}, release_gates: [],
   });
 }
@@ -505,32 +508,32 @@ test('legacy paused max_time session migrates once through mapped lookup, superv
   const dataRoot = makeTempRoot('pickle-legacy-max-time-data-');
   const workingDir = makeTempRoot('pickle-legacy-max-time-work-');
   const sessionDir = path.join(dataRoot, 'sessions', 'legacy-session');
-  const sourceRuntimeDir = path.join(sessionDir, 'source-runtime');
   const statePath = path.join(sessionDir, 'state.json');
   const fakeBin = path.join(sessionDir, 'fake-bin');
-  fs.mkdirSync(sourceRuntimeDir, { recursive: true });
   fs.mkdirSync(fakeBin, { recursive: true });
   const startCommit = initializeGitRepository(workingDir);
-  fs.writeFileSync(path.join(sourceRuntimeDir, 'loop-runner.js'), 'setInterval(() => {}, 1000);\n');
-  fs.writeFileSync(path.join(sourceRuntimeDir, 'supervised-runner.js'), 'throw new Error("stale source runtime executed");\n');
   const fakeCodex = path.join(fakeBin, 'codex');
   fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
-import fs from 'node:fs';
+const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
 if (args[0] === 'exec' && args[1] === '--help') { console.log('--output-last-message --add-dir'); process.exit(0); }
 const prompt = fs.readFileSync(0, 'utf8');
 const output = args[args.indexOf('--output-last-message') + 1];
 const artifactDir = prompt.match(/Worker artifact dir: ([^\\n]+)/)?.[1]?.trim();
+let priorIteration = false;
 if (artifactDir) {
   fs.mkdirSync(artifactDir, { recursive: true });
+  priorIteration = fs.existsSync(artifactDir + '/anatomy-park-summary.json');
   fs.writeFileSync(artifactDir + '/anatomy-park-summary.json', JSON.stringify({
     finding_family: 'legacy-migration-e2e', highest_severity_finding: 'productive real runner iteration',
     data_flow_path: 'daemon -> supervisor -> loop runner -> codex', fix_applied: 'advanced durable iteration',
     verification: ['real loop runner'], trap_doors: [], next_action: 'continue',
   }));
 }
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 350);
+// Complete the first productive iteration promptly, then keep its successor live long
+// enough to take the migration snapshot without racing another fixture iteration.
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, priorIteration ? 15000 : 350);
 fs.writeFileSync(output, '<promise>CONTINUE</promise>');
 console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
 `);
@@ -544,29 +547,13 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     start_commit: startCommit,
     pinned_sha: startCommit,
     max_time_minutes: 1,
-    history: [
-      { step: 'implement', ticket: 'T-1', timestamp: '2023-11-14T22:13:20.000Z' },
-      { step: 'max_time', ticket: 'T-1', timestamp: '2023-11-14T22:14:20.000Z' },
-    ],
-    current_ticket: 'T-1',
+    history: [{ step: 'max_time', timestamp: '2023-11-14T22:14:20.000Z' }],
+    current_ticket: null,
+    tmux_mode: true,
   }));
   const seal = sealLegacySession(sessionDir, workingDir);
-  createLogicalPipeline(sessionDir, 'legacy-session');
-  beginAutonomousExecution(sessionDir);
   writeJson(path.join(sessionDir, 'loop_config.json'), {
     mode: 'anatomy-park', target: fs.realpathSync(workingDir), stall_limit: 5,
-  });
-  registerAutonomousOwnerSpec(
-    sessionDir,
-    'loop-runner.js',
-    [],
-    undefined,
-    path.join(sourceRuntimeDir, 'supervised-runner.js'),
-  );
-  new StateManager().update(statePath, (current) => {
-    current.autonomous_supervisor_pid = 999_999_999;
-    current.autonomous_supervisor_identity = deadProcessIdentity();
-    return current;
   });
 
   const previousRoot = process.env.PICKLE_DATA_ROOT;
@@ -588,19 +575,19 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
 
     const migrated = new StateManager().read(statePath);
     assert.equal(migrated.active, true);
-    assert.equal(migrated.last_exit_reason, 'autonomous_budget_rollover');
+    assert.ok(migrated.last_exit_reason === 'autonomous_budget_rollover' || migrated.last_exit_reason === null);
     assert.equal(migrated.legacy_max_time_migration.prd_seal_hash, seal.semantic_hash);
     assert.equal(migrated.legacy_max_time_migration.start_commit, startCommit);
     assert.equal(migrated.legacy_max_time_migration.pinned_sha, startCommit);
     assert.equal(migrated.legacy_max_time_migration.rollover_intent_id,
-      migrated.autonomous_budget_rollover_intent_id);
-    assert.notEqual(migrated.legacy_max_time_migration.source_owner_spec_id,
-      migrated.legacy_max_time_migration.target_owner_spec_id);
+      migrated.autonomous_budget_rollover_intent_id ?? migrated.autonomous_budget_consumed_intent_id);
+    assert.equal(migrated.legacy_max_time_migration.source_owner_spec_id, null);
     assert.equal(migrated.autonomous_owner_spec.spec_id,
       migrated.legacy_max_time_migration.target_owner_spec_id);
     assert.equal(migrated.history.filter(({ step }) => step === 'legacy_max_time_session_migrated').length, 1);
     assert.equal(migrated.history.filter(({ step }) => step === 'autonomous_budget_rollover').length, 1);
     assert.ok(['pending', 'restoring', 'restored'].includes(migrated.autonomous_owner_restoration.status));
+    assert.equal(readLogicalPipeline(sessionDir).control_state, 'autonomous_execution');
 
     const restored = await waitForState(statePath, (current) => (
       current.autonomous_owner_restoration?.status === 'restored'
@@ -626,8 +613,15 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     };
     const liveMigration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime);
     assert.equal(liveMigration.session_was_active, true);
-    assert.equal(liveMigration.resume_checkpoint.ticket_id, 'T-1');
+    assert.equal(liveMigration.resume_checkpoint.ticket_id, null);
     assert.ok(new StateManager().read(statePath).iteration >= 1);
+    new StateManager().update(statePath, (current) => {
+      current.autonomous_budget_epoch = Number(current.autonomous_budget_epoch) + 1;
+      return current;
+    });
+    const laterEpochLookup = reconcileSessionLiveness(sessionDir);
+    assert.notEqual(laterEpochLookup.state.recovery_kind, 'legacy_max_time_migration_corrupt',
+      'a consumed migration receipt remains valid after an ordinary later budget epoch');
   } finally {
     try {
       cancelLogicalPipelineByOperator(sessionDir, 'test cleanup');
@@ -639,14 +633,349 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
         return current;
       });
     } catch {}
-    if (restoredIdentity) reapRecordedLiveProcessGroup(restoredIdentity);
-    if (daemonIdentity) reapRecordedLiveProcessGroup(daemonIdentity);
+    let cleanupState = null;
+    try { cleanupState = new StateManager().read(statePath); } catch {}
+    for (const identity of [
+      restoredIdentity,
+      daemonIdentity,
+      cleanupState?.autonomous_supervisor_identity,
+      cleanupState?.autonomous_owner_recovery_daemon_identity,
+    ]) {
+      if (identity) reapRecordedLiveProcessGroup(identity);
+    }
     if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
     else process.env.PICKLE_DATA_ROOT = previousRoot;
     if (previousTestMode === undefined) delete process.env.PICKLE_TEST_MODE;
     else process.env.PICKLE_TEST_MODE = previousTestMode;
     if (previousMigrationRuntime === undefined) delete process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
     else process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN = previousMigrationRuntime;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test('sealed validation-shaped legacy max_time state bootstraps the real mux supervisor without source control-plane fields', async () => {
+  const dataRoot = makeTempRoot('pickle-legacy-validation-data-');
+  const workingDir = makeTempRoot('pickle-legacy-validation-work-');
+  const sessionDir = path.join(dataRoot, 'sessions', 'validation-session');
+  const statePath = path.join(sessionDir, 'state.json');
+  const fakeBin = path.join(sessionDir, 'fake-bin');
+  fs.mkdirSync(fakeBin, { recursive: true });
+  let startCommit = initializeGitRepository(workingDir);
+  fs.writeFileSync(path.join(workingDir, 'package.json'), JSON.stringify({
+    name: 'legacy-citadel-fixture', version: '1.0.0', scripts: { test: 'node --version' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd: workingDir });
+  execFileSync('git', ['commit', '-qm', 'add release gate'], { cwd: workingDir });
+  startCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8' }).trim();
+  const fakeCodex = path.join(fakeBin, 'codex');
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const cp = require('node:child_process');
+const args = process.argv.slice(2);
+${fakeLifecycleArtifactWriterSource()}
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--output-last-message --add-dir'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
+const outputIndex = args.indexOf('--output-last-message');
+if (!reportPath) {
+  const phase = prompt.match(/You are executing the "([^"]+)" phase/)?.[1] || '';
+  if (phase === 'implement') {
+    fs.appendFileSync(path.join(process.cwd(), 'tracked.txt'), 'remediated\\n');
+    cp.execFileSync('git', ['add', 'tracked.txt']);
+    cp.execFileSync('git', ['-c', 'user.name=Pickle Test', '-c', 'user.email=pickle@example.invalid',
+      'commit', '-qm', 'fix release validation', '-m', 'Pickle-Ticket: release-validation']);
+  }
+  if (phase) {
+    writeFakeLifecycleArtifact(prompt, phase);
+    if (phase === 'implement') {
+      const artifactPath = prompt.split('\\n').find((line) => line.startsWith('Lifecycle artifact path: '))
+        ?.slice('Lifecycle artifact path: '.length).trim();
+      if (artifactPath) {
+        const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+        artifact.files_changed = ['tracked.txt'];
+        fs.writeFileSync(artifactPath, JSON.stringify(artifact));
+      }
+    }
+  }
+  if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], '<promise>DONE</promise>');
+  process.exit(0);
+}
+const sessionDir = path.dirname(path.dirname(path.dirname(reportPath)));
+const countPath = path.join(sessionDir, 'legacy-citadel-review-count');
+const count = fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, 'utf8')) + 1 : 1;
+fs.writeFileSync(countPath, String(count));
+const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
+const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
+const block = count === 1;
+fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+fs.writeFileSync(reportPath, JSON.stringify({
+  schema_version: 1, verdict: block ? 'block' : 'approve', reviewed_range: reviewedRange,
+  acceptance_criteria_checked: criteria,
+  findings: block ? [{ severity: 'high', title: 'Legacy release requires resumed validation',
+    evidence: 'The pre-control-plane session stopped before final approval.', file: 'tracked.txt', line: 1,
+    recommendation: 'Resume the sealed Citadel review.', ticket_ids: ['release-validation'],
+    acceptance_criteria: ['Release remains sealed.'], paths: ['tracked.txt'] }] : [],
+  generated_at: new Date().toISOString(),
+}));
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], '<promise>THE_CITADEL_APPROVES</promise>');
+console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_tokens: 1 } }));
+`);
+  fs.chmodSync(fakeCodex, 0o755);
+  writeJson(statePath, state({
+    active: false,
+    working_dir: fs.realpathSync(workingDir),
+    session_dir: fs.realpathSync(sessionDir),
+    step: 'paused',
+    iteration: 0,
+    last_exit_reason: 'max_time',
+    start_commit: startCommit,
+    pinned_sha: startCommit,
+    tmux_mode: false,
+    pipeline_mode: false,
+    tmux_runner_pid: null,
+    worker_pid: null,
+    active_child_pid: null,
+    current_ticket: null,
+    history: [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }],
+  }));
+  const seal = sealLegacySession(sessionDir, workingDir);
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'release-validation', title: 'Validate release', status: 'Done', priority: 'P0',
+      depends_on: [], allowed_paths: ['tracked.txt'], acceptance_criteria: ['Release remains sealed.'],
+      verification: [{ kind: 'process', executable: 'node', args: ['--version'] }],
+    }],
+  });
+  assert.equal(fs.existsSync(path.join(sessionDir, 'logical-pipeline.json')), false);
+  const source = new StateManager().read(statePath);
+  for (const field of ['autonomous_owner_spec', 'autonomous_owner_restoration',
+    'autonomous_supervisor_pid', 'autonomous_supervisor_identity',
+    'autonomous_owner_recovery_daemon_pid', 'autonomous_owner_recovery_daemon_identity']) {
+    assert.equal(source[field], undefined, `source fixture must omit ${field}`);
+  }
+
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  const previousPath = process.env.PATH;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  process.env.PATH = `${fakeBin}:${previousPath || ''}`;
+  let supervisorIdentity = null;
+  let daemonIdentity = null;
+  try {
+    assert.equal(await runCitadel(sessionDir), 'citadel-blocked', 'fixture starts from authenticated blocked Citadel evidence');
+    new StateManager().update(statePath, (current) => {
+      current.active = false;
+      current.step = 'paused';
+      current.last_exit_reason = 'max_time';
+      current.completed_at = null;
+      current.cancel_requested_at = null;
+      current.cancelled = false;
+      current.recovery_required = false;
+      current.orphan_child_pid = null;
+      current.orphan_recovery = null;
+      current.active_child_pid = null;
+      current.active_child_identity = null;
+      current.autonomous_budget_rollover_intent_id = null;
+      current.autonomous_budget_rollover_checkpoint_pending = null;
+      current.autonomous_owner_restoration = null;
+      current.history = [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }];
+      return current;
+    });
+    assert.equal(validateCitadelRecoveryEvidence(
+      sessionDir, fs.realpathSync(workingDir), new StateManager().read(statePath),
+    ).report_verdict, 'block');
+    await updateSessionMap(fs.realpathSync(workingDir), sessionDir);
+    assert.equal(await resolveSessionForCwd(workingDir), sessionDir);
+    assert.ok(new StateManager().read(statePath).legacy_max_time_migration, 'mapped lookup records migration receipt');
+    const restored = await waitForState(statePath, (current) => (
+      current.legacy_max_time_migration?.status === 'rollover_consumed'
+        && current.autonomous_budget_rollover_intent_id === null
+        && current.step === 'complete'
+        && readLogicalPipeline(sessionDir).terminal_state === 'completed'
+        && fs.existsSync(path.join(sessionDir, 'citadel-report.json'))
+        && JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-report.json'), 'utf8')).verdict === 'approve'
+        && fs.existsSync(path.join(sessionDir, 'citadel-release-approval.json'))
+        && fs.existsSync(path.join(sessionDir, 'mux-runner.log'))
+        && inspectProcessLivenessIdentity(current.autonomous_supervisor_identity) === 'not-running'
+    ), 40_000);
+    supervisorIdentity = restored.autonomous_supervisor_identity;
+    daemonIdentity = restored.autonomous_owner_recovery_daemon_identity;
+    assert.equal(inspectProcessLivenessIdentity(supervisorIdentity), 'not-running',
+      'the exact supervisor must exit after committing logical completion');
+    assert.equal(restored.autonomous_owner_spec.runner_bin, 'mux-runner.js');
+    assert.deepEqual(restored.autonomous_owner_spec.runner_args, ['--on-failure=retry']);
+    assert.equal(restored.legacy_max_time_migration.source_owner_spec_id, null);
+    assert.equal(restored.legacy_max_time_migration.execution_profile.derivation, 'sealed_standard_session');
+    assert.equal(restored.legacy_max_time_migration.prd_seal_hash, seal.semantic_hash);
+    assert.equal(restored.legacy_max_time_migration.execution_profile.citadel_recovery_authority.report_verdict, 'block');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-report.json'), 'utf8')).verdict, 'approve');
+    assert.equal(restored.autonomous_budget_rollover_intent_id, null);
+    assert.ok(restored.autonomous_budget_consumed_intent_id);
+    assert.equal(readLogicalPipeline(sessionDir).control_state, 'autonomous_execution');
+    assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /mux-runner started/);
+    validateCitadelRecoveryEvidence(sessionDir, fs.realpathSync(workingDir), restored, {
+      allowRepositoryDescendantOf: restored.legacy_max_time_migration.execution_profile.repository_head,
+    });
+    const terminalLookup = reconcileSessionLiveness(sessionDir);
+    assert.equal(terminalLookup.state.step, 'complete');
+    assert.equal(terminalLookup.state.recovery_kind, undefined,
+      'an authenticated completed migration remains terminal on later mapped lookup');
+    const logicalPath = path.join(sessionDir, 'logical-pipeline.json');
+    const crashWindowLogical = JSON.parse(fs.readFileSync(logicalPath, 'utf8'));
+    crashWindowLogical.terminal_state = null;
+    fs.writeFileSync(logicalPath, JSON.stringify(crashWindowLogical));
+    const incompleteTerminalLookup = reconcileSessionLiveness(sessionDir);
+    assert.equal(incompleteTerminalLookup.state.step, 'blocked');
+    assert.equal(incompleteTerminalLookup.state.recovery_kind, 'legacy_max_time_migration_corrupt',
+      'state completion without authenticated logical completion fails closed');
+  } finally {
+    try { cancelLogicalPipelineByOperator(sessionDir, 'test cleanup'); } catch {}
+    try {
+      new StateManager().update(statePath, (current) => {
+        current.cancel_requested_at ||= new Date().toISOString();
+        current.last_exit_reason = 'cancelled';
+        return current;
+      });
+    } catch {}
+    let cleanupState = null;
+    try { cleanupState = new StateManager().read(statePath); } catch {}
+    for (const identity of [
+      supervisorIdentity,
+      daemonIdentity,
+      cleanupState?.autonomous_supervisor_identity,
+      cleanupState?.autonomous_owner_recovery_daemon_identity,
+    ]) {
+      if (identity) reapRecordedLiveProcessGroup(identity);
+    }
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test('completed migrated pipeline remains terminal after its exact supervisor exits', async () => {
+  const dataRoot = makeTempRoot('pickle-legacy-pipeline-data-');
+  const workingDir = makeTempRoot('pickle-legacy-pipeline-work-');
+  const sessionDir = path.join(dataRoot, 'sessions', 'pipeline-session');
+  const statePath = path.join(sessionDir, 'state.json');
+  const fakeBin = path.join(sessionDir, 'fake-bin');
+  fs.mkdirSync(fakeBin, { recursive: true });
+  initializeGitRepository(workingDir);
+  fs.writeFileSync(path.join(workingDir, 'package.json'), JSON.stringify({
+    name: 'legacy-pipeline-fixture', version: '1.0.0', scripts: { test: 'node --version' },
+  }));
+  execFileSync('git', ['add', 'package.json'], { cwd: workingDir });
+  execFileSync('git', ['commit', '-qm', 'add pipeline release gate'], { cwd: workingDir });
+  const startCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: workingDir, encoding: 'utf8',
+  }).trim();
+  const fakeCodex = path.join(fakeBin, 'codex');
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex 9.9.9-test'); process.exit(0); }
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--output-last-message --add-dir'); process.exit(0); }
+const prompt = fs.readFileSync(0, 'utf8');
+const reportPath = prompt.match(/Citadel report path: ([^\\n]+)/)?.[1]?.trim();
+const outputIndex = args.indexOf('--output-last-message');
+if (!reportPath) process.exit(2);
+const criteria = JSON.parse(prompt.match(/Required acceptance criteria .*: (\\[[^\\n]+\\])/)?.[1] || '[]');
+const reviewedRange = prompt.match(/Review git range: ([^\\n]+)/)?.[1]?.trim();
+fs.mkdirSync(require('node:path').dirname(reportPath), { recursive: true });
+fs.writeFileSync(reportPath, JSON.stringify({
+  schema_version: 1, verdict: 'approve', reviewed_range: reviewedRange,
+  acceptance_criteria_checked: criteria, findings: [], generated_at: new Date().toISOString(),
+}));
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], '<promise>THE_CITADEL_APPROVES</promise>');
+console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_tokens: 1 } }));
+`);
+  fs.chmodSync(fakeCodex, 0o755);
+  writeJson(statePath, state({
+    active: false,
+    working_dir: fs.realpathSync(workingDir),
+    session_dir: fs.realpathSync(sessionDir),
+    step: 'paused',
+    iteration: 0,
+    last_exit_reason: 'max_time',
+    start_commit: startCommit,
+    pinned_sha: startCommit,
+    tmux_mode: false,
+    pipeline_mode: true,
+    tmux_runner_pid: null,
+    worker_pid: null,
+    active_child_pid: null,
+    history: [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }],
+  }));
+  sealLegacySession(sessionDir, workingDir);
+  writeJson(path.join(sessionDir, 'pipeline.json'), {
+    schema_version: 1,
+    working_dir: fs.realpathSync(workingDir),
+    target: fs.realpathSync(workingDir),
+    phases: ['citadel'],
+    skip_flags: { anatomy: true, szechuan: true },
+    bootstrap_source: 'task',
+    task: 'finish the sealed migrated pipeline',
+    scope: [],
+  });
+  writeJson(path.join(sessionDir, 'pipeline-state.json'), {
+    schema_version: 1,
+    current_phase: 'citadel',
+    current_phase_index: 0,
+    phase_statuses: { citadel: 'todo' },
+    started_at: '2026-08-09T07:00:00.000Z',
+    phase_started_at: null,
+    completed_at: null,
+    last_error: null,
+    last_exit_reason: null,
+  });
+  writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+    tickets: [{
+      id: 'release-validation', title: 'Validate pipeline release', status: 'Done',
+      acceptance_criteria: ['The autonomous owner performs productive work.'],
+      verification: [{ kind: 'process', executable: 'node', args: ['--version'] }],
+    }],
+  });
+
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  const previousPath = process.env.PATH;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  process.env.PATH = `${fakeBin}:${previousPath || ''}`;
+  let supervisorIdentity = null;
+  let daemonIdentity = null;
+  try {
+    await updateSessionMap(fs.realpathSync(workingDir), sessionDir);
+    assert.equal(await resolveSessionForCwd(workingDir), sessionDir);
+    const completed = await waitForState(statePath, (current) => (
+      current.legacy_max_time_migration?.status === 'rollover_consumed'
+        && current.step === 'complete'
+        && readLogicalPipeline(sessionDir).terminal_state === 'completed'
+        && JSON.parse(fs.readFileSync(path.join(sessionDir, 'pipeline-state.json'), 'utf8')).completed_at
+        && inspectProcessLivenessIdentity(current.autonomous_supervisor_identity) === 'not-running'
+    ), 40_000);
+    supervisorIdentity = completed.autonomous_supervisor_identity;
+    daemonIdentity = completed.autonomous_owner_recovery_daemon_identity;
+    assert.equal(completed.legacy_max_time_migration.execution_profile.runner_mode, 'pipeline');
+    assert.equal(completed.legacy_max_time_migration.execution_profile.runner_bin, 'pipeline-runner.js');
+    const reconciled = reconcileSessionLiveness(sessionDir);
+    assert.equal(reconciled.state.step, 'complete');
+    assert.equal(reconciled.state.recovery_kind, undefined);
+    assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
+  } finally {
+    let cleanupState = null;
+    try { cleanupState = new StateManager().read(statePath); } catch {}
+    for (const identity of [
+      supervisorIdentity,
+      daemonIdentity,
+      cleanupState?.autonomous_supervisor_identity,
+      cleanupState?.autonomous_owner_recovery_daemon_identity,
+    ]) {
+      if (identity) reapRecordedLiveProcessGroup(identity);
+    }
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
   }
@@ -695,6 +1024,113 @@ test('mapped legacy migration refuses a cwd already claimed by another live sess
     const legacy = new StateManager().read(path.join(legacyDir, 'state.json'));
     assert.equal(legacy.active, false);
     assert.equal(legacy.autonomous_budget_rollover_intent_id, undefined);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
+    else process.env.PICKLE_DATA_ROOT = previousRoot;
+  }
+});
+
+test('legacy bootstrap classifier rejects approval, adoption, partial pipeline, and conflicting loop artifacts', () => {
+  for (const fixture of [
+    { label: 'approved', write: (sessionDir) => writeJson(path.join(sessionDir, 'citadel-release-approval.json'), {}) },
+    { label: 'adoption', write: (sessionDir) => writeJson(path.join(sessionDir, 'legacy-session-adoption-transaction.json'), {}) },
+    { label: 'partial-pipeline', state: { pipeline_mode: true }, write: (sessionDir, workingDir) => writeJson(path.join(sessionDir, 'pipeline.json'), { working_dir: workingDir }) },
+    { label: 'conflicting-loop-pipeline', state: { pipeline_mode: true }, write: (sessionDir, workingDir) => {
+      writeJson(path.join(sessionDir, 'pipeline.json'), { working_dir: workingDir });
+      writeJson(path.join(sessionDir, 'pipeline-state.json'), { schema_version: 1 });
+      writeJson(path.join(sessionDir, 'loop_config.json'), { mode: 'anatomy-park', target: workingDir });
+    } },
+  ]) {
+    const workingDir = makeTempRoot(`pickle-legacy-classifier-${fixture.label}-work-`);
+    const sessionDir = makeTempRoot(`pickle-legacy-classifier-${fixture.label}-session-`);
+    const startCommit = initializeGitRepository(workingDir);
+    writeJson(path.join(sessionDir, 'state.json'), state({
+      active: false,
+      working_dir: fs.realpathSync(workingDir),
+      session_dir: fs.realpathSync(sessionDir),
+      step: 'paused',
+      last_exit_reason: 'max_time',
+      start_commit: startCommit,
+      pinned_sha: startCommit,
+      tmux_mode: true,
+      pipeline_mode: false,
+      tmux_runner_pid: null,
+      worker_pid: null,
+      active_child_pid: null,
+      history: [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }],
+      ...fixture.state,
+    }));
+    sealLegacySession(sessionDir, workingDir);
+    writeJson(path.join(sessionDir, 'refinement_manifest.json'), {
+      tickets: [{ id: 'release-validation', title: 'Validate release', status: 'Done' }],
+    });
+    fixture.write(sessionDir, fs.realpathSync(workingDir));
+    const result = reconcileSessionLiveness(sessionDir, undefined, Date.now(), { allowLegacyMaxTimeMigration: true });
+    assert.equal(result.state.active, false, fixture.label);
+    assert.equal(result.state.legacy_max_time_migration, undefined, fixture.label);
+    assert.equal(fs.existsSync(path.join(sessionDir, 'logical-pipeline.json')), false, fixture.label);
+  }
+});
+
+test('legacy logical bootstrap resumes both pre-seal and post-seal crash stages under the same source CAS', async () => {
+  const dataRoot = makeTempRoot('pickle-legacy-logical-data-');
+  const previousRoot = process.env.PICKLE_DATA_ROOT;
+  process.env.PICKLE_DATA_ROOT = dataRoot;
+  try {
+    for (const stage of ['pre-seal', 'post-seal']) {
+    const workingDir = makeTempRoot(`pickle-legacy-logical-${stage}-work-`);
+    const sessionDir = path.join(dataRoot, 'sessions', `${stage}-session`);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const statePath = path.join(sessionDir, 'state.json');
+    const startCommit = initializeGitRepository(workingDir);
+    writeJson(statePath, state({
+      active: false,
+      working_dir: fs.realpathSync(workingDir),
+      session_dir: fs.realpathSync(sessionDir),
+      step: 'paused',
+      last_exit_reason: 'max_time',
+      start_commit: startCommit,
+      pinned_sha: startCommit,
+      tmux_mode: true,
+      pipeline_mode: false,
+      tmux_runner_pid: null,
+      worker_pid: null,
+      active_child_pid: null,
+      history: [{ step: 'max_time', timestamp: '2026-08-09T07:37:50.045Z' }],
+    }));
+    sealLegacySession(sessionDir, workingDir);
+    writeJson(path.join(sessionDir, 'loop_config.json'), {
+      mode: 'anatomy-park', target: fs.realpathSync(workingDir), stall_limit: 5,
+    });
+    const source = new StateManager().read(statePath);
+    const sourceHash = crypto.createHash('sha256').update(JSON.stringify(source)).digest('hex');
+    const pipelineId = `legacy-max-time-${sourceHash.slice(0, 24)}`;
+    createLogicalPipeline(sessionDir, pipelineId);
+    if (stage === 'post-seal') beginAutonomousExecution(sessionDir);
+
+    await updateSessionMap(fs.realpathSync(workingDir), sessionDir);
+    assert.equal(await resolveSessionForCwd(workingDir), sessionDir, stage);
+    const reconciled = new StateManager().read(statePath);
+    assert.equal(reconciled.active, true, stage);
+    assert.equal(reconciled.legacy_max_time_migration.source_state_sha256, sourceHash, stage);
+    assert.equal(reconciled.legacy_max_time_migration.logical_pipeline_id, pipelineId, stage);
+    assert.ok(['pending', 'restoring', 'restored'].includes(reconciled.autonomous_owner_restoration.status), stage);
+    assert.equal(readLogicalPipeline(sessionDir).control_state, 'autonomous_execution', stage);
+    const owned = await waitForState(statePath, (current) => (
+      current.autonomous_owner_recovery_daemon_identity
+    ), 5_000);
+    try { cancelLogicalPipelineByOperator(sessionDir, 'test cleanup'); } catch {}
+    new StateManager().update(statePath, (current) => {
+      current.cancel_requested_at ||= new Date().toISOString();
+      current.last_exit_reason = 'cancelled';
+      return current;
+    });
+    const final = new StateManager().read(statePath);
+    for (const identity of [final.autonomous_supervisor_identity, owned.autonomous_owner_recovery_daemon_identity]) {
+      if (!identity) continue;
+      assert.ok(['reaped', 'not-running'].includes(reapRecordedLiveProcessGroup(identity).status), stage);
+    }
+    }
   } finally {
     if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
     else process.env.PICKLE_DATA_ROOT = previousRoot;

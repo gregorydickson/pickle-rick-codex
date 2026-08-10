@@ -169,6 +169,9 @@ async function main(argv: string[]): Promise<void> {
   const forwarded = argv.filter((arg) => arg !== sessionDir && arg !== runnerArg);
   const runtimeBin = path.dirname(fileURLToPath(import.meta.url));
   const acceptingHandoff = forwarded.some((arg) => arg.startsWith('--handoff-request='));
+  // Validate the durable control plane before launching any detached recovery owner.
+  // A corrupt logical journal is terminal input corruption, not an ownership outage.
+  readLogicalPipeline(sessionDir);
   if (!acceptingHandoff) {
     await initializeAutonomousOwnerRecovery(sessionDir, runnerBin, forwarded, runtimeBin);
   }
