@@ -267,7 +267,10 @@ receipt: `queued | launching | ready | terminal | cancelled | quarantined`.
 13. A required Darwin/tmux soak runs 50 sessions at capacity 4, with at least 46 simultaneously
     queued at peak. It injects imported overflow, malformed request, manager death,
     coordinator-process death, coordinator-tmux loss, cancellation, drain, retirement, and
-    recreation. Every valid nonterminal request promotes within 30 s of eligibility.
+    recreation. Every valid nonterminal request promotes within 30 s of eligibility. Its ticket
+    verification invokes the newly implemented harness directly as
+    `node extension/scripts/legacy-adoption-fleet-soak.js --sessions 50 --capacity 4 --timeout-seconds 900`;
+    refinement must not require a package script that does not exist before the ticket runs.
 14. During the soak there is at most one coordinator tmux stack and one guardian per root; queued
     stack count is zero; newly admitted manager/executor pairs are at most capacity; transient
     launcher overlap is at most one per launching claim for at most 5 s; coordinator-plus-guardian
@@ -316,3 +319,6 @@ Load average alone is not authoritative because unrelated applications can domin
 - No direct async executor child ownership by a synchronously polling supervisor.
 - No removal or replacement of existing executor launch/restart WALs.
 - No hooks, native-agent fanout, or interactive process in the guaranteed path.
+- No verification manifest may depend on a package script introduced by the same ticket. New
+  harnesses use an explicit `node <path> ...` process command so preflight can validate the
+  executable contract before implementation.
