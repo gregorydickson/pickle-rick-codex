@@ -13,6 +13,7 @@ import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { listRunnerDescriptors } from '../services/runner-descriptors.js';
 import { updateSessionMap } from '../services/session-map.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
+import { ensureSessionPrdSeal, initializePrdDevelopmentPipeline } from '../services/session-prd-seal.js';
 import { captureProcessLivenessIdentity, captureSpawnedProcessIdentity, inspectProcessLivenessIdentity } from '../services/orphan-reaper.js';
 import { acceptTestRefinement, makeTempRoot, repoRoot, runNode, writeJson, prependPath, createFakeTmux, writeExecutable, waitFor, fakeLifecycleArtifactWriterSource } from './helpers.js';
 import { createFakeCodex } from './helpers.js';
@@ -1752,7 +1753,7 @@ test('mux-runner refuses pre-existing untracked files before worker execution', 
   assert.match(ticket.frontmatter.failure_reason, /pre-existing-dirt/);
 });
 
-test('mux-runner preserves ticket failure when max_time would block a retry', () => {
+function createMaxTimeFailureFixture() {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-runner-failure-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
@@ -1761,6 +1762,7 @@ test('mux-runner preserves ticket failure when max_time would block a retry', ()
   runGit(projectDir, ['add', 'README.md']);
   runGit(projectDir, ['commit', '-m', 'fixture']);
   const countPath = path.join(dataRoot, 'codex-fail-count.txt');
+  const budgetExpiredMarker = path.join(dataRoot, 'worker-started-before-budget-expiry');
   writeExecutable(
     path.join(fakeBin, 'codex'),
     `#!/usr/bin/env node
@@ -1776,7 +1778,24 @@ if (args[0] === '--version') {
   process.exit(0);
 }
 
-await new Promise((resolve) => setTimeout(resolve, 1200));
+const statePath = process.env.PICKLE_TEST_FAILURE_STATE_PATH;
+const deadline = Date.now() + 5000;
+let state;
+while (Date.now() < deadline) {
+  state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  if (Number.isInteger(state.worker_pid) && state.worker_pid > 0 && state.active_child_identity) break;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+if (!state || !Number.isInteger(state.worker_pid) || state.worker_pid <= 0 || !state.active_child_identity) {
+  console.error('fake codex never received its durable child ownership fence');
+  process.exit(2);
+}
+state.max_time_minutes = 0.005;
+state.run_start_time_epoch = 1;
+const tempPath = statePath + '.fixture-' + process.pid;
+fs.writeFileSync(tempPath, JSON.stringify(state));
+fs.renameSync(tempPath, statePath);
+fs.writeFileSync(${JSON.stringify(budgetExpiredMarker)}, 'worker-started-before-budget-expiry');
 console.error('fake codex failure');
 process.exit(1);
 `,
@@ -1807,11 +1826,35 @@ process.exit(1);
     ...readJsonFile(path.join(sessionDir, 'state.json')),
     active: false,
     step: 'paused',
-    max_time_minutes: 0.005,
+    max_time_minutes: 1,
     start_time_epoch: 1,
     run_start_time_epoch: 1,
     last_exit_reason: null,
   });
+  env.PICKLE_TEST_FAILURE_STATE_PATH = path.join(sessionDir, 'state.json');
+
+  return { budgetExpiredMarker, countPath, dataRoot, env, projectDir, sessionDir };
+}
+
+function assertMaxTimeFailureEvidence(fixture, expectedExitReason) {
+  const { budgetExpiredMarker, countPath, sessionDir } = fixture;
+  const state = readJsonFile(path.join(sessionDir, 'state.json'));
+  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
+  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+
+  assert.equal(state.last_exit_reason, expectedExitReason);
+  assert.equal(ticket.status, 'Blocked');
+  assert.match(ticket.frontmatter.failure_reason, /fake codex failure/);
+  assert.match(log, /ticket r1 failed on attempt 1/);
+  assert.doesNotMatch(log, /attempt 2\/2/);
+  assert.equal(fs.readFileSync(countPath, 'utf8'), '1');
+  assert.equal(fs.readFileSync(budgetExpiredMarker, 'utf8'), 'worker-started-before-budget-expiry');
+  return { log, state };
+}
+
+test('non-durable mux-runner preserves ticket failure when max_time blocks its retry', () => {
+  const fixture = createMaxTimeFailureFixture();
+  const { env, projectDir, sessionDir } = fixture;
 
   try {
     runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
@@ -1822,22 +1865,41 @@ process.exit(1);
     // The child process may surface the terminal error directly; session state is the real assertion target.
   }
 
-  const state = readJsonFile(path.join(sessionDir, 'state.json'));
-  const ticket = parseTicketFile(path.join(sessionDir, 'r1', 'linear_ticket_r1.md'));
-  const log = fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8');
+  const { log, state } = assertMaxTimeFailureEvidence(fixture, 'error');
 
   assert.equal(state.active, false);
-  assert.equal(state.last_exit_reason, 'error');
   assert.equal(state.step, 'paused');
   assert.equal(state.current_ticket, 'r1');
   assert.equal(state.tmux_runner_pid, null);
   assert.equal(state.history.at(-1).step, 'failed');
-  assert.equal(ticket.status, 'Blocked');
-  assert.match(ticket.frontmatter.failure_reason, /fake codex failure/);
-  assert.match(log, /ticket r1 failed on attempt 1/);
   assert.match(log, /mux-runner finished: error/);
-  assert.doesNotMatch(log, /attempt 2\/2/);
-  assert.equal(fs.readFileSync(countPath, 'utf8'), '1');
+});
+
+test('durable mux-runner preserves ticket failure while max_time schedules owner rollover', () => {
+  const fixture = createMaxTimeFailureFixture();
+  const { env, projectDir, sessionDir } = fixture;
+  initializePrdDevelopmentPipeline(sessionDir);
+  ensureSessionPrdSeal(sessionDir);
+
+  runNode([path.join(repoRoot, 'bin/mux-runner.js'), sessionDir, '--on-failure=retry-once'], {
+    env,
+    cwd: projectDir,
+  });
+
+  const { log, state } = assertMaxTimeFailureEvidence(fixture, 'autonomous_budget_rollover');
+  assert.equal(state.active, true);
+  assert.equal(state.current_ticket, 'r1');
+  assert.match(state.autonomous_budget_rollover_intent_id, /^[0-9a-f-]{36}$/);
+  assert.equal(state.autonomous_budget_epoch, 1);
+  assert.match(log, /persisted autonomous budget epoch 1/);
+  assert.match(log, /mux-runner finished: autonomous_budget_rollover/);
+  const logical = readJsonFile(path.join(sessionDir, 'logical-pipeline.json'));
+  assert.equal(logical.terminal_state, null);
+  assert.ok(logical.events.some((event) => (
+    event.kind === 'checkpoint_recorded'
+      && event.details?.checkpoint?.kind === 'autonomous_budget_rollover'
+      && event.details.checkpoint.intent_id === state.autonomous_budget_rollover_intent_id
+  )));
 });
 
 test('mux-runner does not retry verification-contract failures and leaves the ticket blocked', () => {
