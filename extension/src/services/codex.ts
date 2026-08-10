@@ -234,6 +234,7 @@ async function runSpawnedCommand({
     let launchAttested = false;
     let releaseAttested = false;
     let shutdownAckObserved = false;
+    let brokerShutdownCause = '';
     let targetOutcome: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let protocolFailure = '';
     let launchDeliveryFailure = '';
@@ -631,6 +632,7 @@ async function runSpawnedCommand({
 
       if (record.type === 'shutdown_ack') {
         if (!bound || shutdownAckObserved
+          || typeof record.cause !== 'string' || !record.cause
           || (targetIdentity && !sameIdentity(targetIdentity, record.target_identity))) {
           if (shutdownAckObserved && bound
             && (!targetIdentity || sameIdentity(targetIdentity, record.target_identity))) return;
@@ -638,6 +640,7 @@ async function runSpawnedCommand({
           return;
         }
         shutdownAckObserved = true;
+        brokerShutdownCause = record.cause;
         if (!persistDescendantLedger(record.descendant_identities)) {
           protocolFailure = 'Monitored descendant shutdown ledger was malformed or conflicted.';
           return;
@@ -750,8 +753,14 @@ async function runSpawnedCommand({
         const outputFormat = detectOutputFormat(stdout);
         const usage = inspectCodexUsage(stdout);
         const unattestedBrokerClose = controlsArmed && !brokerDrainAttested;
+        const targetExitedBeforeTimeout = terminationCause === 'timeout'
+          && shutdownAckObserved
+          && (brokerShutdownCause === 'target-exit' || /^target-SIG[A-Z0-9]+$/.test(brokerShutdownCause))
+          && Boolean(targetOutcome && (targetOutcome.code !== null || targetOutcome.signal !== null));
+        const effectiveTerminationCause = targetExitedBeforeTimeout ? null : terminationCause;
         const drainFailureDiagnostic = unattestedBrokerClose ? JSON.stringify({
           shutdown_ack_observed: shutdownAckObserved,
+          broker_shutdown_cause: brokerShutdownCause || null,
           launch_attested: launchAttested,
           release_attested: releaseAttested,
           broker_identity_persisted: Boolean(brokerIdentity),
@@ -766,13 +775,14 @@ async function runSpawnedCommand({
           target_outcome: targetOutcome,
           broker_close: { code, signal },
           termination_cause: terminationCause,
+          effective_termination_cause: effectiveTerminationCause,
           attestation_observations: attestationObservations,
         }) : '';
         const naturalExitCode = targetOutcome?.code ?? (targetOutcome?.signal ? 1 : (code ?? (signal ? 1 : 0)));
         const result: Omit<CodexSpawnResult, 'command' | 'args'> = {
-          exitCode: terminationCause === 'cancel'
+          exitCode: effectiveTerminationCause === 'cancel'
             ? 130
-            : terminationCause === 'timeout'
+            : effectiveTerminationCause === 'timeout'
               ? 124
               : successObserved && !unattestedBrokerClose && !protocolFailure
                 ? 0
@@ -786,17 +796,21 @@ async function runSpawnedCommand({
             !brokerDrainAttested ? shutdownReleaseDeliveryFailure : '',
             targetPublicationError?.message || '',
           ].filter(Boolean).join('\n'),
-          timedOut: terminationCause === 'timeout',
+          timedOut: effectiveTerminationCause === 'timeout',
           durationMs: Date.now() - startedAt,
           lastMessage: message,
           usage: usage.usage as CodexUsage,
           usageReported: usage.reported,
-          terminatedAfterSuccess: terminationCause === 'success',
-          cancelled: terminationCause === 'cancel',
+          terminatedAfterSuccess: effectiveTerminationCause === 'success',
+          cancelled: effectiveTerminationCause === 'cancel',
           outputFormat,
           assistantContent: extractAssistantContent(stdout),
           toolCalls: collectCodexToolCalls(stdout),
           drainAttested: brokerDrainAttested,
+          shutdownCause: brokerShutdownCause || null,
+          requestedTerminationCause: terminationCause,
+          effectiveTerminationCause,
+          targetOutcome,
           processIdentities: { broker: brokerIdentity, target: targetIdentity, descendants: descendantIdentities },
         };
         if (targetPublicationError) {

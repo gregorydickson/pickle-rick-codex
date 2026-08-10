@@ -211,20 +211,31 @@ function beginShutdown(cause: string, graceMs: number): void {
   // scheduler-starved, but the broker remains alive as the durable ledger.
   // Disconnect drains immediately; a connected-but-wedged controller gets the
   // bounded autonomous fallback below.
-  send(acknowledgement, (error) => {
-    if (error) {
-      executeShutdown();
-      return;
-    }
-    if (shutdownExecuting) return;
-    signalTermination();
-    shutdownReleaseTimer = setTimeout(() => {
-      shutdownCause = `${shutdownCause}-controller-release-timeout`;
-      process.stderr.write(`Monitored process broker autonomous fallback: ${shutdownCause}\n`);
-      executeShutdown();
-    }, BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS);
-    shutdownReleaseTimer.ref?.();
-  });
+  const publishAcknowledgement = (): void => {
+    send(acknowledgement, (error) => {
+      if (error) {
+        executeShutdown();
+        return;
+      }
+      if (shutdownExecuting) return;
+      signalTermination();
+      shutdownReleaseTimer = setTimeout(() => {
+        shutdownCause = `${shutdownCause}-controller-release-timeout`;
+        process.stderr.write(`Monitored process broker autonomous fallback: ${shutdownCause}\n`);
+        executeShutdown();
+      }, BROKER_SHUTDOWN_RELEASE_TIMEOUT_MS);
+      shutdownReleaseTimer.ref?.();
+    });
+  };
+  const testAckDelayMs = launch.env.PICKLE_TEST_MODE === '1'
+    ? Math.max(0, Math.min(Number(launch.env.PICKLE_TEST_BROKER_ACK_DELAY_MS || 0), 5_000))
+    : 0;
+  if (testAckDelayMs > 0) {
+    const timer = setTimeout(publishAcknowledgement, testAckDelayMs);
+    timer.ref?.();
+  } else {
+    publishAcknowledgement();
+  }
 }
 
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as NodeJS.Signals[]) {

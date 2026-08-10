@@ -165,8 +165,61 @@ test('codex runner treats EPIPE from a closed child stdin as a process outcome',
     timeoutMs: 2_000,
   });
 
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 0, JSON.stringify({
+    shutdownCause: result.shutdownCause,
+    requestedTerminationCause: result.requestedTerminationCause,
+    effectiveTerminationCause: result.effectiveTerminationCause,
+    targetOutcome: result.targetOutcome,
+  }));
   assert.equal(result.timedOut, false);
+});
+
+test('authenticated target exit supersedes a timeout callback that runs before delayed shutdown ack', async () => {
+  const result = await runCommand({
+    command: '/usr/bin/true',
+    args: [],
+    input: 'x'.repeat(8 * 1024 * 1024),
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_BROKER_ACK_DELAY_MS: '3000',
+    },
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(result.exitCode, 0, JSON.stringify({
+    shutdownCause: result.shutdownCause,
+    requestedTerminationCause: result.requestedTerminationCause,
+    effectiveTerminationCause: result.effectiveTerminationCause,
+    targetOutcome: result.targetOutcome,
+  }));
+  assert.equal(result.timedOut, false);
+  assert.equal(result.cancelled, false);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'target-exit');
+  assert.equal(result.requestedTerminationCause, 'timeout');
+  assert.equal(result.effectiveTerminationCause, null);
+  assert.deepEqual(result.targetOutcome, { code: 0, signal: null });
+});
+
+test('explicit cancellation remains terminal when a prior target-exit ack is delayed', async () => {
+  const result = await runCommand({
+    command: '/usr/bin/true',
+    env: {
+      PICKLE_TEST_MODE: '1',
+      PICKLE_TEST_BROKER_ACK_DELAY_MS: '500',
+    },
+    timeoutMs: 10_000,
+    cancelCheck: () => true,
+  });
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.cancelled, true);
+  assert.equal(result.drainAttested, true);
+  assert.equal(result.shutdownCause, 'target-exit');
+  assert.equal(result.requestedTerminationCause, 'cancel');
+  assert.equal(result.effectiveTerminationCause, 'cancel');
+  assert.deepEqual(result.targetOutcome, { code: 0, signal: null });
 });
 
 test('codex runner terminates the spawned process when ownership persistence rejects onSpawn', async () => {

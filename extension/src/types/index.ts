@@ -382,6 +382,10 @@ export interface CodexSpawnResult {
   assistantContent: string;
   toolCalls: import('../services/classifier-utils.js').CodexToolCallObservation[];
   drainAttested: boolean;
+  shutdownCause?: string | null;
+  requestedTerminationCause?: 'success' | 'cancel' | 'timeout' | 'cancel-check-error' | null;
+  effectiveTerminationCause?: 'success' | 'cancel' | 'timeout' | 'cancel-check-error' | null;
+  targetOutcome?: { code: number | null; signal: NodeJS.Signals | null } | null;
   processIdentities: {
     broker: import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
     target: import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
