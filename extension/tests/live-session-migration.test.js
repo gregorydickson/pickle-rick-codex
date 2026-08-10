@@ -2,15 +2,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTempRoot, writeJson } from './helpers.js';
 import {
   LIVE_SESSION_MIGRATION_FILE,
+  deriveRepinnedLiveSessionMigration,
   finalizeLiveSessionMigrationAfterHandoff,
   prepareLiveSessionHandoffCheckpoint,
   prepareLiveSessionMigration,
   verifyLiveSessionMigration,
+  verifyLiveSessionMigrationDomainBoundary,
 } from '../services/live-session-migration.js';
 import {
   acceptRuntimeHandoff,
@@ -27,6 +30,12 @@ const targetRuntime = { runtime_id: 'candidate-green', version: '0.3.0', build_h
 
 function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function canonicalize(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(',')}}`;
 }
 
 function fixture() {
@@ -121,6 +130,47 @@ test('migration continuity detects post-handoff evidence mutation', () => {
   const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date());
   writeJson(path.join(sessionDir, 'ticket-recovery-history.json'), { schema_version: 1, events: [] });
   assert.throws(() => verifyLiveSessionMigration(sessionDir, migration), /continuity failed for ticket-recovery-history.json/);
+});
+
+test('bounded readiness telemetry remains mutable across new and legacy sealed migrations', () => {
+  const { sessionDir } = fixture();
+  const historyPath = path.join(sessionDir, 'readiness-history.json');
+  const firstHistory = Buffer.from(`${JSON.stringify({
+    schema_version: 1, cycles: [{ checked_at: '2026-08-08T18:00:00.000Z', ready: false }],
+  }, null, 2)}\n`);
+  fs.writeFileSync(historyPath, firstHistory);
+  const migration = prepareLiveSessionMigration(sessionDir, sourceRuntime, targetRuntime, new Date());
+  assert.equal(migration.preserved_artifacts.some((entry) => entry.path === 'readiness-history.json'), false);
+
+  const legacyPayload = {
+    ...migration,
+    preserved_artifacts: [...migration.preserved_artifacts, {
+      path: 'readiness-history.json',
+      sha256: crypto.createHash('sha256').update(firstHistory).digest('hex'),
+      size: firstHistory.length,
+    }].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0),
+  };
+  delete legacyPayload.content_hash;
+  const legacyMigration = {
+    ...legacyPayload,
+    content_hash: crypto.createHash('sha256').update(canonicalize(legacyPayload)).digest('hex'),
+  };
+  writeJson(historyPath, {
+    schema_version: 1,
+    cycles: [
+      { checked_at: '2026-08-08T18:00:00.000Z', ready: false },
+      { checked_at: '2026-08-10T17:09:33.186Z', ready: true },
+    ],
+  });
+
+  assert.doesNotThrow(() => verifyLiveSessionMigration(sessionDir, migration));
+  assert.doesNotThrow(() => verifyLiveSessionMigration(sessionDir, legacyMigration));
+  assert.doesNotThrow(() => verifyLiveSessionMigrationDomainBoundary(
+    sessionDir, legacyMigration, sourceRuntime, targetRuntime,
+  ));
+  assert.equal(deriveRepinnedLiveSessionMigration(
+    legacyMigration, targetRuntime,
+  ).preserved_artifacts.some((entry) => entry.path === 'readiness-history.json'), false);
 });
 
 test('migration preserves verification repair receipts and prepared crash transactions', () => {

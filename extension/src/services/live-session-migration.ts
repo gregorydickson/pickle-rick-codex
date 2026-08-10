@@ -50,6 +50,10 @@ export interface PrepareLiveSessionMigrationOptions {
   forceVerificationContractRepair?: boolean;
 }
 
+// Bounded operational telemetry may be updated by readiness diagnostics after
+// a migration is sealed. It remains in place, but is not continuity authority.
+const MUTABLE_SESSION_TELEMETRY = new Set(['readiness-history.json']);
+
 function sha256(value: string | Buffer): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
@@ -69,6 +73,7 @@ function sessionFiles(root: string, current = root): string[] {
     if (entry.isDirectory() && ['watch-materials', 'watch-terminal-recovery'].includes(relative)) return [];
     if (entry.isDirectory()) return sessionFiles(root, absolute);
     if (!entry.isFile() || relative === LIVE_SESSION_MIGRATION_FILE
+      || MUTABLE_SESSION_TELEMETRY.has(relative)
       || relative === 'legacy-session-adoption-transaction.json'
       || relative === 'legacy-session-adoption.json'
       || relative === 'legacy-session-adoption-watch.json'
@@ -81,6 +86,10 @@ function sessionFiles(root: string, current = root): string[] {
       || relative.endsWith('.lock')) return [];
     return [relative];
   });
+}
+
+function durablePreservedArtifacts(artifacts: PreservedArtifact[]): PreservedArtifact[] {
+  return artifacts.filter((artifact) => !MUTABLE_SESSION_TELEMETRY.has(artifact.path));
 }
 
 function inventory(sessionDir: string): PreservedArtifact[] {
@@ -254,7 +263,7 @@ export function deriveRepinnedLiveSessionMigration(
     session_schema: prior.session_schema,
     session_was_active: true as const,
     resume_checkpoint: prior.resume_checkpoint,
-    preserved_artifacts: prior.preserved_artifacts,
+    preserved_artifacts: durablePreservedArtifacts(prior.preserved_artifacts),
     salvage_refs: prior.salvage_refs,
     created_at: now.toISOString(),
   };
@@ -265,7 +274,7 @@ export function verifyLiveSessionMigration(sessionDir: string, migration: Instal
   const { content_hash: contentHash, ...payload } = migration;
   if (contentHash !== sha256(canonicalize(payload))) throw new Error('Live session migration manifest hash mismatch.');
   const current = new Map(stableInventory(sessionDir).map((entry) => [entry.path, entry]));
-  for (const preserved of migration.preserved_artifacts) {
+  for (const preserved of durablePreservedArtifacts(migration.preserved_artifacts)) {
     const actual = current.get(preserved.path);
     if (!actual || actual.sha256 !== preserved.sha256 || actual.size !== preserved.size) {
       throw new Error(`Live session migration continuity failed for ${preserved.path}.`);
@@ -297,13 +306,14 @@ export function verifyLiveSessionMigrationDomainBoundary(
     throw new Error('Live session migration runtime identity does not match the installed runtime.');
   }
   const currentInventory = stableInventory(sessionDir);
-  const preservedPaths = new Set(migration.preserved_artifacts.map((artifact) => artifact.path));
+  const durableMigrationArtifacts = durablePreservedArtifacts(migration.preserved_artifacts);
+  const preservedPaths = new Set(durableMigrationArtifacts.map((artifact) => artifact.path));
   const postSealArtifacts = currentInventory.filter((artifact) => !preservedPaths.has(artifact.path));
   if (postSealArtifacts.some((artifact) => !['logical-pipeline.json', 'prd.lock.json'].includes(artifact.path))) {
     throw new Error('Live session migration has unauthenticated post-seal artifacts.');
   }
   const currentPreserved = currentInventory.filter((artifact) => preservedPaths.has(artifact.path));
-  if (canonicalize(migration.preserved_artifacts) !== canonicalize(currentPreserved)) {
+  if (canonicalize(durableMigrationArtifacts) !== canonicalize(currentPreserved)) {
     throw new Error('Live session migration inventory does not exactly match the durable session.');
   }
   const postSealPrd = postSealArtifacts.some((artifact) => artifact.path === 'prd.lock.json')
