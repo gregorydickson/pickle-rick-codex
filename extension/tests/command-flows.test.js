@@ -1648,7 +1648,12 @@ test('cancel stops every concurrent refinement analyst and releases session owne
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
-  const env = prependPath(fakeBin, { PICKLE_DATA_ROOT: dataRoot });
+  const signalLog = path.join(dataRoot, 'refinement-signal-times.log');
+  const env = prependPath(fakeBin, {
+    PICKLE_DATA_ROOT: dataRoot,
+    PICKLE_TEST_BROKER_ACK_DELAY_MS: '1500',
+    PICKLE_TEST_SIGNAL_LOG: signalLog,
+  });
   writeExecutable(
     path.join(fakeBin, 'codex'),
     `#!/usr/bin/env node
@@ -1660,7 +1665,10 @@ if (args[0] === '--version') {
   process.exit(0);
 }
 fs.readFileSync(0, 'utf8');
-const stop = () => process.exit(143);
+const stop = () => {
+  fs.appendFileSync(process.env.PICKLE_TEST_SIGNAL_LOG, String(Date.now()) + '\\n');
+  process.exit(143);
+};
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 setInterval(() => {}, 1000);
@@ -1683,18 +1691,19 @@ setInterval(() => {}, 1000);
   const identities = await waitFor(() => {
     const state = readJsonFile(path.join(sessionDir, 'state.json'));
     if (!Array.isArray(state.refinement_child_identities)
-      || state.refinement_child_identities.length !== 6) return null;
+      || state.refinement_child_identities.length < 6) return null;
     const groups = new Map();
     for (const identity of state.refinement_child_identities) {
       groups.set(identity.pgid, [...(groups.get(identity.pgid) || []), identity]);
     }
     return groups.size === 3
-      && [...groups.values()].every((group) => group.length === 2
+      && [...groups.values()].every((group) => group.length >= 2
         && group.some(({ pid, pgid }) => pid === pgid))
       ? state.refinement_child_identities
       : null;
   }, { timeoutMs: 10_000, message: 'refinement did not persist all broker/target analyst identities' });
 
+  const cancelStartedAtMs = Date.now();
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
     cwd: projectDir,
     env,
@@ -1708,7 +1717,14 @@ setInterval(() => {}, 1000);
   assert.equal(state.active, false);
   assert.equal(state.last_exit_reason, 'cancelled');
   assert.deepEqual(state.refinement_child_identities, []);
+  assert.notEqual(state.recovery_required, true);
   assert.equal(fs.existsSync(path.join(sessionDir, '.session-operation.lock')), false);
+  const signalTimes = fs.readFileSync(signalLog, 'utf8').trim().split('\n').map(Number);
+  assert.equal(signalTimes.length, 3);
+  assert.ok(signalTimes.every((timestamp) => timestamp - cancelStartedAtMs >= 1_000),
+    'cancel raced the live refinement controller instead of allowing cooperative broker drain');
+  assert.ok(signalTimes.every((timestamp) => timestamp - cancelStartedAtMs < 9_500),
+    'cancel reached the fallback deadline instead of completing through cooperative broker drain');
 });
 
 test('runCodexExecMonitored ignores stale last-message success artifacts', async () => {

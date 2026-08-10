@@ -781,6 +781,8 @@ test('legacy paused max_time session migrates once through mapped lookup, superv
   const sessionDir = path.join(dataRoot, 'sessions', 'legacy-session');
   const statePath = path.join(sessionDir, 'state.json');
   const fakeBin = path.join(sessionDir, 'fake-bin');
+  const stableIterationMarker = path.join(dataRoot, 'second-iteration-ready');
+  const iterationCounter = path.join(dataRoot, 'iteration-count');
   fs.mkdirSync(fakeBin, { recursive: true });
   const startCommit = initializeGitRepository(workingDir);
   const fakeCodex = path.join(fakeBin, 'codex');
@@ -792,16 +794,19 @@ if (args[0] === 'exec' && args[1] === '--help') { console.log('--output-last-mes
 const prompt = fs.readFileSync(0, 'utf8');
 const output = args[args.indexOf('--output-last-message') + 1];
 const artifactDir = prompt.match(/Worker artifact dir: ([^\\n]+)/)?.[1]?.trim();
-let priorIteration = false;
+const invocationCount = fs.existsSync(process.env.PICKLE_TEST_ITERATION_COUNTER)
+  ? Number(fs.readFileSync(process.env.PICKLE_TEST_ITERATION_COUNTER, 'utf8')) + 1 : 1;
+fs.writeFileSync(process.env.PICKLE_TEST_ITERATION_COUNTER, String(invocationCount));
+const priorIteration = invocationCount > 1;
 if (artifactDir) {
   fs.mkdirSync(artifactDir, { recursive: true });
-  priorIteration = fs.existsSync(artifactDir + '/anatomy-park-summary.json');
   fs.writeFileSync(artifactDir + '/anatomy-park-summary.json', JSON.stringify({
     finding_family: 'legacy-migration-e2e', highest_severity_finding: 'productive real runner iteration',
     data_flow_path: 'daemon -> supervisor -> loop runner -> codex', fix_applied: 'advanced durable iteration',
     verification: ['real loop runner'], trap_doors: [], next_action: 'continue',
   }));
 }
+if (priorIteration) fs.writeFileSync(process.env.PICKLE_TEST_STABLE_ITERATION_MARKER, 'ready');
 // Complete the first productive iteration promptly, then keep its successor live long
 // enough to take the migration snapshot without racing another fixture iteration.
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, priorIteration ? 15000 : 350);
@@ -831,9 +836,13 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   const previousTestMode = process.env.PICKLE_TEST_MODE;
   const previousMigrationRuntime = process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
   const previousPath = process.env.PATH;
+  const previousStableIterationMarker = process.env.PICKLE_TEST_STABLE_ITERATION_MARKER;
+  const previousIterationCounter = process.env.PICKLE_TEST_ITERATION_COUNTER;
   process.env.PICKLE_DATA_ROOT = dataRoot;
   delete process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN;
   process.env.PATH = `${fakeBin}:${previousPath || ''}`;
+  process.env.PICKLE_TEST_STABLE_ITERATION_MARKER = stableIterationMarker;
+  process.env.PICKLE_TEST_ITERATION_COUNTER = iterationCounter;
   let restoredIdentity = null;
   let daemonIdentity = null;
   try {
@@ -864,6 +873,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
       current.autonomous_owner_restoration?.status === 'restored'
         && Number(current.iteration) >= 1
         && fs.existsSync(path.join(sessionDir, 'anatomy-park-summary.json'))
+        && fs.existsSync(stableIterationMarker)
     ), 15_000);
     restoredIdentity = restored.autonomous_supervisor_identity;
     daemonIdentity = restored.autonomous_owner_recovery_daemon_identity;
@@ -922,6 +932,10 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
     else process.env.PICKLE_TEST_LEGACY_MIGRATION_RUNTIME_BIN = previousMigrationRuntime;
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
+    if (previousStableIterationMarker === undefined) delete process.env.PICKLE_TEST_STABLE_ITERATION_MARKER;
+    else process.env.PICKLE_TEST_STABLE_ITERATION_MARKER = previousStableIterationMarker;
+    if (previousIterationCounter === undefined) delete process.env.PICKLE_TEST_ITERATION_COUNTER;
+    else process.env.PICKLE_TEST_ITERATION_COUNTER = previousIterationCounter;
   }
 });
 

@@ -50,7 +50,9 @@ async function invoke(sessionDir, command, outcome, phase, options = {}) {
   return await runCodexExecMonitored({
     command,
     prompt: phase,
-    timeoutMs: options.timeoutMs || 2_000,
+    // This suite validates telemetry classification, not broker startup latency.
+    // Keep the non-timeout cases outside the deadline under parallel suite load.
+    timeoutMs: options.timeoutMs ?? 15_000,
     env: { FAKE_OUTCOME: outcome, ...(options.env || {}) },
     cancelCheck: options.cancelCheck,
     telemetry: { sessionDir, ticketId: 'T1', phase, ticketAttempt: 2, phaseAttempt: 1, recoveryEpoch: 1 },
@@ -74,7 +76,9 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
   });
 
   assert.equal(success.exitCode, 0);
+  assert.equal(success.timedOut, false);
   assert.equal(failed.exitCode, 7);
+  assert.equal(failed.timedOut, false);
   assert.equal(timedOut.timedOut, true);
   assert.equal(fs.readFileSync(timeoutMarker, 'utf8'), 'ready');
   assert.ok(timedOut.durationMs >= 500);
@@ -110,19 +114,23 @@ test('successful, failed, timed-out, and cancelled model calls retain actual usa
 test('a true no-usage timeout persists unavailable telemetry without fabricated zero tokens', async () => {
   const sessionDir = makeTempRoot('pickle-no-usage-timeout-');
   const executable = path.join(makeTempRoot('pickle-no-usage-timeout-bin-'), 'codex');
+  const startMarker = path.join(sessionDir, 'started');
   fs.writeFileSync(executable, `#!/usr/bin/env node
+require('node:fs').writeFileSync(process.env.FAKE_MARKER, 'ready');
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
 
   const result = await runCodexExecMonitored({
     command: executable,
     prompt: 'no usage timeout',
-    timeoutMs: 80,
+    timeoutMs: 8_000,
+    env: { FAKE_MARKER: startMarker },
     telemetry: { sessionDir, ticketId: 'T1', phase: 'no_usage_timeout' },
   });
 
   assert.equal(result.exitCode, 124);
   assert.equal(result.timedOut, true);
+  assert.equal(fs.readFileSync(startMarker, 'utf8'), 'ready');
   assert.equal(result.usageReported, false);
   assert.deepEqual(result.usage, {
     input_tokens: 0,
@@ -130,7 +138,7 @@ setInterval(() => {}, 1000);
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
   });
-  assert.ok(result.durationMs >= 80);
+  assert.ok(result.durationMs >= 8_000);
   assertExactDrain(result);
   const event = JSON.parse(fs.readFileSync(path.join(sessionDir, 'execution-telemetry.json'), 'utf8')).events[0];
   assert.equal(event.outcome, 'timed_out');

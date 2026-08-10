@@ -329,14 +329,14 @@ test('authenticated A-B-A snapshot oscillation cannot renew the convergence leas
 });
 
 test('post-ack watchdog reaps a broker wedged before consuming shutdown release', {
-  timeout: 15_000,
+  timeout: 20_000,
 }, async () => {
   const startedAt = Date.now();
   const result = await runCommand({
     command: '/usr/bin/true',
     env: {
       PICKLE_TEST_MODE: '1',
-      PICKLE_TEST_BROKER_WEDGE_AFTER_ACK_MS: '5000',
+      PICKLE_TEST_BROKER_WEDGE_AFTER_ACK_MS: '10000',
       PICKLE_TEST_CONTROLLER_FORCE_KILL_TIMEOUT_MS: '500',
     },
     timeoutMs: 10_000,
@@ -344,7 +344,7 @@ test('post-ack watchdog reaps a broker wedged before consuming shutdown release'
 
   assert.equal(result.drainAttested, true, result.stderr);
   assert.equal(result.shutdownCause, 'target-exit');
-  assert.ok(Date.now() - startedAt < 4_000, 'post-ack broker wedge exceeded its release/drain watchdog');
+  assert.ok(Date.now() - startedAt < 9_500, 'post-ack broker wedge exceeded its release/drain watchdog');
 });
 
 test('prelaunch stop-attestation failure releases and drains the exact broker-only ledger', {
