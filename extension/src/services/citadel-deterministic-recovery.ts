@@ -12,6 +12,10 @@ import type { CodexSpawnResult } from '../types/index.js';
 import { createDisposableDetachedWorktree } from './disposable-worktree.js';
 import { assertRecordedActiveChildRecovered } from './orphan-reaper.js';
 import { StateManager } from './state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from './monitored-process-ownership.js';
 
 const RECOVERY_FILE = 'citadel-deterministic-recovery.json';
 const STRATEGIES = [
@@ -321,6 +325,8 @@ export async function runDeterministicRecoveryDiagnostic(
     ].join('\n\n');
     let ownershipError: unknown = null;
     try {
+      const statePath = path.join(sessionDir, 'state.json');
+      recoverMonitoredProcessOwnership(stateManager, statePath);
       const result: CodexSpawnResult = await (options.runCodex ?? runCodexExecMonitored)({
         cwd: isolated.workingDir,
         prompt,
@@ -328,16 +334,12 @@ export async function runDeterministicRecoveryDiagnostic(
         progressArtifactPaths: [artifactPath],
         addDirs: [attemptDir],
         inheritConfiguredAddDirs: false,
-        onSpawn: (child, identity) => {
-          stateManager.update(path.join(sessionDir, 'state.json'), (current) => {
-            current.active_child_pid = child.pid;
-            current.active_child_kind = 'codex';
-            current.active_child_command = `citadel-deterministic-diagnostic-${ordinal}`;
-            current.active_child_identity = identity;
-            current.active_child_controller_pid = process.pid;
-            return current;
-          });
-        },
+        ...monitoredProcessStateCallbacks(
+          stateManager,
+          statePath,
+          'codex',
+          `citadel-deterministic-diagnostic-${ordinal}`,
+        ),
         cancelCheck: () => {
           const current = stateManager.read(path.join(sessionDir, 'state.json'));
           if (current.last_exit_reason === 'cancelled' || current.cancel_requested_at) return true;
@@ -387,20 +389,7 @@ export async function runDeterministicRecoveryDiagnostic(
       try {
         isolated.cleanup();
       } finally {
-        try {
-          isolated.assertLiveUnchanged();
-        } finally {
-          if (!ownershipError) {
-            stateManager.update(path.join(sessionDir, 'state.json'), (current) => {
-              current.active_child_pid = null;
-              current.active_child_kind = null;
-              current.active_child_command = null;
-              current.active_child_identity = null;
-              current.active_child_controller_pid = null;
-              return current;
-            });
-          }
-        }
+        isolated.assertLiveUnchanged();
       }
     }
   }

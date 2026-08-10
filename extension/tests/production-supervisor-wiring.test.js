@@ -63,6 +63,21 @@ function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
 
+function assertExactProcessesAndGroupsAbsent(identities) {
+  assert.ok(identities.length >= 2, 'fixture must observe the durable broker and target identities');
+  for (const identity of identities) {
+    assert.equal(inspectProcessLivenessIdentity(identity), 'not-running');
+  }
+  if (process.platform === 'win32') return;
+  for (const pgid of new Set(identities.map(({ pgid }) => pgid))) {
+    assert.throws(
+      () => process.kill(-pgid, 0),
+      (error) => error?.code === 'ESRCH',
+      `attested process group ${pgid} must be absent`,
+    );
+  }
+}
+
 function writeCitadelSystemBlock(sessionDir, overrides = {}) {
   writeJson(path.join(sessionDir, 'citadel-system-block.json'), {
     schema_version: 1,
@@ -367,28 +382,61 @@ test('replacement executor reuses a real fenced plan checkpoint and completes wi
   const replacement = spawn(process.execPath, [path.join(moduleRoot, 'bin', 'mux-runner.js'), sessionDir, '--on-failure=retry'], {
     cwd: moduleRoot,
     env,
+    detached: true,
     stdio: 'ignore',
   });
+  const replacementIdentity = captureSpawnedProcessIdentity(replacement.pid);
+  assert.ok(replacementIdentity, 'replacement executor must have an immutable process-group identity');
   let observedReplacementExit = null;
   replacement.once('exit', (code, signal) => { observedReplacementExit = { code, signal }; });
+  const forceReplacementCleanup = async () => {
+    if (inspectProcessLivenessIdentity(replacementIdentity) === 'matched') {
+      try {
+        process.kill(-replacementIdentity.pgid, 'SIGKILL');
+      } catch (error) {
+        if (error?.code !== 'ESRCH') throw error;
+      }
+    }
+    await waitFor(() => observedReplacementExit || inspectProcessLivenessIdentity(replacementIdentity) !== 'matched', {
+      timeoutMs: 5_000,
+      intervalMs: 20,
+      message: 'failed replacement executor did not reap after exact-group cleanup',
+    });
+  };
   let checkpointCount = afterKill.events.filter((event) => event.kind === 'checkpoint_recorded').length;
   let observedTerminalState = afterKill.terminal_state;
+  let observedInvocationCount = 0;
+  let observedHistoryCount = new StateManager().read(statePath).history.length;
   let lastDurableProgressAt = Date.now();
-  let replacementExit;
+  const workerLivenessMs = Number(state.worker_timeout_seconds) * 1_000;
   try {
-    replacementExit = await waitFor(() => {
-      if (observedReplacementExit) return observedReplacementExit;
+    await waitFor(() => {
       const logical = readLogicalPipeline(sessionDir);
+      if (logical.terminal_state === 'completed') return logical;
+      if (observedReplacementExit) {
+        throw new Error(`replacement executor exited before logical terminalization: ${JSON.stringify(observedReplacementExit)}`);
+      }
+      if (logical.terminal_state !== null) {
+        throw new Error(`replacement executor reached unexpected logical terminal state ${logical.terminal_state}`);
+      }
+      const currentState = new StateManager().read(statePath);
       const currentCheckpointCount = logical.events.filter((event) => event.kind === 'checkpoint_recorded').length;
-      if (currentCheckpointCount > checkpointCount || logical.terminal_state !== observedTerminalState) {
+      const currentInvocationCount = fs.existsSync(invocationLog)
+        ? fs.readFileSync(invocationLog, 'utf8').trim().split('\n').filter(Boolean).length
+        : 0;
+      if (currentCheckpointCount > checkpointCount
+        || logical.terminal_state !== observedTerminalState
+        || currentInvocationCount > observedInvocationCount
+        || currentState.history.length > observedHistoryCount) {
         checkpointCount = currentCheckpointCount;
         observedTerminalState = logical.terminal_state;
+        observedInvocationCount = currentInvocationCount;
+        observedHistoryCount = currentState.history.length;
         lastDurableProgressAt = Date.now();
       }
-      if (Date.now() - lastDurableProgressAt > 20_000) {
-        const currentState = new StateManager().read(statePath);
+      if (Date.now() - lastDurableProgressAt > workerLivenessMs) {
         const latestCheckpoint = [...logical.events].reverse().find((event) => event.kind === 'checkpoint_recorded');
-        throw new Error(`replacement executor made no durable phase progress for 20 seconds: ${JSON.stringify({
+        throw new Error(`replacement executor made no semantic progress within its configured worker liveness bound: ${JSON.stringify({
           pid: replacement.pid,
           exit: observedReplacementExit,
           lease_owner: logical.lease?.owner_id || null,
@@ -401,15 +449,34 @@ test('replacement executor reuses a real fenced plan checkpoint and completes wi
       }
       return false;
     }, {
-      timeoutMs: Number(state.worker_timeout_seconds) * 1_000,
+      timeoutMs: workerLivenessMs * 12,
       intervalMs: 50,
-      message: 'replacement executor exceeded the configured worker liveness bound despite durable phase progress',
+      message: 'replacement executor exceeded the phase-count-derived convergence bound despite semantic progress',
     });
   } catch (error) {
-    replacement.kill('SIGKILL');
+    await forceReplacementCleanup();
+    throw error;
+  }
+  let replacementExit;
+  try {
+    replacementExit = await waitFor(() => observedReplacementExit, {
+      timeoutMs: 10_000,
+      intervalMs: 20,
+      message: 'logically completed replacement executor did not drain and exit',
+    });
+  } catch (error) {
+    await forceReplacementCleanup();
     throw error;
   }
   assert.deepEqual(replacementExit, { code: 0, signal: null });
+  assert.equal(inspectProcessLivenessIdentity(replacementIdentity), 'not-running');
+  if (process.platform !== 'win32') {
+    assert.throws(
+      () => process.kill(-replacementIdentity.pgid, 0),
+      (error) => error?.code === 'ESRCH',
+      'replacement executor process group must be absent after logical terminalization',
+    );
+  }
   const prompts = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line).prompt);
   const phases = prompts.map((prompt) => prompt.match(/You are executing the "([^"]+)" phase/)?.[1]).filter(Boolean);
   for (const phase of ['research', 'research_review', 'plan', 'plan_review', 'implement', 'review', 'conformance']) {
@@ -418,7 +485,14 @@ test('replacement executor reuses a real fenced plan checkpoint and completes wi
   const completed = readLogicalPipeline(sessionDir);
   assert.equal(completed.executor_restart_count, 2);
   assert.equal(completed.terminal_state, 'completed');
+  assert.equal(completed.lease, null);
   assert.equal(completed.events.some((event) => event.kind === 'pipeline_cancelled'), false);
+  const drainedState = new StateManager().read(statePath);
+  assert.equal(drainedState.active_child_pid, null);
+  assert.equal(drainedState.active_child_identity, null);
+  assert.deepEqual(drainedState.active_child_identities || [], []);
+  assert.equal(drainedState.active_child_controller_pid, null);
+  assert.equal(drainedState.active_child_controller_identity, null);
   assert.match(fs.readFileSync(path.join(sessionDir, 'mux-runner.log'), 'utf8'), /reused durable supervisor checkpoint through plan_review/);
 });
 
@@ -1653,7 +1727,7 @@ test('pipeline resumes a real reviewer contract diagnostic beyond five exhausted
   assert.equal(readLogicalPipeline(sessionDir).terminal_state, 'completed');
 });
 
-test('live reviewer diagnostic ownership drain remains resumable without consuming its mechanism', async () => {
+test('live reviewer diagnostic ownership drain reaps its worker and remains resumable without consuming its mechanism', async () => {
   const { sessionDir } = createAcceptedSession('Done');
   const reviewIdentity = '4'.repeat(64);
   writeJson(path.join(sessionDir, 'citadel-review-state.json'), {
@@ -1693,13 +1767,19 @@ test('live reviewer diagnostic ownership drain remains resumable without consumi
   const fakeBin = makeTempRoot('production-supervisor-reviewer-drain-bin-');
   createFakeCodex(fakeBin);
   const block = readCitadelSystemBlock(sessionDir);
+  const manager = new StateManager();
+  const statePath = path.join(sessionDir, 'state.json');
+  let drainedIdentities = [];
   const startedAt = Date.now();
   await assert.rejects(
     () => withProcessEnvironment(prependPath(fakeBin, {
       FAKE_REVIEWER_RECOVERY_DELAY_MS: '10000',
     }), async () => await repairCitadelReviewerArtifactContract(sessionDir, block, {
       assertDurableOwnership: () => {
-        if (Date.now() - startedAt > 150) throw new DurableOwnershipDrainError('fixture reviewer lease drained');
+        if (Date.now() - startedAt > 150) {
+          drainedIdentities = [...(manager.read(statePath).active_child_identities || [])];
+          throw new DurableOwnershipDrainError('fixture reviewer lease drained');
+        }
       },
     })),
     (error) => {
@@ -1716,9 +1796,13 @@ test('live reviewer diagnostic ownership drain remains resumable without consumi
   assert.equal(interruptedJournal.mechanism, 'schema_scaffold_replay');
   assert.deepEqual(interruptedJournal.mechanism_history, ['schema_scaffold_replay']);
   assert.deepEqual(interruptedJournal.attempts.map(({ status }) => status), ['started']);
-  const drainedState = new StateManager().read(path.join(sessionDir, 'state.json'));
-  assert.ok(Number.isInteger(drainedState.active_child_pid));
-  assert.ok(drainedState.active_child_identity);
+  assertExactProcessesAndGroupsAbsent(drainedIdentities);
+  const drainedState = manager.read(statePath);
+  assert.equal(drainedState.active_child_pid, null);
+  assert.equal(drainedState.active_child_identity, null);
+  assert.deepEqual(drainedState.active_child_identities, []);
+  assert.equal(drainedState.active_child_controller_pid, null);
+  assert.equal(drainedState.active_child_controller_identity, null);
 
   interruptedJournal.status = 'interrupted';
   interruptedJournal.attempts[0].status = 'interrupted';
@@ -1740,7 +1824,7 @@ test('live reviewer diagnostic ownership drain remains resumable without consumi
   assert.deepEqual(resolvedJournal.attempts.map(({ status }) => status), ['interrupted', 'resolved']);
 });
 
-test('criterion shard ownership drain preserves its worktree until exact child reap', async () => {
+test('criterion shard ownership drain reaps its worker while preserving resumable worktree state', async () => {
   const { sessionDir, workingDir } = createAcceptedSession('Done');
   const reviewBase = git(workingDir, ['rev-parse', 'HEAD']);
   fs.appendFileSync(path.join(workingDir, 'README.md'), '\ncriterion shard repository evidence\n');
@@ -1789,6 +1873,7 @@ test('criterion shard ownership drain preserves its worktree until exact child r
   createFakeCodex(fakeBin);
   const block = readCitadelSystemBlock(sessionDir);
   const manager = new StateManager();
+  let drainedIdentities = [];
   await assert.rejects(
     () => withProcessEnvironment(prependPath(fakeBin, {
       FAKE_CRITERION_SHARD_DELAY_MS: '10000',
@@ -1796,6 +1881,7 @@ test('criterion shard ownership drain preserves its worktree until exact child r
       assertDurableOwnership: () => {
         if (String(manager.read(path.join(sessionDir, 'state.json')).active_child_command || '')
           .startsWith('citadel-criterion-shard-')) {
+          drainedIdentities = [...(manager.read(path.join(sessionDir, 'state.json')).active_child_identities || [])];
           throw new DurableOwnershipDrainError('fixture criterion shard lease drained');
         }
       },
@@ -1815,9 +1901,13 @@ test('criterion shard ownership drain preserves its worktree until exact child r
   const drainedAttempt = drainedShardJournal.shards[0].attempts[0];
   assert.equal(drainedAttempt.status, 'started');
   assert.equal(fs.existsSync(drainedAttempt.worktree_path), true);
+  assertExactProcessesAndGroupsAbsent(drainedIdentities);
   const drainedState = manager.read(path.join(sessionDir, 'state.json'));
-  assert.ok(Number.isInteger(drainedState.active_child_pid));
-  assert.ok(drainedState.active_child_identity);
+  assert.equal(drainedState.active_child_pid, null);
+  assert.equal(drainedState.active_child_identity, null);
+  assert.deepEqual(drainedState.active_child_identities, []);
+  assert.equal(drainedState.active_child_controller_pid, null);
+  assert.equal(drainedState.active_child_controller_identity, null);
 
   const replacement = await withProcessEnvironment(prependPath(fakeBin, {
     FAKE_CRITERION_SHARD_DELAY_MS: '0',

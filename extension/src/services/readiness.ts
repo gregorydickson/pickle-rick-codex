@@ -9,7 +9,11 @@ import { normalizeMetricTargetContract, normalizeMetricTolerance } from './metri
 import { captureProtectedPathManifest } from './microverse-protection.js';
 import { atomicWriteJson, listTicketFiles, parseTicketFile, readJsonFile } from './pickle-utils.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
-import { inspectRecordedLiveProcessIdentity, type PersistedProcessIdentity } from './orphan-reaper.js';
+import {
+  inspectRecordedLiveProcessIdentity,
+  isPersistedProcessIdentityValid,
+  type PersistedProcessIdentity,
+} from './orphan-reaper.js';
 import {
   inspectRefinementRepositoryAdvance,
   validateRefinementAcceptance,
@@ -378,7 +382,9 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
   }
   if (state?.active === true) {
     const runnerPid = Number(state.tmux_runner_pid);
-    const controllerPid = Number(state.active_child_controller_pid);
+    const rawControllerIdentity = state.active_child_controller_identity;
+    const controllerIdentity = isPersistedProcessIdentityValid(rawControllerIdentity)
+      ? rawControllerIdentity as PersistedProcessIdentity : null;
     const childPid = Number(state.active_child_pid);
     const rawChildIdentity = state.active_child_identity;
     const childIdentity = rawChildIdentity && typeof rawChildIdentity === 'object'
@@ -393,7 +399,7 @@ export function checkReadiness(sessionDir: string, options: CheckReadinessOption
       && inspectRecordedLiveProcessIdentity(childIdentity as PersistedProcessIdentity) === 'matched';
     if (
       processAlive(runnerPid)
-      || processAlive(controllerPid)
+      || (controllerIdentity !== null && inspectRecordedLiveProcessIdentity(controllerIdentity) === 'matched')
       || (processAlive(childPid) && !childRecoverable)
     ) {
       findings.push(finding('error', 'session-active', 'Session has a live runner, controller, or child process.'));

@@ -8,6 +8,98 @@ import { runCodexExecMonitored } from '../services/codex.js';
 import { parseTicketFile, readJsonFile } from '../services/pickle-utils.js';
 import { makeTempRoot, repoRoot, runNode, createFakeCodex, prependPath, waitFor, writeExecutable } from './helpers.js';
 
+async function runNodeWithProgressBudgets(args, {
+  cwd,
+  env,
+  progressPaths,
+  inactivityMs = 15_000,
+  absoluteMs = 30_000,
+}) {
+  const child = spawn(process.execPath, args, {
+    cwd,
+    env: { ...process.env, ...env },
+    detached: process.platform !== 'win32',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let streamBytes = 0;
+  let lastProgressAt = Date.now();
+  let signature = '';
+  let budgetError = null;
+
+  const progressSignature = () => JSON.stringify({
+    streamBytes,
+    artifacts: progressPaths.map((filePath) => {
+      try {
+        const stat = fs.statSync(filePath);
+        return [filePath, stat.size, stat.mtimeMs];
+      } catch {
+        return [filePath, -1, -1];
+      }
+    }),
+  });
+  const observeProgress = () => {
+    const next = progressSignature();
+    if (next === signature) return;
+    signature = next;
+    lastProgressAt = Date.now();
+  };
+  const terminate = () => {
+    try {
+      if (process.platform !== 'win32') process.kill(-child.pid, 'SIGTERM');
+      else child.kill('SIGTERM');
+    } catch {}
+    const killTimer = setTimeout(() => {
+      try {
+        if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {}
+    }, 1_000);
+    killTimer.unref?.();
+  };
+
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    streamBytes += chunk.length;
+    observeProgress();
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+    streamBytes += chunk.length;
+    observeProgress();
+  });
+  observeProgress();
+  const poll = setInterval(() => {
+    observeProgress();
+    if (!budgetError && Date.now() - lastProgressAt >= inactivityMs) {
+      budgetError = new Error(`refinement command made no progress for ${inactivityMs}ms`);
+      terminate();
+    }
+  }, 50);
+  const absolute = setTimeout(() => {
+    if (!budgetError) {
+      budgetError = new Error(`refinement command exceeded ${absoluteMs}ms`);
+      terminate();
+    }
+  }, absoluteMs);
+
+  return await new Promise((resolve, reject) => {
+    child.on('error', (error) => {
+      clearInterval(poll);
+      clearTimeout(absolute);
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      clearInterval(poll);
+      clearTimeout(absolute);
+      if (budgetError) return reject(budgetError);
+      if (code !== 0) return reject(new Error(stderr || `node exited ${code ?? signal}`));
+      resolve(stdout);
+    });
+  });
+}
+
 test('validate-codex reports the configured codex version and guaranteed path', () => {
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
   createFakeCodex(fakeBin);
@@ -1314,13 +1406,17 @@ console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(state.step, 'research');
 });
 
-test('spawn-refinement-team exits promptly after success artifacts even if codex lingers', () => {
+test('spawn-refinement-team terminates and drains exact Codex children after success artifacts', async () => {
   const dataRoot = makeTempRoot();
   const projectDir = makeTempRoot('pickle-rick-project-');
   const fakeBin = makeTempRoot('pickle-rick-codex-bin-');
+  const invocationLog = path.join(dataRoot, 'lingering-refinement-invocations.jsonl');
+  const signalLog = path.join(dataRoot, 'lingering-refinement-signals.jsonl');
   const env = prependPath(fakeBin, {
     PICKLE_DATA_ROOT: dataRoot,
-    FAKE_CODEX_HANG_MS: '10000',
+    FAKE_CODEX_HANG_MS: '60000',
+    FAKE_CODEX_INVOCATION_LOG: invocationLog,
+    FAKE_CODEX_SIGNAL_LOG: signalLog,
   });
   createFakeCodex(fakeBin);
 
@@ -1333,19 +1429,39 @@ test('spawn-refinement-team exits promptly after success artifacts even if codex
     '# PRD\n\n## Summary\nRefinement test\n\n## Task Breakdown\n| Order | ID | Title | Priority | Phase | Depends On |\n|---|---|---|---|---|---|\n| 10 | ticket-001 | Harden tests | P1 | 0 | none |\n',
   );
 
-  const started = Date.now();
-  runNode([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
+  const artifacts = [
+    path.join(sessionDir, 'analyst-requirements.md'),
+    path.join(sessionDir, 'analyst-codebase.md'),
+    path.join(sessionDir, 'analyst-risk.md'),
+    path.join(sessionDir, 'prd_refined.md'),
+    path.join(sessionDir, 'refinement_manifest.json'),
+  ];
+  await runNodeWithProgressBudgets([path.join(repoRoot, 'bin/spawn-refinement-team.js'), sessionDir], {
     cwd: projectDir,
     env,
+    progressPaths: [invocationLog, signalLog, ...artifacts],
   });
-  const elapsed = Date.now() - started;
 
-  assert.ok(elapsed < 5000, `spawn-refinement-team took too long after success: ${elapsed}ms`);
-  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-requirements.md')));
-  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-codebase.md')));
-  assert.ok(fs.existsSync(path.join(sessionDir, 'analyst-risk.md')));
-  assert.ok(fs.existsSync(path.join(sessionDir, 'prd_refined.md')));
-  assert.ok(fs.existsSync(path.join(sessionDir, 'refinement_manifest.json')));
+  for (const artifact of artifacts) assert.ok(fs.existsSync(artifact));
+  const invocations = fs.readFileSync(invocationLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const signals = fs.readFileSync(signalLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(invocations.length, 4, 'only three analysts and one synthesis may launch');
+  assert.equal(signals.length, invocations.length, 'every exact lingering Codex child must receive SIGTERM');
+  assert.deepEqual(
+    new Set(signals.map(({ pid, invocation_nonce }) => `${pid}:${invocation_nonce}`)),
+    new Set(invocations.map(({ pid, invocation_nonce }) => `${pid}:${invocation_nonce}`)),
+  );
+  assert.deepEqual(invocations.filter(({ prompt }) => prompt.includes('Refinement analyst role:'))
+    .map(({ prompt }) => prompt.match(/Refinement analyst role: ([^\n]+)/)?.[1]).sort(), [
+    'codebase-integration', 'requirements-gaps', 'risk-and-sequencing',
+  ]);
+  assert.equal(invocations.filter(({ prompt }) => (
+    prompt.includes('You are synthesizing parallel PRD refinement analyst reports')
+  )).length, 1);
+  for (const { pid } of invocations) {
+    assert.throws(() => process.kill(pid, 0), (error) => error?.code === 'ESRCH',
+      `Codex child ${pid} must be reaped before refinement returns`);
+  }
 });
 
 test('spawn-refinement-team records refine phase transitions and progress logs', async () => {
@@ -1537,10 +1653,18 @@ setInterval(() => {}, 1000);
 
   const identities = await waitFor(() => {
     const state = readJsonFile(path.join(sessionDir, 'state.json'));
-    return Array.isArray(state.refinement_child_identities) && state.refinement_child_identities.length === 3
+    if (!Array.isArray(state.refinement_child_identities)
+      || state.refinement_child_identities.length !== 6) return null;
+    const groups = new Map();
+    for (const identity of state.refinement_child_identities) {
+      groups.set(identity.pgid, [...(groups.get(identity.pgid) || []), identity]);
+    }
+    return groups.size === 3
+      && [...groups.values()].every((group) => group.length === 2
+        && group.some(({ pid, pgid }) => pid === pgid))
       ? state.refinement_child_identities
       : null;
-  }, { timeoutMs: 5_000, message: 'refinement did not persist all analyst identities' });
+  }, { timeoutMs: 10_000, message: 'refinement did not persist all broker/target analyst identities' });
 
   runNode([path.join(repoRoot, 'bin/cancel.js'), '--session-dir', sessionDir], {
     cwd: projectDir,
@@ -1607,6 +1731,7 @@ test('runCodexExecMonitored treats observed success as success even if the proce
   const runtimeDir = makeTempRoot('pickle-rick-codex-bin-');
   const artifactDir = makeTempRoot('pickle-rick-artifacts-');
   const artifactPath = path.join(artifactDir, 'phase.txt');
+  const exitIntentPath = path.join(artifactDir, 'exit-intent.txt');
   const codexPath = path.join(runtimeDir, 'codex');
 
   fs.writeFileSync(
@@ -1628,14 +1753,18 @@ for (let index = 0; index < args.length; index += 1) {
   }
 }
 
-setTimeout(() => {
-  fs.writeFileSync(${JSON.stringify(artifactPath)}, 'phase-complete\\n');
-  if (outputLastMessagePath) {
-    fs.writeFileSync(outputLastMessagePath, '<promise>IMPLEMENT_COMPLETE</promise>');
-  }
-  console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
-  setTimeout(() => process.exit(23), 150);
-}, 50);
+process.on('SIGTERM', () => {
+  // This non-zero exit is causally after the monitor observes the success
+  // proof and requests a coordinated drain; it cannot race the success poll.
+  fs.writeFileSync(${JSON.stringify(exitIntentPath)}, '23\\n');
+  process.exit(23);
+});
+fs.writeFileSync(${JSON.stringify(artifactPath)}, 'phase-complete\\n');
+if (outputLastMessagePath) {
+  fs.writeFileSync(outputLastMessagePath, '<promise>IMPLEMENT_COMPLETE</promise>');
+}
+console.log(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+setInterval(() => {}, 1000);
 `,
     { mode: 0o755 },
   );
@@ -1644,17 +1773,19 @@ setTimeout(() => {
   const result = await runCodexExecMonitored({
     command: codexPath,
     prompt: 'run implement phase',
-    timeoutMs: 2_000,
+    timeoutMs: 15_000,
     outputLastMessagePath: path.join(artifactDir, 'phase.last-message.txt'),
-    successSignalGraceMs: 500,
+    successSignalGraceMs: 0,
     successPollMs: 25,
-    successCheck: ({ lastMessage }) =>
-      fs.existsSync(artifactPath) && /<promise>\s*IMPLEMENT_COMPLETE\s*<\/promise>/.test(lastMessage),
+    successCheck: ({ lastMessage }) => fs.existsSync(artifactPath)
+      && /<promise>\s*IMPLEMENT_COMPLETE\s*<\/promise>/.test(lastMessage),
   });
 
+  assert.equal(fs.readFileSync(exitIntentPath, 'utf8'), '23\n');
   assert.equal(result.exitCode, 0);
   assert.equal(result.timedOut, false);
-  assert.equal(result.terminatedAfterSuccess, false);
+  assert.equal(result.terminatedAfterSuccess, true);
+  assert.equal(result.drainAttested, true);
   assert.match(result.lastMessage, /IMPLEMENT_COMPLETE/);
 });
 
@@ -1856,10 +1987,16 @@ const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex test'); process.exit(0); }
 const output = args[args.indexOf('--output-last-message') + 1];
 if (process.env.NO_SUCCESS !== '1') fs.writeFileSync(output, '<promise>DONE</promise>');
+if (process.env.FINITE_PROGRESS === '1') {
+  // Finite completion is an artifact event, not a wall-clock race against the
+  // monitor's success-shutdown lease. Ongoing progress below separately proves
+  // that repeated artifact changes defer shutdown through the hard deadline.
+  fs.writeFileSync(${JSON.stringify(artifactPath)}, '01234');
+  process.exit(0);
+}
 let count = 0;
 const timer = setInterval(() => {
   fs.appendFileSync(${JSON.stringify(artifactPath)}, String(count++));
-  if (process.env.FINITE_PROGRESS === '1' && count === 5) { clearInterval(timer); process.exit(0); }
 }, 30);
 `, { mode: 0o755 });
 
@@ -1875,7 +2012,8 @@ const timer = setInterval(() => {
     successCheck: ({ lastMessage }) => lastMessage.includes('<promise>DONE</promise>'),
   });
   assert.equal(finite.exitCode, 0);
-  assert.equal(finite.terminatedAfterSuccess, false);
+  assert.equal(finite.timedOut, false);
+  assert.equal(finite.drainAttested, true);
   assert.equal(fs.readFileSync(artifactPath, 'utf8'), '01234');
 
   const ongoing = await runCodexExecMonitored({

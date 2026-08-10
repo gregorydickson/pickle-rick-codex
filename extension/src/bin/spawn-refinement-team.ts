@@ -6,7 +6,10 @@ import { logActivity } from '../services/activity-logger.js';
 import { assertCodexSucceeded, runCodexExecMonitored } from '../services/codex.js';
 import { loadConfig } from '../services/config.js';
 import {
+  captureProcessLivenessIdentity,
+  inspectProcessLivenessIdentity,
   reapRecordedLiveProcessGroup,
+  reapRecordedProcessGroupFromMember,
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
 import { atomicWriteFile, atomicWriteJson, readJsonFile, readTextFile } from '../services/pickle-utils.js';
@@ -207,16 +210,73 @@ function terminateSpawnedProcess(pid: number): void {
   killTimer.unref?.();
 }
 
+function processGroupIsAbsent(pgid: number): boolean {
+  if (process.platform === 'win32') return true;
+  try {
+    process.kill(-pgid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+function reconcileQuiescentRefinementChildren(manager: StateManager, statePath: string): void {
+  manager.update(statePath, (current) => {
+    const recorded = refinementChildIdentities(current);
+    const quiescentGroups = new Set<number>();
+    for (const pgid of new Set(recorded.map((identity) => identity.pgid))) {
+      const group = recorded.filter((identity) => identity.pgid === pgid);
+      if (group.every((identity) => inspectProcessLivenessIdentity(identity) === 'not-running')
+        && processGroupIsAbsent(pgid)) quiescentGroups.add(pgid);
+    }
+    const identities = recorded.filter((identity) => !quiescentGroups.has(identity.pgid));
+    current.refinement_child_identities = identities;
+    const next = identities.findLast((identity) => identity.pid === identity.pgid) || null;
+    current.active_child_pid = next?.pid || null;
+    current.active_child_kind = next ? 'refinement' : null;
+    current.active_child_command = next ? 'refinement-worker' : null;
+    current.active_child_identity = next;
+    return current;
+  });
+}
+
 function recoverRefinementChildren(manager: StateManager, statePath: string): void {
   const state = manager.read(statePath);
   const identities = refinementChildIdentities(state);
+  const groups = new Map<number, PersistedProcessIdentity[]>();
   for (const identity of identities) {
-    const result = reapRecordedLiveProcessGroup(identity);
-    if (result.status !== 'reaped' && result.status !== 'not-running') {
-      throw new Error(`Cannot recover refinement worker ${identity.pid}: ${result.reason}`);
+    const group = groups.get(identity.pgid) || [];
+    group.push(identity);
+    groups.set(identity.pgid, group);
+  }
+  for (const group of groups.values()) {
+    const leader = group.find((identity) => identity.pid === identity.pgid);
+    if (leader) {
+      const result = reapRecordedLiveProcessGroup(leader);
+      if (result.status !== 'reaped' && result.status !== 'not-running') {
+        throw new Error(`Cannot recover refinement broker ${leader.pid}: ${result.reason}`);
+      }
+    }
+    for (const identity of group) {
+      const liveness = inspectProcessLivenessIdentity(identity);
+      if (liveness === 'not-running') continue;
+      if (liveness === 'reused') {
+        throw new Error(`Cannot recover refinement worker ${identity.pid}: immutable identity was reused`);
+      }
+      const result = identity.pid === identity.pgid
+        ? reapRecordedLiveProcessGroup(identity)
+        : reapRecordedProcessGroupFromMember(identity);
+      if (result.status !== 'reaped' && result.status !== 'not-running') {
+        throw new Error(`Cannot recover refinement worker ${identity.pid}: ${result.reason}`);
+      }
+    }
+    if (!processGroupIsAbsent(group[0].pgid)) {
+      throw new Error(`Cannot recover refinement process group ${group[0].pgid}: group remains live without an exact signal authority`);
     }
   }
   if (identities.length === 0 && !state.refinement_child_identities) return;
+  const controllerIdentity = captureProcessLivenessIdentity(process.pid);
+  if (!controllerIdentity) throw new Error('Cannot attest refinement controller identity during recovery.');
   manager.update(statePath, (current) => {
     current.refinement_child_identities = [];
     current.active_child_pid = null;
@@ -224,6 +284,7 @@ function recoverRefinementChildren(manager: StateManager, statePath: string): vo
     current.active_child_command = null;
     current.active_child_identity = null;
     current.active_child_controller_pid = process.pid;
+    current.active_child_controller_identity = controllerIdentity;
     return current;
   });
 }
@@ -235,9 +296,10 @@ async function runRefinementCodex(
   label: string,
   localCancelCheck: () => boolean = () => false,
 ): Promise<CodexSpawnResult> {
-  let childPid = 0;
-  try {
-    return await runCodexExecMonitored({
+  let brokerPid = 0;
+  const controllerIdentity = captureProcessLivenessIdentity(process.pid);
+  if (!controllerIdentity) throw new Error('Cannot attest refinement controller identity.');
+  return await runCodexExecMonitored({
       ...options,
       telemetry: {
         sessionDir: path.dirname(statePath),
@@ -251,43 +313,75 @@ async function runRefinementCodex(
       env: { ...REFINEMENT_WORKER_ENV, ...(options.env || {}) },
       cancelCheck: () => localCancelCheck() || isRefinementCancelled(manager, statePath),
       onSpawn: (child, identity) => {
-        childPid = Number(child.pid || 0);
+        brokerPid = Number(child.pid || 0);
         try {
           manager.update(statePath, (current) => {
             const identities = refinementChildIdentities(current)
-              .filter((entry) => entry.pid !== childPid);
+              .filter((entry) => entry.pid !== brokerPid);
             identities.push(identity);
             current.refinement_child_identities = identities;
-            current.active_child_pid = childPid || null;
+            current.active_child_pid = brokerPid || null;
             current.active_child_kind = 'refinement';
             current.active_child_command = label;
             current.active_child_identity = identity;
             current.active_child_controller_pid = process.pid;
+            current.active_child_controller_identity = controllerIdentity;
             return current;
           });
         } catch (error) {
-          terminateSpawnedProcess(childPid);
+          terminateSpawnedProcess(brokerPid);
           throw error;
         }
         options.onSpawn?.(child, identity);
       },
+      onTargetSpawn: (brokerIdentity, targetIdentity) => {
+        manager.update(statePath, (current) => {
+          const identities = refinementChildIdentities(current)
+            .filter((entry) => entry.pid !== targetIdentity.pid);
+          if (!identities.some((entry) => entry.pid === brokerIdentity.pid
+            && entry.fingerprint === brokerIdentity.fingerprint)) {
+            throw new Error('Refinement target cannot be published without its exact broker identity.');
+          }
+          identities.push(targetIdentity);
+          current.refinement_child_identities = identities;
+          return current;
+        });
+        options.onTargetSpawn?.(brokerIdentity, targetIdentity);
+      },
+      onDescendants: (brokerIdentity, targetIdentity, descendants) => {
+        manager.update(statePath, (current) => {
+          const identities = refinementChildIdentities(current);
+          if (!identities.some((entry) => entry.fingerprint === brokerIdentity.fingerprint)
+            || !identities.some((entry) => entry.fingerprint === targetIdentity.fingerprint)) {
+            throw new Error('Refinement descendants cannot be published without broker and target identities.');
+          }
+          for (const descendant of descendants) {
+            if (!identities.some((entry) => entry.fingerprint === descendant.fingerprint)) identities.push(descendant);
+          }
+          current.refinement_child_identities = identities;
+          return current;
+        });
+        options.onDescendants?.(brokerIdentity, targetIdentity, descendants);
+      },
+      onDrain: (brokerIdentity, targetIdentity, descendants) => {
+        manager.update(statePath, (current) => {
+          const drainedFingerprints = new Set([brokerIdentity, targetIdentity, ...descendants]
+            .map((identity) => identity.fingerprint));
+          const identities = refinementChildIdentities(current)
+            .filter((entry) => !drainedFingerprints.has(entry.fingerprint));
+          current.refinement_child_identities = identities;
+          const next = identities.findLast((entry) => entry.pid === entry.pgid) || null;
+          current.active_child_pid = next?.pid || null;
+          current.active_child_kind = next ? 'refinement' : null;
+          current.active_child_command = next ? 'refinement-worker' : null;
+          current.active_child_identity = next;
+          current.active_child_controller_pid = process.pid;
+          current.active_child_controller_identity = controllerIdentity;
+          return current;
+        });
+        options.onDrain?.(brokerIdentity, targetIdentity, descendants);
+      },
     });
-  } finally {
-    if (childPid > 0) {
-      manager.update(statePath, (current) => {
-        const identities = refinementChildIdentities(current)
-          .filter((entry) => entry.pid !== childPid);
-        current.refinement_child_identities = identities;
-        const next = identities.at(-1) || null;
-        current.active_child_pid = next?.pid || null;
-        current.active_child_kind = next ? 'refinement' : null;
-        current.active_child_command = next ? 'refinement-worker' : null;
-        current.active_child_identity = next;
-        current.active_child_controller_pid = process.pid;
-        return current;
-      });
-    }
-  }
 }
 
 async function runAnalyst(
@@ -616,6 +710,7 @@ export function promoteRefinementArtifacts(input: {
         current.step = 'research';
         current.refinement_child_identities = [];
         current.active_child_controller_pid = null;
+        current.active_child_controller_identity = null;
         appendHistory(current, 'refine');
         return current;
       });
@@ -848,6 +943,12 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
 
   const ownershipManager = new StateManager();
   const statePath = path.join(sessionDir, 'state.json');
+  const controllerIdentity = captureProcessLivenessIdentity(process.pid);
+  if (!controllerIdentity) {
+    leaseManager.releaseLock(leasePath);
+    releaseOperation();
+    throw new Error('Cannot attest refinement controller identity.');
+  }
   ownershipManager.update(statePath, (current) => {
     const cancellationAtMs = Date.parse(String(current.cancel_requested_at || ''));
     const cancelledThisRun = Number.isFinite(cancellationAtMs) && cancellationAtMs >= runStartedAtMs;
@@ -856,6 +957,7 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
       if (current.last_exit_reason === 'cancelled') current.last_exit_reason = null;
     }
     current.active_child_controller_pid = process.pid;
+    current.active_child_controller_identity = controllerIdentity;
     return current;
   });
   const requestCancellation = (): void => {
@@ -882,11 +984,17 @@ export async function refinePrd(sessionDir: string, options: RefinePrdOptions = 
       ownershipManager.update(statePath, (current) => {
         if (current.active_child_controller_pid === process.pid) {
           current.active_child_controller_pid = null;
+          current.active_child_controller_identity = null;
         }
         return current;
       });
     } catch {
       // Preserve the original refinement failure.
+    }
+    try {
+      reconcileQuiescentRefinementChildren(ownershipManager, statePath);
+    } catch {
+      // Preserve the original refinement failure and any recovery evidence.
     }
     leaseManager.releaseLock(leasePath);
     releaseOperation();

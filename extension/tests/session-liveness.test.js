@@ -32,6 +32,7 @@ import {
 } from '../services/durable-supervisor.js';
 import { prepareLiveSessionHandoffCheckpoint, prepareLiveSessionMigration } from '../services/live-session-migration.js';
 import { updateSessionMap } from '../services/session-map.js';
+import { assertSessionOperationAvailable } from '../services/session-operation.js';
 import { writePrdSeal } from '../services/prd-seal.js';
 import {
   captureOwnedTmuxRunnerBinding,
@@ -85,6 +86,174 @@ async function waitForState(statePath, predicate, timeoutMs = 3_000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`Timed out waiting for state predicate at ${statePath}`);
+}
+
+async function waitForOwnerRecoveryMilestone(statePath, predicate, semanticProjection, label) {
+  const inactivityMs = 15_000;
+  const absoluteMs = 45_000;
+  const startedAt = Date.now();
+  let lastSemanticProgressAt = startedAt;
+  let highWater = [];
+  let lastState = null;
+  while (Date.now() - startedAt < absoluteMs) {
+    const current = new StateManager().read(statePath);
+    lastState = current;
+    if (predicate(current)) return current;
+    const semantic = semanticProjection(current);
+    if (semantic.some((value, index) => value > (highWater[index] || 0))) {
+      highWater = semantic.map((value, index) => Math.max(value, highWater[index] || 0));
+      lastSemanticProgressAt = Date.now();
+    }
+    if (Date.now() - lastSemanticProgressAt >= inactivityMs) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`${label} made no durable semantic progress within its recovery budgets: ${JSON.stringify({
+    inactivity_ms: inactivityMs,
+    absolute_ms: absoluteMs,
+    high_water: highWater,
+    restoration: lastState?.autonomous_owner_restoration || null,
+    handoff: lastState?.autonomous_owner_handoff_transaction || null,
+    owner_spec_id: lastState?.autonomous_owner_spec?.spec_id || null,
+    tmux_binding: lastState?.tmux_runner_binding || null,
+    recovery_required: lastState?.recovery_required,
+    recovery_reason: lastState?.recovery_reason,
+  })}`);
+}
+
+async function waitForOwnerRunCount(filePath, expected) {
+  const inactivityMs = 15_000;
+  const absoluteMs = 45_000;
+  const startedAt = Date.now();
+  let lastSemanticProgressAt = startedAt;
+  let highWater = 0;
+  while (Date.now() - startedAt < absoluteMs) {
+    let lines = 0;
+    try {
+      lines = fs.readFileSync(filePath, 'utf8').trim().split('\n').filter(Boolean).length;
+    } catch {}
+    if (lines >= expected) return;
+    if (lines > highWater) {
+      highWater = lines;
+      lastSemanticProgressAt = Date.now();
+    }
+    if (Date.now() - lastSemanticProgressAt >= inactivityMs) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Owner launch made no semantic progress toward ${expected} runs: ${JSON.stringify({
+    inactivity_ms: inactivityMs, absolute_ms: absoluteMs, observed_runs: highWater, file: filePath,
+  })}`);
+}
+
+function readJsonIfPresent(filePath) {
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return null; }
+}
+
+function fileTail(filePath, bytes = 4_096) {
+  try {
+    const value = fs.readFileSync(filePath, 'utf8');
+    return value.slice(-bytes);
+  } catch {
+    return '';
+  }
+}
+
+function persistedIdentityLiveness(identity) {
+  return identity ? inspectProcessLivenessIdentity(identity) : 'absent';
+}
+
+async function waitForLegacyMigrationCompletion(statePath, sessionDir, predicate, {
+  workerTimeoutSeconds,
+  baselineReviewCount,
+}) {
+  // The fake runtime is bounded by the same worker timeout used by the
+  // production Citadel model call. Give every durable stage that full bound
+  // plus drain/scheduling reserve, while retaining an immutable whole-flow cap.
+  const workerBoundMs = Math.max(1_000, Number(workerTimeoutSeconds) * 1_000);
+  const inactivityMs = workerBoundMs + 30_000;
+  const absoluteMs = (workerBoundMs * 3) + 60_000;
+  const startedAt = Date.now();
+  let lastSemanticProgressAt = startedAt;
+  let highWater = [];
+  let lastStage = 'migration-not-published';
+  let lastState = null;
+  let observedSupervisorIdentity = null;
+  let observedDaemonIdentity = null;
+
+  while (Date.now() - startedAt < absoluteMs) {
+    const current = new StateManager().read(statePath);
+    lastState = current;
+    observedSupervisorIdentity ||= current.autonomous_supervisor_identity || null;
+    observedDaemonIdentity ||= current.autonomous_owner_recovery_daemon_identity || null;
+    const observedSupervisorAbsent = observedSupervisorIdentity
+      && inspectProcessLivenessIdentity(observedSupervisorIdentity) === 'not-running';
+    const observedDaemonAbsent = observedDaemonIdentity
+      && inspectProcessLivenessIdentity(observedDaemonIdentity) === 'not-running';
+    if (predicate(current) && observedSupervisorAbsent && observedDaemonAbsent) return {
+      state: current,
+      supervisorIdentity: observedSupervisorIdentity,
+      daemonIdentity: observedDaemonIdentity,
+    };
+    const migrationStatus = String(current.legacy_max_time_migration?.status || '');
+    const migrationRank = ['rollover_scheduled', 'owner_restoration_planned', 'owner_restored', 'rollover_consumed']
+      .indexOf(migrationStatus) + 1;
+    const restorationStatus = String(current.autonomous_owner_restoration?.status || '');
+    const restorationRank = ['pending', 'restoring', 'restored', 'rollover_consumed']
+      .indexOf(restorationStatus) + 1;
+    const report = readJsonIfPresent(path.join(sessionDir, 'citadel-report.json'));
+    const reviewCount = Number(fileTail(path.join(sessionDir, 'legacy-citadel-review-count'), 64).trim() || 0);
+    const logical = readJsonIfPresent(path.join(sessionDir, 'logical-pipeline.json'));
+    const historySteps = new Set((current.history || []).map((entry) => String(entry?.step || '')).filter(Boolean));
+    const muxLog = fileTail(path.join(sessionDir, 'mux-runner.log'));
+    const semantic = [
+      Math.max(0, migrationRank),
+      Math.max(0, restorationRank),
+      current.autonomous_budget_consumed_intent_id ? 1 : 0,
+      historySteps.size,
+      /mux-runner started/.test(muxLog) ? 1 : 0,
+      reviewCount > baselineReviewCount ? reviewCount - baselineReviewCount : 0,
+      report?.verdict === 'approve' ? 1 : 0,
+      fs.existsSync(path.join(sessionDir, 'citadel-release-approval.json')) ? 1 : 0,
+      current.step === 'complete' ? 1 : 0,
+      logical?.terminal_state === 'completed' ? 1 : 0,
+      observedSupervisorAbsent ? 1 : 0,
+      observedDaemonAbsent ? 1 : 0,
+    ];
+    if (semantic.some((value, index) => value > (highWater[index] || 0))) {
+      highWater = semantic.map((value, index) => Math.max(value, highWater[index] || 0));
+      lastSemanticProgressAt = Date.now();
+      lastStage = [
+        migrationStatus || 'migration-pending',
+        restorationStatus || 'owner-pending',
+        current.step || 'no-step',
+        report?.verdict || 'no-citadel-report',
+      ].join('/');
+    }
+    if (Date.now() - lastSemanticProgressAt >= inactivityMs) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  const logical = readJsonIfPresent(path.join(sessionDir, 'logical-pipeline.json'));
+  const identityLiveness = Object.fromEntries([
+    ['supervisor', lastState?.autonomous_supervisor_identity],
+    ['recovery_daemon', lastState?.autonomous_owner_recovery_daemon_identity],
+    ['active_child', lastState?.active_child_identity],
+  ].map(([label, identity]) => [label, identity
+    ? inspectProcessLivenessIdentity(identity) : 'absent']));
+  assert.fail(`Legacy migration made no new durable semantic progress within its configured budgets: ${JSON.stringify({
+    inactivity_ms: inactivityMs,
+    absolute_ms: absoluteMs,
+    last_stage: lastStage,
+    high_water: highWater,
+    migration: lastState?.legacy_max_time_migration || null,
+    restoration: lastState?.autonomous_owner_restoration || null,
+    step: lastState?.step,
+    current_ticket: lastState?.current_ticket,
+    logical,
+    identity_liveness: identityLiveness,
+    citadel_report: readJsonIfPresent(path.join(sessionDir, 'citadel-report.json')),
+    citadel_review_count: fileTail(path.join(sessionDir, 'legacy-citadel-review-count'), 64),
+    mux_log_tail: fileTail(path.join(sessionDir, 'mux-runner.log')),
+  })}`);
 }
 
 function runLivenessProcess(sessionDir, nowMs) {
@@ -197,6 +366,81 @@ test('reconcileSessionLiveness demotes a tmux session whose runner is gone', () 
   assert.equal(result.state.step, 'paused');
 });
 
+test('reconcileSessionLiveness reaps the full monitored ledger when the broker is dead', { timeout: 15_000 }, async () => {
+  const sessionDir = makeTempRoot('pickle-liveness-monitored-ledger-');
+  const statePath = path.join(sessionDir, 'state.json');
+  const targetPidPath = path.join(sessionDir, 'target.pid');
+  const broker = spawn(process.execPath, ['-e', [
+    "const {spawn}=require('node:child_process');const fs=require('node:fs');",
+    "const c=spawn(process.execPath,['-e','process.on(\"SIGTERM\",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});",
+    "fs.writeFileSync(process.env.TARGET_PID_PATH,String(c.pid));setInterval(()=>{},1000);",
+  ].join('')], { detached: true, stdio: 'ignore', env: { ...process.env, TARGET_PID_PATH: targetPidPath } });
+  let brokerIdentity;
+  let targetIdentity;
+  try {
+    while (!fs.existsSync(targetPidPath)) await new Promise((resolve) => setTimeout(resolve, 10));
+    brokerIdentity = captureProcessLivenessIdentity(broker.pid);
+    targetIdentity = captureProcessLivenessIdentity(Number(fs.readFileSync(targetPidPath, 'utf8')));
+    assert.ok(brokerIdentity && targetIdentity);
+    writeJson(statePath, state({
+      session_dir: sessionDir,
+      tmux_mode: true,
+      tmux_runner_pid: 999_999_999,
+      active_child_pid: brokerIdentity.pid,
+      active_child_identity: brokerIdentity,
+      active_child_identities: [brokerIdentity, targetIdentity],
+    }));
+    process.kill(brokerIdentity.pid, 'SIGKILL');
+    await new Promise((resolve) => broker.once('exit', resolve));
+    assert.equal(inspectProcessLivenessIdentity(targetIdentity), 'matched');
+
+    const result = reconcileSessionLiveness(sessionDir, undefined, 1_700_000_100_000);
+    assert.equal(result.stale, true);
+    assert.equal(result.state.recovery_required, false);
+    assert.deepEqual(result.state.active_child_identities, []);
+    assert.equal(inspectProcessLivenessIdentity(targetIdentity), 'not-running');
+  } finally {
+    if (brokerIdentity) { try { process.kill(-brokerIdentity.pgid, 'SIGKILL'); } catch {} }
+    if (targetIdentity && targetIdentity.pgid !== brokerIdentity?.pgid) {
+      try { process.kill(-targetIdentity.pgid, 'SIGKILL'); } catch {}
+    }
+  }
+});
+
+test('reconcileSessionLiveness does not prune a live refinement identity ledger', { timeout: 15_000 }, async () => {
+  const sessionDir = makeTempRoot('pickle-liveness-refinement-ledger-');
+  const statePath = path.join(sessionDir, 'state.json');
+  const childPidPath = path.join(sessionDir, 'child.pid');
+  const launcher = spawn(process.execPath, ['-e', [
+    "const {spawn}=require('node:child_process');const fs=require('node:fs');",
+    "const c=spawn(process.execPath,['-e','process.on(\"SIGTERM\",()=>{});setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});",
+    "c.unref();fs.writeFileSync(process.env.CHILD_PID_PATH,String(c.pid));",
+  ].join('')], { stdio: 'ignore', env: { ...process.env, CHILD_PID_PATH: childPidPath } });
+  let identity;
+  try {
+    await new Promise((resolve) => launcher.once('exit', resolve));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const childPid = Number(fs.readFileSync(childPidPath, 'utf8'));
+    while (!(identity = captureProcessLivenessIdentity(childPid))) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    writeJson(statePath, state({
+      session_dir: sessionDir,
+      tmux_mode: true,
+      tmux_runner_pid: 999_999_999,
+      active_child_pid: identity.pid,
+      active_child_identity: identity,
+      refinement_child_identities: [identity],
+    }));
+    const result = reconcileSessionLiveness(sessionDir, undefined, 1_700_000_100_000);
+    assert.equal(result.stale, true);
+    assert.deepEqual(result.state.refinement_child_identities, []);
+    assert.equal(inspectProcessLivenessIdentity(identity), 'not-running');
+  } finally {
+    if (identity) { try { process.kill(-identity.pgid, 'SIGKILL'); } catch {} }
+  }
+});
+
 test('reconcileSessionLiveness preserves an active session during a bounded autonomous budget relaunch', () => {
   const sessionDir = makeTempRoot('pickle-liveness-budget-rollover-');
   const nowMs = 1_700_000_100_000;
@@ -283,10 +527,11 @@ test('expired rollover restores the exact supervisor owner after repeated whole-
       current.autonomous_supervisor_identity = null;
       return current;
     });
-    await waitForLineCount(markerPath, 1);
+    await waitForOwnerRunCount(markerPath, 1);
     daemon = runAutonomousOwnerRecoveryDaemon(sessionDir, { intervalMs: 10 });
 
     for (let cycle = 0; cycle < 2; cycle += 1) {
+      const previousIntentId = new StateManager().read(statePath).autonomous_owner_restoration?.intent_id || null;
       if (cycle === 0) killTmuxSessionById(binding.session_id);
       else process.kill(binding.pane_pid, 'SIGKILL');
       const nowMs = 1_700_000_100_000 + cycle * 120_000;
@@ -294,7 +539,21 @@ test('expired rollover restores the exact supervisor owner after repeated whole-
       assert.equal(reconciled.stale, false);
       assert.equal(reconciled.state.autonomous_budget_rollover_intent_id, 'same-rollover-uuid');
       assert.ok(['pending', 'restored'].includes(reconciled.state.autonomous_owner_restoration.status));
-      const restored = await waitForState(statePath, (current) => current.autonomous_owner_restoration?.status === 'restored');
+      const restored = await waitForOwnerRecoveryMilestone(
+        statePath,
+        (current) => current.autonomous_owner_restoration?.status === 'restored'
+          && current.autonomous_owner_restoration?.intent_id !== previousIntentId,
+        (current) => {
+          const restoration = current.autonomous_owner_restoration;
+          const isNewIntent = restoration?.intent_id !== previousIntentId;
+          return [
+            isNewIntent ? 1 : 0,
+            isNewIntent ? ['pending', 'restoring', 'restored'].indexOf(restoration?.status) + 1 : 0,
+            current.recovery_required === true ? 0 : 1,
+          ];
+        },
+        `owner restoration cycle ${cycle + 1}`,
+      );
       assert.equal(restored.autonomous_budget_rollover_intent_id, 'same-rollover-uuid');
       assert.equal(restored.autonomous_owner_restoration.status, 'restored');
       binding = restored.tmux_runner_binding;
@@ -305,7 +564,7 @@ test('expired rollover restores the exact supervisor owner after repeated whole-
       });
       if (cycle === 0) assert.notEqual(binding.session_id, reconciled.state.tmux_runner_binding.session_id);
       else assert.equal(binding.session_id, reconciled.state.tmux_runner_binding.session_id);
-      await waitForLineCount(markerPath, cycle + 2);
+      await waitForOwnerRunCount(markerPath, cycle + 2);
     }
     assert.equal(fs.readFileSync(markerPath, 'utf8').trim().split('\n').length, 3);
 
@@ -372,13 +631,25 @@ test('expired rollover restores the exact supervisor owner after repeated whole-
     });
     killTmuxSessionById(binding.session_id);
     reconcileSessionLiveness(sessionDir, undefined, 1_700_000_350_000);
-    const targetRestored = await waitForState(
+    const previousTargetRestorationIntent = committed.autonomous_owner_restoration?.intent_id || null;
+    const targetRestored = await waitForOwnerRecoveryMilestone(
       statePath,
       (current) => current.autonomous_owner_restoration?.status === 'restored'
         && current.tmux_runner_binding?.session_id !== binding.session_id,
+      (current) => {
+        const restoration = current.autonomous_owner_restoration;
+        const isNewIntent = restoration?.intent_id !== previousTargetRestorationIntent;
+        return [
+          current.autonomous_owner_spec?.spec_id === stagedTargetSpec.spec_id ? 1 : 0,
+          isNewIntent ? 1 : 0,
+          isNewIntent ? ['pending', 'restoring', 'restored'].indexOf(restoration?.status) + 1 : 0,
+          current.tmux_runner_binding?.session_id !== binding.session_id ? 1 : 0,
+        ];
+      },
+      'accepted target owner restoration',
     );
     binding = targetRestored.tmux_runner_binding;
-    await waitForLineCount(targetMarkerPath, 1);
+    await waitForOwnerRunCount(targetMarkerPath, 1);
     assert.equal(fs.readFileSync(markerPath, 'utf8').trim().split('\n').length, 3, 'source owner was never restored');
 
     const rollbackCheckpoint = prepareLiveSessionHandoffCheckpoint(sessionDir, targetRuntime, sourceRuntime);
@@ -730,6 +1001,7 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     session_dir: fs.realpathSync(sessionDir),
     step: 'paused',
     iteration: 0,
+    worker_timeout_seconds: 60,
     last_exit_reason: 'max_time',
     start_commit: startCommit,
     pinned_sha: startCommit,
@@ -765,6 +1037,7 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
   let daemonIdentity = null;
   try {
     assert.equal(await runCitadel(sessionDir), 'citadel-blocked', 'fixture starts from authenticated blocked Citadel evidence');
+    const baselineReviewCount = Number(fs.readFileSync(path.join(sessionDir, 'legacy-citadel-review-count'), 'utf8'));
     new StateManager().update(statePath, (current) => {
       current.active = false;
       current.step = 'paused';
@@ -789,7 +1062,7 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     await updateSessionMap(fs.realpathSync(workingDir), sessionDir);
     assert.equal(await resolveSessionForCwd(workingDir), sessionDir);
     assert.ok(new StateManager().read(statePath).legacy_max_time_migration, 'mapped lookup records migration receipt');
-    const restored = await waitForState(statePath, (current) => (
+    const completion = await waitForLegacyMigrationCompletion(statePath, sessionDir, (current) => (
       current.legacy_max_time_migration?.status === 'rollover_consumed'
         && current.autonomous_budget_rollover_intent_id === null
         && current.step === 'complete'
@@ -798,12 +1071,30 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
         && JSON.parse(fs.readFileSync(path.join(sessionDir, 'citadel-report.json'), 'utf8')).verdict === 'approve'
         && fs.existsSync(path.join(sessionDir, 'citadel-release-approval.json'))
         && fs.existsSync(path.join(sessionDir, 'mux-runner.log'))
-        && inspectProcessLivenessIdentity(current.autonomous_supervisor_identity) === 'not-running'
-    ), 40_000);
-    supervisorIdentity = restored.autonomous_supervisor_identity;
-    daemonIdentity = restored.autonomous_owner_recovery_daemon_identity;
+        && persistedIdentityLiveness(current.autonomous_supervisor_identity) === 'not-running'
+        && current.worker_pid == null
+        && current.active_child_pid == null
+        && current.active_child_identity == null
+    ), {
+      workerTimeoutSeconds: Number(new StateManager().read(statePath).worker_timeout_seconds || 60),
+      baselineReviewCount,
+    });
+    const restored = completion.state;
+    supervisorIdentity = completion.supervisorIdentity || restored.autonomous_supervisor_identity;
+    daemonIdentity = completion.daemonIdentity || restored.autonomous_owner_recovery_daemon_identity;
     assert.equal(inspectProcessLivenessIdentity(supervisorIdentity), 'not-running',
       'the exact supervisor must exit after committing logical completion');
+    assert.ok(daemonIdentity, 'the recovery daemon identity must be observed before its terminal cleanup');
+    assert.equal(inspectProcessLivenessIdentity(daemonIdentity), 'not-running',
+      'the exact observed recovery daemon must exit after logical completion');
+    assert.equal(restored.worker_pid, null);
+    assert.equal(restored.active_child_pid, null);
+    assert.equal(restored.active_child_identity, null);
+    for (const lockName of ['.session-operation.lock', '.legacy-max-time-migration-fence.lock',
+      '.autonomous-owner-recovery-daemon.lock']) {
+      assert.equal(fs.existsSync(path.join(sessionDir, lockName)), false, `${lockName} must be released`);
+    }
+    assertSessionOperationAvailable(sessionDir);
     assert.equal(restored.autonomous_owner_spec.runner_bin, 'mux-runner.js');
     assert.deepEqual(restored.autonomous_owner_spec.runner_args, ['--on-failure=retry']);
     assert.equal(restored.legacy_max_time_migration.source_owner_spec_id, null);
@@ -841,13 +1132,20 @@ console.log(JSON.stringify({ type: 'result', usage: { input_tokens: 2, output_to
     } catch {}
     let cleanupState = null;
     try { cleanupState = new StateManager().read(statePath); } catch {}
-    for (const identity of [
+    const cleanupResults = [];
+    const cleanupIdentities = [
       supervisorIdentity,
       daemonIdentity,
       cleanupState?.autonomous_supervisor_identity,
       cleanupState?.autonomous_owner_recovery_daemon_identity,
-    ]) {
-      if (identity) reapRecordedLiveProcessGroup(identity);
+    ].filter((identity, index, all) => identity
+      && all.findIndex((candidate) => candidate?.fingerprint === identity.fingerprint) === index);
+    for (const identity of cleanupIdentities) {
+      cleanupResults.push(reapRecordedLiveProcessGroup(identity));
+    }
+    for (const result of cleanupResults) {
+      assert.ok(['reaped', 'not-running'].includes(result.status),
+        `legacy migration cleanup could not prove exact reaping: ${JSON.stringify(result)}`);
     }
     if (previousRoot === undefined) delete process.env.PICKLE_DATA_ROOT;
     else process.env.PICKLE_DATA_ROOT = previousRoot;

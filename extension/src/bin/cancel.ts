@@ -3,9 +3,13 @@ import { deactivateSession, getStatePath, loadSessionState, resolveSessionForCwd
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
   reapOwnedOrphanProcessGroup,
+  isPersistedProcessIdentityValid,
   reapRecordedLiveProcessGroup,
+  reapRecordedProcessGroupFromMember,
+  inspectProcessLivenessIdentity,
   type PersistedProcessIdentity,
 } from '../services/orphan-reaper.js';
+import { recoverMonitoredProcessOwnership } from '../services/monitored-process-ownership.js';
 import { cleanupTerminalTmuxSession } from '../services/terminal-tmux-cleanup.js';
 import { sessionOperationOwnerPid } from '../services/session-operation.js';
 import fs from 'node:fs';
@@ -16,9 +20,13 @@ function runtimePids(state: PersistedState): number[] {
   const refinementPids = Array.isArray(state?.refinement_child_identities)
     ? state.refinement_child_identities.map((entry) => Number((entry as Record<string, unknown> | null)?.pid))
     : [];
+  const monitoredPids = Array.isArray(state?.active_child_identities)
+    ? state.active_child_identities.map((entry) => Number((entry as Record<string, unknown> | null)?.pid))
+    : [];
   return [...new Set([
     Number(state?.active_child_pid),
     ...refinementPids,
+    ...monitoredPids,
   ].filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid))];
 }
 
@@ -37,27 +45,17 @@ function persistedChildIdentity(state: PersistedState, pid: number): PersistedPr
   const refinementIdentity = Array.isArray(state.refinement_child_identities)
     ? state.refinement_child_identities.find((entry) => Number((entry as Record<string, unknown> | null)?.pid) === pid)
     : null;
-  const value = refinementIdentity || state.active_child_identity;
-  if (!value || typeof value !== 'object') return null;
-  const identity = value as Record<string, unknown>;
-  if (
-    Number(identity.pid) !== pid
-    || !Number.isInteger(Number(identity.pgid))
-    || typeof identity.start_time !== 'string'
-    || !identity.start_time
-    || typeof identity.fingerprint !== 'string'
-    || !identity.fingerprint
-  ) return null;
-  return {
-    pid,
-    pgid: Number(identity.pgid),
-    start_time: identity.start_time,
-    fingerprint: identity.fingerprint,
-  };
+  const monitoredIdentity = Array.isArray(state.active_child_identities)
+    ? state.active_child_identities.find((entry) => Number((entry as Record<string, unknown> | null)?.pid) === pid)
+    : null;
+  const value = monitoredIdentity || refinementIdentity || state.active_child_identity;
+  if (!isPersistedProcessIdentityValid(value) || value.pid !== pid) return null;
+  return value;
 }
 
 function hasLiveController(state: PersistedState): boolean {
-  if (processAlive(state.active_child_controller_pid)) return true;
+  if (isPersistedProcessIdentityValid(state.active_child_controller_identity)
+    && inspectProcessLivenessIdentity(state.active_child_controller_identity) === 'matched') return true;
   return state.active === true && (
     processAlive(state.worker_pid) || processAlive(state.tmux_runner_pid)
   );
@@ -96,26 +94,41 @@ async function main(argv: string[]): Promise<void> {
       return current;
     });
   }
-  const recoveries = pidsToSignal.map((pid) => {
+  let monitoredRecoveryError: Error | null = null;
+  if (Array.isArray(stateBeforeCancel.active_child_identities)
+    && stateBeforeCancel.active_child_identities.length > 0) {
+    try {
+      recoverMonitoredProcessOwnership(new StateManager(), getStatePath(resolved), { allowLiveController: true });
+    } catch (error) {
+      monitoredRecoveryError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  const monitoredPids = new Set(Array.isArray(stateBeforeCancel.active_child_identities)
+    ? stateBeforeCancel.active_child_identities.map((entry) => Number((entry as Record<string, unknown>)?.pid))
+    : []);
+  const recoveries = pidsToSignal.filter((pid) => !monitoredPids.has(pid)).map((pid) => {
     const identity = persistedChildIdentity(stateBeforeCancel, pid);
     return identity
-      ? reapRecordedLiveProcessGroup(identity)
+      ? identity.pid === identity.pgid
+        ? reapRecordedLiveProcessGroup(identity)
+        : reapRecordedProcessGroupFromMember(identity)
       : reapOwnedOrphanProcessGroup(resolved, pid);
   });
   const unsafeRecovery = recoveries.find((result) => result.status === 'ambiguous' || result.status === 'signal-failed');
+  const recoveryFailure = monitoredRecoveryError?.message || unsafeRecovery?.reason || null;
 
-  await deactivateSession(resolved, unsafeRecovery ? 'cancel_recovery_required' : 'cancelled', {
-    preserveMapping: Boolean(unsafeRecovery),
+  await deactivateSession(resolved, recoveryFailure ? 'cancel_recovery_required' : 'cancelled', {
+    preserveMapping: Boolean(recoveryFailure),
   });
-  if (unsafeRecovery) {
+  if (recoveryFailure) {
     new StateManager().update(getStatePath(resolved), (current) => {
       current.recovery_required = true;
-      current.recovery_reason = unsafeRecovery.reason;
-      current.orphan_child_pid = unsafeRecovery.pid;
-      current.orphan_recovery = unsafeRecovery;
+      current.recovery_reason = recoveryFailure;
+      current.orphan_child_pid = unsafeRecovery?.pid || current.active_child_pid;
+      current.orphan_recovery = unsafeRecovery || { status: 'ambiguous', reason: recoveryFailure };
       return current;
     });
-    console.log(`Cancellation blocked on recovery for ${resolved}: ${unsafeRecovery.reason}`);
+    console.log(`Cancellation blocked on recovery for ${resolved}: ${recoveryFailure}`);
     process.exitCode = 1;
     return;
   }

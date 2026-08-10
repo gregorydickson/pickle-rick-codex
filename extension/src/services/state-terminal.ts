@@ -9,11 +9,24 @@ export function safeDeactivate(state: PersistedState): PersistedState {
   state.active = false;
   state.tmux_runner_pid = null;
   state.worker_pid = null;
+  const monitoredLedgerPresent = (Array.isArray(state.active_child_identities)
+    && state.active_child_identities.length > 0)
+    || (Array.isArray(state.refinement_child_identities)
+      && state.refinement_child_identities.length > 0);
+  if (monitoredLedgerPresent) {
+    state.recovery_required = true;
+    state.recovery_kind = state.recovery_kind || 'monitored_process_ownership';
+    state.recovery_reason = state.recovery_reason
+      || 'Terminal finalization retained an undrained monitored process ledger.';
+    state.orphan_child_pid = state.active_child_pid;
+    return state;
+  }
   state.active_child_pid = null;
   state.active_child_kind = null;
   state.active_child_command = null;
   state.active_child_identity = null;
   state.active_child_controller_pid = null;
+  state.active_child_controller_identity = null;
   return state;
 }
 

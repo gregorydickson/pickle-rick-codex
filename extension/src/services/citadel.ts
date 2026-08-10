@@ -14,6 +14,10 @@ import {
 import { recoverableHardReset } from './recoverable-git.js';
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from './monitored-process-ownership.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
 import { auditPersistedScopeForCitadel } from './scope-contract.js';
@@ -1241,6 +1245,8 @@ function failedReviewerResult(error: unknown, durationMs: number): CodexSpawnRes
     usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
     usageReported: false, terminatedAfterSuccess: false, cancelled: false,
     outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+    drainAttested: false,
+    processIdentities: { broker: null, target: null, descendants: [] },
   };
 }
 
@@ -2919,7 +2925,13 @@ export async function runCitadel(
             current.active_child_pid = child.pid;
             current.active_child_kind = 'citadel-check';
             current.active_child_command = command;
-            current.active_child_identity = captureSpawnedProcessIdentity(Number(child.pid));
+            // npm and shell launchers may exec in place after spawn. Their PID,
+            // process group, session, and start time remain immutable, but the
+            // command text legitimately changes. Persist structural ownership
+            // so cancellation does not mistake that exec transition for PID reuse.
+            current.active_child_identity = captureSpawnedProcessIdentity(
+              Number(child.pid), 5, process.pid, { strictCommand: false },
+            );
             current.active_child_controller_pid = process.pid;
             return current;
           });
@@ -2934,6 +2946,7 @@ export async function runCitadel(
             current.active_child_command = null;
             current.active_child_identity = null;
             current.active_child_controller_pid = null;
+            current.active_child_controller_identity = null;
             return current;
           });
         },
@@ -3218,6 +3231,7 @@ export async function runCitadel(
     };
     try {
       assertOwnership();
+      recoverMonitoredProcessOwnership(manager, path.join(sessionDir, 'state.json'));
       result = await runCodexExecMonitored({
         cwd: citadelWorkingDir,
         prompt: buildCitadelPrompt(
@@ -3229,16 +3243,12 @@ export async function runCitadel(
         outputLastMessagePath,
         progressArtifactPaths: [candidatePath],
         addDirs: [attemptDir],
-        onSpawn: (child, identity) => {
-          manager.update(path.join(sessionDir, 'state.json'), (current) => {
-            current.active_child_pid = child.pid;
-            current.active_child_kind = 'codex';
-            current.active_child_command = `citadel-attempt-${attempt}`;
-            current.active_child_identity = identity;
-            current.active_child_controller_pid = process.pid;
-            return current;
-          });
-        },
+        ...monitoredProcessStateCallbacks(
+          manager,
+          path.join(sessionDir, 'state.json'),
+          'codex',
+          `citadel-attempt-${attempt}`,
+        ),
         cancelCheck: shouldCancel,
       });
       assertOwnership();
@@ -3247,17 +3257,6 @@ export async function runCitadel(
       finishJournalAttempt('interrupted', error);
       assertOwnership();
       reviewerError = error;
-    } finally {
-      if (!ownershipDrainError) {
-        manager.update(path.join(sessionDir, 'state.json'), (current) => {
-          current.active_child_pid = null;
-          current.active_child_kind = null;
-          current.active_child_command = null;
-          current.active_child_identity = null;
-          current.active_child_controller_pid = null;
-          return current;
-        });
-      }
     }
     if (restoreIsolatedCheckpoint(`reviewer-attempt-${attempt}`)) {
       finalizeAttempt(

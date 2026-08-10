@@ -71,6 +71,11 @@ import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { createDisposableDetachedWorktree } from '../services/disposable-worktree.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
 import {
+  clearActiveChildIfNoMonitoredOwnership,
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from '../services/monitored-process-ownership.js';
+import {
   normalizeTicketId,
   readManifest,
   refinementTicketMaterializationPaths,
@@ -789,17 +794,14 @@ export async function repairTicketVerificationContract(
     'Return <promise>CONTRACT_REPAIR_COMPLETE</promise> after writing the artifact.',
   ].join('\n\n');
   let result;
+  recoverMonitoredProcessOwnership(manager, statePath);
   try {
     result = await runCodexExecMonitored({
       execArgs: ['--sandbox', 'workspace-write'], cwd: isolated.workingDir, prompt,
       timeoutMs: options.timeoutMs || Number(state.worker_timeout_seconds || 900) * 1000,
       outputLastMessagePath: lastMessagePath, progressArtifactPaths: [artifactPath], addDirs: [sessionDir], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CONTRACT_REPAIR_COMPLETE') || hasPromiseToken(lastMessage, 'CONTRACT_REPAIR_COMPLETE'),
-      onSpawn: (child, identity) => updateActiveChild(statePath, manager, {
-        active_child_pid: child.pid,
-        active_child_kind: 'codex',
-        active_child_command: 'contract-repair',
-      }, identity),
+      ...monitoredProcessStateCallbacks(manager, statePath, 'codex', 'contract-repair'),
       cancelCheck: shouldCancel,
     });
     assertOwnership();
@@ -810,9 +812,7 @@ export async function repairTicketVerificationContract(
       try {
         isolated.cleanup();
       } finally {
-        if (!ownershipDrainError) {
-          updateActiveChild(statePath, manager, { active_child_pid: null, active_child_kind: null, active_child_command: null });
-        }
+        if (!ownershipDrainError) clearActiveChildIfNoMonitoredOwnership(manager, statePath);
       }
     }
   }
@@ -1384,6 +1384,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
         prepareWorkerLifecycleArtifact(candidateArtifactPath);
         let modelResult: CodexSpawnResult | null = null;
         let modelOutcome: 'success' | 'failed' | 'cancelled' | 'timed_out' = 'failed';
+        recoverMonitoredProcessOwnership(manager, statePath);
         try {
           const result = await runCodexExecMonitored({
             // Lifecycle artifacts authorize repository advancement. Pin the sandbox
@@ -1414,13 +1415,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
             successCheck: phaseSuccessCheck(phase, lastMessagePath),
             successSignalGraceMs: 150,
             successPollMs: 50,
-            onSpawn: (child, identity) => {
-              updateActiveChild(statePath, manager, {
-                active_child_pid: child.pid,
-                active_child_kind: 'codex',
-                active_child_command: phase,
-              }, identity);
-            },
+            ...monitoredProcessStateCallbacks(manager, statePath, 'codex', phase),
             cancelCheck: shouldCancel,
           });
           modelResult = result;
@@ -1745,12 +1740,7 @@ export async function runTicket(sessionDir: string, ticketId: string, options: R
   } finally {
     try {
       assertOwnership();
-      updateActiveChild(statePath, manager, {
-        worker_pid: null,
-        active_child_pid: null,
-        active_child_kind: null,
-        active_child_command: null,
-      });
+      clearActiveChildIfNoMonitoredOwnership(manager, statePath, { worker_pid: null });
     } catch {
       // Preserve the immutable child/recovery handle for the new owner. A stale
       // worker must never erase state written by its replacement.

@@ -18,6 +18,7 @@ export interface ProcessIdentity {
   pid: number;
   parentPid: number;
   pgid: number;
+  sessionId: number;
   startTime: string;
   argv: string[] | null;
   command: string | null;
@@ -29,6 +30,11 @@ export interface PersistedProcessIdentity {
   pgid: number;
   start_time: string;
   fingerprint: string;
+  identity_version?: 2;
+  session_id?: number;
+  command_sha256?: string;
+  identity_kind?: 'managed' | 'descendant';
+  strict_command?: boolean;
 }
 
 export interface OrphanReaperOptions {
@@ -55,57 +61,116 @@ function readProcArgv(pid: number): string[] | null {
 
 function inspectProcess(pid: number): ProcessIdentity | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=', '-o', 'pgid=', '-o', 'state=', '-o', 'lstart='], {
+  const metadata = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=', '-o', 'pgid=', '-o', 'sess=', '-o', 'state=', '-o', 'lstart='], {
     encoding: 'utf8',
     timeout: 5_000,
   });
   if (metadata.status !== 0 || !metadata.stdout.trim()) return null;
-  const match = metadata.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]+)$/);
+  const match = metadata.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]+)$/);
   if (!match) return null;
   const parentPid = Number(match[1]);
   const pgid = Number(match[2]);
-  if (match[3].startsWith('Z')) return null;
-  const startTime = match[4].trim();
+  const sessionId = Number(match[3]);
+  if (match[4].startsWith('Z')) return null;
+  const startTime = match[5].trim();
   const commandResult = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'command='], {
     encoding: 'utf8',
     timeout: 5_000,
   });
   if (commandResult.status !== 0 || !commandResult.stdout.trim()) return null;
   const command = commandResult.stdout.trim();
+  const commandSha256 = crypto.createHash('sha256').update(command).digest('hex');
   const argv = readProcArgv(pid);
   return {
     pid,
     parentPid,
     pgid,
+    sessionId,
     startTime,
     argv,
     command,
-    fingerprint: crypto.createHash('sha256').update(`${pid}\0${pgid}\0${startTime}`).digest('hex'),
+    fingerprint: crypto.createHash('sha256')
+      .update(`v2\0${pid}\0${pgid}\0${sessionId}\0${startTime}\0${commandSha256}`).digest('hex'),
   };
+}
+
+function structuralFingerprint(identity: Pick<ProcessIdentity, 'pid' | 'pgid' | 'sessionId' | 'startTime'>): string {
+  return crypto.createHash('sha256')
+    .update(`v2-descendant\0${identity.pid}\0${identity.pgid}\0${identity.sessionId}\0${identity.startTime}`).digest('hex');
+}
+
+function persistIdentity(
+  identity: ProcessIdentity,
+  options: { identityKind?: 'managed' | 'descendant'; strictCommand?: boolean } = {},
+): PersistedProcessIdentity {
+  const identityKind = options.identityKind || 'managed';
+  const strictCommand = options.strictCommand ?? identityKind !== 'descendant';
+  return {
+    pid: identity.pid,
+    pgid: identity.pgid,
+    start_time: identity.startTime,
+    fingerprint: strictCommand ? identity.fingerprint : structuralFingerprint(identity),
+    identity_version: 2,
+    session_id: identity.sessionId,
+    command_sha256: crypto.createHash('sha256').update(identity.command || '').digest('hex'),
+    identity_kind: identityKind,
+    strict_command: strictCommand,
+  };
+}
+
+function identityMatches(expected: PersistedProcessIdentity, current: ProcessIdentity | null): boolean {
+  if (!current || current.pid !== expected.pid || current.pgid !== expected.pgid
+    || current.startTime !== expected.start_time) return false;
+  if (expected.identity_version === 2) {
+    if (current.sessionId !== expected.session_id) return false;
+    return expected.strict_command === false || expected.identity_kind === 'descendant'
+      ? structuralFingerprint(current) === expected.fingerprint
+      : current.fingerprint === expected.fingerprint;
+  }
+  if (current.fingerprint === expected.fingerprint) return true;
+  const legacy = crypto.createHash('sha256')
+    .update(`${current.pid}\0${current.pgid}\0${current.startTime}`).digest('hex');
+  return legacy === expected.fingerprint;
+}
+
+export function isPersistedProcessIdentityValid(value: unknown): value is PersistedProcessIdentity {
+  const identity = value as PersistedProcessIdentity | null;
+  if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0
+    || !Number.isInteger(identity.pgid) || identity.pgid <= 0
+    || typeof identity.start_time !== 'string' || !identity.start_time
+    || typeof identity.fingerprint !== 'string') return false;
+  if (identity.identity_version === 2) {
+    if (!Number.isInteger(identity.session_id) || Number(identity.session_id) < 0
+      || !/^[a-f0-9]{64}$/.test(String(identity.command_sha256 || ''))) return false;
+    if (identity.identity_kind !== undefined && !['managed', 'descendant'].includes(identity.identity_kind)) return false;
+    if (identity.strict_command !== undefined && typeof identity.strict_command !== 'boolean') return false;
+    const expectedFingerprint = identity.strict_command === false || identity.identity_kind === 'descendant'
+      ? crypto.createHash('sha256')
+        .update(`v2-descendant\0${identity.pid}\0${identity.pgid}\0${identity.session_id}\0${identity.start_time}`).digest('hex')
+      : crypto.createHash('sha256')
+        .update(`v2\0${identity.pid}\0${identity.pgid}\0${identity.session_id}\0${identity.start_time}\0${identity.command_sha256}`)
+        .digest('hex');
+    return identity.fingerprint === expectedFingerprint;
+  }
+  return identity.fingerprint === crypto.createHash('sha256')
+    .update(`${identity.pid}\0${identity.pgid}\0${identity.start_time}`).digest('hex');
 }
 
 export function captureProcessIdentity(pid: number): PersistedProcessIdentity | null {
   const identity = inspectProcess(pid);
   if (!identity || identity.pgid !== identity.pid) return null;
-  return {
-    pid: identity.pid,
-    pgid: identity.pgid,
-    start_time: identity.startTime,
-    fingerprint: identity.fingerprint,
-  };
+  return persistIdentity(identity);
 }
 
 /** Capture immutable liveness identity for a process without requiring it to
  * lead its process group. This is for leases/locks, never group signalling. */
-export function captureProcessLivenessIdentity(pid: number): PersistedProcessIdentity | null {
+export function captureProcessLivenessIdentity(
+  pid: number,
+  options: { identityKind?: 'managed' | 'descendant' } = {},
+): PersistedProcessIdentity | null {
   const identity = inspectProcess(pid);
   if (!identity) return null;
-  return {
-    pid: identity.pid,
-    pgid: identity.pgid,
-    start_time: identity.startTime,
-    fingerprint: identity.fingerprint,
-  };
+  return persistIdentity(identity, options);
 }
 
 export function inspectProcessLivenessIdentity(
@@ -113,28 +178,19 @@ export function inspectProcessLivenessIdentity(
 ): 'not-running' | 'matched' | 'reused' {
   const current = inspectProcess(persisted.pid);
   if (!current) return 'not-running';
-  return current.pid === persisted.pid
-    && current.pgid === persisted.pgid
-    && current.startTime === persisted.start_time
-    && current.fingerprint === persisted.fingerprint
-    ? 'matched'
-    : 'reused';
+  return identityMatches(persisted, current) ? 'matched' : 'reused';
 }
 
 export function captureSpawnedProcessIdentity(
   pid: number,
   attempts: number = 5,
   expectedParentPid: number = process.pid,
+  options: { strictCommand?: boolean } = {},
 ): PersistedProcessIdentity | null {
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
     const observed = inspectProcess(pid);
     if (observed && observed.pgid === observed.pid && observed.parentPid === expectedParentPid) {
-      return {
-        pid: observed.pid,
-        pgid: observed.pgid,
-        start_time: observed.startTime,
-        fingerprint: observed.fingerprint,
-      };
+      return persistIdentity(observed, options);
     }
     if (observed && observed.parentPid !== expectedParentPid) return null;
     if (attempt + 1 < attempts) waitSync(10);
@@ -144,11 +200,8 @@ export function captureSpawnedProcessIdentity(
 
 function matchesPersistedIdentity(expected: PersistedProcessIdentity, current: ProcessIdentity | null): boolean {
   return Boolean(
-    current
-      && current.pid === expected.pid
-      && current.pgid === expected.pgid
-      && current.startTime === expected.start_time
-      && current.fingerprint === expected.fingerprint
+    identityMatches(expected, current)
+      && current
       && current.pgid === current.pid,
   );
 }
@@ -297,6 +350,43 @@ export function reapRecordedLiveProcessGroup(
   }
 }
 
+/** Recover a recorded process group through an immutable non-leader member.
+ * This is the fail-closed fallback for a broker that disappeared before its
+ * target. It deliberately uses immediate KILL: a TERM grace could remove the
+ * sole immutable member and destroy the authority needed to reap stubborn
+ * descendants in the same group. */
+export function reapRecordedProcessGroupFromMember(
+  persisted: PersistedProcessIdentity,
+  options: OrphanReaperOptions = {},
+): OrphanReapResult {
+  const inspect = options.inspect || inspectProcess;
+  const signalGroup = options.signalGroup || ((pgid, signal) => process.kill(-pgid, signal));
+  const wait = options.wait || waitSync;
+  const matchesMember = (current: ProcessIdentity | null): boolean => Boolean(
+    identityMatches(persisted, current),
+  );
+  const initial = inspect(persisted.pid);
+  if (!initial) {
+    return { status: 'not-running', pid: persisted.pid, pgid: persisted.pgid, reason: 'recorded group member is no longer running', signals: [] };
+  }
+  if (!matchesMember(initial)) {
+    return { status: 'ambiguous', pid: persisted.pid, pgid: initial.pgid, reason: 'recorded group member identity changed', signals: [] };
+  }
+  const beforeKill = inspect(persisted.pid);
+  if (!matchesMember(beforeKill)) {
+    return { status: 'ambiguous', pid: persisted.pid, pgid: beforeKill?.pgid || null, reason: 'recorded group member identity changed before KILL', signals: [] };
+  }
+  const signals: NodeJS.Signals[] = [];
+  try {
+    signalGroup(persisted.pgid, 'SIGKILL');
+    signals.push('SIGKILL');
+    wait(50);
+    return { status: 'reaped', pid: persisted.pid, pgid: persisted.pgid, reason: 'exact live group member authorized immediate KILL', signals };
+  } catch (error) {
+    return { status: 'signal-failed', pid: persisted.pid, pgid: persisted.pgid, reason: error instanceof Error ? error.message : String(error), signals };
+  }
+}
+
 export function recoverSessionOrphanState(sessionDir: string, state: Record<string, unknown>): OrphanReapResult | null {
   const pid = Number(state.orphan_child_pid || state.active_child_pid);
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -361,6 +451,69 @@ export function assertRecordedActiveChildRecovered(
 ): OrphanReapResult | null {
   const statePath = path.join(sessionDir, 'state.json');
   const state = stateManager.read(statePath);
+  const rawLedger = Array.isArray(state.active_child_identities) ? state.active_child_identities : [];
+  if (rawLedger.length > 0) {
+    if (!rawLedger.every(isPersistedProcessIdentityValid)) {
+      throw new Error('Session recovery required: monitored process identity ledger is invalid');
+    }
+    const ledger = rawLedger as PersistedProcessIdentity[];
+    const groups = new Map<number, PersistedProcessIdentity[]>();
+    for (const entry of ledger) groups.set(entry.pgid, [...(groups.get(entry.pgid) || []), entry]);
+    let recovered = false;
+    for (const group of groups.values()) {
+      const leader = group.find((entry) => entry.pid === entry.pgid);
+      if (leader && inspectProcessLivenessIdentity(leader) === 'matched') {
+        const leaderResult = reapRecordedLiveProcessGroup(leader);
+        if (!['reaped', 'not-running'].includes(leaderResult.status)) {
+          throw new Error(`Session recovery required: ${leaderResult.reason}`);
+        }
+        recovered ||= leaderResult.status === 'reaped';
+      }
+      for (const entry of group) {
+        const liveness = inspectProcessLivenessIdentity(entry);
+        if (liveness === 'not-running') continue;
+        if (liveness === 'reused') throw new Error('Session recovery required: monitored process identity was reused');
+        const memberResult = entry.pid === entry.pgid
+          ? reapRecordedLiveProcessGroup(entry) : reapRecordedProcessGroupFromMember(entry);
+        if (!['reaped', 'not-running'].includes(memberResult.status)) {
+          throw new Error(`Session recovery required: ${memberResult.reason}`);
+        }
+        recovered ||= memberResult.status === 'reaped';
+      }
+      if (group.some((entry) => inspectProcessLivenessIdentity(entry) !== 'not-running')
+        || (() => {
+          if (process.platform === 'win32') return false;
+          try { process.kill(-group[0].pgid, 0); return true; } catch { return false; }
+        })()) {
+        throw new Error('Session recovery required: monitored process group remains live after exact recovery');
+      }
+    }
+    stateManager.update(statePath, (current) => {
+      const currentLedger = Array.isArray(current.active_child_identities)
+        ? current.active_child_identities as PersistedProcessIdentity[] : [];
+      if (JSON.stringify(currentLedger) !== JSON.stringify(ledger)) {
+        throw new Error('Session recovery required: monitored process ownership changed during recovery');
+      }
+      current.active_child_identities = [];
+      current.active_child_pid = null;
+      current.active_child_kind = null;
+      current.active_child_command = null;
+      current.active_child_identity = null;
+      current.active_child_controller_pid = null;
+      current.active_child_controller_identity = null;
+      current.orphan_child_pid = null;
+      current.recovery_required = false;
+      current.recovery_reason = null;
+      return current;
+    });
+    return {
+      status: recovered ? 'reaped' : 'not-running',
+      pid: ledger[0].pid,
+      pgid: ledger[0].pgid,
+      reason: recovered ? 'monitored process ledger was reaped' : 'monitored process ledger was already absent',
+      signals: [],
+    };
+  }
   const pid = Number(state.active_child_pid);
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const rawIdentity = state.active_child_identity;
@@ -397,7 +550,9 @@ export function assertRecordedActiveChildRecovered(
     current.active_child_kind = null;
     current.active_child_command = null;
     current.active_child_identity = null;
+    current.active_child_identities = [];
     current.active_child_controller_pid = null;
+    current.active_child_controller_identity = null;
     current.orphan_child_pid = null;
     current.recovery_required = false;
     current.recovery_reason = null;

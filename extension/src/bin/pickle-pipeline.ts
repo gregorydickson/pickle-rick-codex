@@ -213,6 +213,7 @@ function markAbruptRunnerLossBeforeResume(sessionDir: string, manager: StateMana
     current.active_child_command = null;
     current.active_child_identity = null;
     current.active_child_controller_pid = null;
+    current.active_child_controller_identity = null;
     current.last_exit_reason = 'runner_lost';
     current.step = 'paused';
     appendHistory(current, 'runner_lost', current.current_ticket || undefined);

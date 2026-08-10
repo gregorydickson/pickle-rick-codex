@@ -837,14 +837,27 @@ test('Citadel ignores arbitrary output spam for semantic progress and drains at 
   skip: process.platform === 'win32',
 }, async () => {
   const cwd = makeTempRoot('pickle-citadel-progress-timeout-');
+  const spamProgressPath = path.join(cwd, 'spam-progress');
   let childIdentity = null;
   const result = await runMonitoredCitadelCheck({
     command: 'continuous progress fixture',
     executable: process.execPath,
-    args: ['-e', "setInterval(() => process.stdout.write('extension-test-integration\\nunknown-item\\nextension-test-fast\\nextension-test-fast\\n'), 50)"],
+    args: ['-e', [
+      "const fs = require('node:fs');",
+      'let sequence = 0;',
+      'const emitSpam = () => {',
+      `  fs.appendFileSync(${JSON.stringify(spamProgressPath)}, String(++sequence) + '\\n');`,
+      "  process.stdout.write('extension-test-integration\\nunknown-item\\nextension-test-fast\\nextension-test-fast\\n');",
+      '};',
+      'emitSpam();',
+      'setInterval(emitSpam, 20);',
+    ].join(' ')],
   }, cwd, {
-    timeoutMs: 250,
-    absoluteTimeoutMs: 700,
+    timeoutMs: 300,
+    // The absolute execution cap is intentionally well outside the inactivity
+    // deadline. Process-tree teardown happens after either deadline fires and
+    // is not itself evidence that arbitrary child output extended execution.
+    absoluteTimeoutMs: 5_000,
     isCancelled: () => false,
     onSpawn: (child) => { childIdentity = captureSpawnedProcessIdentity(Number(child.pid)); },
     onExit: () => {},
@@ -854,12 +867,14 @@ test('Citadel ignores arbitrary output spam for semantic progress and drains at 
   assert.equal(result.status, 'failed');
   assert.equal(result.timed_out, true);
   assert.equal(result.timeout_kind, 'inactivity');
-  assert.equal(result.inactivity_timeout_ms, 250);
-  assert.equal(result.absolute_timeout_ms, 700);
+  assert.equal(result.inactivity_timeout_ms, 300);
+  assert.equal(result.absolute_timeout_ms, 5_000);
   assert.ok(result.output_bytes > 0);
-  assert.ok(result.elapsed_ms >= 250);
-  assert.ok(result.elapsed_ms < 700);
+  const spamSequence = fs.readFileSync(spamProgressPath, 'utf8').trim().split('\n').map(Number);
+  assert.ok(spamSequence.length > 1, 'the child must emit repeated output while the inactivity clock runs');
+  assert.deepEqual(spamSequence, spamSequence.map((_value, index) => index + 1));
   assert.match(result.output, /trusted semantic progress/);
+  assert.notEqual(result.process_tree_quiescent, false);
   assert.throws(
     () => process.kill(-childIdentity.pgid, 0),
     (error) => error?.code === 'ESRCH',

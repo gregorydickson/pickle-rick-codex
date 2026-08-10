@@ -13,6 +13,10 @@ import { deriveCitadelAcceptanceCriteria, type CitadelSystemBlockArtifact } from
 import { assertRecordedActiveChildRecovered } from './orphan-reaper.js';
 import { atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { StateManager } from './state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from './monitored-process-ownership.js';
 import { isDurableOwnershipDrainError } from './durable-runtime.js';
 import { createDisposableDetachedWorktree } from './disposable-worktree.js';
 import { getHeadSha, getWorkingTreeFingerprint } from './git-utils.js';
@@ -846,6 +850,7 @@ async function executeCriterionShards(
         'Write exactly one JSON object with schema_version:1, shard_id, criterion, checkpoint_head, reviewed_range, status (pass or fail), evidence (non-empty string array), repository_paths (non-empty eligible path array), repository_evidence (non-empty array of exact {path,sha256,observation} objects derived from files you actually read), checks_cited (non-empty exact deterministic command array), and findings (array). Inspect the reviewed diff and cited repository files, hash their exact bytes with SHA-256, and record a concrete observation. Assess only this exact criterion. Do not write a Citadel report.',
         'Return <promise>CITADEL_CRITERION_SHARD_COMPLETE</promise> after writing the shard result.',
       ].join('\n\n');
+      recoverMonitoredProcessOwnership(manager, statePath);
       const result = await runCodexExecMonitored({
         telemetry: { sessionDir, ticketId: shard.shard_id, phase: 'citadel_criterion_shard_repair' },
         execArgs: ['--sandbox', 'workspace-write', '--skip-git-repo-check'],
@@ -858,14 +863,12 @@ async function executeCriterionShards(
         inheritConfiguredAddDirs: false,
         successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_CRITERION_SHARD_COMPLETE')
           || hasPromiseToken(lastMessage, 'CITADEL_CRITERION_SHARD_COMPLETE'),
-        onSpawn: (child, identity) => manager.update(statePath, (current) => {
-          current.active_child_pid = child.pid;
-          current.active_child_kind = 'codex';
-          current.active_child_command = `citadel-criterion-shard-${shard.shard_id}`;
-          current.active_child_identity = identity;
-          current.active_child_controller_pid = process.pid;
-          return current;
-        }),
+        ...monitoredProcessStateCallbacks(
+          manager,
+          statePath,
+          'codex',
+          `citadel-criterion-shard-${shard.shard_id}`,
+        ),
         cancelCheck: () => {
           try { options.assertDurableOwnership?.(); } catch (error) {
             preserveActiveChild = true;
@@ -923,14 +926,6 @@ async function executeCriterionShards(
           isolated.assertLiveUnchanged();
         } finally {
           isolated.cleanup();
-          manager.update(statePath, (current) => {
-            current.active_child_pid = null;
-            current.active_child_kind = null;
-            current.active_child_command = null;
-            current.active_child_identity = null;
-            current.active_child_controller_pid = null;
-            return current;
-          });
         }
       }
     }
@@ -1281,8 +1276,8 @@ export async function repairCitadelReviewerArtifactContract(
     'Return <promise>CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE</promise> after writing the artifact.',
   ].join('\n\n');
   const startedAt = Date.now();
-  let preserveActiveChild = false;
   try {
+    recoverMonitoredProcessOwnership(manager, statePath);
     const result = await runCodexExecMonitored({
       telemetry: { sessionDir, ticketId: 'citadel-reviewer-contract', phase: 'citadel_reviewer_contract_repair' },
       execArgs: ['--sandbox', 'workspace-write', '--skip-git-repo-check'],
@@ -1297,21 +1292,9 @@ export async function repairCitadelReviewerArtifactContract(
         hasPromiseToken(stdout, 'CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE')
         || hasPromiseToken(lastMessage, 'CITADEL_REVIEWER_CONTRACT_RECOVERY_COMPLETE')
       ),
-      onSpawn: (child, identity) => manager.update(statePath, (current) => {
-        current.active_child_pid = child.pid;
-        current.active_child_kind = 'codex';
-        current.active_child_command = 'citadel-reviewer-contract-repair';
-        current.active_child_identity = identity;
-        current.active_child_controller_pid = process.pid;
-        return current;
-      }),
+      ...monitoredProcessStateCallbacks(manager, statePath, 'codex', 'citadel-reviewer-contract-repair'),
       cancelCheck: () => {
-        try {
-          options.assertDurableOwnership?.();
-        } catch (error) {
-          preserveActiveChild = true;
-          throw error;
-        }
+        options.assertDurableOwnership?.();
         const cancelledAt = Date.parse(String(manager.read(statePath).cancel_requested_at || ''));
         return Number.isFinite(cancelledAt) && cancelledAt >= startedAt;
       },
@@ -1338,7 +1321,6 @@ export async function repairCitadelReviewerArtifactContract(
     }
     const ownershipDrain = durableOwnershipDrainCause(error);
     if (ownershipDrain) {
-      preserveActiveChild = true;
       throw ownershipDrain;
     }
     attempt.status = 'rejected';
@@ -1348,20 +1330,5 @@ export async function repairCitadelReviewerArtifactContract(
     journal.updated_at = attempt.completed_at;
     atomicWriteJson(recoveryJournalPath(sessionDir), journal);
     return { kind: 'recovery_scheduled', diagnostic_identity: diagnosticIdentity };
-  } finally {
-    if (!preserveActiveChild) {
-      try {
-        manager.update(statePath, (current) => {
-          current.active_child_pid = null;
-          current.active_child_kind = null;
-          current.active_child_command = null;
-          current.active_child_identity = null;
-          current.active_child_controller_pid = null;
-          return current;
-        });
-      } catch {
-        // Durable recovery identity remains available in the journal if state cleanup loses a race.
-      }
-    }
   }
 }

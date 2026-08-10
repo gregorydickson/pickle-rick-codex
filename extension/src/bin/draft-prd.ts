@@ -8,6 +8,10 @@ import { loadConfig } from '../services/config.js';
 import { buildDraftPrdPrompt } from '../services/prompts.js';
 import { appendHistory } from '../services/session.js';
 import { StateManager } from '../services/state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from '../services/monitored-process-ownership.js';
 import type { CodexSpawnResult } from '../types/index.js';
 
 interface DraftPrdOptions {
@@ -50,6 +54,7 @@ export async function draftPrd(sessionDir: string, task: string, options: DraftP
   const prdPath = path.join(sessionDir, 'prd.md');
   const outputLastMessagePath = path.join(sessionDir, 'draft-prd.last-message.txt');
   const prompt = buildDraftPrdPrompt({ task, sessionDir });
+  recoverMonitoredProcessOwnership(manager, statePath);
   const result = await runCodexExecMonitored({
     telemetry: { sessionDir, ticketId: 'pipeline', phase: 'prd' },
     cwd: state.working_dir as string,
@@ -60,6 +65,7 @@ export async function draftPrd(sessionDir: string, task: string, options: DraftP
     cleanupPaths: [prdPath],
     successCheck: ({ lastMessage }) =>
       fs.existsSync(prdPath) && hasPromiseToken(lastMessage, 'PRD_COMPLETE'),
+    ...monitoredProcessStateCallbacks(manager, statePath, 'codex', 'draft-prd'),
   });
 
   assertCodexSucceeded(result, 'PRD drafting failed');

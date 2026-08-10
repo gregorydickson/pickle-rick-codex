@@ -33,7 +33,12 @@ import { StateManager } from './state-manager.js';
 import type { PersistedState } from './state-manager.js';
 import type { Config } from '../types/index.js';
 import { tmuxSessionExists } from './tmux.js';
-import { inspectProcessLivenessIdentity, recoverSessionOrphanState, type PersistedProcessIdentity } from './orphan-reaper.js';
+import { inspectProcessLivenessIdentity, isPersistedProcessIdentityValid, recoverSessionOrphanState, type PersistedProcessIdentity } from './orphan-reaper.js';
+import {
+  activeMonitoredProcessIdentities,
+  recoverMonitoredProcessOwnership,
+  recoverRefinementProcessOwnership,
+} from './monitored-process-ownership.js';
 import {
   validateAutonomousOwnerSpec,
   ensureAutonomousOwnerRecoveryDaemon,
@@ -149,6 +154,7 @@ export function createInitialState({
     start_time_epoch: epochSeconds,
     original_prompt: prompt,
     current_ticket: null,
+    active_child_identities: [],
     history: [],
     started_at: now.toISOString(),
     run_start_time_epoch: epochSeconds,
@@ -678,13 +684,7 @@ function sha256Json(value: unknown): string {
 }
 
 function validPersistedProcessIdentity(value: unknown): value is PersistedProcessIdentity {
-  const identity = value as PersistedProcessIdentity | null;
-  if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0
-    || !Number.isInteger(identity.pgid) || identity.pgid <= 0
-    || typeof identity.start_time !== 'string' || !identity.start_time
-    || typeof identity.fingerprint !== 'string') return false;
-  return identity.fingerprint === crypto.createHash('sha256')
-    .update(`${identity.pid}\0${identity.pgid}\0${identity.start_time}`).digest('hex');
+  return isPersistedProcessIdentityValid(value);
 }
 
 function legacyMaxTimeMigrationEvidence(
@@ -1087,6 +1087,34 @@ function reconcileSessionLivenessInternal(
   const expired = maxMinutes > 0 && startedMs > 0 && nowMs - startedMs >= maxMinutes * 60_000;
   if (!runnerMissing && !expired) return { state, stale: false };
 
+  // The compatibility pid identifies only the broker. A dead broker can leave
+  // an exact guardian or detached descendant ledger behind, so reconcile the
+  // complete durable ownership record before classifying this session stale.
+  try {
+    if (Array.isArray(state.refinement_child_identities)
+      && state.refinement_child_identities.length > 0) {
+      recoverRefinementProcessOwnership(stateManager, statePath);
+      state = stateManager.read(statePath);
+    }
+    if (activeMonitoredProcessIdentities(state).length > 0) {
+      recoverMonitoredProcessOwnership(stateManager, statePath);
+      state = stateManager.read(statePath);
+    }
+  } catch (error) {
+    state = stateManager.update(statePath, (current) => {
+      current.active = false;
+      current.step = current.step === 'complete' ? current.step : 'blocked';
+      current.last_exit_reason = runnerMissing ? 'runner_lost_orphaned_child' : 'max_time_orphaned_child';
+      current.recovery_required = true;
+      current.recovery_kind = 'monitored_process_ownership';
+      current.recovery_reason = error instanceof Error ? error.message : String(error);
+      current.orphan_child_pid = current.active_child_pid;
+      appendHistory(current, String(current.last_exit_reason), current.current_ticket || undefined);
+      return current;
+    });
+    return { state, stale: false };
+  }
+
   if (expired && !rolloverIntentId) {
     // Cancellation and unsafe recovery state are authoritative. In particular,
     // never manufacture a new autonomous intent while cancellation or an
@@ -1164,6 +1192,7 @@ function reconcileSessionLivenessInternal(
         current.active_child_command = null;
         current.active_child_identity = null;
         current.active_child_controller_pid = null;
+        current.active_child_controller_identity = null;
         return current;
       });
       if (reconcileRepairRace()) return { state: stateManager.read(statePath), stale: false };

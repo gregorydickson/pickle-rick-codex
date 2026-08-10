@@ -70,6 +70,10 @@ function validPersistedIdentity(value: unknown): value is PersistedProcessIdenti
 }
 
 function repairHasUnsafeActiveChild(state: PersistedState): boolean {
+  // A monitored broker ledger may retain a target or descendant after its
+  // compatibility broker identity exits. Only the exact group recovery path
+  // may clear that durable evidence.
+  if (Array.isArray(state.active_child_identities) && state.active_child_identities.length > 0) return true;
   const pid = Number(state.active_child_pid || 0);
   const identity = state.active_child_identity;
   if (validPersistedIdentity(identity)) {
@@ -87,6 +91,7 @@ function repairHasUnsafeActiveChild(state: PersistedState): boolean {
   state.active_child_command = null;
   state.active_child_identity = null;
   state.active_child_controller_pid = null;
+  state.active_child_controller_identity = null;
   return false;
 }
 

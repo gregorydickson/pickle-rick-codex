@@ -381,6 +381,12 @@ export interface CodexSpawnResult {
   outputFormat: 'stream-json' | 'codex-block' | 'plain-text';
   assistantContent: string;
   toolCalls: import('../services/classifier-utils.js').CodexToolCallObservation[];
+  drainAttested: boolean;
+  processIdentities: {
+    broker: import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
+    target: import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
+    descendants: import('../services/orphan-reaper.js').PersistedProcessIdentity[];
+  };
 }
 
 export interface SuccessCheckContext {
@@ -414,6 +420,20 @@ export interface RunSpawnedCommandOptions {
     child: import('node:child_process').ChildProcess,
     identity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
   ) => void;
+  onTargetSpawn?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+  ) => void;
+  onDescendants?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
+  ) => void;
+  onDrain?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
+  ) => void;
   captureSpawnedIdentity?: (
     pid: number,
   ) => import('../services/orphan-reaper.js').PersistedProcessIdentity | null;
@@ -434,6 +454,20 @@ export interface CodexExecOptions {
   onSpawn?: (
     child: import('node:child_process').ChildProcess,
     identity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+  ) => void;
+  onTargetSpawn?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+  ) => void;
+  onDescendants?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
+  ) => void;
+  onDrain?: (
+    brokerIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    targetIdentity: import('../services/orphan-reaper.js').PersistedProcessIdentity,
+    descendantIdentities: import('../services/orphan-reaper.js').PersistedProcessIdentity[],
   ) => void;
   captureSpawnedIdentity?: (
     pid: number,

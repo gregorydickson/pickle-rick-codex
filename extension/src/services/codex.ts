@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
@@ -6,7 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { finalizeModelCallTelemetry, reserveModelCallTelemetry } from './productive-autonomy.js';
 import { loadConfig } from './config.js';
 import { safeErrorMessage } from './pickle-utils.js';
-import { captureSpawnedProcessIdentity } from './orphan-reaper.js';
+import {
+  captureProcessLivenessIdentity,
+  captureSpawnedProcessIdentity,
+  inspectProcessLivenessIdentity,
+  isPersistedProcessIdentityValid,
+  type PersistedProcessIdentity,
+} from './orphan-reaper.js';
 import {
   collectCodexToolCalls,
   detectOutputFormat,
@@ -102,7 +109,7 @@ function readLastMessage(filePath: string): string {
     : '';
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+function terminateUnreleasedBroker(child: ChildProcess, signal: NodeJS.Signals): void {
   const pid = Number(child?.pid || 0);
   if (!Number.isInteger(pid) || pid <= 0) return;
 
@@ -122,6 +129,31 @@ function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void
   }
 }
 
+function commandDigest(command: string, args: string[], cwd?: string): string {
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({ command, args, cwd: cwd || null }))
+    .digest('hex');
+}
+
+function sameIdentity(left: PersistedProcessIdentity | null, right: unknown): boolean {
+  if (!left || !right || typeof right !== 'object') return false;
+  const candidate = right as Partial<PersistedProcessIdentity>;
+  return candidate.pid === left.pid
+    && candidate.pgid === left.pgid
+    && candidate.start_time === left.start_time
+    && candidate.fingerprint === left.fingerprint;
+}
+
+function processGroupAlive(pgid: number): boolean {
+  if (process.platform === 'win32') return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 async function runSpawnedCommand({
   command,
   args = [],
@@ -138,6 +170,9 @@ async function runSpawnedCommand({
   usageCompletionGraceMs = 5_000,
   cleanupPaths = [],
   onSpawn,
+  onTargetSpawn,
+  onDescendants,
+  onDrain,
   captureSpawnedIdentity = captureSpawnedProcessIdentity,
   cancelCheck,
 }: RunSpawnedCommandOptions): Promise<CodexSpawnResult> {
@@ -187,6 +222,23 @@ async function runSpawnedCommand({
     let observedArtifactSignature = '';
     let progressSignature = '';
     let controlsArmed = false;
+    let brokerIdentity: PersistedProcessIdentity | null = null;
+    let targetIdentity: PersistedProcessIdentity | null = null;
+    let descendantIdentities: PersistedProcessIdentity[] = [];
+    let brokerDrainAttested = false;
+    let launchAttested = false;
+    let releaseAttested = false;
+    let shutdownAckObserved = false;
+    let targetOutcome: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let protocolFailure = '';
+    let launchDeliveryFailure = '';
+    let releaseDeliveryFailure = '';
+    let shutdownDeliveryFailure = '';
+    let shutdownReleaseDeliveryFailure = '';
+    let targetPublicationError: Error | null = null;
+    let fallbackTimer: NodeJS.Timeout | null = null;
+    const launchId = crypto.randomUUID();
+    const launchCommandDigest = commandDigest(command, args, cwd);
 
     const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../bin/monitored-process-broker.js');
     const child = spawn(process.execPath, [brokerPath], {
@@ -196,11 +248,39 @@ async function runSpawnedCommand({
       detached: process.platform !== 'win32',
     });
 
+    const sendBrokerControl = (
+      message: Record<string, unknown>,
+      authorityObserved: () => boolean,
+      recordUnacknowledgedFailure: (error: Error) => void,
+    ): boolean => {
+      const recordFailure = (error: unknown): void => {
+        // IPC can report EPIPE after the broker consumed a message and
+        // published its identity-bound acknowledgement. Only that protocol
+        // evidence supersedes the transport failure.
+        if (authorityObserved()) return;
+        recordUnacknowledgedFailure(error instanceof Error ? error : new Error(String(error)));
+      };
+      if (!child.connected || typeof child.send !== 'function') {
+        recordFailure(new Error('Monitored process broker IPC channel is disconnected.'));
+        return false;
+      }
+      try {
+        child.send(message, (error) => {
+          if (error) recordFailure(error);
+        });
+        return true;
+      } catch (error) {
+        recordFailure(error);
+        return false;
+      }
+    };
+
     const cleanup = (): void => {
       if (successGraceTimer) clearTimeout(successGraceTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (pollTimer) clearInterval(pollTimer);
       if (cancelTimer) clearInterval(cancelTimer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
     };
 
     const finalize = (result: Omit<CodexSpawnResult, 'command' | 'args'>): void => {
@@ -245,18 +325,38 @@ async function runSpawnedCommand({
       }
     }, 0);
 
-    const scheduleTermination = (
-      signal: NodeJS.Signals,
-      followupSignal: NodeJS.Signals | null = null,
-      delayMs: number = 1_000,
-    ): void => {
-      terminateProcessTree(child, signal);
-      if (!followupSignal) return;
-      setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          terminateProcessTree(child, followupSignal);
+    const signalAttestedGroup = (signal: NodeJS.Signals): boolean => {
+      if (!brokerIdentity) return false;
+      const brokerLiveness = inspectProcessLivenessIdentity(brokerIdentity);
+      const targetLiveness = targetIdentity ? inspectProcessLivenessIdentity(targetIdentity) : 'not-running';
+      // A numeric PGID is safe only while at least one immutable member still
+      // proves ownership. PID reuse is never treated as absence or authority.
+      if (brokerLiveness !== 'matched'
+        && !(targetIdentity?.pgid === brokerIdentity.pgid && targetLiveness === 'matched')) return false;
+      try {
+        if (process.platform !== 'win32') process.kill(-brokerIdentity.pgid, signal);
+        else if (brokerLiveness === 'matched') child.kill(signal);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ESRCH';
+      }
+    };
+
+    const requestBrokerShutdown = (cause: string): void => {
+      sendBrokerControl(
+        { type: 'terminate', launch_id: launchId, cause, grace_ms: 500 },
+        () => shutdownAckObserved,
+        (error) => {
+          shutdownDeliveryFailure = `Monitored broker termination delivery failed: ${safeErrorMessage(error)}`;
+        },
+      );
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      fallbackTimer = setTimeout(() => {
+        if (!shutdownAckObserved || processGroupAlive(brokerIdentity?.pgid || 0)) {
+          signalAttestedGroup('SIGKILL');
         }
-      }, delayMs).unref?.();
+      }, 3_000);
+      fallbackTimer.unref?.();
     };
 
     const requestTermination = (
@@ -270,7 +370,7 @@ async function runSpawnedCommand({
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (pollTimer) clearInterval(pollTimer);
       if (cancelTimer) clearInterval(cancelTimer);
-      scheduleTermination('SIGTERM', 'SIGKILL');
+      requestBrokerShutdown(cause);
       return true;
     };
 
@@ -417,8 +517,136 @@ async function runSpawnedCommand({
     };
 
     child.on('message', (message: unknown) => {
-      if (message && typeof message === 'object'
-        && (message as { type?: unknown }).type === 'launched') armExecutionControls();
+      if (!message || typeof message !== 'object') return;
+      const record = message as Record<string, unknown>;
+      if (record.launch_id !== launchId) return; // stale/foreign IPC is inert
+
+      const bound = record.command_digest === launchCommandDigest
+        && sameIdentity(brokerIdentity, record.broker_identity);
+
+      const persistDescendantLedger = (raw: unknown): boolean => {
+        if (!brokerIdentity || !targetIdentity || !Array.isArray(raw)) return false;
+        const merged = [...descendantIdentities];
+        for (const rawIdentity of raw) {
+          if (!rawIdentity || typeof rawIdentity !== 'object') return false;
+          const candidate = rawIdentity as PersistedProcessIdentity;
+          if (!isPersistedProcessIdentityValid(candidate)) return false;
+          const liveness = inspectProcessLivenessIdentity(candidate);
+          // Exit between broker observation and controller delivery is benign;
+          // a live mismatch is PID reuse and must fail closed.
+          if (liveness === 'reused') return false;
+          const existingPid = merged.find((identity) => identity.pid === candidate.pid);
+          if (existingPid && !sameIdentity(existingPid, candidate)) return false;
+          if (!merged.some((identity) => identity.fingerprint === candidate.fingerprint)
+            && candidate.fingerprint !== targetIdentity.fingerprint
+            && candidate.fingerprint !== brokerIdentity.fingerprint) merged.push(candidate);
+        }
+        try {
+          onDescendants?.(brokerIdentity, targetIdentity, merged);
+        } catch (error) {
+          targetPublicationError = error instanceof Error ? error : new Error(String(error));
+          requestBrokerShutdown('descendant-publication-failed');
+          return false;
+        }
+        descendantIdentities = merged;
+        return true;
+      };
+      if (record.type === 'launched') {
+        if (!bound || !brokerIdentity || !record.target_identity || typeof record.target_identity !== 'object') {
+          protocolFailure = 'Monitored process broker launch attestation failed.';
+          requestBrokerShutdown('launch-attestation-failed');
+          return;
+        }
+        const candidate = record.target_identity as PersistedProcessIdentity;
+        const independentlyCaptured = captureProcessLivenessIdentity(Number(candidate.pid));
+        if (!independentlyCaptured || !sameIdentity(independentlyCaptured, candidate)
+          || candidate.pgid !== brokerIdentity.pgid) {
+          protocolFailure = 'Monitored target identity or process-group binding could not be verified.';
+          requestBrokerShutdown('target-attestation-failed');
+          return;
+        }
+        if (targetIdentity) {
+          if (!sameIdentity(targetIdentity, candidate)) {
+            protocolFailure = 'Monitored process broker sent conflicting target attestations.';
+            requestBrokerShutdown('conflicting-target-attestation');
+          }
+          return;
+        }
+        targetIdentity = independentlyCaptured;
+        launchAttested = true;
+        try {
+          onTargetSpawn?.(brokerIdentity, independentlyCaptured);
+        } catch (error) {
+          targetPublicationError = error instanceof Error ? error : new Error(String(error));
+          requestBrokerShutdown('target-publication-failed');
+          return;
+        }
+        if (process.platform === 'win32') {
+          releaseAttested = true;
+          armExecutionControls();
+        } else {
+          sendBrokerControl(
+            { type: 'release', launch_id: launchId, command_digest: launchCommandDigest },
+            () => releaseAttested,
+            (error) => {
+              releaseDeliveryFailure = `Monitored target release failed: ${safeErrorMessage(error)}`;
+              protocolFailure = releaseDeliveryFailure;
+              requestBrokerShutdown('target-release-failed');
+            },
+          );
+        }
+        return;
+      }
+
+      if (record.type === 'released') {
+        if (!bound || !targetIdentity || !sameIdentity(targetIdentity, record.target_identity)) {
+          protocolFailure = 'Monitored target release attestation failed.';
+          requestBrokerShutdown('release-attestation-failed');
+          return;
+        }
+        releaseAttested = true;
+        if (protocolFailure === releaseDeliveryFailure) protocolFailure = '';
+        releaseDeliveryFailure = '';
+        armExecutionControls();
+        return;
+      }
+
+      if (record.type === 'descendants') {
+        if (!bound || !targetIdentity || !sameIdentity(targetIdentity, record.target_identity)
+          || !persistDescendantLedger(record.descendant_identities)) {
+          protocolFailure = 'Monitored descendant ledger update failed attestation.';
+          requestBrokerShutdown('descendant-attestation-failed');
+        }
+        return;
+      }
+
+      if (record.type === 'shutdown_ack') {
+        if (!bound || shutdownAckObserved
+          || (targetIdentity && !sameIdentity(targetIdentity, record.target_identity))) {
+          if (shutdownAckObserved && bound
+            && (!targetIdentity || sameIdentity(targetIdentity, record.target_identity))) return;
+          protocolFailure = 'Monitored process broker shutdown attestation failed.';
+          return;
+        }
+        shutdownAckObserved = true;
+        if (!persistDescendantLedger(record.descendant_identities)) {
+          protocolFailure = 'Monitored descendant shutdown ledger was malformed or conflicted.';
+          return;
+        }
+        targetOutcome = {
+          code: typeof record.target_exit_code === 'number' ? record.target_exit_code : null,
+          signal: typeof record.target_signal === 'string' ? record.target_signal as NodeJS.Signals : null,
+        };
+        sendBrokerControl(
+          { type: 'shutdown_release', launch_id: launchId, command_digest: launchCommandDigest },
+          () => child.exitCode !== null || child.signalCode !== null,
+          (error) => {
+            // The broker's bounded self-drain can still prove quiescence, but
+            // retain the transport failure until that exact proof arrives.
+            shutdownReleaseDeliveryFailure = `Monitored broker shutdown release delivery failed: ${safeErrorMessage(error)}`;
+          },
+        );
+      }
     });
 
     child.stdout!.on('data', (chunk: Buffer) => {
@@ -450,6 +678,7 @@ async function runSpawnedCommand({
       if (terminationCause === null && !successObserved) checkForSuccess();
       cleanup();
       const flushStarted = Date.now();
+      const attestationDeadline = Date.now() + 2_000;
       let stableSignature = currentProgressSignature();
       const flushQuietMs = Math.max(50, Math.min(successSignalGraceMs, 250));
       const finalizeAfterFlush = (): void => {
@@ -459,21 +688,65 @@ async function runSpawnedCommand({
           setTimeout(finalizeAfterFlush, flushQuietMs);
           return;
         }
+        const brokerLiveness = brokerIdentity
+          ? inspectProcessLivenessIdentity(brokerIdentity) : 'not-running';
+        const targetLiveness = targetIdentity
+          ? inspectProcessLivenessIdentity(targetIdentity) : 'not-running';
+        const descendantLiveness = descendantIdentities.map(inspectProcessLivenessIdentity);
+        if (!launchAttested && launchDeliveryFailure && !protocolFailure) {
+          protocolFailure = launchDeliveryFailure;
+        }
+        if (!shutdownAckObserved && shutdownDeliveryFailure && !protocolFailure) {
+          protocolFailure = shutdownDeliveryFailure;
+        }
+        const attestedGroups = new Set([brokerIdentity?.pgid,
+          ...descendantIdentities.map((identity) => identity.pgid)].filter((pgid): pgid is number => Boolean(pgid)));
+        const groupsAbsent = [...attestedGroups].every((pgid) => !processGroupAlive(pgid));
+        const identitiesAbsent = brokerLiveness === 'not-running' && targetLiveness === 'not-running'
+          && descendantLiveness.every((liveness) => liveness === 'not-running');
+        if (shutdownAckObserved && identitiesAbsent && groupsAbsent && !protocolFailure
+          && brokerIdentity && targetIdentity) {
+          brokerDrainAttested = true;
+        } else if ((brokerLiveness === 'matched' || targetLiveness === 'matched'
+          || descendantLiveness.includes('matched'))
+          && Date.now() < attestationDeadline) {
+          setTimeout(finalizeAfterFlush, 25);
+          return;
+        } else if (!groupsAbsent && Date.now() < attestationDeadline) {
+          setTimeout(finalizeAfterFlush, 25);
+          return;
+        }
+        if (brokerDrainAttested && brokerIdentity && targetIdentity) {
+          try {
+            onDrain?.(brokerIdentity, targetIdentity, descendantIdentities);
+          } catch (error) {
+            protocolFailure = `Monitored process drain persistence failed: ${safeErrorMessage(error)}`;
+            brokerDrainAttested = false;
+          }
+        }
         const stdout = currentStdout();
         const stderr = currentStderr();
         const message = readLastMessage(outputLastMessagePath);
         const outputFormat = detectOutputFormat(stdout);
         const usage = inspectCodexUsage(stdout);
+        const unattestedBrokerClose = controlsArmed && !brokerDrainAttested;
+        const naturalExitCode = targetOutcome?.code ?? (targetOutcome?.signal ? 1 : (code ?? (signal ? 1 : 0)));
         const result: Omit<CodexSpawnResult, 'command' | 'args'> = {
           exitCode: terminationCause === 'cancel'
             ? 130
             : terminationCause === 'timeout'
               ? 124
-              : successObserved
+              : successObserved && !unattestedBrokerClose && !protocolFailure
                 ? 0
-                : (code ?? (signal ? 1 : 0)),
+                : protocolFailure || targetPublicationError || unattestedBrokerClose
+                  ? 1
+                  : naturalExitCode,
           stdout,
-          stderr,
+          stderr: [stderr, protocolFailure,
+            unattestedBrokerClose ? 'Monitored process broker closed without an exact quiescent target attestation.' : '',
+            !brokerDrainAttested ? shutdownReleaseDeliveryFailure : '',
+            targetPublicationError?.message || '',
+          ].filter(Boolean).join('\n'),
           timedOut: terminationCause === 'timeout',
           durationMs: Date.now() - startedAt,
           lastMessage: message,
@@ -484,7 +757,15 @@ async function runSpawnedCommand({
           outputFormat,
           assistantContent: extractAssistantContent(stdout),
           toolCalls: collectCodexToolCalls(stdout),
+          drainAttested: brokerDrainAttested,
+          processIdentities: { broker: brokerIdentity, target: targetIdentity, descendants: descendantIdentities },
         };
+        if (targetPublicationError) {
+          settled = true;
+          cleanup();
+          reject(targetPublicationError);
+          return;
+        }
         if (cancelCheckError) {
           settled = true;
           cleanup();
@@ -503,33 +784,36 @@ async function runSpawnedCommand({
       // expected consequence of the child closing its read end first.
       if (error.code === 'EPIPE') return;
       if (settled) return;
-      cleanup();
-      terminateProcessTree(child, 'SIGTERM');
-      reject(error);
+      targetPublicationError = error;
+      requestBrokerShutdown('stdin-error');
     });
 
     try {
-      const brokerIdentity = captureSpawnedIdentity(Number(child.pid));
-      if (!brokerIdentity) {
+      const capturedBrokerIdentity = captureSpawnedIdentity(Number(child.pid));
+      if (!capturedBrokerIdentity) {
         throw new Error('Could not capture immutable monitored process broker identity.');
       }
-      onSpawn?.(child, brokerIdentity);
-      child.send?.({
+      brokerIdentity = capturedBrokerIdentity;
+      onSpawn?.(child, capturedBrokerIdentity);
+      sendBrokerControl({
         type: 'launch',
+        launch_id: launchId,
+        command_digest: launchCommandDigest,
         command,
         args,
         cwd,
         env: { ...process.env, ...env },
-      }, (error) => {
-        if (!error || settled) return;
-        cleanup();
-        terminateProcessTree(child, 'SIGTERM');
-        reject(error);
+      }, () => launchAttested, (error) => {
+        // Do not reject from this transport callback. The broker may already
+        // have consumed the request and queued its authenticated `launched`
+        // response before closing the channel. Its identity-bound response or
+        // eventual process close decides the outcome.
+        launchDeliveryFailure = `Monitored broker launch delivery failed: ${safeErrorMessage(error)}`;
       });
     } catch (error) {
       cleanup();
-      terminateProcessTree(child, 'SIGTERM');
-      const killTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 1_000);
+      terminateUnreleasedBroker(child, 'SIGTERM');
+      const killTimer = setTimeout(() => terminateUnreleasedBroker(child, 'SIGKILL'), 1_000);
       killTimer.unref?.();
       child.stdin!.destroy();
       reject(error);
@@ -604,6 +888,9 @@ export async function runCodexExec(options: CodexExecOptions): Promise<CodexSpaw
     progressArtifactPaths: options.progressArtifactPaths,
     cleanupPaths: options.cleanupPaths,
     onSpawn: options.onSpawn,
+    onTargetSpawn: options.onTargetSpawn,
+    onDescendants: options.onDescendants,
+    onDrain: options.onDrain,
     captureSpawnedIdentity: options.captureSpawnedIdentity,
     cancelCheck: options.cancelCheck,
     awaitUsageOnSuccess: args.includes('--json'),
@@ -631,6 +918,9 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
       successPollMs: options.successPollMs,
       cleanupPaths: options.cleanupPaths,
       onSpawn: options.onSpawn,
+      onTargetSpawn: options.onTargetSpawn,
+      onDescendants: options.onDescendants,
+      onDrain: options.onDrain,
       captureSpawnedIdentity: options.captureSpawnedIdentity,
       cancelCheck: options.cancelCheck,
       awaitUsageOnSuccess: args.includes('--json'),
@@ -645,6 +935,8 @@ export async function runCodexExecMonitored(options: CodexExecOptions): Promise<
           usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
           usageReported: false, terminatedAfterSuccess: false, cancelled: false,
           outputFormat: 'plain-text', assistantContent: '', toolCalls: [],
+          drainAttested: false,
+          processIdentities: { broker: null, target: null, descendants: [] },
         },
         outcome: 'failed',
       });

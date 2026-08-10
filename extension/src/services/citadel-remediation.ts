@@ -8,6 +8,10 @@ import { resetPipelineForAutonomousRemediation } from './pipeline-state.js';
 import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonFile } from './pickle-utils.js';
 import { normalizeTicketScopePath, resolveTicketScope } from './execution-gate.js';
 import { StateManager } from './state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from './monitored-process-ownership.js';
 import { DurableOwnershipDrainError, isDurableOwnershipDrainError } from './durable-runtime.js';
 import { normalizeTicketId, readManifest, ticketDependencyIds, updateTicketStatus } from './tickets.js';
 import type { Ticket } from '../types/index.js';
@@ -558,7 +562,9 @@ const CONTROLLED_STATE_FIELDS = [
   'active_child_kind',
   'active_child_command',
   'active_child_identity',
+  'active_child_identities',
   'active_child_controller_pid',
+  'active_child_controller_identity',
 ];
 
 function normalizedAuthoritativeContent(relativePath: string, content: string | null): string {
@@ -829,6 +835,7 @@ export async function repairCitadelAttribution(
       options.assertDurableOwnership?.();
       let result: Awaited<ReturnType<typeof runCodexExecMonitored>> | null = null;
       let workerError: unknown = null;
+      recoverMonitoredProcessOwnership(manager, statePath);
       try {
         result = await runCodexExecMonitored({
         telemetry: { sessionDir, ticketId: 'citadel-attribution', phase: 'citadel_attribution_repair' },
@@ -837,14 +844,7 @@ export async function repairCitadelAttribution(
         outputLastMessagePath: lastMessagePath, progressArtifactPaths: [candidateArtifactPath], addDirs: [], inheritConfiguredAddDirs: false,
         successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE')
           || hasPromiseToken(lastMessage, 'CITADEL_ATTRIBUTION_REPAIR_COMPLETE'),
-        onSpawn: (child, identity) => manager.update(statePath, (current) => {
-          current.active_child_pid = child.pid;
-          current.active_child_kind = 'codex';
-          current.active_child_command = 'citadel-attribution-repair';
-          current.active_child_identity = identity;
-          current.active_child_controller_pid = process.pid;
-          return current;
-        }),
+        ...monitoredProcessStateCallbacks(manager, statePath, 'codex', 'citadel-attribution-repair'),
         cancelCheck: () => {
           const cancellationAtMs = Date.parse(String(manager.read(statePath).cancel_requested_at || ''));
           return Number.isFinite(cancellationAtMs) && cancellationAtMs >= repairStartedAtMs;
@@ -853,19 +853,6 @@ export async function repairCitadelAttribution(
         options.assertDurableOwnership?.();
       } catch (error) {
         workerError = error;
-      } finally {
-        try {
-          manager.update(statePath, (current) => {
-            current.active_child_pid = null;
-            current.active_child_kind = null;
-            current.active_child_command = null;
-            current.active_child_identity = null;
-            current.active_child_controller_pid = null;
-            return current;
-          });
-        } catch (error) {
-          workerError ||= error;
-        }
       }
       try {
         const driftResult = quarantineAndRestoreAuthoritativeDrift(

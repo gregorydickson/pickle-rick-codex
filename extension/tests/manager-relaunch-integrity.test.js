@@ -201,6 +201,49 @@ test('tmux, pipeline, and legacy managers continue beyond ten through authentica
   }
 });
 
+test('authority reconstruction binds and preserves monitored child controller ownership', () => {
+  const preservedHashes = [];
+  for (const controllerPid of [41001, 41002]) {
+    const sessionDir = makeTempRoot('pickle-relaunch-controller-ownership-');
+    const controllerIdentity = {
+      identity_version: 1,
+      identity_kind: 'process',
+      pid: controllerPid,
+      pgid: controllerPid,
+      start_time: String(controllerPid),
+      command_sha256: crypto.createHash('sha256').update(`controller-${controllerPid}`).digest('hex'),
+      fingerprint: crypto.createHash('sha256').update(`fingerprint-${controllerPid}`).digest('hex'),
+      session_id: String(controllerPid),
+    };
+    createState(sessionDir, {
+      active_child_controller_pid: controllerPid,
+      active_child_controller_identity: controllerIdentity,
+    });
+    for (let count = 1; count <= CODEX_MANAGER_RELAUNCH_CAP + 2; count += 1) {
+      recordPickleTmuxManagerRelaunch(sessionDir);
+    }
+    new StateManager().update(path.join(sessionDir, 'state.json'), (state) => {
+      state.step = 'drifted';
+      return state;
+    });
+
+    const activated = activatePreparedManagerRelaunchRecovery(sessionDir);
+    const evidence = JSON.parse(fs.readFileSync(
+      path.join(sessionDir, activated.execution_evidence_path), 'utf8',
+    ));
+    const restored = new StateManager().read(path.join(sessionDir, 'state.json'));
+    assert.equal(restored.active_child_controller_pid, controllerPid);
+    assert.deepEqual(restored.active_child_controller_identity, controllerIdentity);
+    assert.equal(evidence.preserved_runtime_hash_before, evidence.preserved_runtime_hash_after);
+    preservedHashes.push(evidence.preserved_runtime_hash_after);
+  }
+  assert.notEqual(
+    preservedHashes[0],
+    preservedHashes[1],
+    'changing only controller ownership must change the authenticated runtime preservation hash',
+  );
+});
+
 test('mux and detached-loop runner entrypoints consume prepared reconstruction before startup', async () => {
   const fixtures = [
     {

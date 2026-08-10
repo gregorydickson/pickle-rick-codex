@@ -288,7 +288,8 @@ test('malicious attribution worker cannot mutate live tickets while returning a 
   assert.equal(fs.existsSync(path.join(sessionDir, 'independent', 'linear_ticket_independent.md')), false);
   const liveState = JSON.parse(fs.readFileSync(path.join(sessionDir, 'state.json'), 'utf8'));
   assert.equal(liveState.active, true);
-  assert.equal(liveState.active_child_pid, null);
+  assert.equal(liveState.active_child_pid ?? null, null);
+  assert.deepEqual(liveState.active_child_identities ?? [], []);
   const pending = reconcileCitadelAttributionRepair(sessionDir);
   assert.equal(pending.attempt_count, 1);
   assert.equal(pending.strategy_history.at(-1).status, 'failed');

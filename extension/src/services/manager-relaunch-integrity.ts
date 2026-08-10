@@ -432,7 +432,8 @@ function recoveryEpochForCount(count: number): number {
 const RUNTIME_STATE_KEYS = new Set([
   'active', 'tmux_mode', 'tmux_runner_pid', 'tmux_session_name', 'tmux_runner_binding',
   'preserve_tmux_monitor', 'worker_pid', 'worker_identity', 'active_child_pid',
-  'active_child_identity', 'active_child_kind', 'active_child_command', 'last_exit_reason',
+  'active_child_identity', 'active_child_identities', 'active_child_kind', 'active_child_command',
+  'active_child_controller_pid', 'active_child_controller_identity', 'last_exit_reason',
   'max_iterations', 'max_time_minutes', 'history',
   'session_map_cwds', 'cancel_requested_at', 'cancel_reason',
 ]);

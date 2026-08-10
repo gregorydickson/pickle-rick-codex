@@ -1,5 +1,6 @@
 // @tier: fast
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import test from 'node:test';
 import { spawn } from 'node:child_process';
 import {
@@ -8,6 +9,7 @@ import {
   captureSpawnedProcessIdentity,
   reapOwnedOrphanProcessGroup,
   reapRecordedLiveProcessGroup,
+  reapRecordedProcessGroupFromMember,
   recoverSessionOrphanState,
 } from '../services/orphan-reaper.js';
 import { makeTempRoot } from './helpers.js';
@@ -168,6 +170,28 @@ test('recorded child policy rejects absent and mismatched spawn identities', () 
     assert.equal(result.status, 'ambiguous');
     assert.deepEqual(result.signals, []);
   }
+
+  const commandSha256 = crypto.createHash('sha256').update('node exact-worker.js --nonce=a').digest('hex');
+  const strong = {
+    pid: 4100, pgid: 4100, start_time: persisted.start_time,
+    identity_version: 2, session_id: 77, command_sha256: commandSha256,
+    fingerprint: crypto.createHash('sha256')
+      .update(`v2\0${4100}\0${4100}\0${77}\0${persisted.start_time}\0${commandSha256}`).digest('hex'),
+  };
+  const replacementCommand = crypto.createHash('sha256').update('node replacement.js').digest('hex');
+  const sameSecondReplacement = recordedIdentity({
+    sessionId: 77,
+    command: 'node replacement.js',
+    fingerprint: crypto.createHash('sha256')
+      .update(`v2\0${4100}\0${4100}\0${77}\0${persisted.start_time}\0${replacementCommand}`).digest('hex'),
+  });
+  const sameSecondSignals = [];
+  const sameSecond = reapRecordedLiveProcessGroup(strong, {
+    inspect: () => sameSecondReplacement,
+    signalGroup: (pgid, signal) => sameSecondSignals.push([pgid, signal]),
+  });
+  assert.equal(sameSecond.status, 'ambiguous');
+  assert.deepEqual(sameSecondSignals, [], 'same-second PID reuse with different command must never be signalled');
 });
 
 test('recorded child policy rechecks immutable identity before TERM', () => {
@@ -227,7 +251,7 @@ test('recorded child policy accepts graceful exit and escalates a stable survivo
   assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
 });
 
-test('recorded child policy refuses or reports a failed KILL after TERM', () => {
+test('recorded child and member policies refuse unsafe KILL after TERM', () => {
   const persisted = persistedIdentity();
   const current = recordedIdentity();
   const changed = reapRecordedLiveProcessGroup(persisted, {
@@ -247,6 +271,35 @@ test('recorded child policy refuses or reports a failed KILL after TERM', () => 
   });
   assert.equal(failed.status, 'signal-failed');
   assert.equal(failed.reason, 'KILL denied');
+
+  const persistedMember = persistedIdentity({ pid: 4101, pgid: 4100 });
+  const member = recordedIdentity({ pid: 4101, pgid: 4100 });
+  const signals = [];
+  const reaped = reapRecordedProcessGroupFromMember(persistedMember, {
+    inspect: sequence(member, member),
+    signalGroup: (pgid, signal) => signals.push([pgid, signal]),
+    wait: () => {},
+  });
+  assert.equal(reaped.status, 'reaped');
+  assert.deepEqual(signals, [[4100, 'SIGKILL']]);
+
+  const reusedSignals = [];
+  const reused = reapRecordedProcessGroupFromMember(persistedMember, {
+    inspect: sequence(member, { ...member, startTime: 'replacement' }),
+    signalGroup: (pgid, signal) => reusedSignals.push([pgid, signal]),
+    wait: () => {},
+  });
+  assert.equal(reused.status, 'ambiguous');
+  assert.deepEqual(reusedSignals, [], 'PID reuse must suppress numeric KILL');
+
+  const exited = reapRecordedProcessGroupFromMember(persistedMember, {
+    inspect: sequence(member, null),
+    signalGroup: () => {},
+    wait: () => {},
+  });
+  assert.equal(exited.status, 'ambiguous');
+  assert.match(exited.reason, /changed before KILL/);
+  assert.deepEqual(exited.signals, []);
 });
 
 test('capture and recovery entrypoints fail closed for invalid process identifiers', () => {
@@ -282,6 +335,11 @@ test('spawn identity capture rejects a live pid that is not owned by the expecte
   const pid = Number(child.pid);
   try {
     assert.ok(captureSpawnedProcessIdentity(pid, 20), 'direct detached child identity is captured');
+    const execCapableIdentity = captureSpawnedProcessIdentity(
+      pid, 20, process.pid, { strictCommand: false },
+    );
+    assert.equal(execCapableIdentity.identity_kind, 'managed');
+    assert.equal(execCapableIdentity.strict_command, false);
     assert.equal(
       captureSpawnedProcessIdentity(pid, 1, process.pid + 1),
       null,

@@ -551,6 +551,7 @@ function clearQuiescedOwnership(sessionDir: string): void {
     state.active_child_command = null;
     state.active_child_identity = null;
     state.active_child_controller_pid = null;
+    state.active_child_controller_identity = null;
     state.step = 'verification_contract_repair';
     state.failure_kind = 'verification_contract_failed';
     state.failure_reason = 'legacy session adoption requires structured verification contract repair';

@@ -7,6 +7,10 @@ import { CodexCancelCheckError, assertCodexSucceeded, hasPromiseToken, runCodexE
 import { atomicWriteJson, readJsonFile } from './pickle-utils.js';
 import { assertPrdSealMatchesPrd, readPrdSeal } from './prd-seal.js';
 import { StateManager } from './state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from './monitored-process-ownership.js';
 import { getHeadSha, getSymbolicHead, getWorkingTreeFingerprint, isGitRepo } from './git-utils.js';
 import {
   normalizeTicketId,
@@ -324,7 +328,8 @@ function logicalState(value: Record<string, unknown>): Record<string, unknown> {
   const clone = structuredClone(value);
   for (const key of [
     'active_child_pid', 'active_child_kind', 'active_child_command',
-    'active_child_identity', 'active_child_controller_pid',
+    'active_child_identity', 'active_child_identities', 'active_child_controller_pid',
+    'active_child_controller_identity',
   ]) delete clone[key];
   return clone;
 }
@@ -365,22 +370,11 @@ function cleanupWorkerState(
   manager: StateManager,
   statePath: string,
   cancelledByMonitor: boolean,
-  workerChildPid: number | null,
 ): { cancelled: boolean } {
   manager.acquireLock(statePath);
   try {
     const current = manager.read(statePath);
     const cancelled = cancelledByMonitor || current.active === false;
-    if (workerChildPid !== null
-      && current.active_child_pid === workerChildPid
-      && current.active_child_controller_pid === process.pid
-      && current.active_child_command === 'dependency-repair') {
-      current.active_child_pid = null;
-      current.active_child_kind = null;
-      current.active_child_command = null;
-      current.active_child_identity = null;
-      current.active_child_controller_pid = null;
-    }
     atomicWriteJson(statePath, current);
     return { cancelled };
   } finally {
@@ -676,8 +670,8 @@ export async function repairTicketDependencyContract(
   let result;
   let workerError: unknown = null;
   let isolationError: Error | null = null;
-  let workerChildPid: number | null = null;
   const fence = captureWorkerFence(sessionDir, workingDir);
+  recoverMonitoredProcessOwnership(manager, statePath);
   try {
     result = await runCodexExecMonitored({
       telemetry: { sessionDir, ticketId: normalizedTicketId, phase: 'dependency_repair' },
@@ -687,15 +681,7 @@ export async function repairTicketDependencyContract(
       progressArtifactPaths: [artifactPath], addDirs: [], inheritConfiguredAddDirs: false,
       successCheck: ({ stdout, lastMessage }) => hasPromiseToken(stdout, 'DEPENDENCY_REPAIR_COMPLETE')
         || hasPromiseToken(lastMessage, 'DEPENDENCY_REPAIR_COMPLETE'),
-      onSpawn: (child, identity) => manager.update(statePath, (current) => {
-        workerChildPid = Number(child.pid);
-        current.active_child_pid = workerChildPid;
-        current.active_child_kind = 'codex';
-        current.active_child_command = 'dependency-repair';
-        current.active_child_identity = identity;
-        current.active_child_controller_pid = process.pid;
-        return current;
-      }),
+      ...monitoredProcessStateCallbacks(manager, statePath, 'codex', 'dependency-repair'),
       cancelCheck: () => manager.read(statePath).active === false,
     });
     options.assertDurableOwnership?.();
@@ -715,7 +701,7 @@ export async function repairTicketDependencyContract(
       let cleanupFailure: string | null = null;
       let stateCleanup: { cancelled: boolean } | null = null;
       try {
-        stateCleanup = cleanupWorkerState(manager, statePath, result?.cancelled === true, workerChildPid);
+        stateCleanup = cleanupWorkerState(manager, statePath, result?.cancelled === true);
       } catch (error) {
         cleanupFailure = error instanceof Error ? error.message : String(error);
       }
@@ -727,7 +713,12 @@ export async function repairTicketDependencyContract(
           reason: 'dependency-repair-unattributed-authoritative-drift',
           drift,
           cleanup_failure: cleanupFailure,
-          monitor_error: workerError instanceof CodexCancelCheckError ? workerError.message : null,
+          // The monitored broker can observe an unreadable authoritative state
+          // either in its cancellation poll or while persisting a target ledger.
+          // Both are monitor-boundary failures and must remain diagnosable; the
+          // scheduling race between those callbacks must not erase the evidence.
+          monitor_error: workerError instanceof Error
+            ? workerError.message : workerError === null ? null : String(workerError),
           worker_error: workerError instanceof Error ? workerError.message : workerError === null ? null : String(workerError),
           candidate_artifact: candidateArtifact,
           authoritative_drift: authoritativeDriftEvidence(sessionDir, drift),
@@ -745,7 +736,7 @@ export async function repairTicketDependencyContract(
         : new Error(driftMessage);
     } else {
       try {
-        cleanupWorkerState(manager, statePath, result?.cancelled === true, workerChildPid);
+        cleanupWorkerState(manager, statePath, result?.cancelled === true);
       } catch (error) {
         isolationError = new Error(`dependency-repair-state-cleanup-failed: ${error instanceof Error ? error.message : String(error)}`);
       }

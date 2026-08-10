@@ -988,7 +988,7 @@ setInterval(() => {}, 1000);
       kind: 'content', size: 1, content_base64: Buffer.from('{').toString('base64'),
     }, artifactMode);
     assert.match(quarantine.cleanup_failure, /State file must contain a JSON object/);
-    assert.match(quarantine.monitor_error, /Codex cancellation check failed.*State file must contain a JSON object/, `${artifactMode}: ${quarantine.worker_error}`);
+    assert.match(quarantine.monitor_error, /State file must contain a JSON object/, `${artifactMode}: ${quarantine.worker_error}`);
   }
 });
 

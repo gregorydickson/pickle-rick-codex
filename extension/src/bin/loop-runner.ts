@@ -91,6 +91,10 @@ import {
 } from '../services/autonomous-budget.js';
 import { isDurableOwnershipDrainError, startDurableRuntimeOwnership } from '../services/durable-runtime.js';
 import { StateManager, type PersistedState } from '../services/state-manager.js';
+import {
+  monitoredProcessStateCallbacks,
+  recoverMonitoredProcessOwnership,
+} from '../services/monitored-process-ownership.js';
 import { atomicWriteJson, readJsonFile } from '../services/pickle-utils.js';
 import { scrubWorkerOutput } from '../services/worker-output.js';
 import { acquireSessionOperation } from '../services/session-operation.js';
@@ -1670,6 +1674,7 @@ async function runLoopWithLease(
       const controlSnapshots = captureControlFiles(sessionDir);
       const outputLastMessagePath = createOutputLastMessagePath(sessionDir, loopConfig.mode, iteration, attemptOrdinal);
       fs.rmSync(outputLastMessagePath, { force: true });
+      recoverMonitoredProcessOwnership(manager, statePath);
       const result = await runCodexExecMonitored({
         telemetry: {
           sessionDir,
@@ -1700,25 +1705,8 @@ async function runLoopWithLease(
         successCheck: loopSuccessCheck(outputLastMessagePath),
         successSignalGraceMs: 150,
         successPollMs: 50,
-        onSpawn: (child, identity) => {
-          manager.update(statePath, (current) => {
-            current.active_child_pid = child.pid;
-            current.active_child_kind = 'codex';
-            current.active_child_command = loopConfig.mode;
-            current.active_child_identity = identity;
-            current.active_child_controller_pid = process.pid;
-            return current;
-          });
-        },
+        ...monitoredProcessStateCallbacks(manager, statePath, 'codex', loopConfig.mode),
         cancelCheck: () => manager.read(statePath).active === false,
-      });
-      manager.update(statePath, (current) => {
-        current.active_child_pid = null;
-        current.active_child_kind = null;
-        current.active_child_command = null;
-        current.active_child_identity = null;
-        current.active_child_controller_pid = null;
-        return current;
       });
       const tamperedControlFiles = restoreTamperedControlFiles(controlSnapshots);
       if (result.cancelled || manager.read(statePath).active === false) {

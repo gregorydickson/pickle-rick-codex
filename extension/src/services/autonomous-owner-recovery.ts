@@ -8,6 +8,7 @@ import {
   captureProcessLivenessIdentity,
   captureSpawnedProcessIdentity,
   inspectProcessLivenessIdentity,
+  isPersistedProcessIdentityValid,
   reapRecordedLiveProcessGroup,
   type PersistedProcessIdentity,
 } from './orphan-reaper.js';
@@ -207,16 +208,9 @@ export function deriveAutonomousProcessOwnerSpec(
 }
 
 function persistedIdentity(value: unknown, expectedPid: number | null): PersistedProcessIdentity | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (!isPersistedProcessIdentityValid(value)) return null;
   const identity = value as PersistedProcessIdentity;
-  if (!Number.isInteger(identity.pid) || identity.pid <= 0
-    || !Number.isInteger(identity.pgid) || identity.pgid <= 0
-    || typeof identity.start_time !== 'string' || !identity.start_time
-    || typeof identity.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(identity.fingerprint)
-    || (expectedPid !== null && identity.pid !== expectedPid)) return null;
-  const expectedFingerprint = crypto.createHash('sha256')
-    .update(`${identity.pid}\0${identity.pgid}\0${identity.start_time}`).digest('hex');
-  if (identity.fingerprint !== expectedFingerprint) return null;
+  if (expectedPid !== null && identity.pid !== expectedPid) return null;
   return identity;
 }
 
