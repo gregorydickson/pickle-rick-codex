@@ -3,8 +3,9 @@
 **Live ledger** for `pickle-rick-codex` (the Codex/`codex exec` port of Pickle Rick). Kept lean. PRDs live in
 `prds/`; shipped detail lives in `git log`. `AGENTS.md` is the canonical runtime contract.
 
-**Updated 2026-07-24.** A fresh source, installation, integration, safety, and Claude-parity audit replaced
-the stale June snapshot. The TypeScript migration, eight-phase worker lifecycle, recoverable safety seams, scoped
+**Updated 2026-08-11.** Stale-process production evidence was added to the P1 drain queue. The July 24 source,
+installation, integration, safety, and Claude-parity audit replaced the stale June snapshot. The TypeScript migration,
+eight-phase worker lifecycle, recoverable safety seams, scoped
 detached pipeline, and mandatory Citadel gate are present. The port remains beta until the hardened pipeline gains
 current authenticated dogfood evidence and the remaining reduced parity surfaces are exercised in the field.
 
@@ -27,6 +28,7 @@ drain row — field runs are the evidence that drives the work. Keep docs aligne
 
 | # | Item | Pri | State | Source |
 |---|------|-----|-------|--------|
+| stale-process-leakage | **Stale recovery daemons, brokers, executors, fixtures, sockets, and child trees** — Production and repeated test runs left 27 recovery daemons under PPID 1, stale brokers with deleted working directories, retained app-server descendants/sockets, and more than 50 Node processes. Repair explicit ownership, authenticated abandonment detection, bounded signal/teardown paths, and real-process test cleanup without weakening valid detached-pipeline survival. | **P1** | **READY TO REFINE** — production evidence recorded; requires complete spawn/lifetime inventory, real-process regressions, and a 25-iteration zero-leak soak. Do not disturb active pipelines. | `p1-stale-process-leakage.md` |
 | autonomous-recovery-field-incidents | **Generated-artifact, dependency-bootstrap, and review-refusal recovery** — Rule Explorer dogfood showed malformed generated verification/artifact metadata, missing worktree dependencies, and review refusals each exhaust a ticket or synthesis budget instead of entering a typed remediation path. | **P1** | **READY TO REFINE** — field evidence: sessions `2026-08-02-429773fc`, `2026-08-02-dd376715`, and `2026-08-02-e947aa91`. | `p1-autonomous-recovery-field-incidents.md` |
 | quality-delta-grounded-conformance | **False quality deltas and ungrounded conformance** — LoanLight audit ticket changed one Markdown file, but raw transcript-set comparison classified unchanged pre-existing TypeScript/test failures as new. The same ticket's conformance phase approved a nonexistent `.claude` launcher using narrative-only evidence because deterministic verification runs afterward. Introduce structured diagnostic deltas, persisted comparison evidence, criterion-to-verification obligations, verification receipts before conformance, and receipt-grounded final decisions. | **P1** | **READY TO REFINE** — field evidence: session `2026-07-24-fed336a8`, rejected commit `c0541520b9d9ff0db40ac161ddfc84be69fe38b6`. Drain with `field-bootstrap-contracts`; neither alone makes the field path trustworthy. | `p1-quality-delta-and-grounded-conformance-field-incident.md` |
 | field-bootstrap-contracts | **Field-run bootstrap contract gaps** — LoanLight dogfood exposed invalid synthesized `proof_corpus` path syntax, empty quality-baseline failure for monorepo `*:all` scripts, and a false-success tmux launch before immediate runner failure. Preserve fail-closed gates while aligning prompt grammar, adding one diagnostic manifest-repair pass, supporting conventional monorepo quality scripts/valid absent baselines, and authenticating launcher handoff. | **P1** | **READY TO REFINE** — field evidence: sessions `2026-07-24-a1f58326` and `2026-07-24-c0a9d0ec`. Drain before feature work. | `p1-field-run-bootstrap-contract-gaps.md` |
