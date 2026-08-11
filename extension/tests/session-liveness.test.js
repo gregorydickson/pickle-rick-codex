@@ -14,6 +14,7 @@ import {
 } from '../services/orphan-reaper.js';
 import { consumeAutonomousBudgetRollover } from '../services/autonomous-budget.js';
 import {
+  deriveAutonomousProcessOwnerSpec,
   registerAutonomousOwnerSpec,
   restoreAutonomousBudgetOwner,
   runAutonomousOwnerRecoveryDaemon,
@@ -2144,6 +2145,72 @@ test('reconcileSessionLiveness blocks and preserves discoverability for a live o
   assert.equal(result.state.recovery_required, true);
   assert.equal(result.state.active_child_pid, process.pid);
   assert.equal(result.state.orphan_child_pid, process.pid);
+});
+
+test('runner-loss daemon clears an exited ambiguous child and restores the exact owner', async () => {
+  const sessionDir = makeTempRoot('pickle-runner-loss-owner-recovery-');
+  const workingDir = makeTempRoot('pickle-runner-loss-owner-working-');
+  const runtimeBin = makeTempRoot('pickle-runner-loss-owner-runtime-');
+  fs.writeFileSync(path.join(runtimeBin, 'supervised-runner.js'), 'setInterval(() => {}, 1_000);\n');
+  fs.writeFileSync(path.join(runtimeBin, 'mux-runner.js'), '// immutable runner identity\n');
+  const spec = deriveAutonomousProcessOwnerSpec(
+    sessionDir,
+    workingDir,
+    'mux-runner.js',
+    [],
+    runtimeBin,
+  );
+  const missingChildIdentity = {
+    pid: 999_999_991,
+    pgid: 999_999_991,
+    start_time: 'Mon Aug 10 19:48:45 2026',
+    fingerprint: 'a'.repeat(64),
+    identity_version: 2,
+    session_id: 0,
+    command_sha256: 'b'.repeat(64),
+    identity_kind: 'managed',
+    strict_command: true,
+  };
+  const statePath = path.join(sessionDir, 'state.json');
+  writeJson(statePath, state({
+    session_dir: sessionDir,
+    working_dir: workingDir,
+    active: false,
+    step: 'blocked',
+    last_exit_reason: 'runner_lost_orphaned_child',
+    recovery_required: true,
+    recovery_reason: 'live child identity does not match the spawn record',
+    active_child_pid: missingChildIdentity.pid,
+    active_child_identity: missingChildIdentity,
+    orphan_child_pid: missingChildIdentity.pid,
+    autonomous_owner_spec: spec,
+  }));
+
+  let restoredIdentity = null;
+  const daemon = runAutonomousOwnerRecoveryDaemon(sessionDir, { intervalMs: 10 });
+  try {
+    const restored = await waitForState(statePath, (current) => (
+      current.autonomous_owner_restoration?.status === 'restored'
+    ));
+    restoredIdentity = restored.autonomous_supervisor_identity;
+    assert.equal(restored.recovery_required, false);
+    assert.equal(restored.active_child_pid, null);
+    assert.equal(restored.orphan_child_pid, null);
+    assert.equal(restored.last_exit_reason, 'runner_lost');
+    assert.equal(restored.step, 'paused');
+    assert.equal(restored.autonomous_owner_restoration.recovery_kind, 'runner_lost');
+    assert.equal(restored.autonomous_owner_restoration.rollover_epoch, 0);
+    assert.equal(restored.autonomous_owner_restoration.status, 'restored');
+    assert.equal(inspectProcessLivenessIdentity(restoredIdentity), 'matched');
+  } finally {
+    new StateManager().update(statePath, (current) => {
+      current.cancelled = true;
+      current.last_exit_reason = 'cancelled';
+      return current;
+    });
+    await daemon;
+    if (restoredIdentity) reapRecordedLiveProcessGroup(restoredIdentity);
+  }
 });
 
 test('reconcileSessionLiveness reaps an identity-matched lifecycle child using a nested candidate add-dir', () => {

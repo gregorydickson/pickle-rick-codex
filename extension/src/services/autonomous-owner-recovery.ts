@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendHistory, getStatePath, reconcileSessionLiveness } from './session.js';
-import { LockError, StateManager } from './state-manager.js';
+import { LockError, StateManager, type PersistedState } from './state-manager.js';
 import {
+  assertRecordedActiveChildRecovered,
   captureProcessLivenessIdentity,
   captureSpawnedProcessIdentity,
   inspectProcessLivenessIdentity,
@@ -156,6 +157,7 @@ export interface AutonomousOwnerRestorationIntent {
   restorer_identity?: PersistedProcessIdentity | null;
   restored_tmux_binding?: TmuxRunnerBinding;
   error?: string;
+  recovery_kind?: 'budget_rollover' | 'runner_lost';
 }
 
 interface AutonomousOwnerHandoffTransaction {
@@ -260,6 +262,96 @@ function ownerSpec(value: unknown): AutonomousOwnerSpec | null {
 
 export function validateAutonomousOwnerSpec(value: unknown): AutonomousOwnerSpec | null {
   return ownerSpec(value);
+}
+
+function restorationMatchesControlState(
+  intent: AutonomousOwnerRestorationIntent,
+  current: PersistedState,
+  spec: AutonomousOwnerSpec,
+): boolean {
+  if (intent.owner_spec_id !== spec.spec_id) return false;
+  if (intent.recovery_kind === 'runner_lost') {
+    return intent.rollover_epoch === 0
+      && intent.rollover_intent_id.startsWith('runner-loss:')
+      && current.active === false
+      && current.last_exit_reason === 'runner_lost'
+      && current.recovery_required !== true;
+  }
+  return intent.rollover_intent_id === current.autonomous_budget_rollover_intent_id
+    && intent.rollover_epoch === Number(current.autonomous_budget_epoch || 0);
+}
+
+/**
+ * Keep a live, ambiguous child fenced after runner loss. Once that exact PID
+ * is absent, clear its durable ownership and schedule ordinary owner recovery
+ * without pretending the failure was a budget rollover.
+ */
+export function prepareRunnerLossOwnerRestoration(
+  sessionDir: string,
+  stateManager: StateManager = new StateManager(),
+  nowMs: number = Date.now(),
+): boolean {
+  const resolvedSessionDir = fs.realpathSync(sessionDir);
+  const statePath = getStatePath(resolvedSessionDir);
+  let state = stateManager.read(statePath);
+  if (state.active === false && state.last_exit_reason === 'runner_lost_orphaned_child'
+    && state.recovery_required === true) {
+    try {
+      assertRecordedActiveChildRecovered(resolvedSessionDir, stateManager);
+    } catch {
+      return false;
+    }
+    state = stateManager.update(statePath, (current) => {
+      if (current.active !== false || current.last_exit_reason !== 'runner_lost_orphaned_child'
+        || current.recovery_required === true || Number(current.active_child_pid || 0) > 0
+        || Number(current.orphan_child_pid || 0) > 0) return current;
+      current.last_exit_reason = 'runner_lost';
+      current.step = current.step === 'complete' ? current.step : 'paused';
+      appendHistory(current, 'runner_loss_orphan_recovered',
+        typeof current.current_ticket === 'string' ? current.current_ticket : undefined);
+      return current;
+    });
+  }
+  if (state.active !== false || state.last_exit_reason !== 'runner_lost'
+    || state.recovery_required === true || state.cancel_requested_at || state.cancelled === true) return false;
+  const spec = ownerSpec(state.autonomous_owner_spec);
+  if (!spec || spec.session_dir !== resolvedSessionDir) return false;
+  const supervisorIdentity = state.autonomous_supervisor_identity as PersistedProcessIdentity | null;
+  if (supervisorIdentity && inspectProcessLivenessIdentity(supervisorIdentity) === 'matched') return false;
+
+  let prepared = false;
+  stateManager.update(statePath, (current) => {
+    const exactSpec = ownerSpec(current.autonomous_owner_spec);
+    if (current.active !== false || current.last_exit_reason !== 'runner_lost'
+      || current.recovery_required === true || current.cancel_requested_at || current.cancelled === true
+      || !exactSpec || exactSpec.spec_id !== spec.spec_id || exactSpec.session_dir !== resolvedSessionDir) return current;
+    const exactSupervisorIdentity = current.autonomous_supervisor_identity as PersistedProcessIdentity | null;
+    if (exactSupervisorIdentity && inspectProcessLivenessIdentity(exactSupervisorIdentity) === 'matched') return current;
+    const existing = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
+    if (existing && restorationMatchesControlState(existing, current, exactSpec)
+      && (existing.status === 'pending' || existing.status === 'restoring')) {
+      prepared = true;
+      return current;
+    }
+    current.autonomous_owner_restoration = {
+      schema_version: 1,
+      intent_id: crypto.randomUUID(),
+      rollover_intent_id: `runner-loss:${crypto.randomUUID()}`,
+      rollover_epoch: 0,
+      owner_spec_id: exactSpec.spec_id,
+      status: 'pending',
+      attempt: existing?.recovery_kind === 'runner_lost' ? Number(existing.attempt || 0) : 0,
+      not_before: new Date(nowMs).toISOString(),
+      restorer_pid: null,
+      restorer_identity: null,
+      recovery_kind: 'runner_lost',
+    };
+    appendHistory(current, 'runner_loss_owner_restoration_planned',
+      typeof current.current_ticket === 'string' ? current.current_ticket : undefined);
+    prepared = true;
+    return current;
+  });
+  return prepared;
 }
 
 export function deriveAutonomousProcessOwnerSpec(
@@ -819,9 +911,8 @@ export function restoreAutonomousBudgetOwner(
         if (current.recovery_required === true) return current;
         const intent = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
         const spec = ownerSpec(current.autonomous_owner_spec);
-        if (!intent || !spec || spec.session_dir !== resolvedSessionDir || intent.owner_spec_id !== spec.spec_id
-          || intent.rollover_intent_id !== current.autonomous_budget_rollover_intent_id
-          || intent.rollover_epoch !== Number(current.autonomous_budget_epoch || 0)
+        if (!intent || !spec || spec.session_dir !== resolvedSessionDir
+          || !restorationMatchesControlState(intent, current, spec)
           || (intent.status !== 'pending' && intent.status !== 'failed')
           || Date.parse(intent.not_before) > nowMs) return current;
         intentId = intent.intent_id;
@@ -844,9 +935,7 @@ export function restoreAutonomousBudgetOwner(
         const intent = current.autonomous_owner_restoration as AutonomousOwnerRestorationIntent | null;
         const spec = ownerSpec(current.autonomous_owner_spec);
         if (intent && spec?.session_dir === resolvedSessionDir
-          && intent.owner_spec_id === spec.spec_id
-          && intent.rollover_intent_id === current.autonomous_budget_rollover_intent_id
-          && intent.rollover_epoch === Number(current.autonomous_budget_epoch || 0)
+          && restorationMatchesControlState(intent, current, spec)
           && (intent.status === 'restoring' || intent.status === 'restored')) return 'noop';
       }
       throw error;
@@ -1555,6 +1644,11 @@ export async function runAutonomousOwnerRecoveryDaemon(
       if (state.autonomous_owner_recovery_suspended === true) {
         await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 1_000));
         continue;
+      }
+      try {
+        prepareRunnerLossOwnerRestoration(resolvedSessionDir, manager);
+      } catch {
+        // Exact orphan evidence remains fenced for the next pass.
       }
       try {
         restoreAutonomousBudgetOwner(resolvedSessionDir, manager);
